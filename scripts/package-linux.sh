@@ -18,7 +18,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cargo build --locked --release --target "$TARGET" --bin masque
+if [ "${USE_ZIGBUILD:-0}" = "1" ]; then
+    cargo zigbuild --locked --release --target "$TARGET" --bin masque
+else
+    cargo build --locked --release --target "$TARGET" --bin masque
+fi
 
 install -d \
     "$STAGING_ROOT/$ARCHIVE_NAME/bin" \

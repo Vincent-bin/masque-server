@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install native build tools
         run: |
@@ -27,12 +27,19 @@ jobs:
           rustup default stable
           rustup target add x86_64-unknown-linux-musl
 
+      - name: Install Zig cross-linker
+        run: |
+          python3 -m pip install --user cargo-zigbuild==0.23.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cargo-zigbuild" --version
+
       - name: Test
         run: cargo test --workspace --release --locked
 
       - name: Build release archive
         env:
           TARGET: x86_64-unknown-linux-musl
+          USE_ZIGBUILD: "1"
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             export VERSION="${GITHUB_REF_NAME#v}"
@@ -42,7 +49,7 @@ jobs:
           scripts/package-linux.sh
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: masque-linux-x86_64
           path: dist/*
