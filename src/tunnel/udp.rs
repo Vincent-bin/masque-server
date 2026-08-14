@@ -4,9 +4,11 @@
 // bidirectionally between the QUIC client and the target.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 /// State for a single CONNECT-UDP tunnel.
@@ -14,11 +16,13 @@ pub struct UdpTunnel {
     /// The HTTP/3 stream ID this tunnel is bound to.
     pub stream_id: u64,
     /// Proxy-side UDP socket connected to the target.
-    pub socket: UdpSocket,
+    pub socket: Arc<UdpSocket>,
     /// Resolved target address.
     pub target_addr: SocketAddr,
     /// Timestamp of last datagram relayed (either direction).
     pub last_activity: Instant,
+    /// Background task that waits for target responses and wakes the server.
+    pub(crate) recv_task: Option<JoinHandle<()>>,
 }
 
 impl UdpTunnel {
@@ -47,10 +51,26 @@ impl UdpTunnel {
 
         Ok(Self {
             stream_id,
+            socket: Arc::new(socket),
+            target_addr,
+            last_activity: Instant::now(),
+            recv_task: None,
+        })
+    }
+
+    pub(crate) fn from_socket(
+        stream_id: u64,
+        target_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        recv_task: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            stream_id,
             socket,
             target_addr,
             last_activity: Instant::now(),
-        })
+            recv_task: Some(recv_task),
+        }
     }
 
     /// Forward a payload from the client to the target.
@@ -60,8 +80,7 @@ impl UdpTunnel {
         Ok(())
     }
 
-    /// Try to receive a packet from the target (non-blocking via poll).
-    /// Returns the payload bytes, or None if no data is ready.
+    /// Wait for a packet from the target.
     pub async fn recv_from_target(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.socket.recv(buf).await?;
         self.last_activity = Instant::now();
@@ -76,5 +95,13 @@ impl UdpTunnel {
     /// Get the quarter stream ID for datagram framing.
     pub fn quarter_stream_id(&self) -> u64 {
         self.stream_id / 4
+    }
+}
+
+impl Drop for UdpTunnel {
+    fn drop(&mut self) {
+        if let Some(task) = self.recv_task.take() {
+            task.abort();
+        }
     }
 }

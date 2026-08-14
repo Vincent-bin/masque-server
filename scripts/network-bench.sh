@@ -46,7 +46,9 @@ EOF
 
 cargo build --workspace --release
 
-python3 tests/e2e/echo-server.py 9999 >"$BENCH_DIR/echo.log" 2>&1 &
+MASQUE_ECHO_SERVER_ADDR=127.0.0.1:9999 \
+RUST_LOG=warn \
+target/release/masque-e2e >"$BENCH_DIR/echo.log" 2>&1 &
 ECHO_PID=$!
 
 RUST_LOG=warn target/release/masque --config "$BENCH_DIR/masque.toml" \

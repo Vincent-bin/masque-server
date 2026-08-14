@@ -79,8 +79,24 @@ fn main() {
     bench("datagram/encode-64", Some(64), || {
         datagram::encode(black_box(&datagram_64))
     });
+    bench("datagram/encode-payload-64", Some(64), || {
+        datagram::encode_payload(black_box(400), black_box(&datagram_64.payload))
+    });
+    let mut reusable_64 = Vec::with_capacity(80);
+    bench("datagram/encode-into-64", Some(64), || {
+        datagram::encode_payload_into(
+            black_box(400),
+            black_box(&datagram_64.payload),
+            black_box(&mut reusable_64),
+        )
+        .unwrap();
+        reusable_64.len()
+    });
     bench("datagram/decode-64", Some(64), || {
         datagram::decode(black_box(&wire_64))
+    });
+    bench("datagram/decode-ref-64", Some(64), || {
+        datagram::decode_ref(black_box(&wire_64))
     });
 
     let datagram_1200 = HttpDatagram {
@@ -92,8 +108,24 @@ fn main() {
     bench("datagram/encode-1200", Some(1_200), || {
         datagram::encode(black_box(&datagram_1200))
     });
+    bench("datagram/encode-payload-1200", Some(1_200), || {
+        datagram::encode_payload(black_box(400), black_box(&datagram_1200.payload))
+    });
+    let mut reusable_1200 = Vec::with_capacity(1_216);
+    bench("datagram/encode-into-1200", Some(1_200), || {
+        datagram::encode_payload_into(
+            black_box(400),
+            black_box(&datagram_1200.payload),
+            black_box(&mut reusable_1200),
+        )
+        .unwrap();
+        reusable_1200.len()
+    });
     bench("datagram/decode-1200", Some(1_200), || {
         datagram::decode(black_box(&wire_1200))
+    });
+    bench("datagram/decode-ref-1200", Some(1_200), || {
+        datagram::decode_ref(black_box(&wire_1200))
     });
 
     let capsule = CapsuleFrame::Datagram(vec![0x3c; 1_200]);

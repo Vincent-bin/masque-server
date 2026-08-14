@@ -153,7 +153,33 @@ ipv6_pool = "fd00:abcd::/64"
 cargo test
 ```
 
-169 unit tests covering all protocol codecs, address management, routing, and configuration parsing.
+The test suite covers protocol codecs, address management, routing, configuration,
+and end-to-end tunnel behavior.
+
+### Benchmarks
+
+Run the allocation and codec microbenchmarks in release mode:
+
+```sh
+cargo bench --bench core
+```
+
+Run the loopback CONNECT-UDP latency and throughput benchmark:
+
+```sh
+scripts/network-bench.sh
+```
+
+The network benchmark builds release binaries and reports both a direct Rust
+UDP echo baseline and the MASQUE path, so echo-server or load-generator limits
+are visible. Its duration, in-flight window, and RTT sample count can be tuned:
+
+```sh
+MASQUE_BENCH_DURATION_SECS=10 \
+MASQUE_BENCH_WINDOW=256 \
+MASQUE_BENCH_RTT_SAMPLES=100 \
+scripts/network-bench.sh
+```
 
 ## References
 

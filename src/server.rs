@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use quiche::h3::NameValue;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::address_pool::AddressPool;
@@ -28,6 +30,18 @@ const MAX_DATAGRAM_SIZE: usize = 65535;
 /// Unique connection ID length.
 const CONN_ID_LEN: usize = 16;
 
+/// Bounded queue used by per-tunnel receive tasks to wake the main loop.
+const UDP_RESPONSE_QUEUE_CAPACITY: usize = 4096;
+
+/// Drain a bounded batch of already-buffered QUIC packets per readiness wakeup.
+const MAX_QUIC_RECV_BATCH: usize = 64;
+
+struct UdpResponse {
+    connection_index: u64,
+    stream_id: u64,
+    datagram: Vec<u8>,
+}
+
 /// Top-level MASQUE server.
 pub struct Server {
     socket: UdpSocket,
@@ -44,8 +58,12 @@ pub struct Server {
     /// Maps quiche ConnectionId to our internal conn_index for routing table
     /// lookups.
     conn_index_map: HashMap<quiche::ConnectionId<'static>, u64>,
+    /// Reverse index for routing TUN packets without scanning every connection.
+    conn_by_index: HashMap<u64, quiche::ConnectionId<'static>>,
     /// Shared TUN device for CONNECT-IP tunnels (None if IP proxy disabled).
     tun: Option<TunManager>,
+    udp_response_tx: mpsc::Sender<UdpResponse>,
+    udp_response_rx: mpsc::Receiver<UdpResponse>,
 }
 
 impl Server {
@@ -155,6 +173,9 @@ impl Server {
             None
         };
 
+        let (udp_response_tx, udp_response_rx) =
+            mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
+
         Ok(Self {
             socket,
             quic_config,
@@ -166,7 +187,10 @@ impl Server {
             config,
             next_conn_index: 0,
             conn_index_map: HashMap::new(),
+            conn_by_index: HashMap::new(),
             tun,
+            udp_response_tx,
+            udp_response_rx,
         })
     }
 
@@ -174,6 +198,9 @@ impl Server {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut dgram_buf = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut tun_buf = vec![0u8; MAX_DATAGRAM_SIZE];
+        let tun_device = self.tun.as_ref().map(TunManager::device);
 
         let local_addr = self.socket.local_addr()?;
         let idle_timeout =
@@ -196,15 +223,28 @@ impl Server {
             // Wait for a packet, signal, or timeout.
             enum Event {
                 Packet(std::io::Result<(usize, SocketAddr)>),
+                TargetDatagram(Option<UdpResponse>),
+                TunPacket(std::io::Result<usize>),
                 Shutdown,
                 Timeout,
             }
 
             let event = if let Some(timeout) = timeout {
                 tokio::select! {
-                    biased;
                     _ = tokio::signal::ctrl_c(), if !shutting_down => {
                         Event::Shutdown
+                    }
+                    response = self.udp_response_rx.recv(), if !shutting_down => {
+                        Event::TargetDatagram(response)
+                    }
+                    result = async {
+                        tun_device
+                            .as_ref()
+                            .expect("TUN select branch requires a device")
+                            .recv(&mut tun_buf)
+                            .await
+                    }, if tun_device.is_some() && !shutting_down => {
+                        Event::TunPacket(result)
                     }
                     result = tokio::time::timeout(
                         timeout, self.socket.recv_from(&mut buf)
@@ -241,6 +281,25 @@ impl Server {
                             from,
                             local_addr,
                         );
+                        for _ in 1..MAX_QUIC_RECV_BATCH {
+                            match self.socket.try_recv_from(&mut buf) {
+                                Ok((len, from)) => self.handle_packet(
+                                    &mut buf[..len],
+                                    from,
+                                    local_addr,
+                                ),
+                                Err(e)
+                                    if e.kind()
+                                        == std::io::ErrorKind::WouldBlock =>
+                                {
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!(%e, "socket recv error");
+                                    break;
+                                }
+                            }
+                        }
                     } else {
                         // During shutdown, still feed packets to quiche so
                         // it can send CONNECTION_CLOSE frames.
@@ -261,14 +320,24 @@ impl Server {
                 Event::Packet(Err(e)) => {
                     error!(%e, "socket recv error");
                 }
+                Event::TargetDatagram(Some(response)) => {
+                    self.relay_target_datagrams(response);
+                }
+                Event::TargetDatagram(None) => {}
+                Event::TunPacket(Ok(len)) => {
+                    if self.relay_tun_packet(&tun_buf[..len]) {
+                        self.relay_tun_inbound(&mut tun_buf);
+                    }
+                }
+                Event::TunPacket(Err(e)) => {
+                    error!(%e, "TUN recv error");
+                }
                 Event::Timeout => {}
             }
 
             // Process QUIC DATAGRAMs → forward to target UDP/TUN.
             if !shutting_down {
-                self.relay_client_datagrams();
-                self.relay_target_datagrams(&mut buf).await;
-                self.relay_tun_inbound(&mut buf);
+                self.relay_client_datagrams(&mut dgram_buf);
                 self.cleanup_idle_tunnels(idle_timeout);
             }
 
@@ -290,6 +359,7 @@ impl Server {
                         self.address_pool.release_all(&tunnel.assigned_addrs);
                     }
                     if let Some(conn_idx) = self.conn_index_map.remove(&id) {
+                        self.conn_by_index.remove(&conn_idx);
                         self.routing_table.remove_by_connection(conn_idx);
                     }
                 }
@@ -337,66 +407,69 @@ impl Server {
             }
         };
 
-        let conn_id = ring::hmac::sign(
-            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"masque"),
-            &hdr.dcid,
-        );
-        let conn_id_vec = conn_id.as_ref()[..CONN_ID_LEN].to_vec();
-        let conn_id = quiche::ConnectionId::from_vec(conn_id_vec);
-
-        // Look up existing connection or accept a new one.
-        if !self.connections.contains_key(&hdr.dcid)
-            && !self.connections.contains_key(&conn_id)
+        // Established packets carry the server-issued CID and take this fast
+        // path. Deriving a CID requires HMAC-SHA256, so only do that for a new
+        // Initial or for packets that still carry the original destination ID.
+        let key = if let Some((conn_id, _)) =
+            self.connections.get_key_value(&hdr.dcid)
         {
-            if hdr.ty != quiche::Type::Initial {
-                debug!("non-initial packet for unknown connection");
-                return;
-            }
-
-            // Enforce max_connections limit.
-            if self.connections.len() >= self.config.server.max_connections {
-                warn!("max connections reached, rejecting new connection");
-                return;
-            }
-
-            let scid = quiche::ConnectionId::from_vec(
-                conn_id.as_ref().to_vec(),
+            conn_id.clone()
+        } else {
+            let conn_id = ring::hmac::sign(
+                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"masque"),
+                &hdr.dcid,
+            );
+            let conn_id = quiche::ConnectionId::from_vec(
+                conn_id.as_ref()[..CONN_ID_LEN].to_vec(),
             );
 
-            let quic = match quiche::accept(
-                &scid,
-                None,
-                local,
-                from,
-                &mut self.quic_config,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!(%e, "failed to accept connection");
+            if !self.connections.contains_key(&conn_id) {
+                if hdr.ty != quiche::Type::Initial {
+                    debug!("non-initial packet for unknown connection");
                     return;
                 }
-            };
 
-            info!(?scid, %from, "new connection");
+                // Enforce max_connections limit.
+                if self.connections.len()
+                    >= self.config.server.max_connections
+                {
+                    warn!("max connections reached, rejecting new connection");
+                    return;
+                }
 
-            let conn_idx = self.next_conn_index;
-            self.next_conn_index += 1;
-            self.conn_index_map.insert(scid.clone(), conn_idx);
+                let scid = quiche::ConnectionId::from_vec(
+                    conn_id.as_ref().to_vec(),
+                );
 
-            let client = ClientConnection::new(quic);
-            self.connections.insert(scid, client);
-        }
+                let quic = match quiche::accept(
+                    &scid,
+                    None,
+                    local,
+                    from,
+                    &mut self.quic_config,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(%e, "failed to accept connection");
+                        return;
+                    }
+                };
 
-        // Find the connection — try dcid first, then derived conn_id.
-        let key = if self.connections.contains_key(&hdr.dcid) {
-            hdr.dcid.into_owned()
-        } else if self.connections.contains_key(&conn_id) {
+                info!(?scid, %from, "new connection");
+
+                let conn_idx = self.next_conn_index;
+                self.next_conn_index += 1;
+                self.conn_index_map.insert(scid.clone(), conn_idx);
+                self.conn_by_index.insert(conn_idx, scid.clone());
+
+                let client = ClientConnection::new(quic);
+                self.connections.insert(scid, client);
+            }
+
             conn_id
-        } else {
-            debug!("packet for unknown connection");
-            return;
         };
 
+        let conn_idx = self.conn_index_map.get(&key).copied().unwrap_or(0);
         let client = self.connections.get_mut(&key).unwrap();
 
         // Feed the packet to quiche.
@@ -476,13 +549,13 @@ impl Server {
             }
         }
 
-        // Now handle pending UDP tunnel setups (we deferred these so
-        // we could drop the h3 borrow and do the sync part here).
-        // The actual async socket creation will be handled in the next
-        // event loop tick via a spawn or direct await.
-        // For simplicity, we store them as pending and resolve them
-        // in drive_connections.
+        // Handle tunnel setups after releasing the HTTP/3 borrow.
         let max_tunnels = self.config.server.max_tunnels_per_connection;
+        let udp_response_tx = if pending_udp_setups.is_empty() {
+            None
+        } else {
+            Some(self.udp_response_tx.clone())
+        };
         for (stream_id, target) in pending_udp_setups {
             let total_tunnels =
                 client.udp_tunnels.len() + client.ip_tunnels.len();
@@ -523,12 +596,49 @@ impl Server {
                             std_sock.set_nonblocking(true).ok();
                             match UdpSocket::from_std(std_sock) {
                                 Ok(tok_sock) => {
-                                    let tunnel = UdpTunnel {
+                                    let socket = Arc::new(tok_sock);
+                                    let recv_socket = Arc::clone(&socket);
+                                    let response_tx = udp_response_tx
+                                        .as_ref()
+                                        .unwrap()
+                                        .clone();
+                                    let recv_task = tokio::spawn(async move {
+                                        let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+                                        loop {
+                                            match recv_socket.recv(&mut buf).await {
+                                                Ok(len) => {
+                                                    let datagram = match datagram::encode_payload(
+                                                        stream_id,
+                                                        &buf[..len],
+                                                    ) {
+                                                        Ok(datagram) => datagram,
+                                                        Err(e) => {
+                                                            debug!(stream_id, %e, "datagram encode failed");
+                                                            continue;
+                                                        }
+                                                    };
+                                                    let response = UdpResponse {
+                                                        connection_index: conn_idx,
+                                                        stream_id,
+                                                        datagram,
+                                                    };
+                                                    if response_tx.send(response).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!(stream_id, %e, "target recv failed");
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
+                                    let tunnel = UdpTunnel::from_socket(
                                         stream_id,
-                                        socket: tok_sock,
-                                        target_addr: addr,
-                                        last_activity: std::time::Instant::now(),
-                                    };
+                                        addr,
+                                        socket,
+                                        recv_task,
+                                    );
                                     info!(
                                         stream_id,
                                         target = %addr,
@@ -569,7 +679,6 @@ impl Server {
 
         // Handle pending CONNECT-IP tunnel setups: allocate addresses,
         // register routes, send capsules.
-        let conn_idx = self.conn_index_map.get(&key).copied().unwrap_or(0);
         for stream_id in pending_ip_setups {
             let total_tunnels =
                 client.udp_tunnels.len() + client.ip_tunnels.len();
@@ -887,12 +996,10 @@ impl Server {
     }
 
     /// Relay QUIC DATAGRAMs from clients to target UDP sockets and TUN device.
-    fn relay_client_datagrams(&mut self) {
+    fn relay_client_datagrams(&mut self, dgram_buf: &mut [u8]) {
         for client in self.connections.values_mut() {
-            let mut dgram_buf = vec![0u8; MAX_DATAGRAM_SIZE];
-
             loop {
-                let len = match client.quic.dgram_recv(&mut dgram_buf) {
+                let len = match client.quic.dgram_recv(dgram_buf) {
                     Ok(len) => len,
                     Err(quiche::Error::Done) => break,
                     Err(e) => {
@@ -901,7 +1008,7 @@ impl Server {
                     }
                 };
 
-                let dgram = match datagram::decode(&dgram_buf[..len]) {
+                let dgram = match datagram::decode_ref(&dgram_buf[..len]) {
                     Ok(d) => d,
                     Err(e) => {
                         debug!(%e, "malformed datagram");
@@ -920,7 +1027,7 @@ impl Server {
 
                 // Check UDP tunnels first.
                 if let Some(tunnel) = client.udp_tunnels.get_mut(&dgram.stream_id) {
-                    match tunnel.socket.try_send(&dgram.payload) {
+                    match tunnel.socket.try_send(dgram.payload) {
                         Ok(_) => {
                             tunnel.last_activity = std::time::Instant::now();
                         }
@@ -939,7 +1046,7 @@ impl Server {
                 // Check IP tunnels — validate source and forward to TUN.
                 if let Some(tunnel) = client.ip_tunnels.get_mut(&dgram.stream_id) {
                     // Validate source address.
-                    match ip_packet::src_addr(&dgram.payload) {
+                    match ip_packet::src_addr(dgram.payload) {
                         Ok(src) => {
                             if !tunnel.owns_address(&src) {
                                 debug!(
@@ -964,7 +1071,7 @@ impl Server {
 
                     // Write to TUN device.
                     if let Some(tun) = &self.tun {
-                        match tun.try_send(&dgram.payload) {
+                        match tun.try_send(dgram.payload) {
                             Ok(_) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                             Err(e) => {
@@ -987,67 +1094,43 @@ impl Server {
         }
     }
 
-    /// Read from target UDP sockets and send QUIC DATAGRAMs to clients.
-    async fn relay_target_datagrams(&mut self, buf: &mut [u8]) {
-        for client in self.connections.values_mut() {
-            let streams: Vec<u64> = client.udp_tunnels.keys().copied().collect();
+    /// Forward queued target responses and drain the receive queue in a batch.
+    fn relay_target_datagrams(&mut self, first: UdpResponse) {
+        let mut response = Some(first);
 
-            for stream_id in streams {
-                let tunnel = client.udp_tunnels.get_mut(&stream_id).unwrap();
+        while let Some(dgram) = response {
+            let mut queue_full = false;
+            if let Some(conn_id) = self.conn_by_index.get(&dgram.connection_index) {
+                if let Some(client) = self.connections.get_mut(conn_id) {
+                    if let Some(tunnel) = client.udp_tunnels.get_mut(&dgram.stream_id) {
+                        tunnel.last_activity = std::time::Instant::now();
 
-                // Non-blocking read from target socket
-                loop {
-                    match tunnel.socket.try_recv(buf) {
-                        Ok(len) => {
-                            tunnel.last_activity = std::time::Instant::now();
-
-                            // Encode as HTTP Datagram and send via QUIC DATAGRAM
-                            match datagram::encode_payload(stream_id, &buf[..len]) {
-                                Ok(encoded) => {
-                                    if let Err(e) =
-                                        client.quic.dgram_send(&encoded)
-                                    {
-                                        if e != quiche::Error::Done {
-                                            debug!(
-                                                stream_id,
-                                                %e,
-                                                "dgram_send failed"
-                                            );
-                                        }
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(stream_id, %e, "datagram encode failed");
-                                    break;
-                                }
+                        if let Err(e) = client.quic.dgram_send_vec(dgram.datagram) {
+                            if e != quiche::Error::Done {
+                                debug!(
+                                    stream_id = dgram.stream_id,
+                                    %e,
+                                    "dgram_send failed"
+                                );
                             }
-                        }
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock =>
-                        {
-                            break;
-                        }
-                        Err(e) => {
-                            debug!(stream_id, %e, "target recv failed");
-                            break;
+                            queue_full = true;
                         }
                     }
                 }
             }
+
+            if queue_full {
+                break;
+            }
+            response = self.udp_response_rx.try_recv().ok();
         }
     }
 
     /// Read IP packets from TUN device and route them to the correct client.
     fn relay_tun_inbound(&mut self, buf: &mut [u8]) {
-        let tun = match &self.tun {
-            Some(t) => t,
-            None => return,
-        };
-
         // Non-blocking reads from TUN.
         loop {
-            let len = match tun.try_recv(buf) {
+            let len = match self.tun.as_ref().unwrap().try_recv(buf) {
                 Ok(len) => len,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -1056,71 +1139,73 @@ impl Server {
                 }
             };
 
-            let pkt = &buf[..len];
+            if !self.relay_tun_packet(&buf[..len]) {
+                break;
+            }
+        }
+    }
 
-            // Extract destination IP from the packet header.
-            let dst = match ip_packet::dst_addr(pkt) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    debug!(%e, "invalid IP header from TUN");
-                    continue;
-                }
-            };
+    /// Route one TUN packet. Returns false when the QUIC DATAGRAM queue is full.
+    fn relay_tun_packet(&mut self, pkt: &[u8]) -> bool {
+        // Extract destination IP from the packet header.
+        let dst = match ip_packet::dst_addr(pkt) {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!(%e, "invalid IP header from TUN");
+                return true;
+            }
+        };
 
-            // Look up the tunnel owner in the routing table.
-            let owner = match self.routing_table.lookup(&dst) {
-                Some(o) => *o,
-                None => {
-                    // No route — packet is for an address we don't manage.
-                    continue;
-                }
-            };
+        // Look up the tunnel owner in the routing table.
+        let owner = match self.routing_table.lookup(&dst) {
+            Some(o) => *o,
+            None => return true,
+        };
 
-            // Find the connection that owns this tunnel.
-            let client = self
-                .conn_index_map
-                .iter()
-                .find(|&(_, &idx)| idx == owner.conn_id)
-                .and_then(|(cid, _)| self.connections.get_mut(cid));
+        let conn_id = match self.conn_by_index.get(&owner.conn_id) {
+            Some(conn_id) => conn_id,
+            None => {
+                debug!(
+                    conn_id = owner.conn_id,
+                    "TUN packet for unknown connection"
+                );
+                return true;
+            }
+        };
 
-            let client = match client {
-                Some(c) => c,
-                None => {
-                    debug!(
-                        conn_id = owner.conn_id,
-                        "TUN packet for unknown connection"
-                    );
-                    continue;
-                }
-            };
+        let client = match self.connections.get_mut(conn_id) {
+            Some(client) => client,
+            None => return true,
+        };
 
-            // Update tunnel activity and send DATAGRAM to client.
-            if let Some(tunnel) = client.ip_tunnels.get_mut(&owner.stream_id) {
-                tunnel.last_activity = std::time::Instant::now();
+        // Update tunnel activity and send DATAGRAM to client.
+        if let Some(tunnel) = client.ip_tunnels.get_mut(&owner.stream_id) {
+            tunnel.last_activity = std::time::Instant::now();
 
-                match datagram::encode_payload(owner.stream_id, pkt) {
-                    Ok(encoded) => {
-                        if let Err(e) = client.quic.dgram_send(&encoded) {
-                            if e != quiche::Error::Done {
-                                debug!(
-                                    stream_id = owner.stream_id,
-                                    %e,
-                                    "dgram_send for TUN packet failed"
-                                );
-                            }
-                            break;
+            match datagram::encode_payload(owner.stream_id, pkt) {
+                Ok(encoded) => {
+                    if let Err(e) = client.quic.dgram_send_vec(encoded) {
+                        if e != quiche::Error::Done {
+                            debug!(
+                                stream_id = owner.stream_id,
+                                %e,
+                                "dgram_send for TUN packet failed"
+                            );
                         }
+                        return false;
                     }
-                    Err(e) => {
-                        debug!(
-                            stream_id = owner.stream_id,
-                            %e,
-                            "datagram encode for TUN packet failed"
-                        );
-                    }
+                }
+                Err(e) => {
+                    debug!(
+                        stream_id = owner.stream_id,
+                        %e,
+                        "datagram encode for TUN packet failed"
+                    );
                 }
             }
         }
+
+        true
     }
 
     /// Close tunnels that have been idle too long.

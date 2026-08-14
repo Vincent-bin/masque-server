@@ -42,22 +42,37 @@ pub struct HttpDatagram {
     pub payload: Vec<u8>,
 }
 
-/// Decode an HTTP Datagram from a QUIC DATAGRAM frame payload.
-pub fn decode(buf: &[u8]) -> Result<HttpDatagram, DatagramError> {
-    // Parse Quarter Stream ID
+/// A borrowed HTTP Datagram view that avoids copying the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpDatagramRef<'a> {
+    pub stream_id: u64,
+    pub context_id: u64,
+    pub payload: &'a [u8],
+}
+
+/// Decode an HTTP Datagram without allocating or copying its payload.
+pub fn decode_ref(buf: &[u8]) -> Result<HttpDatagramRef<'_>, DatagramError> {
     let (qsid, qlen) =
         varint::decode(buf).map_err(|_| DatagramError::TooShort)?;
+    let (context_id, clen) = varint::decode(&buf[qlen..])
+        .map_err(|_| DatagramError::TooShort)?;
 
-    let stream_id = qsid * 4;
+    Ok(HttpDatagramRef {
+        stream_id: qsid * 4,
+        context_id,
+        payload: &buf[qlen + clen..],
+    })
+}
 
-    // Parse Context ID
-    let (context_id, clen) =
-        varint::decode(&buf[qlen..]).map_err(|_| DatagramError::TooShort)?;
+/// Decode an HTTP Datagram from a QUIC DATAGRAM frame payload.
+pub fn decode(buf: &[u8]) -> Result<HttpDatagram, DatagramError> {
+    let dgram = decode_ref(buf)?;
 
-    let header_len = qlen + clen;
-    let payload = buf[header_len..].to_vec();
-
-    Ok(HttpDatagram { stream_id, context_id, payload })
+    Ok(HttpDatagram {
+        stream_id: dgram.stream_id,
+        context_id: dgram.context_id,
+        payload: dgram.payload.to_vec(),
+    })
 }
 
 /// Encode an HTTP Datagram into a QUIC DATAGRAM frame payload.
@@ -80,11 +95,27 @@ pub fn encode(dgram: &HttpDatagram) -> Result<Vec<u8>, DatagramError> {
 
 /// Convenience: encode a raw payload (context_id=0) for a given stream.
 pub fn encode_payload(stream_id: u64, payload: &[u8]) -> Result<Vec<u8>, DatagramError> {
-    encode(&HttpDatagram {
-        stream_id,
-        context_id: 0,
-        payload: payload.to_vec(),
-    })
+    let mut buf = Vec::with_capacity(payload.len() + 16);
+    encode_payload_into(stream_id, payload, &mut buf)?;
+    Ok(buf)
+}
+
+/// Encode a raw payload into a reusable output buffer.
+pub fn encode_payload_into(
+    stream_id: u64,
+    payload: &[u8],
+    buf: &mut Vec<u8>,
+) -> Result<(), DatagramError> {
+    if stream_id % 4 != 0 {
+        return Err(DatagramError::InvalidStreamId(stream_id));
+    }
+
+    buf.clear();
+    varint::encode_to_vec(stream_id / 4, buf)
+        .map_err(|_| DatagramError::InvalidStreamId(stream_id))?;
+    varint::encode_to_vec(0, buf).map_err(|_| DatagramError::TooShort)?;
+    buf.extend_from_slice(payload);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -203,6 +234,17 @@ mod tests {
         assert_eq!(dgram.stream_id, 8);
         assert_eq!(dgram.context_id, 0);
         assert_eq!(dgram.payload, vec![0xca, 0xfe]);
+    }
+
+    #[test]
+    fn encode_payload_into_reuses_buffer() {
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(&[0xff; 32]);
+        encode_payload_into(8, &[0xca, 0xfe], &mut buf).unwrap();
+        let dgram = decode_ref(&buf).unwrap();
+        assert_eq!(dgram.stream_id, 8);
+        assert_eq!(dgram.context_id, 0);
+        assert_eq!(dgram.payload, &[0xca, 0xfe]);
     }
 
     // ── Round-trip ────────────────────────────────────────────────────

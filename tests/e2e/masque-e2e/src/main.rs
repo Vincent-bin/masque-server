@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,53 @@ use tracing::{error, info, warn};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const BUF_SIZE: usize = 65535;
+
+struct InFlight {
+    sent_at: HashMap<u64, Instant>,
+    order: VecDeque<(u64, Instant)>,
+}
+
+impl InFlight {
+    fn with_capacity(window: usize) -> Self {
+        Self {
+            sent_at: HashMap::with_capacity(window * 2),
+            order: VecDeque::with_capacity(window * 2),
+        }
+    }
+
+    fn insert(&mut self, sequence: u64, sent_at: Instant) {
+        self.sent_at.insert(sequence, sent_at);
+        self.order.push_back((sequence, sent_at));
+    }
+
+    fn remove(&mut self, sequence: &u64) -> bool {
+        self.sent_at.remove(sequence).is_some()
+    }
+
+    fn expire(&mut self, now: Instant, expiry: Duration) -> u64 {
+        let mut expired = 0;
+
+        while let Some(&(sequence, sent_at)) = self.order.front() {
+            if now.saturating_duration_since(sent_at) < expiry {
+                break;
+            }
+            self.order.pop_front();
+            if self.sent_at.remove(&sequence).is_some() {
+                expired += 1;
+            }
+        }
+
+        expired
+    }
+
+    fn len(&self) -> usize {
+        self.sent_at.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sent_at.is_empty()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // QUIC + H3 test client
@@ -283,7 +330,7 @@ impl Client {
         let mut encoded = Vec::with_capacity(payload_size + 16);
         let mut packet_buf = [0u8; BUF_SIZE];
         let mut dgram_buf = [0u8; BUF_SIZE];
-        let mut in_flight = HashMap::<u64, Instant>::with_capacity(window * 2);
+        let mut in_flight = InFlight::with_capacity(window);
         let mut next_sequence = 0_u64;
         let mut sent = 0_u64;
         let mut received = 0_u64;
@@ -291,23 +338,17 @@ impl Client {
 
         while Instant::now() < drain_deadline {
             let now = Instant::now();
-            in_flight.retain(|_, sent_at| {
-                let keep = now.duration_since(*sent_at) < expiry;
-                if !keep {
-                    expired += 1;
-                }
-                keep
-            });
+            expired += in_flight.expire(now, expiry);
 
             let mut made_progress = false;
             while now < deadline && in_flight.len() < window {
                 payload[..8].copy_from_slice(&next_sequence.to_be_bytes());
-                encoded.clear();
-                masque::varint::encode_to_vec(stream_id / 4, &mut encoded)
-                    .map_err(|e| anyhow::anyhow!("encode stream id: {e}"))?;
-                masque::varint::encode_to_vec(0, &mut encoded)
-                    .map_err(|e| anyhow::anyhow!("encode context id: {e}"))?;
-                encoded.extend_from_slice(&payload);
+                masque::datagram::encode_payload_into(
+                    stream_id,
+                    &payload,
+                    &mut encoded,
+                )
+                .map_err(|e| anyhow::anyhow!("encode datagram: {e}"))?;
 
                 match self.quic.dgram_send(&encoded) {
                     Ok(()) => {
@@ -347,13 +388,13 @@ impl Client {
                     Err(quiche::Error::Done) => break,
                     Err(e) => bail!("dgram recv: {e}"),
                 };
-                let dgram = masque::datagram::decode(&dgram_buf[..len])
+                let dgram = masque::datagram::decode_ref(&dgram_buf[..len])
                     .map_err(|e| anyhow::anyhow!("decode dgram: {e}"))?;
                 if dgram.stream_id != stream_id || dgram.payload.len() < 8 {
                     continue;
                 }
                 let sequence = u64::from_be_bytes(dgram.payload[..8].try_into().unwrap());
-                if in_flight.remove(&sequence).is_some() && Instant::now() <= deadline {
+                if in_flight.remove(&sequence) && Instant::now() <= deadline {
                     received += 1;
                 }
                 made_progress = true;
@@ -371,6 +412,104 @@ impl Client {
         self.socket.set_nonblocking(false)?;
         Ok((sent, received, expired))
     }
+}
+
+fn connect_echo_socket(echo_addr: &str) -> Result<UdpSocket> {
+    let peer: SocketAddr = echo_addr.parse().context("parse echo server addr")?;
+    let bind_addr = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
+    socket.connect(peer)?;
+    Ok(socket)
+}
+
+fn run_echo_server(bind_addr: &str) -> Result<()> {
+    let socket = UdpSocket::bind(bind_addr)
+        .with_context(|| format!("bind UDP echo server at {bind_addr}"))?;
+    let mut buf = [0u8; BUF_SIZE];
+
+    loop {
+        let (len, peer) = socket.recv_from(&mut buf)?;
+        let sent = socket.send_to(&buf[..len], peer)?;
+        if sent != len {
+            bail!("short UDP echo send: {sent}/{len}");
+        }
+    }
+}
+
+/// Exercise the same echo process without MASQUE/QUIC so the benchmark can
+/// distinguish proxy overhead from the load generator and echo-server ceiling.
+fn run_direct_echo_throughput(
+    echo_addr: &str,
+    payload_size: usize,
+    duration: Duration,
+    window: usize,
+) -> Result<(u64, u64, u64)> {
+    let socket = connect_echo_socket(echo_addr)?;
+    socket.set_nonblocking(true)?;
+
+    let started = Instant::now();
+    let deadline = started + duration;
+    let drain_deadline = deadline + Duration::from_secs(1);
+    let expiry = Duration::from_millis(250);
+    let mut payload = vec![0x5a; payload_size];
+    let mut recv_buf = [0u8; BUF_SIZE];
+    let mut in_flight = InFlight::with_capacity(window);
+    let mut next_sequence = 0_u64;
+    let mut sent = 0_u64;
+    let mut received = 0_u64;
+    let mut expired = 0_u64;
+
+    while Instant::now() < drain_deadline {
+        let now = Instant::now();
+        expired += in_flight.expire(now, expiry);
+
+        let mut made_progress = false;
+        while now < deadline && in_flight.len() < window {
+            payload[..8].copy_from_slice(&next_sequence.to_be_bytes());
+            match socket.send(&payload) {
+                Ok(len) if len == payload.len() => {
+                    in_flight.insert(next_sequence, now);
+                    next_sequence += 1;
+                    sent += 1;
+                    made_progress = true;
+                }
+                Ok(len) => bail!("short UDP send: {len}/{}", payload.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        loop {
+            match socket.recv(&mut recv_buf) {
+                Ok(len) => {
+                    if len >= 8 {
+                        let sequence =
+                            u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
+                        if in_flight.remove(&sequence) && Instant::now() <= deadline {
+                            received += 1;
+                        }
+                    }
+                    made_progress = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        if now >= deadline && in_flight.is_empty() {
+            break;
+        }
+        if !made_progress {
+            std::thread::yield_now();
+        }
+    }
+
+    expired += in_flight.len() as u64;
+    Ok((sent, received, expired))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,13 +629,59 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50);
 
+    if duration_secs == 0 || window == 0 || latency_samples == 0 {
+        bail!("benchmark duration, window, and RTT samples must be non-zero");
+    }
+
     println!(
         "CONNECT-UDP loopback benchmark: {duration_secs}s per payload, window {window}"
     );
 
+    println!("Direct UDP echo baseline:");
+    let direct_socket = connect_echo_socket(echo_addr)?;
+    direct_socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let latency_payload = vec![0x3c; 64];
+    let mut response = [0u8; BUF_SIZE];
+    let mut direct_latencies = Vec::with_capacity(latency_samples);
+    for _ in 0..latency_samples {
+        let started = Instant::now();
+        direct_socket.send(&latency_payload)?;
+        let len = direct_socket.recv(&mut response)?;
+        if response[..len] != latency_payload {
+            bail!("direct UDP latency probe payload mismatch");
+        }
+        direct_latencies.push(started.elapsed().as_secs_f64() * 1e6);
+    }
+    direct_latencies.sort_by(f64::total_cmp);
+    let percentile = |values: &[f64], p: f64| {
+        values[((values.len() - 1) as f64 * p) as usize]
+    };
+    println!(
+        "  RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
+        percentile(&direct_latencies, 0.50),
+        percentile(&direct_latencies, 0.95),
+        percentile(&direct_latencies, 0.99),
+    );
+
+    let duration = Duration::from_secs(duration_secs);
+    for payload_size in [64, 1_200] {
+        let (sent, received, expired) =
+            run_direct_echo_throughput(echo_addr, payload_size, duration, window)?;
+        let seconds = duration.as_secs_f64();
+        let tx_pps = sent as f64 / seconds;
+        let rx_pps = received as f64 / seconds;
+        let goodput_gbps =
+            received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
+        let response_shortfall =
+            (sent - received) as f64 * 100.0 / sent.max(1) as f64;
+        println!(
+            "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
+        );
+    }
+
+    println!("MASQUE CONNECT-UDP:");
     let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
 
-    let latency_payload = vec![0x3c; 64];
     let mut latencies = Vec::with_capacity(latency_samples);
     for _ in 0..latency_samples {
         let started = Instant::now();
@@ -508,19 +693,17 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         latencies.push(started.elapsed().as_secs_f64() * 1e6);
     }
     latencies.sort_by(f64::total_cmp);
-    let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
     println!(
-        "RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
-        percentile(0.50),
-        percentile(0.95),
-        percentile(0.99),
+        "  RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
+        percentile(&latencies, 0.50),
+        percentile(&latencies, 0.95),
+        percentile(&latencies, 0.99),
     );
 
     drop(client);
 
     for payload_size in [64, 1_200] {
         let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
-        let duration = Duration::from_secs(duration_secs);
         let (sent, received, expired) =
             client.run_echo_throughput(stream_id, payload_size, duration, window)?;
         let seconds = duration.as_secs_f64();
@@ -534,7 +717,7 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
             (sent - received) as f64 * 100.0 / sent as f64
         };
         println!(
-            "Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, bidirectional relay {relay_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
+            "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, bidirectional relay {relay_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
         );
     }
     Ok(())
@@ -809,6 +992,14 @@ fn main() {
                 .unwrap_or_else(|_| "masque_e2e=info".parse().unwrap()),
         )
         .init();
+
+    if let Ok(bind_addr) = std::env::var("MASQUE_ECHO_SERVER_ADDR") {
+        if let Err(e) = run_echo_server(&bind_addr) {
+            error!(%e, "UDP echo server failed");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let server_addr =
         std::env::var("MASQUE_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4433".into());
