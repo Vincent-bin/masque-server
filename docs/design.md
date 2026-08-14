@@ -549,6 +549,8 @@ key_path = "certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true               # QUIC DATAGRAM extension
+enable_udp_gso = true             # Linux UDP segmentation offload
+enable_udp_gro = true             # Linux UDP generic receive offload
 
 [udp_proxy]
 enabled = true

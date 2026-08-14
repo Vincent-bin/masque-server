@@ -6,6 +6,8 @@
 use std::net::IpAddr;
 use std::time::Instant;
 
+use crate::datagram::DatagramHeader;
+
 /// State for a single CONNECT-IP tunnel.
 pub struct IpTunnel {
     /// The HTTP/3 stream ID this tunnel is bound to.
@@ -14,14 +16,23 @@ pub struct IpTunnel {
     pub assigned_addrs: Vec<IpAddr>,
     /// Timestamp of last packet relayed (either direction).
     pub last_activity: Instant,
+    /// Precomputed datagram framing prefix for this stream.
+    pub header: DatagramHeader,
 }
 
 impl IpTunnel {
+    /// Create a tunnel for `stream_id`, which must be a client-initiated
+    /// bidirectional stream (divisible by 4).
     pub fn new(stream_id: u64) -> Self {
         Self {
             stream_id,
             assigned_addrs: Vec::new(),
             last_activity: Instant::now(),
+            // Stream IDs come from quiche's request streams, which are always
+            // client-initiated bidi; fall back to stream 0's framing rather
+            // than panicking if that ever changes.
+            header: DatagramHeader::new(stream_id)
+                .unwrap_or_else(|_| DatagramHeader::new(0).unwrap()),
         }
     }
 

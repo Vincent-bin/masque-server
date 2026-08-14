@@ -121,6 +121,10 @@ fn main() {
         .unwrap();
         reusable_1200.len()
     });
+    let header_400 = datagram::DatagramHeader::new(400).unwrap();
+    bench("datagram/header-encode-1200", Some(1_200), || {
+        black_box(&header_400).encode(black_box(&datagram_1200.payload))
+    });
     bench("datagram/decode-1200", Some(1_200), || {
         datagram::decode(black_box(&wire_1200))
     });
@@ -141,6 +145,21 @@ fn main() {
         decoder.decode(black_box(&capsule_wire))
     });
 
+    // Many small capsules arriving in one read: exercises how the decoder
+    // retires bytes it has already consumed.
+    let mut capsule_burst = Vec::new();
+    for _ in 0..32 {
+        capsule_encoder::encode(
+            &CapsuleFrame::Datagram(vec![0x3c; 64]),
+            &mut capsule_burst,
+        );
+    }
+    let burst_bytes = capsule_burst.len();
+    let mut burst_decoder = CapsuleDecoder::new();
+    bench("capsule/decode-burst-32x64", Some(burst_bytes), || {
+        burst_decoder.decode(black_box(&capsule_burst))
+    });
+
     let mut ipv4 = [0_u8; 20];
     ipv4[0] = 0x45;
     ipv4[2..4].copy_from_slice(&20_u16.to_be_bytes());
@@ -158,6 +177,13 @@ fn main() {
     ipv6[24..40].copy_from_slice(&Ipv6Addr::UNSPECIFIED.octets());
     bench("ip-packet/parse-ipv6", Some(40), || {
         masque::ip_packet::parse(black_box(&ipv6))
+    });
+    // The relay path only ever wants one address per packet.
+    bench("ip-packet/src-addr-ipv4", Some(20), || {
+        masque::ip_packet::src_addr(black_box(&ipv4))
+    });
+    bench("ip-packet/dst-addr-ipv6", Some(40), || {
+        masque::ip_packet::dst_addr(black_box(&ipv6))
     });
 
     let mut routes = RoutingTable::new();
@@ -177,6 +203,23 @@ fn main() {
     bench("routing/lookup-50k", None, || {
         route_index = (route_index + 7_919) % route_keys.len();
         routes.lookup(black_box(&route_keys[route_index]))
+    });
+
+    // Tearing down a tunnel removes its own addresses by key rather than
+    // scanning the table, so cost should not track table size.
+    let teardown_owner = TunnelOwner {
+        conn_id: 999_999,
+        stream_id: 4,
+    };
+    let teardown_addrs = [
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+        IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+    ];
+    bench("routing/teardown-tunnel-in-50k", None, || {
+        for addr in &teardown_addrs {
+            routes.insert(*addr, teardown_owner);
+        }
+        routes.remove_owned(black_box(&teardown_addrs), &teardown_owner)
     });
 
     let allow = vec!["0.0.0.0/0".to_owned()];

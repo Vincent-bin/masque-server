@@ -29,11 +29,20 @@ impl std::error::Error for DecodeError {}
 /// Incremental capsule decoder.
 pub struct CapsuleDecoder {
     buf: Vec<u8>,
+    /// Bytes at the front of `buf` that have already been decoded.
+    consumed: usize,
 }
+
+/// Compact `buf` once the decoded prefix grows past this many bytes, so a long
+/// stream neither memmoves after every capsule nor grows without bound.
+const COMPACT_THRESHOLD: usize = 16 * 1024;
 
 impl CapsuleDecoder {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            consumed: 0,
+        }
     }
 
     /// Feed data into the decoder and try to extract complete capsules.
@@ -41,14 +50,24 @@ impl CapsuleDecoder {
     /// Returns a list of decoded frames. `Incomplete` data is buffered
     /// internally and will be re-tried on the next call.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<CapsuleFrame>, DecodeError> {
+        // Drop the already-decoded prefix before appending, rather than
+        // memmoving the remainder after every single capsule.
+        if self.consumed > 0
+            && (self.consumed >= COMPACT_THRESHOLD
+                || self.consumed == self.buf.len())
+        {
+            self.buf.drain(..self.consumed);
+            self.consumed = 0;
+        }
+
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
 
         loop {
-            match try_decode_one(&self.buf) {
+            match try_decode_one(&self.buf[self.consumed..]) {
                 Ok((frame, consumed)) => {
                     frames.push(frame);
-                    self.buf.drain(..consumed);
+                    self.consumed += consumed;
                 }
                 Err(DecodeError::Incomplete) => break,
                 Err(e) => return Err(e),
@@ -60,7 +79,7 @@ impl CapsuleDecoder {
 
     /// Returns the number of buffered bytes not yet decoded.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.consumed
     }
 }
 

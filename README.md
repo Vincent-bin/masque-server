@@ -80,6 +80,11 @@ review `/etc/masque/masque.toml`, and start the service with
 - tun-rs 2 (TUN device support, requires Linux `CAP_NET_ADMIN` for CONNECT-IP)
 - tokio 1 (async runtime)
 
+On Linux, the QUIC listener automatically uses `recvmmsg`/`sendmmsg` and,
+when supported by the kernel, UDP GSO/GRO. Set `quic.enable_udp_gso` or
+`quic.enable_udp_gro` to `false` for an A/B benchmark or to disable an
+offload explicitly. Other platforms use the portable Tokio UDP path.
+
 ## Usage
 
 ```sh
@@ -112,6 +117,8 @@ key_path = "certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
+enable_udp_gso = true
+enable_udp_gro = true
 
 [udp_proxy]
 enabled = true

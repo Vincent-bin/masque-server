@@ -3,8 +3,9 @@
 // Maps client-assigned IP addresses to (connection_id, stream_id) so that
 // inbound packets from the TUN device can be forwarded to the correct tunnel.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
+
+use crate::fxhash::FxHashMap;
 
 /// Identifies a specific tunnel within a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,13 +21,13 @@ pub struct TunnelOwner {
 /// Used by the TUN reader to route inbound packets to the correct QUIC
 /// connection and stream.
 pub struct RoutingTable {
-    entries: HashMap<IpAddr, TunnelOwner>,
+    entries: FxHashMap<IpAddr, TunnelOwner>,
 }
 
 impl RoutingTable {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 
@@ -46,34 +47,52 @@ impl RoutingTable {
         self.entries.remove(addr)
     }
 
+    /// Remove the routes for `addrs`, but only where the current owner matches
+    /// `owner`.
+    ///
+    /// This is the teardown path used by the server: a tunnel already tracks
+    /// its own assigned addresses, so removing them by key costs O(addrs)
+    /// rather than a full scan of the table. The owner check keeps a stale
+    /// teardown from evicting a route that has since been reassigned.
+    pub fn remove_owned(&mut self, addrs: &[IpAddr], owner: &TunnelOwner) {
+        for addr in addrs {
+            if self.entries.get(addr) == Some(owner) {
+                self.entries.remove(addr);
+            }
+        }
+    }
+
     /// Remove all routes owned by a specific tunnel.
     /// Returns the addresses that were removed.
+    ///
+    /// Scans the whole table; prefer [`RoutingTable::remove_owned`] when the
+    /// caller already knows the addresses.
     pub fn remove_by_owner(&mut self, owner: &TunnelOwner) -> Vec<IpAddr> {
-        let addrs: Vec<IpAddr> = self
-            .entries
-            .iter()
-            .filter(|(_, o)| *o == owner)
-            .map(|(a, _)| *a)
-            .collect();
-        for addr in &addrs {
-            self.entries.remove(addr);
-        }
-        addrs
+        let mut removed = Vec::new();
+        self.entries.retain(|addr, o| {
+            if o == owner {
+                removed.push(*addr);
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Remove all routes for a given connection (all streams).
     /// Returns the addresses that were removed.
     pub fn remove_by_connection(&mut self, conn_id: u64) -> Vec<IpAddr> {
-        let addrs: Vec<IpAddr> = self
-            .entries
-            .iter()
-            .filter(|(_, o)| o.conn_id == conn_id)
-            .map(|(a, _)| *a)
-            .collect();
-        for addr in &addrs {
-            self.entries.remove(addr);
-        }
-        addrs
+        let mut removed = Vec::new();
+        self.entries.retain(|addr, o| {
+            if o.conn_id == conn_id {
+                removed.push(*addr);
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Number of active routes.
@@ -234,6 +253,35 @@ mod tests {
 
         let removed = rt.remove_by_connection(1);
         assert_eq!(removed.len(), 2);
+        assert_eq!(rt.len(), 1);
+    }
+
+    #[test]
+    fn remove_owned_removes_only_matching_owner() {
+        let mut rt = RoutingTable::new();
+        let mine = owner(1, 4);
+        let theirs = owner(2, 4);
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let reassigned = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+        rt.insert(a, mine);
+        rt.insert(b, mine);
+        // Same address, but it now belongs to a different tunnel.
+        rt.insert(reassigned, theirs);
+
+        rt.remove_owned(&[a, b, reassigned], &mine);
+
+        assert!(rt.lookup(&a).is_none());
+        assert!(rt.lookup(&b).is_none());
+        assert_eq!(rt.lookup(&reassigned), Some(&theirs));
+    }
+
+    #[test]
+    fn remove_owned_ignores_unknown_addresses() {
+        let mut rt = RoutingTable::new();
+        rt.insert(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), owner(1, 4));
+        rt.remove_owned(&[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))], &owner(1, 4));
         assert_eq!(rt.len(), 1);
     }
 

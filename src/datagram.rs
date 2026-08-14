@@ -82,7 +82,11 @@ pub fn encode(dgram: &HttpDatagram) -> Result<Vec<u8>, DatagramError> {
     }
 
     let qsid = dgram.stream_id / 4;
-    let mut buf = Vec::new();
+    let header_len = varint::encoded_len(qsid)
+        .map_err(|_| DatagramError::InvalidStreamId(dgram.stream_id))?
+        + varint::encoded_len(dgram.context_id)
+            .map_err(|_| DatagramError::TooShort)?;
+    let mut buf = Vec::with_capacity(header_len + dgram.payload.len());
 
     varint::encode_to_vec(qsid, &mut buf)
         .map_err(|_| DatagramError::InvalidStreamId(dgram.stream_id))?;
@@ -93,11 +97,68 @@ pub fn encode(dgram: &HttpDatagram) -> Result<Vec<u8>, DatagramError> {
     Ok(buf)
 }
 
+/// The `[Quarter Stream ID][Context ID = 0]` prefix for one stream.
+///
+/// Both fields are constant for the lifetime of a tunnel, so a tunnel encodes
+/// them once at setup and then only has to prepend the bytes per datagram
+/// instead of running the varint encoder on every packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramHeader {
+    /// Quarter Stream ID varint (max 8 bytes) followed by the context ID (1
+    /// byte, since context 0 always encodes as a single zero byte).
+    bytes: [u8; 9],
+    len: u8,
+}
+
+impl DatagramHeader {
+    /// Build the header for `stream_id`, which must be a client-initiated
+    /// bidirectional stream.
+    pub fn new(stream_id: u64) -> Result<Self, DatagramError> {
+        if stream_id % 4 != 0 {
+            return Err(DatagramError::InvalidStreamId(stream_id));
+        }
+
+        let mut bytes = [0u8; 9];
+        let qlen = varint::encode(stream_id / 4, &mut bytes)
+            .map_err(|_| DatagramError::InvalidStreamId(stream_id))?;
+        // Context ID 0 is already in place as the trailing zero byte.
+
+        Ok(Self {
+            bytes,
+            len: (qlen + 1) as u8,
+        })
+    }
+
+    /// The encoded header bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    /// Encode `payload` behind this header into an exactly-sized buffer.
+    #[inline]
+    pub fn encode(&self, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.len as usize + payload.len());
+        buf.extend_from_slice(self.as_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Encode `payload` behind this header into a reusable buffer.
+    #[inline]
+    pub fn encode_into(&self, payload: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.reserve(self.len as usize + payload.len());
+        buf.extend_from_slice(self.as_bytes());
+        buf.extend_from_slice(payload);
+    }
+}
+
 /// Convenience: encode a raw payload (context_id=0) for a given stream.
+///
+/// Prefer [`DatagramHeader`] when relaying repeatedly on the same stream.
 pub fn encode_payload(stream_id: u64, payload: &[u8]) -> Result<Vec<u8>, DatagramError> {
-    let mut buf = Vec::with_capacity(payload.len() + 16);
-    encode_payload_into(stream_id, payload, &mut buf)?;
-    Ok(buf)
+    Ok(DatagramHeader::new(stream_id)?.encode(payload))
 }
 
 /// Encode a raw payload into a reusable output buffer.
@@ -106,15 +167,7 @@ pub fn encode_payload_into(
     payload: &[u8],
     buf: &mut Vec<u8>,
 ) -> Result<(), DatagramError> {
-    if stream_id % 4 != 0 {
-        return Err(DatagramError::InvalidStreamId(stream_id));
-    }
-
-    buf.clear();
-    varint::encode_to_vec(stream_id / 4, buf)
-        .map_err(|_| DatagramError::InvalidStreamId(stream_id))?;
-    varint::encode_to_vec(0, buf).map_err(|_| DatagramError::TooShort)?;
-    buf.extend_from_slice(payload);
+    DatagramHeader::new(stream_id)?.encode_into(payload, buf);
     Ok(())
 }
 
@@ -245,6 +298,55 @@ mod tests {
         assert_eq!(dgram.stream_id, 8);
         assert_eq!(dgram.context_id, 0);
         assert_eq!(dgram.payload, &[0xca, 0xfe]);
+    }
+
+    // ── Precomputed header ────────────────────────────────────────────
+
+    #[test]
+    fn header_matches_encode_payload() {
+        for stream_id in [0u64, 4, 400, 4_000, 4_000_000, 400_000_000_000] {
+            let header = DatagramHeader::new(stream_id).unwrap();
+            let expected = encode_payload(stream_id, &[0x11, 0x22]).unwrap();
+            assert_eq!(
+                header.encode(&[0x11, 0x22]),
+                expected,
+                "header mismatch for stream {stream_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_roundtrips_through_decode() {
+        let header = DatagramHeader::new(400).unwrap();
+        let wire = header.encode(&[0xde, 0xad, 0xbe, 0xef]);
+        let dgram = decode_ref(&wire).unwrap();
+        assert_eq!(dgram.stream_id, 400);
+        assert_eq!(dgram.context_id, 0);
+        assert_eq!(dgram.payload, &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn header_rejects_non_bidi_stream() {
+        assert_eq!(
+            DatagramHeader::new(3),
+            Err(DatagramError::InvalidStreamId(3))
+        );
+    }
+
+    #[test]
+    fn header_encode_into_clears_previous_contents() {
+        let header = DatagramHeader::new(8).unwrap();
+        let mut buf = vec![0xff; 32];
+        header.encode_into(&[0xca, 0xfe], &mut buf);
+        assert_eq!(buf, header.encode(&[0xca, 0xfe]));
+    }
+
+    #[test]
+    fn header_allocates_exactly() {
+        let header = DatagramHeader::new(4).unwrap();
+        let buf = header.encode(&[0u8; 1_200]);
+        assert_eq!(buf.len(), 1_202);
+        assert_eq!(buf.capacity(), 1_202);
     }
 
     // ── Round-trip ────────────────────────────────────────────────────

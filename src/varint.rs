@@ -134,10 +134,12 @@ pub fn encode(value: u64, buf: &mut [u8]) -> Result<usize, Error> {
 
 /// Encode `value` and append the bytes to `vec`.
 pub fn encode_to_vec(value: u64, vec: &mut Vec<u8>) -> Result<usize, Error> {
-    let len = encoded_len(value)?;
-    let start = vec.len();
-    vec.resize(start + len, 0);
-    encode(value, &mut vec[start..])
+    // Encode into a stack buffer and append, rather than `resize`-ing the vec
+    // first: that zero-fills the tail only for `encode` to overwrite it.
+    let mut scratch = [0u8; 8];
+    let len = encode(value, &mut scratch)?;
+    vec.extend_from_slice(&scratch[..len]);
+    Ok(len)
 }
 
 #[cfg(test)]

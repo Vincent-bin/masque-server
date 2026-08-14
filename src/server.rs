@@ -1,9 +1,8 @@
 // QUIC listener and connection accept loop.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue;
 use tokio::net::UdpSocket;
@@ -15,17 +14,19 @@ use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
 use crate::config::ServerConfig;
 use crate::connection::ClientConnection;
-use crate::datagram;
+use crate::datagram::{self, DatagramHeader};
+use crate::fxhash::FxHashMap;
 use crate::ip_packet;
 use crate::policy::TargetPolicy;
+use crate::quic_udp::{
+    MAX_BATCH_PACKETS, MAX_DATAGRAM_SIZE, QuicUdpSocket, RecvPacketBatch,
+    SendPacketBatch,
+};
 use crate::routing::{RoutingTable, TunnelOwner};
 use crate::tun::TunManager;
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::udp::UdpTunnel;
 use crate::uri;
-
-/// Maximum UDP datagram size we read from the socket.
-const MAX_DATAGRAM_SIZE: usize = 65535;
 
 /// Unique connection ID length.
 const CONN_ID_LEN: usize = 16;
@@ -34,7 +35,16 @@ const CONN_ID_LEN: usize = 16;
 const UDP_RESPONSE_QUEUE_CAPACITY: usize = 4096;
 
 /// Drain a bounded batch of already-buffered QUIC packets per readiness wakeup.
-const MAX_QUIC_RECV_BATCH: usize = 64;
+const MAX_QUIC_RECV_BATCH: usize = MAX_BATCH_PACKETS;
+
+/// Drain a bounded batch of already-buffered TUN packets per readiness wakeup,
+/// so a busy TUN device cannot starve the QUIC socket.
+const MAX_TUN_RECV_BATCH: usize = 64;
+
+/// How often idle tunnels are swept. Tunnels close after `idle_timeout_secs`,
+/// so this is a background chore rather than something that belongs on the
+/// packet path.
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 struct UdpResponse {
     connection_index: u64,
@@ -44,22 +54,27 @@ struct UdpResponse {
 
 /// Top-level MASQUE server.
 pub struct Server {
-    socket: UdpSocket,
+    socket: QuicUdpSocket,
     quic_config: quiche::Config,
     h3_config: quiche::h3::Config,
-    connections: HashMap<quiche::ConnectionId<'static>, ClientConnection>,
+    connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
     udp_policy: TargetPolicy,
     address_pool: AddressPool,
     routing_table: RoutingTable,
     config: ServerConfig,
     /// Monotonically increasing connection index used as the conn_id in
     /// TunnelOwner (since quiche ConnectionId is not easily hashable).
+    ///
+    /// Indices are never reused, so a route left behind by a torn-down tunnel
+    /// can never resolve to a later connection.
     next_conn_index: u64,
-    /// Maps quiche ConnectionId to our internal conn_index for routing table
-    /// lookups.
-    conn_index_map: HashMap<quiche::ConnectionId<'static>, u64>,
     /// Reverse index for routing TUN packets without scanning every connection.
-    conn_by_index: HashMap<u64, quiche::ConnectionId<'static>>,
+    conn_by_index: FxHashMap<u64, quiche::ConnectionId<'static>>,
+    /// Key for deriving a server connection ID from a client's DCID.
+    ///
+    /// Generated per-process, so a client cannot precompute which server
+    /// connection ID — or which hash bucket — its DCID will map to.
+    conn_id_key: ring::hmac::Key,
     /// Shared TUN device for CONNECT-IP tunnels (None if IP proxy disabled).
     tun: Option<TunManager>,
     udp_response_tx: mpsc::Sender<UdpResponse>,
@@ -69,8 +84,19 @@ pub struct Server {
 impl Server {
     /// Create a new server bound to the configured address.
     pub async fn bind(config: ServerConfig) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind(config.server.listen_addr).await?;
-        info!(addr = %config.server.listen_addr, "listening");
+        let socket = QuicUdpSocket::bind(
+            config.server.listen_addr,
+            config.quic.max_datagram_size,
+            config.quic.enable_udp_gso,
+            config.quic.enable_udp_gro,
+        )
+        .await?;
+        info!(
+            addr = %config.server.listen_addr,
+            udp_gso = socket.udp_gso_enabled(),
+            udp_gro = socket.udp_gro_enabled(),
+            "listening"
+        );
 
         let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 
@@ -176,18 +202,28 @@ impl Server {
         let (udp_response_tx, udp_response_rx) =
             mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
 
+        let mut key_bytes = [0u8; 32];
+        ring::rand::SecureRandom::fill(
+            &ring::rand::SystemRandom::new(),
+            &mut key_bytes,
+        )
+        .map_err(|_| anyhow::anyhow!("failed to seed connection ID key"))?;
+
         Ok(Self {
             socket,
             quic_config,
             h3_config,
-            connections: HashMap::new(),
+            connections: FxHashMap::default(),
             udp_policy,
             address_pool,
             routing_table: RoutingTable::new(),
             config,
             next_conn_index: 0,
-            conn_index_map: HashMap::new(),
-            conn_by_index: HashMap::new(),
+            conn_by_index: FxHashMap::default(),
+            conn_id_key: ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                &key_bytes,
+            ),
             tun,
             udp_response_tx,
             udp_response_rx,
@@ -196,10 +232,11 @@ impl Server {
 
     /// Run the server event loop.
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut dgram_buf = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut tun_buf = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut recv_batch = RecvPacketBatch::new(MAX_QUIC_RECV_BATCH);
+        let mut send_batch = SendPacketBatch::new();
         let tun_device = self.tun.as_ref().map(TunManager::device);
 
         let local_addr = self.socket.local_addr()?;
@@ -209,6 +246,7 @@ impl Server {
         let mut shutting_down = false;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut next_idle_sweep = Instant::now() + IDLE_SWEEP_INTERVAL;
 
         loop {
             // Calculate the earliest timer across all connections.
@@ -222,7 +260,7 @@ impl Server {
 
             // Wait for a packet, signal, or timeout.
             enum Event {
-                Packet(std::io::Result<(usize, SocketAddr)>),
+                PacketBatch(std::io::Result<usize>),
                 TargetDatagram(Option<UdpResponse>),
                 TunPacket(std::io::Result<usize>),
                 Shutdown,
@@ -247,14 +285,16 @@ impl Server {
                         Event::TunPacket(result)
                     }
                     result = tokio::time::timeout(
-                        timeout, self.socket.recv_from(&mut buf)
+                        timeout, self.socket.recv_batch(&mut recv_batch)
                     ) => match result {
-                        Ok(r) => Event::Packet(r),
+                        Ok(r) => Event::PacketBatch(r),
                         Err(_) => Event::Timeout,
                     },
                 }
             } else {
-                Event::Packet(self.socket.recv_from(&mut buf).await)
+                Event::PacketBatch(
+                    self.socket.recv_batch(&mut recv_batch).await
+                )
             };
 
             match event {
@@ -274,50 +314,29 @@ impl Server {
                             .ok();
                     }
                 }
-                Event::Packet(Ok((len, from))) => {
-                    if !shutting_down {
-                        self.handle_packet(
-                            &mut buf[..len],
-                            from,
-                            local_addr,
-                        );
-                        for _ in 1..MAX_QUIC_RECV_BATCH {
-                            match self.socket.try_recv_from(&mut buf) {
-                                Ok((len, from)) => self.handle_packet(
-                                    &mut buf[..len],
-                                    from,
-                                    local_addr,
-                                ),
-                                Err(e)
-                                    if e.kind()
-                                        == std::io::ErrorKind::WouldBlock =>
-                                {
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!(%e, "socket recv error");
-                                    break;
-                                }
-                            }
+                Event::PacketBatch(Ok(received)) => {
+                    recv_batch.for_each_packet_mut(received, |packet, from| {
+                        if !shutting_down {
+                            self.handle_packet(packet, from, local_addr);
+                            return;
                         }
-                    } else {
-                        // During shutdown, still feed packets to quiche so
-                        // it can send CONNECTION_CLOSE frames.
-                        if let Ok(hdr) = quiche::Header::from_slice(
-                            &mut buf[..len],
-                            CONN_ID_LEN,
-                        ) {
+
+                        // During shutdown, still feed packets to quiche so it
+                        // can send CONNECTION_CLOSE frames.
+                        if let Ok(hdr) =
+                            quiche::Header::from_slice(packet, CONN_ID_LEN)
+                        {
                             if let Some(client) =
                                 self.connections.get_mut(&hdr.dcid)
                             {
                                 let recv_info =
                                     quiche::RecvInfo { from, to: local_addr };
-                                client.quic.recv(&mut buf[..len], recv_info).ok();
+                                client.quic.recv(packet, recv_info).ok();
                             }
                         }
-                    }
+                    });
                 }
-                Event::Packet(Err(e)) => {
+                Event::PacketBatch(Err(e)) => {
                     error!(%e, "socket recv error");
                 }
                 Event::TargetDatagram(Some(response)) => {
@@ -338,11 +357,19 @@ impl Server {
             // Process QUIC DATAGRAMs → forward to target UDP/TUN.
             if !shutting_down {
                 self.relay_client_datagrams(&mut dgram_buf);
-                self.cleanup_idle_tunnels(idle_timeout);
+
+                // Sweeping every iteration would walk every connection and
+                // every tunnel per packet batch; once a second is plenty for a
+                // timeout measured in seconds.
+                let now = Instant::now();
+                if now >= next_idle_sweep {
+                    self.cleanup_idle_tunnels(idle_timeout);
+                    next_idle_sweep = now + IDLE_SWEEP_INTERVAL;
+                }
             }
 
             // Drive all connections: handle timers, send pending data.
-            self.drive_connections(&mut out).await;
+            self.drive_connections(&mut out, &mut send_batch).await;
 
             // Remove closed connections and clean up their resources.
             let closed_ids: Vec<quiche::ConnectionId<'static>> = self
@@ -357,11 +384,17 @@ impl Server {
                     info!(?id, "connection closed");
                     for tunnel in client.ip_tunnels.values() {
                         self.address_pool.release_all(&tunnel.assigned_addrs);
+                        // Remove by key rather than scanning the whole routing
+                        // table once per tunnel.
+                        self.routing_table.remove_owned(
+                            &tunnel.assigned_addrs,
+                            &TunnelOwner {
+                                conn_id: client.index,
+                                stream_id: tunnel.stream_id,
+                            },
+                        );
                     }
-                    if let Some(conn_idx) = self.conn_index_map.remove(&id) {
-                        self.conn_by_index.remove(&conn_idx);
-                        self.routing_table.remove_by_connection(conn_idx);
-                    }
+                    self.conn_by_index.remove(&client.index);
                 }
             }
 
@@ -415,10 +448,7 @@ impl Server {
         {
             conn_id.clone()
         } else {
-            let conn_id = ring::hmac::sign(
-                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"masque"),
-                &hdr.dcid,
-            );
+            let conn_id = ring::hmac::sign(&self.conn_id_key, &hdr.dcid);
             let conn_id = quiche::ConnectionId::from_vec(
                 conn_id.as_ref()[..CONN_ID_LEN].to_vec(),
             );
@@ -459,18 +489,17 @@ impl Server {
 
                 let conn_idx = self.next_conn_index;
                 self.next_conn_index += 1;
-                self.conn_index_map.insert(scid.clone(), conn_idx);
                 self.conn_by_index.insert(conn_idx, scid.clone());
 
-                let client = ClientConnection::new(quic);
+                let client = ClientConnection::new(quic, conn_idx);
                 self.connections.insert(scid, client);
             }
 
             conn_id
         };
 
-        let conn_idx = self.conn_index_map.get(&key).copied().unwrap_or(0);
         let client = self.connections.get_mut(&key).unwrap();
+        let conn_idx = client.index;
 
         // Feed the packet to quiche.
         let recv_info = quiche::RecvInfo { from, to: local };
@@ -557,12 +586,10 @@ impl Server {
             Some(self.udp_response_tx.clone())
         };
         for (stream_id, target) in pending_udp_setups {
-            let total_tunnels =
-                client.udp_tunnels.len() + client.ip_tunnels.len();
-            if total_tunnels >= max_tunnels {
+            if client.tunnel_count() >= max_tunnels {
                 warn!(
                     stream_id,
-                    total_tunnels,
+                    total_tunnels = client.tunnel_count(),
                     "tunnel limit reached, rejecting"
                 );
                 if let Some(h3) = &mut client.h3 {
@@ -572,6 +599,22 @@ impl Server {
                 }
                 continue;
             }
+
+            // Frame the datagram header once per tunnel, rather than re-running
+            // the varint encoder for every relayed packet.
+            let header = match DatagramHeader::new(stream_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(stream_id, %e, "cannot frame datagrams for stream");
+                    if let Some(h3) = &mut client.h3 {
+                        Self::send_error_response(
+                            h3, &mut client.quic, stream_id, 400,
+                        );
+                    }
+                    continue;
+                }
+            };
+
             match target.resolve() {
                 Ok(addrs) => {
                     // Use the first resolved address.
@@ -607,20 +650,10 @@ impl Server {
                                         loop {
                                             match recv_socket.recv(&mut buf).await {
                                                 Ok(len) => {
-                                                    let datagram = match datagram::encode_payload(
-                                                        stream_id,
-                                                        &buf[..len],
-                                                    ) {
-                                                        Ok(datagram) => datagram,
-                                                        Err(e) => {
-                                                            debug!(stream_id, %e, "datagram encode failed");
-                                                            continue;
-                                                        }
-                                                    };
                                                     let response = UdpResponse {
                                                         connection_index: conn_idx,
                                                         stream_id,
-                                                        datagram,
+                                                        datagram: header.encode(&buf[..len]),
                                                     };
                                                     if response_tx.send(response).await.is_err() {
                                                         break;
@@ -680,12 +713,10 @@ impl Server {
         // Handle pending CONNECT-IP tunnel setups: allocate addresses,
         // register routes, send capsules.
         for stream_id in pending_ip_setups {
-            let total_tunnels =
-                client.udp_tunnels.len() + client.ip_tunnels.len();
-            if total_tunnels >= max_tunnels {
+            if client.tunnel_count() >= max_tunnels {
                 warn!(
                     stream_id,
-                    total_tunnels,
+                    total_tunnels = client.tunnel_count(),
                     "tunnel limit reached, rejecting IP tunnel"
                 );
                 if let Some(h3) = &mut client.h3 {
@@ -776,25 +807,16 @@ impl Server {
             info!(stream_id, addr = %v6_addr, "assigned IPv6 to IP tunnel");
         }
 
-        // Send ADDRESS_ASSIGN capsule on the stream.
-        let capsule_data = {
-            let frame = CapsuleFrame::AddressAssign(assigned);
-            let mut buf = Vec::new();
-            capsule::encoder::encode(&frame, &mut buf);
-            buf
-        };
-        if let Some(h3) = &mut client.h3 {
-            if let Err(e) =
-                h3.send_body(&mut client.quic, stream_id, &capsule_data, false)
-            {
-                warn!(stream_id, %e, "failed to send ADDRESS_ASSIGN capsule");
-            }
-        }
-
-        // Send ROUTE_ADVERTISEMENT capsule: advertise a default route so
+        // Send ADDRESS_ASSIGN and ROUTE_ADVERTISEMENT back to back: one buffer,
+        // one send_body call. The route advertisement is a default route, so
         // the client knows it can send all traffic through this tunnel.
-        let route_capsule = {
-            let frame = CapsuleFrame::RouteAdvertisement(vec![
+        let mut capsules = Vec::new();
+        capsule::encoder::encode(
+            &CapsuleFrame::AddressAssign(assigned),
+            &mut capsules,
+        );
+        capsule::encoder::encode(
+            &CapsuleFrame::RouteAdvertisement(vec![
                 IpAddressRange {
                     start: IpAddress::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
                     end: IpAddress::V4(std::net::Ipv4Addr::new(255, 255, 255, 255)),
@@ -807,16 +829,15 @@ impl Server {
                     )),
                     ip_protocol: 0,
                 },
-            ]);
-            let mut buf = Vec::new();
-            capsule::encoder::encode(&frame, &mut buf);
-            buf
-        };
+            ]),
+            &mut capsules,
+        );
+
         if let Some(h3) = &mut client.h3 {
             if let Err(e) =
-                h3.send_body(&mut client.quic, stream_id, &route_capsule, false)
+                h3.send_body(&mut client.quic, stream_id, &capsules, false)
             {
-                warn!(stream_id, %e, "failed to send ROUTE_ADVERTISEMENT capsule");
+                warn!(stream_id, %e, "failed to send CONNECT-IP capsules");
             }
         }
 
@@ -838,12 +859,15 @@ impl Server {
             // Release addresses back to the pool.
             address_pool.release_all(&tunnel.assigned_addrs);
 
-            // Remove routes for this tunnel.
-            let owner = TunnelOwner {
-                conn_id: conn_idx,
-                stream_id,
-            };
-            routing_table.remove_by_owner(&owner);
+            // Remove this tunnel's routes by key — the tunnel knows exactly
+            // which addresses it holds, so there is no need to scan the table.
+            routing_table.remove_owned(
+                &tunnel.assigned_addrs,
+                &TunnelOwner {
+                    conn_id: conn_idx,
+                    stream_id,
+                },
+            );
         }
     }
 
@@ -858,43 +882,45 @@ impl Server {
         pending_udp_setups: &mut Vec<(u64, uri::UdpTarget)>,
         pending_ip_setups: &mut Vec<u64>,
     ) {
-        let method = headers
-            .iter()
-            .find(|h| h.name() == b":method")
-            .map(|h| h.value().to_vec());
-        let path = headers
-            .iter()
-            .find(|h| h.name() == b":path")
-            .map(|h| String::from_utf8_lossy(h.value()).to_string());
-        let protocol = headers
-            .iter()
-            .find(|h| h.name() == b":protocol")
-            .map(|h| String::from_utf8_lossy(h.value()).to_string());
+        // One pass over the header list, borrowing the values rather than
+        // copying each one into an owned String.
+        let mut method: &[u8] = b"";
+        let mut path: &[u8] = b"";
+        let mut protocol: &[u8] = b"";
+
+        for header in headers {
+            match header.name() {
+                b":method" => method = header.value(),
+                b":path" => path = header.value(),
+                b":protocol" => protocol = header.value(),
+                _ => {}
+            }
+        }
 
         info!(
             stream_id,
-            method = ?method.as_deref().map(|m| String::from_utf8_lossy(m).to_string()),
-            path = ?path,
-            protocol = ?protocol,
+            method = %String::from_utf8_lossy(method),
+            path = %String::from_utf8_lossy(path),
+            protocol = %String::from_utf8_lossy(protocol),
             "request received"
         );
 
         // Check for Extended CONNECT
-        if method.as_deref() == Some(b"CONNECT") {
-            match protocol.as_deref() {
-                Some("connect-udp") if config.udp_proxy.enabled => {
+        if method == b"CONNECT" {
+            match protocol {
+                b"connect-udp" if config.udp_proxy.enabled => {
                     Self::handle_connect_udp(
                         h3,
                         quic,
                         stream_id,
-                        path.as_deref().unwrap_or(""),
+                        &String::from_utf8_lossy(path),
                         config,
                         udp_policy,
                         pending_udp_setups,
                     );
                     return;
                 }
-                Some("connect-ip") if config.ip_proxy.enabled => {
+                b"connect-ip" if config.ip_proxy.enabled => {
                     Self::handle_connect_ip_response(
                         h3,
                         quic,
@@ -1103,17 +1129,22 @@ impl Server {
             if let Some(conn_id) = self.conn_by_index.get(&dgram.connection_index) {
                 if let Some(client) = self.connections.get_mut(conn_id) {
                     if let Some(tunnel) = client.udp_tunnels.get_mut(&dgram.stream_id) {
-                        tunnel.last_activity = std::time::Instant::now();
+                        tunnel.last_activity = Instant::now();
 
-                        if let Err(e) = client.quic.dgram_send_vec(dgram.datagram) {
-                            if e != quiche::Error::Done {
+                        match client.quic.dgram_send_vec(dgram.datagram) {
+                            Ok(()) => {}
+                            // The send queue is full: stop draining and let the
+                            // flush at the end of the loop make room.
+                            Err(quiche::Error::Done) => queue_full = true,
+                            // Oversized, or datagrams disabled. Dropping this
+                            // one says nothing about the next, so keep draining.
+                            Err(e) => {
                                 debug!(
                                     stream_id = dgram.stream_id,
                                     %e,
                                     "dgram_send failed"
                                 );
                             }
-                            queue_full = true;
                         }
                     }
                 }
@@ -1128,8 +1159,9 @@ impl Server {
 
     /// Read IP packets from TUN device and route them to the correct client.
     fn relay_tun_inbound(&mut self, buf: &mut [u8]) {
-        // Non-blocking reads from TUN.
-        loop {
+        // Non-blocking reads from TUN. Bounded so a saturated TUN device cannot
+        // starve the QUIC socket.
+        for _ in 1..MAX_TUN_RECV_BATCH {
             let len = match self.tun.as_ref().unwrap().try_recv(buf) {
                 Ok(len) => len,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1180,26 +1212,24 @@ impl Server {
 
         // Update tunnel activity and send DATAGRAM to client.
         if let Some(tunnel) = client.ip_tunnels.get_mut(&owner.stream_id) {
-            tunnel.last_activity = std::time::Instant::now();
+            // Check for backpressure before framing, so a full queue costs no
+            // allocation.
+            if client.quic.is_dgram_send_queue_full() {
+                return false;
+            }
 
-            match datagram::encode_payload(owner.stream_id, pkt) {
-                Ok(encoded) => {
-                    if let Err(e) = client.quic.dgram_send_vec(encoded) {
-                        if e != quiche::Error::Done {
-                            debug!(
-                                stream_id = owner.stream_id,
-                                %e,
-                                "dgram_send for TUN packet failed"
-                            );
-                        }
-                        return false;
-                    }
-                }
+            tunnel.last_activity = Instant::now();
+
+            match client.quic.dgram_send_vec(tunnel.header.encode(pkt)) {
+                Ok(()) => {}
+                Err(quiche::Error::Done) => return false,
+                // Oversized, or datagrams disabled — dropping this packet says
+                // nothing about the next one, so keep draining the device.
                 Err(e) => {
                     debug!(
                         stream_id = owner.stream_id,
                         %e,
-                        "datagram encode for TUN packet failed"
+                        "dgram_send for TUN packet failed"
                     );
                 }
             }
@@ -1215,49 +1245,39 @@ impl Server {
             Vec::new();
 
         for (conn_id, client) in &mut self.connections {
-            // UDP tunnels
-            let idle_udp: Vec<u64> = client
-                .udp_tunnels
-                .iter()
-                .filter(|(_, t)| t.is_idle(timeout))
-                .map(|(id, _)| *id)
-                .collect();
+            // Borrow the fields separately so the tunnel maps can be walked
+            // while still writing to the same connection's H3 stream.
+            let ClientConnection {
+                quic,
+                h3,
+                udp_tunnels,
+                ip_tunnels,
+                index,
+            } = client;
 
-            for stream_id in idle_udp {
+            // UDP tunnels: dropping the tunnel aborts its receive task.
+            udp_tunnels.retain(|stream_id, tunnel| {
+                if !tunnel.is_idle(timeout) {
+                    return true;
+                }
                 info!(stream_id, "closing idle UDP tunnel");
-                client.udp_tunnels.remove(&stream_id);
-
-                if let Some(h3) = &mut client.h3 {
-                    h3.send_body(&mut client.quic, stream_id, b"", true)
-                        .ok();
+                if let Some(h3) = h3.as_mut() {
+                    h3.send_body(quic, *stream_id, b"", true).ok();
                 }
-            }
+                false
+            });
 
-            // IP tunnels
-            let idle_ip: Vec<u64> = client
-                .ip_tunnels
-                .iter()
-                .filter(|(_, t)| t.is_idle(timeout))
-                .map(|(id, _)| *id)
-                .collect();
-
-            for stream_id in &idle_ip {
+            // IP tunnels also need pool and route cleanup, which needs
+            // `&mut self`, so only signal the close here and tear down below.
+            for (stream_id, tunnel) in ip_tunnels.iter() {
+                if !tunnel.is_idle(timeout) {
+                    continue;
+                }
                 info!(stream_id, "closing idle IP tunnel");
-                if let Some(h3) = &mut client.h3 {
-                    h3.send_body(&mut client.quic, *stream_id, b"", true)
-                        .ok();
+                if let Some(h3) = h3.as_mut() {
+                    h3.send_body(quic, *stream_id, b"", true).ok();
                 }
-            }
-
-            if !idle_ip.is_empty() {
-                let conn_idx = self
-                    .conn_index_map
-                    .get(conn_id)
-                    .copied()
-                    .unwrap_or(0);
-                for stream_id in idle_ip {
-                    idle_ip_tunnels.push((conn_id.clone(), stream_id, conn_idx));
-                }
+                idle_ip_tunnels.push((conn_id.clone(), *stream_id, *index));
             }
         }
 
@@ -1282,8 +1302,16 @@ impl Server {
         stream_id: u64,
         status: u16,
     ) {
-        let headers = vec![
-            quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
+        // Every status we send is three digits, so format it without a
+        // heap-allocated String.
+        let status_buf = [
+            b'0' + (status / 100 % 10) as u8,
+            b'0' + (status / 10 % 10) as u8,
+            b'0' + (status % 10) as u8,
+        ];
+
+        let headers = [
+            quiche::h3::Header::new(b":status", &status_buf),
             quiche::h3::Header::new(b"content-length", b"0"),
         ];
 
@@ -1293,26 +1321,66 @@ impl Server {
     }
 
     /// Drive all connections: handle timers and flush outgoing packets.
-    async fn drive_connections(&mut self, out: &mut [u8]) {
+    async fn drive_connections(
+        &mut self,
+        out: &mut [u8],
+        batch: &mut SendPacketBatch,
+    ) {
+        let socket = &mut self.socket;
+
         for (_, client) in &mut self.connections {
             client.quic.on_timeout();
 
-            // Flush outgoing QUIC packets.
+            // Build at most one congestion-control send quantum at a time.
+            // Linux can collapse equal-sized packets into one GSO aggregate;
+            // remaining messages are still emitted by one sendmmsg syscall.
             loop {
-                let (write, send_info) = match client.quic.send(out) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        error!(%e, "quiche send error");
-                        client.quic.close(false, 0x1, b"send error").ok();
-                        break;
-                    }
-                };
+                batch.clear();
+                let max_packet_size = client.quic.max_send_udp_payload_size();
+                let send_quantum = client
+                    .quic
+                    .send_quantum()
+                    .max(max_packet_size)
+                    .min(MAX_DATAGRAM_SIZE);
+                let mut generated_bytes = 0;
+                let mut quiche_done = false;
 
-                if let Err(e) =
-                    self.socket.send_to(&out[..write], send_info.to).await
+                while batch.packet_count() < MAX_BATCH_PACKETS &&
+                    generated_bytes < send_quantum
                 {
+                    let (write, send_info) = match client.quic.send(out) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => {
+                            quiche_done = true;
+                            break;
+                        },
+                        Err(e) => {
+                            error!(%e, "quiche send error");
+                            client.quic.close(false, 0x1, b"send error").ok();
+                            quiche_done = true;
+                            break;
+                        },
+                    };
+
+                    batch.push(
+                        &out[..write],
+                        send_info,
+                        socket.udp_gso_enabled(),
+                        send_quantum,
+                    );
+                    generated_bytes += write;
+                }
+
+                if batch.is_empty() {
+                    break;
+                }
+
+                if let Err(e) = socket.send_batch(batch).await {
                     warn!(%e, "socket send error");
+                }
+
+                if quiche_done {
+                    break;
                 }
             }
         }
