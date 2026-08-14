@@ -49,6 +49,30 @@ docs/
 cargo build --release
 ```
 
+### Linux x86_64 release package
+
+GitHub Actions builds a static `x86_64-unknown-linux-musl` archive on every
+`v*` tag and attaches it to the corresponding GitHub Release. It can also be
+run manually from the Actions page to produce a workflow artifact.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+On the Linux host, extract the archive and install the binary, example config,
+and systemd unit:
+
+```sh
+tar xzf masque-v0.1.0-linux-x86_64.tar.gz
+cd masque-v0.1.0-linux-x86_64
+sudo ./install.sh
+```
+
+Then install the TLS certificate and private key under `/etc/masque/certs/`,
+review `/etc/masque/masque.toml`, and start the service with
+`sudo systemctl start masque`.
+
 ### Dependencies
 
 - Rust 2024 edition

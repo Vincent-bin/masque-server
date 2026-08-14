@@ -1,0 +1,37 @@
+[server]
+listen_addr = "0.0.0.0:443"
+idle_timeout_secs = 30
+max_connections = 10000
+max_tunnels_per_connection = 100
+
+[tls]
+cert_path = "/etc/masque/certs/server.crt"
+key_path = "/etc/masque/certs/server.key"
+
+[quic]
+max_datagram_size = 1350
+initial_max_streams_bidi = 128
+enable_dgram = true
+
+[udp_proxy]
+enabled = true
+uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+]
+
+[ip_proxy]
+enabled = true
+uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
+tun_name = "masque0"
+tun_mtu = 1280
+ipv4_pool = "10.89.0.0/16"
+ipv6_pool = "fd00:abcd::/64"

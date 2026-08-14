@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use masque::capsule::decoder::CapsuleDecoder;
+use anyhow::{Context, Result, bail};
 use masque::capsule::CapsuleFrame;
+use masque::capsule::decoder::CapsuleDecoder;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use tracing::{error, info, warn};
@@ -53,7 +54,13 @@ impl Client {
 
         let quic = quiche::connect(Some("server"), &scid, local, peer, &mut config)?;
 
-        Ok(Client { socket, quic, h3: None, peer, local })
+        Ok(Client {
+            socket,
+            quic,
+            h3: None,
+            peer,
+            local,
+        })
     }
 
     /// Send all pending QUIC packets to the network.
@@ -82,7 +89,10 @@ impl Client {
         let mut buf = [0u8; BUF_SIZE];
         match self.socket.recv(&mut buf) {
             Ok(len) => {
-                let info = quiche::RecvInfo { from: self.peer, to: self.local };
+                let info = quiche::RecvInfo {
+                    from: self.peer,
+                    to: self.local,
+                };
                 match self.quic.recv(&mut buf[..len], info) {
                     Ok(_) | Err(quiche::Error::Done) => {}
                     Err(e) => bail!("QUIC recv: {e}"),
@@ -126,18 +136,13 @@ impl Client {
     /// Create the HTTP/3 layer on top of the QUIC connection.
     fn init_h3(&mut self) -> Result<()> {
         let h3_config = quiche::h3::Config::new()?;
-        let h3 =
-            quiche::h3::Connection::with_transport(&mut self.quic, &h3_config)?;
+        let h3 = quiche::h3::Connection::with_transport(&mut self.quic, &h3_config)?;
         self.h3 = Some(h3);
         Ok(())
     }
 
     /// Send an HTTP/3 request; returns the stream ID.
-    fn send_request(
-        &mut self,
-        headers: &[quiche::h3::Header],
-        fin: bool,
-    ) -> Result<u64> {
+    fn send_request(&mut self, headers: &[quiche::h3::Header], fin: bool) -> Result<u64> {
         let h3 = self.h3.as_mut().context("H3 not initialised")?;
         let stream_id = h3.send_request(&mut self.quic, headers, fin)?;
         self.flush()?;
@@ -155,10 +160,7 @@ impl Client {
                         let status = list
                             .iter()
                             .find(|h| h.name() == b":status")
-                            .map(|h| {
-                                String::from_utf8_lossy(h.value())
-                                    .parse::<u16>()
-                            })
+                            .map(|h| String::from_utf8_lossy(h.value()).parse::<u16>())
                             .transpose()
                             .map_err(|e| anyhow::anyhow!("bad :status: {e}"))?
                             .context("missing :status")?;
@@ -187,11 +189,7 @@ impl Client {
     }
 
     /// Drive the connection and collect capsules from the H3 body stream.
-    fn recv_capsules(
-        &mut self,
-        stream_id: u64,
-        timeout: Duration,
-    ) -> Result<Vec<CapsuleFrame>> {
+    fn recv_capsules(&mut self, stream_id: u64, timeout: Duration) -> Result<Vec<CapsuleFrame>> {
         let deadline = Instant::now() + timeout;
         let mut decoder = CapsuleDecoder::new();
         let mut frames = Vec::new();
@@ -219,13 +217,11 @@ impl Client {
                 loop {
                     let h3 = self.h3.as_mut().unwrap();
                     match h3.recv_body(&mut self.quic, stream_id, &mut body_buf) {
-                        Ok(len) => {
-                            match decoder.decode(&body_buf[..len]) {
-                                Ok(mut capsules) => frames.append(&mut capsules),
-                                Err(masque::capsule::decoder::DecodeError::Incomplete) => {}
-                                Err(e) => bail!("capsule decode: {e:?}"),
-                            }
-                        }
+                        Ok(len) => match decoder.decode(&body_buf[..len]) {
+                            Ok(mut capsules) => frames.append(&mut capsules),
+                            Err(masque::capsule::decoder::DecodeError::Incomplete) => {}
+                            Err(e) => bail!("capsule decode: {e:?}"),
+                        },
                         Err(quiche::h3::Error::Done) => break,
                         Err(e) => bail!("recv_body: {e}"),
                     }
@@ -245,10 +241,7 @@ impl Client {
     }
 
     /// Wait for a QUIC DATAGRAM and decode it as an HTTP Datagram.
-    fn recv_dgram(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<masque::datagram::HttpDatagram> {
+    fn recv_dgram(&mut self, timeout: Duration) -> Result<masque::datagram::HttpDatagram> {
         let deadline = Instant::now() + timeout;
         loop {
             let mut buf = [0u8; BUF_SIZE];
@@ -266,6 +259,117 @@ impl Client {
             }
             self.drive()?;
         }
+    }
+
+    /// Saturate one CONNECT-UDP tunnel with a bounded number of in-flight
+    /// echo requests. Returns (sent packets, received packets, expired packets).
+    fn run_echo_throughput(
+        &mut self,
+        stream_id: u64,
+        payload_size: usize,
+        duration: Duration,
+        window: usize,
+    ) -> Result<(u64, u64, u64)> {
+        if payload_size < 8 {
+            bail!("benchmark payload must be at least 8 bytes");
+        }
+
+        self.socket.set_nonblocking(true)?;
+        let started = Instant::now();
+        let deadline = started + duration;
+        let drain_deadline = deadline + Duration::from_secs(1);
+        let expiry = Duration::from_millis(250);
+        let mut payload = vec![0x5a; payload_size];
+        let mut encoded = Vec::with_capacity(payload_size + 16);
+        let mut packet_buf = [0u8; BUF_SIZE];
+        let mut dgram_buf = [0u8; BUF_SIZE];
+        let mut in_flight = HashMap::<u64, Instant>::with_capacity(window * 2);
+        let mut next_sequence = 0_u64;
+        let mut sent = 0_u64;
+        let mut received = 0_u64;
+        let mut expired = 0_u64;
+
+        while Instant::now() < drain_deadline {
+            let now = Instant::now();
+            in_flight.retain(|_, sent_at| {
+                let keep = now.duration_since(*sent_at) < expiry;
+                if !keep {
+                    expired += 1;
+                }
+                keep
+            });
+
+            let mut made_progress = false;
+            while now < deadline && in_flight.len() < window {
+                payload[..8].copy_from_slice(&next_sequence.to_be_bytes());
+                encoded.clear();
+                masque::varint::encode_to_vec(stream_id / 4, &mut encoded)
+                    .map_err(|e| anyhow::anyhow!("encode stream id: {e}"))?;
+                masque::varint::encode_to_vec(0, &mut encoded)
+                    .map_err(|e| anyhow::anyhow!("encode context id: {e}"))?;
+                encoded.extend_from_slice(&payload);
+
+                match self.quic.dgram_send(&encoded) {
+                    Ok(()) => {
+                        in_flight.insert(next_sequence, now);
+                        next_sequence += 1;
+                        sent += 1;
+                        made_progress = true;
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => bail!("dgram send: {e}"),
+                }
+            }
+
+            self.flush()?;
+
+            loop {
+                match self.socket.recv(&mut packet_buf) {
+                    Ok(len) => {
+                        let info = quiche::RecvInfo {
+                            from: self.peer,
+                            to: self.local,
+                        };
+                        match self.quic.recv(&mut packet_buf[..len], info) {
+                            Ok(_) | Err(quiche::Error::Done) => {}
+                            Err(e) => bail!("QUIC recv: {e}"),
+                        }
+                        made_progress = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => bail!("socket recv: {e}"),
+                }
+            }
+
+            loop {
+                let len = match self.quic.dgram_recv(&mut dgram_buf) {
+                    Ok(len) => len,
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => bail!("dgram recv: {e}"),
+                };
+                let dgram = masque::datagram::decode(&dgram_buf[..len])
+                    .map_err(|e| anyhow::anyhow!("decode dgram: {e}"))?;
+                if dgram.stream_id != stream_id || dgram.payload.len() < 8 {
+                    continue;
+                }
+                let sequence = u64::from_be_bytes(dgram.payload[..8].try_into().unwrap());
+                if in_flight.remove(&sequence).is_some() && Instant::now() <= deadline {
+                    received += 1;
+                }
+                made_progress = true;
+            }
+
+            if now >= deadline && in_flight.is_empty() {
+                break;
+            }
+            if !made_progress {
+                std::thread::yield_now();
+            }
+        }
+
+        expired += in_flight.len() as u64;
+        self.socket.set_nonblocking(false)?;
+        Ok((sent, received, expired))
     }
 }
 
@@ -306,9 +410,7 @@ fn connect_udp_headers(
     target_host: &str,
     target_port: &str,
 ) -> Vec<quiche::h3::Header> {
-    let path = format!(
-        "/.well-known/masque/udp/{target_host}/{target_port}/"
-    );
+    let path = format!("/.well-known/masque/udp/{target_host}/{target_port}/");
     vec![
         quiche::h3::Header::new(b":method", b"CONNECT"),
         quiche::h3::Header::new(b":protocol", b"connect-udp"),
@@ -319,22 +421,32 @@ fn connect_udp_headers(
     ]
 }
 
+fn connect_udp_tunnel(server_addr: &str, echo_addr: &str) -> Result<(Client, u64)> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+    let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
+    let headers = connect_udp_headers(server_addr, echo_host, echo_port);
+    let stream_id = client.send_request(&headers, false)?;
+    let (_, status) = client.poll_response(Duration::from_secs(5))?;
+    if status != 200 {
+        bail!("expected 200, got {status}");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    Ok((client, stream_id))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-fn test_connect_udp_happy_path(
-    server_addr: &str,
-    echo_addr: &str,
-) -> Result<()> {
+fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
 
     // Split echo address into host:port
-    let (echo_host, echo_port) = echo_addr
-        .rsplit_once(':')
-        .context("bad ECHO_SERVER_ADDR")?;
+    let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
 
     let headers = connect_udp_headers(server_addr, echo_host, echo_port);
     let stream_id = client.send_request(&headers, false)?;
@@ -364,10 +476,71 @@ fn test_connect_udp_happy_path(
     Ok(())
 }
 
-fn test_connect_udp_policy_deny(
-    server_addr: &str,
-    _echo_addr: &str,
-) -> Result<()> {
+fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let duration_secs = std::env::var("MASQUE_BENCH_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    let window = std::env::var("MASQUE_BENCH_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
+    let latency_samples = std::env::var("MASQUE_BENCH_RTT_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50);
+
+    println!(
+        "CONNECT-UDP loopback benchmark: {duration_secs}s per payload, window {window}"
+    );
+
+    let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
+
+    let latency_payload = vec![0x3c; 64];
+    let mut latencies = Vec::with_capacity(latency_samples);
+    for _ in 0..latency_samples {
+        let started = Instant::now();
+        client.send_dgram(stream_id, &latency_payload)?;
+        let response = client.recv_dgram(Duration::from_secs(2))?;
+        if response.payload != latency_payload {
+            bail!("latency probe payload mismatch");
+        }
+        latencies.push(started.elapsed().as_secs_f64() * 1e6);
+    }
+    latencies.sort_by(f64::total_cmp);
+    let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
+    println!(
+        "RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
+    );
+
+    drop(client);
+
+    for payload_size in [64, 1_200] {
+        let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
+        let duration = Duration::from_secs(duration_secs);
+        let (sent, received, expired) =
+            client.run_echo_throughput(stream_id, payload_size, duration, window)?;
+        let seconds = duration.as_secs_f64();
+        let tx_pps = sent as f64 / seconds;
+        let rx_pps = received as f64 / seconds;
+        let goodput_gbps = received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
+        let relay_gbps = goodput_gbps * 2.0;
+        let response_shortfall = if sent == 0 {
+            0.0
+        } else {
+            (sent - received) as f64 * 100.0 / sent as f64
+        };
+        println!(
+            "Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, bidirectional relay {relay_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
+        );
+    }
+    Ok(())
+}
+
+fn test_connect_udp_policy_deny(server_addr: &str, _echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
@@ -382,10 +555,7 @@ fn test_connect_udp_policy_deny(
     Ok(())
 }
 
-fn test_connect_udp_bad_uri(
-    server_addr: &str,
-    _echo_addr: &str,
-) -> Result<()> {
+fn test_connect_udp_bad_uri(server_addr: &str, _echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
@@ -407,10 +577,7 @@ fn test_connect_udp_bad_uri(
     Ok(())
 }
 
-fn test_non_connect_404(
-    server_addr: &str,
-    _echo_addr: &str,
-) -> Result<()> {
+fn test_non_connect_404(server_addr: &str, _echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
@@ -500,10 +667,7 @@ fn build_udp_in_ipv4(
 // CONNECT-IP tests
 // ---------------------------------------------------------------------------
 
-fn test_connect_ip_handshake(
-    server_addr: &str,
-    _echo_addr: &str,
-) -> Result<()> {
+fn test_connect_ip_handshake(server_addr: &str, _echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
@@ -558,10 +722,7 @@ fn test_connect_ip_handshake(
     Ok(())
 }
 
-fn test_connect_ip_round_trip(
-    server_addr: &str,
-    echo_addr: &str,
-) -> Result<()> {
+fn test_connect_ip_round_trip(server_addr: &str, echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
@@ -591,9 +752,7 @@ fn test_connect_ip_round_trip(
     info!(%assigned_v4, "assigned address");
 
     // Parse echo server address.
-    let (echo_host, echo_port) = echo_addr
-        .rsplit_once(':')
-        .context("bad ECHO_SERVER_ADDR")?;
+    let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
     let echo_ip: Ipv4Addr = echo_host.parse().context("parse echo host")?;
     let echo_port: u16 = echo_port.parse().context("parse echo port")?;
 
@@ -651,16 +810,23 @@ fn main() {
         )
         .init();
 
-    let server_addr = std::env::var("MASQUE_SERVER_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:4433".into());
-    let echo_addr = std::env::var("ECHO_SERVER_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9999".into());
+    let server_addr =
+        std::env::var("MASQUE_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4433".into());
+    let echo_addr = std::env::var("ECHO_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:9999".into());
 
     info!(%server_addr, %echo_addr, "MASQUE E2E test suite");
 
     if let Err(e) = wait_for_server(&server_addr) {
         error!(%e, "server not ready");
         std::process::exit(1);
+    }
+
+    if std::env::var_os("MASQUE_BENCH").is_some() {
+        if let Err(e) = benchmark_connect_udp(&server_addr, &echo_addr) {
+            error!(%e, "network benchmark failed");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let tests: &[(&str, fn(&str, &str) -> Result<()>)] = &[
