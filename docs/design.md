@@ -16,7 +16,7 @@ server implements the following RFCs:
 
 ```
 ┌─────────────────────────────────────────────┐
-│           CONNECT-UDP / CONNECT-IP          │  Application tunnels
+│       CONNECT / CONNECT-UDP / CONNECT-IP    │  Application tunnels
 ├─────────────────────────────────────────────┤
 │           HTTP Datagrams (RFC 9297)         │  Context-ID multiplexing
 ├─────────────────────────────────────────────┤
@@ -556,6 +556,12 @@ initial_max_streams_bidi = 128
 enable_dgram = true               # QUIC DATAGRAM extension
 enable_udp_gso = false            # opt in after verifying the Linux egress path
 enable_udp_gro = true             # Linux UDP generic receive offload
+
+[tcp_proxy]
+enabled = true
+connect_timeout_secs = 10
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
 
 [udp_proxy]
 enabled = true

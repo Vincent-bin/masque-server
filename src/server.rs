@@ -20,12 +20,12 @@ use crate::fxhash::FxHashMap;
 use crate::ip_packet;
 use crate::policy::TargetPolicy;
 use crate::quic_udp::{
-    MAX_BATCH_PACKETS, MAX_DATAGRAM_SIZE, QuicUdpSocket, RecvPacketBatch,
-    SendPacketBatch,
+    QuicUdpSocket, RecvPacketBatch, SendPacketBatch, MAX_BATCH_PACKETS, MAX_DATAGRAM_SIZE,
 };
 use crate::routing::{RoutingTable, TunnelOwner};
 use crate::tun::TunManager;
 use crate::tunnel::ip::IpTunnel;
+use crate::tunnel::tcp::{spawn_tcp_connect, PendingTcpTunnel, TcpRelayEvent, TcpTunnel};
 use crate::tunnel::udp::UdpTunnel;
 use crate::uri;
 
@@ -34,6 +34,10 @@ const CONN_ID_LEN: usize = 16;
 
 /// Bounded queue used by per-tunnel receive tasks to wake the main loop.
 const UDP_RESPONSE_QUEUE_CAPACITY: usize = 4096;
+
+/// TCP readers wait for the main loop to acknowledge each chunk, so this
+/// queue bounds both wakeups and response memory across all tunnels.
+const TCP_RELAY_QUEUE_CAPACITY: usize = 1024;
 
 /// Drain a bounded batch of already-buffered QUIC packets per readiness wakeup.
 const MAX_QUIC_RECV_BATCH: usize = MAX_BATCH_PACKETS;
@@ -60,6 +64,7 @@ pub struct Server {
     h3_config: quiche::h3::Config,
     connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
     auth: Option<BasicAuthenticator>,
+    tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
     address_pool: AddressPool,
     routing_table: RoutingTable,
@@ -81,6 +86,8 @@ pub struct Server {
     tun: Option<TunManager>,
     udp_response_tx: mpsc::Sender<UdpResponse>,
     udp_response_rx: mpsc::Receiver<UdpResponse>,
+    tcp_event_tx: mpsc::Sender<TcpRelayEvent>,
+    tcp_event_rx: mpsc::Receiver<TcpRelayEvent>,
 }
 
 impl Server {
@@ -113,31 +120,20 @@ impl Server {
         let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 
         // TLS
-        quic_config.load_cert_chain_from_pem_file(
-            config.tls.cert_path.to_str().unwrap_or(""),
-        )?;
-        quic_config.load_priv_key_from_pem_file(
-            config.tls.key_path.to_str().unwrap_or(""),
-        )?;
+        quic_config.load_cert_chain_from_pem_file(config.tls.cert_path.to_str().unwrap_or(""))?;
+        quic_config.load_priv_key_from_pem_file(config.tls.key_path.to_str().unwrap_or(""))?;
 
-        quic_config
-            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+        quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
 
         // Transport parameters
-        quic_config.set_max_idle_timeout(
-            (config.server.idle_timeout_secs * 1000) as u64,
-        );
-        quic_config
-            .set_max_recv_udp_payload_size(config.quic.max_datagram_size);
-        quic_config
-            .set_max_send_udp_payload_size(config.quic.max_datagram_size);
+        quic_config.set_max_idle_timeout((config.server.idle_timeout_secs * 1000) as u64);
+        quic_config.set_max_recv_udp_payload_size(config.quic.max_datagram_size);
+        quic_config.set_max_send_udp_payload_size(config.quic.max_datagram_size);
         quic_config.set_initial_max_data(10_000_000);
         quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
         quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
         quic_config.set_initial_max_stream_data_uni(1_000_000);
-        quic_config.set_initial_max_streams_bidi(
-            config.quic.initial_max_streams_bidi,
-        );
+        quic_config.set_initial_max_streams_bidi(config.quic.initial_max_streams_bidi);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.enable_pacing(true);
 
@@ -148,17 +144,20 @@ impl Server {
 
         let mut h3_config = quiche::h3::Config::new()?;
         h3_config.set_max_field_section_size(8192);
+        h3_config.enable_extended_connect(true);
+
+        let tcp_policy = TargetPolicy::new(
+            &config.tcp_proxy.allow_targets,
+            &config.tcp_proxy.deny_targets,
+        );
 
         let udp_policy = TargetPolicy::new(
             &config.udp_proxy.allow_targets,
             &config.udp_proxy.deny_targets,
         );
 
-        let address_pool = AddressPool::new(
-            &config.ip_proxy.ipv4_pool,
-            &config.ip_proxy.ipv6_pool,
-        )
-        .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
+        let address_pool = AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
+            .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
 
         // Create TUN device if IP proxy is enabled.
         let tun = if config.ip_proxy.enabled {
@@ -171,10 +170,7 @@ impl Server {
                     .parse()
                     .map_err(|e| anyhow::anyhow!("bad v4 pool: {e}"))?;
                 let gw_bits = u32::from(net.network()) | 1;
-                (
-                    Some(std::net::Ipv4Addr::from(gw_bits)),
-                    net.prefix_len(),
-                )
+                (Some(std::net::Ipv4Addr::from(gw_bits)), net.prefix_len())
             } else {
                 (None, 0)
             };
@@ -186,10 +182,7 @@ impl Server {
                     .parse()
                     .map_err(|e| anyhow::anyhow!("bad v6 pool: {e}"))?;
                 let gw_bits = u128::from(net.network()) | 1;
-                (
-                    Some(std::net::Ipv6Addr::from(gw_bits)),
-                    net.prefix_len(),
-                )
+                (Some(std::net::Ipv6Addr::from(gw_bits)), net.prefix_len())
             } else {
                 (None, 0)
             };
@@ -212,15 +205,12 @@ impl Server {
             None
         };
 
-        let (udp_response_tx, udp_response_rx) =
-            mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
+        let (udp_response_tx, udp_response_rx) = mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
+        let (tcp_event_tx, tcp_event_rx) = mpsc::channel(TCP_RELAY_QUEUE_CAPACITY);
 
         let mut key_bytes = [0u8; 32];
-        ring::rand::SecureRandom::fill(
-            &ring::rand::SystemRandom::new(),
-            &mut key_bytes,
-        )
-        .map_err(|_| anyhow::anyhow!("failed to seed connection ID key"))?;
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key_bytes)
+            .map_err(|_| anyhow::anyhow!("failed to seed connection ID key"))?;
 
         Ok(Self {
             socket,
@@ -228,19 +218,19 @@ impl Server {
             h3_config,
             connections: FxHashMap::default(),
             auth,
+            tcp_policy,
             udp_policy,
             address_pool,
             routing_table: RoutingTable::new(),
             config,
             next_conn_index: 0,
             conn_by_index: FxHashMap::default(),
-            conn_id_key: ring::hmac::Key::new(
-                ring::hmac::HMAC_SHA256,
-                &key_bytes,
-            ),
+            conn_id_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes),
             tun,
             udp_response_tx,
             udp_response_rx,
+            tcp_event_tx,
+            tcp_event_rx,
         })
     }
 
@@ -254,8 +244,7 @@ impl Server {
         let tun_device = self.tun.as_ref().map(TunManager::device);
 
         let local_addr = self.socket.local_addr()?;
-        let idle_timeout =
-            Duration::from_secs(self.config.server.idle_timeout_secs);
+        let idle_timeout = Duration::from_secs(self.config.server.idle_timeout_secs);
 
         let mut shutting_down = false;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -273,8 +262,7 @@ impl Server {
                     next_wakeup = next_wakeup.min(timeout);
                 }
                 if let Some(deadline) = client.deferred_send.deadline() {
-                    next_wakeup = next_wakeup
-                        .min(deadline.saturating_duration_since(now));
+                    next_wakeup = next_wakeup.min(deadline.saturating_duration_since(now));
                 }
             }
             let timeout = Some(next_wakeup);
@@ -283,6 +271,7 @@ impl Server {
             enum Event {
                 PacketBatch(std::io::Result<usize>),
                 TargetDatagram(Option<UdpResponse>),
+                TcpRelay(Option<TcpRelayEvent>),
                 TunPacket(std::io::Result<usize>),
                 Shutdown,
                 Timeout,
@@ -295,6 +284,9 @@ impl Server {
                     }
                     response = self.udp_response_rx.recv(), if !shutting_down => {
                         Event::TargetDatagram(response)
+                    }
+                    response = self.tcp_event_rx.recv(), if !shutting_down => {
+                        Event::TcpRelay(response)
                     }
                     result = async {
                         tun_device
@@ -313,26 +305,20 @@ impl Server {
                     },
                 }
             } else {
-                Event::PacketBatch(
-                    self.socket.recv_batch(&mut recv_batch).await
-                )
+                Event::PacketBatch(self.socket.recv_batch(&mut recv_batch).await)
             };
 
             match event {
                 Event::Shutdown => {
                     info!("shutdown signal received, draining connections...");
                     shutting_down = true;
-                    drain_deadline =
-                        Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+                    drain_deadline = Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
 
                     for client in self.connections.values_mut() {
                         if let Some(h3) = &mut client.h3 {
                             h3.send_goaway(&mut client.quic, 0).ok();
                         }
-                        client
-                            .quic
-                            .close(true, 0x0, b"server shutting down")
-                            .ok();
+                        client.quic.close(true, 0x0, b"server shutting down").ok();
                     }
                 }
                 Event::PacketBatch(Ok(received)) => {
@@ -344,14 +330,12 @@ impl Server {
 
                         // During shutdown, still feed packets to quiche so it
                         // can send CONNECTION_CLOSE frames.
-                        if let Ok(hdr) =
-                            quiche::Header::from_slice(packet, CONN_ID_LEN)
-                        {
-                            if let Some(client) =
-                                self.connections.get_mut(&hdr.dcid)
-                            {
-                                let recv_info =
-                                    quiche::RecvInfo { from, to: local_addr };
+                        if let Ok(hdr) = quiche::Header::from_slice(packet, CONN_ID_LEN) {
+                            if let Some(client) = self.connections.get_mut(&hdr.dcid) {
+                                let recv_info = quiche::RecvInfo {
+                                    from,
+                                    to: local_addr,
+                                };
                                 client.quic.recv(packet, recv_info).ok();
                             }
                         }
@@ -364,6 +348,10 @@ impl Server {
                     self.relay_target_datagrams(response);
                 }
                 Event::TargetDatagram(None) => {}
+                Event::TcpRelay(Some(event)) => {
+                    self.handle_tcp_event(event);
+                }
+                Event::TcpRelay(None) => {}
                 Event::TunPacket(Ok(len)) => {
                     if self.relay_tun_packet(&tun_buf[..len]) {
                         self.relay_tun_inbound(&mut tun_buf);
@@ -377,6 +365,7 @@ impl Server {
 
             // Process QUIC DATAGRAMs → forward to target UDP/TUN.
             if !shutting_down {
+                self.flush_tcp_responses();
                 self.relay_client_datagrams(&mut dgram_buf);
 
                 // Sweeping every iteration would walk every connection and
@@ -435,8 +424,7 @@ impl Server {
                         // Release all remaining IP tunnel resources.
                         for client in self.connections.values() {
                             for tunnel in client.ip_tunnels.values() {
-                                self.address_pool
-                                    .release_all(&tunnel.assigned_addrs);
+                                self.address_pool.release_all(&tunnel.assigned_addrs);
                             }
                         }
                         return Ok(());
@@ -447,12 +435,7 @@ impl Server {
     }
 
     /// Process an incoming UDP packet (QUIC).
-    fn handle_packet(
-        &mut self,
-        buf: &mut [u8],
-        from: SocketAddr,
-        local: SocketAddr,
-    ) {
+    fn handle_packet(&mut self, buf: &mut [u8], from: SocketAddr, local: SocketAddr) {
         let hdr = match quiche::Header::from_slice(buf, CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
@@ -464,15 +447,11 @@ impl Server {
         // Established packets carry the server-issued CID and take this fast
         // path. Deriving a CID requires HMAC-SHA256, so only do that for a new
         // Initial or for packets that still carry the original destination ID.
-        let key = if let Some((conn_id, _)) =
-            self.connections.get_key_value(&hdr.dcid)
-        {
+        let key = if let Some((conn_id, _)) = self.connections.get_key_value(&hdr.dcid) {
             conn_id.clone()
         } else {
             let conn_id = ring::hmac::sign(&self.conn_id_key, &hdr.dcid);
-            let conn_id = quiche::ConnectionId::from_vec(
-                conn_id.as_ref()[..CONN_ID_LEN].to_vec(),
-            );
+            let conn_id = quiche::ConnectionId::from_vec(conn_id.as_ref()[..CONN_ID_LEN].to_vec());
 
             if !self.connections.contains_key(&conn_id) {
                 if hdr.ty != quiche::Type::Initial {
@@ -481,24 +460,14 @@ impl Server {
                 }
 
                 // Enforce max_connections limit.
-                if self.connections.len()
-                    >= self.config.server.max_connections
-                {
+                if self.connections.len() >= self.config.server.max_connections {
                     warn!("max connections reached, rejecting new connection");
                     return;
                 }
 
-                let scid = quiche::ConnectionId::from_vec(
-                    conn_id.as_ref().to_vec(),
-                );
+                let scid = quiche::ConnectionId::from_vec(conn_id.as_ref().to_vec());
 
-                let quic = match quiche::accept(
-                    &scid,
-                    None,
-                    local,
-                    from,
-                    &mut self.quic_config,
-                ) {
+                let quic = match quiche::accept(&scid, None, local, from, &mut self.quic_config) {
                     Ok(c) => c,
                     Err(e) => {
                         error!(%e, "failed to accept connection");
@@ -532,10 +501,7 @@ impl Server {
 
         // Upgrade to HTTP/3 once QUIC handshake completes.
         if client.h3.is_none() && client.quic.is_established() {
-            match quiche::h3::Connection::with_transport(
-                &mut client.quic,
-                &self.h3_config,
-            ) {
+            match quiche::h3::Connection::with_transport(&mut client.quic, &self.h3_config) {
                 Ok(h3) => {
                     client.h3 = Some(h3);
                     debug!("HTTP/3 connection established");
@@ -548,15 +514,18 @@ impl Server {
 
         // Collect pending tunnel setups so we can do async I/O outside
         // the borrow of h3.
+        let mut pending_tcp_setups: Vec<(u64, uri::TcpTarget)> = Vec::new();
         let mut pending_udp_setups: Vec<(u64, uri::UdpTarget)> = Vec::new();
         let mut pending_ip_setups: Vec<u64> = Vec::new();
         let mut closed_ip_streams: Vec<u64> = Vec::new();
+        let mut failed_tcp_streams: Vec<u64> = Vec::new();
 
         // Process HTTP/3 events.
         if let Some(h3) = &mut client.h3 {
             loop {
                 match h3.poll(&mut client.quic) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                        let tcp_setup_count = pending_tcp_setups.len();
                         Self::handle_request(
                             h3,
                             &mut client.quic,
@@ -565,14 +534,44 @@ impl Server {
                             &self.config,
                             self.auth.as_ref(),
                             &self.udp_policy,
+                            &mut pending_tcp_setups,
                             &mut pending_udp_setups,
                             &mut pending_ip_setups,
                         );
+                        if pending_tcp_setups.len() > tcp_setup_count {
+                            debug_assert_eq!(
+                                pending_tcp_setups.len(),
+                                tcp_setup_count + 1
+                            );
+                            debug_assert_eq!(
+                                pending_tcp_setups.last().unwrap().0,
+                                stream_id
+                            );
+                            client.pending_tcp_tunnels.insert(
+                                stream_id,
+                                PendingTcpTunnel::staging(stream_id),
+                            );
+                        }
                     }
                     Ok((stream_id, quiche::h3::Event::Data)) => {
-                        debug!(stream_id, "H3 data event");
+                        if !Self::relay_tcp_request_body(
+                            h3,
+                            &mut client.quic,
+                            stream_id,
+                            &mut client.pending_tcp_tunnels,
+                            &mut client.tcp_tunnels,
+                        ) {
+                            failed_tcp_streams.push(stream_id);
+                        }
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
+                        if let Some(tunnel) = client.pending_tcp_tunnels.get_mut(&stream_id) {
+                            tunnel.client_finished = true;
+                            tunnel.last_activity = Instant::now();
+                        }
+                        if let Some(tunnel) = client.tcp_tunnels.get_mut(&stream_id) {
+                            tunnel.finish_client();
+                        }
                         // Stream closed by client — remove tunnel if any.
                         if client.udp_tunnels.remove(&stream_id).is_some() {
                             info!(stream_id, "UDP tunnel closed by client");
@@ -582,6 +581,12 @@ impl Server {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        if client.pending_tcp_tunnels.remove(&stream_id).is_some() {
+                            info!(stream_id, "pending TCP tunnel reset by client");
+                        }
+                        if client.tcp_tunnels.remove(&stream_id).is_some() {
+                            info!(stream_id, "TCP tunnel reset by client");
+                        }
                         if client.udp_tunnels.remove(&stream_id).is_some() {
                             info!(stream_id, "UDP tunnel reset by client");
                         }
@@ -600,8 +605,46 @@ impl Server {
             }
         }
 
+        for stream_id in failed_tcp_streams {
+            warn!(
+                stream_id,
+                "closing TCP tunnel after request-body backpressure failure"
+            );
+            Self::reset_tcp_stream(client, stream_id);
+        }
+
         // Handle tunnel setups after releasing the HTTP/3 borrow.
         let max_tunnels = self.config.server.max_tunnels_per_connection;
+        for (stream_id, target) in pending_tcp_setups {
+            if !client.pending_tcp_tunnels.contains_key(&stream_id) {
+                continue;
+            }
+            if client.tunnel_count() > max_tunnels {
+                warn!(
+                    stream_id,
+                    total_tunnels = client.tunnel_count(),
+                    "tunnel limit reached, rejecting TCP tunnel"
+                );
+                if let Some(h3) = &mut client.h3 {
+                    Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                }
+                client.pending_tcp_tunnels.remove(&stream_id);
+                continue;
+            }
+
+            let connect_task = spawn_tcp_connect(
+                conn_idx,
+                stream_id,
+                target,
+                self.tcp_policy.clone(),
+                Duration::from_secs(self.config.tcp_proxy.connect_timeout_secs),
+                self.tcp_event_tx.clone(),
+            );
+            if let Some(pending) = client.pending_tcp_tunnels.get_mut(&stream_id) {
+                pending.start_connect(connect_task);
+            }
+        }
+
         let udp_response_tx = if pending_udp_setups.is_empty() {
             None
         } else {
@@ -615,9 +658,7 @@ impl Server {
                     "tunnel limit reached, rejecting"
                 );
                 if let Some(h3) = &mut client.h3 {
-                    Self::send_error_response(
-                        h3, &mut client.quic, stream_id, 503,
-                    );
+                    Self::send_error_response(h3, &mut client.quic, stream_id, 503);
                 }
                 continue;
             }
@@ -629,9 +670,7 @@ impl Server {
                 Err(e) => {
                     warn!(stream_id, %e, "cannot frame datagrams for stream");
                     if let Some(h3) = &mut client.h3 {
-                        Self::send_error_response(
-                            h3, &mut client.quic, stream_id, 400,
-                        );
+                        Self::send_error_response(h3, &mut client.quic, stream_id, 400);
                     }
                     continue;
                 }
@@ -652,9 +691,7 @@ impl Server {
                             if let Err(e) = std_sock.connect(addr) {
                                 warn!(stream_id, %e, "UDP connect failed");
                                 if let Some(h3) = &mut client.h3 {
-                                    Self::send_error_response(
-                                        h3, &mut client.quic, stream_id, 502,
-                                    );
+                                    Self::send_error_response(h3, &mut client.quic, stream_id, 502);
                                 }
                                 continue;
                             }
@@ -663,10 +700,7 @@ impl Server {
                                 Ok(tok_sock) => {
                                     let socket = Arc::new(tok_sock);
                                     let recv_socket = Arc::clone(&socket);
-                                    let response_tx = udp_response_tx
-                                        .as_ref()
-                                        .unwrap()
-                                        .clone();
+                                    let response_tx = udp_response_tx.as_ref().unwrap().clone();
                                     let recv_task = tokio::spawn(async move {
                                         let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
                                         loop {
@@ -688,12 +722,8 @@ impl Server {
                                             }
                                         }
                                     });
-                                    let tunnel = UdpTunnel::from_socket(
-                                        stream_id,
-                                        addr,
-                                        socket,
-                                        recv_task,
-                                    );
+                                    let tunnel =
+                                        UdpTunnel::from_socket(stream_id, addr, socket, recv_task);
                                     info!(
                                         stream_id,
                                         target = %addr,
@@ -705,7 +735,10 @@ impl Server {
                                     warn!(stream_id, %e, "tokio socket convert failed");
                                     if let Some(h3) = &mut client.h3 {
                                         Self::send_error_response(
-                                            h3, &mut client.quic, stream_id, 502,
+                                            h3,
+                                            &mut client.quic,
+                                            stream_id,
+                                            502,
                                         );
                                     }
                                 }
@@ -714,9 +747,7 @@ impl Server {
                         Err(e) => {
                             warn!(stream_id, %e, "UDP bind failed");
                             if let Some(h3) = &mut client.h3 {
-                                Self::send_error_response(
-                                    h3, &mut client.quic, stream_id, 502,
-                                );
+                                Self::send_error_response(h3, &mut client.quic, stream_id, 502);
                             }
                         }
                     }
@@ -724,9 +755,7 @@ impl Server {
                 Err(e) => {
                     warn!(stream_id, %e, "DNS resolution failed");
                     if let Some(h3) = &mut client.h3 {
-                        Self::send_error_response(
-                            h3, &mut client.quic, stream_id, 502,
-                        );
+                        Self::send_error_response(h3, &mut client.quic, stream_id, 502);
                     }
                 }
             }
@@ -742,9 +771,7 @@ impl Server {
                     "tunnel limit reached, rejecting IP tunnel"
                 );
                 if let Some(h3) = &mut client.h3 {
-                    Self::send_error_response(
-                        h3, &mut client.quic, stream_id, 503,
-                    );
+                    Self::send_error_response(h3, &mut client.quic, stream_id, 503);
                 }
                 continue;
             }
@@ -833,10 +860,7 @@ impl Server {
         // one send_body call. The route advertisement is a default route, so
         // the client knows it can send all traffic through this tunnel.
         let mut capsules = Vec::new();
-        capsule::encoder::encode(
-            &CapsuleFrame::AddressAssign(assigned),
-            &mut capsules,
-        );
+        capsule::encoder::encode(&CapsuleFrame::AddressAssign(assigned), &mut capsules);
         capsule::encoder::encode(
             &CapsuleFrame::RouteAdvertisement(vec![
                 IpAddressRange {
@@ -856,9 +880,7 @@ impl Server {
         );
 
         if let Some(h3) = &mut client.h3 {
-            if let Err(e) =
-                h3.send_body(&mut client.quic, stream_id, &capsules, false)
-            {
+            if let Err(e) = h3.send_body(&mut client.quic, stream_id, &capsules, false) {
                 warn!(stream_id, %e, "failed to send CONNECT-IP capsules");
             }
         }
@@ -902,6 +924,7 @@ impl Server {
         config: &ServerConfig,
         auth: Option<&BasicAuthenticator>,
         udp_policy: &TargetPolicy,
+        pending_tcp_setups: &mut Vec<(u64, uri::TcpTarget)>,
         pending_udp_setups: &mut Vec<(u64, uri::UdpTarget)>,
         pending_ip_setups: &mut Vec<u64>,
     ) {
@@ -910,6 +933,7 @@ impl Server {
         let mut method: &[u8] = b"";
         let mut path: &[u8] = b"";
         let mut protocol: &[u8] = b"";
+        let mut authority: &[u8] = b"";
         let mut proxy_authorization: Option<&[u8]> = None;
         let mut duplicate_proxy_authorization = false;
 
@@ -918,6 +942,7 @@ impl Server {
                 b":method" => method = header.value(),
                 b":path" => path = header.value(),
                 b":protocol" => protocol = header.value(),
+                b":authority" => authority = header.value(),
                 b"proxy-authorization" => {
                     if proxy_authorization.replace(header.value()).is_some() {
                         duplicate_proxy_authorization = true;
@@ -932,6 +957,7 @@ impl Server {
             method = %String::from_utf8_lossy(method),
             path = %String::from_utf8_lossy(path),
             protocol = %String::from_utf8_lossy(protocol),
+            authority = %String::from_utf8_lossy(authority),
             "request received"
         );
 
@@ -945,12 +971,10 @@ impl Server {
             ) || matches!(
                 protocol,
                 b"connect-ip" if config.ip_proxy.enabled
-            );
+            ) || (protocol.is_empty() && config.tcp_proxy.enabled);
             if supported {
                 if let Some(auth) = auth {
-                    if duplicate_proxy_authorization ||
-                        !auth.authenticate(proxy_authorization)
-                    {
+                    if duplicate_proxy_authorization || !auth.authenticate(proxy_authorization) {
                         warn!(stream_id, "proxy authentication failed");
                         Self::send_proxy_auth_required(h3, quic, stream_id);
                         return;
@@ -960,6 +984,31 @@ impl Server {
 
             // Check for Extended CONNECT.
             match protocol {
+                b"" if config.tcp_proxy.enabled => {
+                    let authority = match std::str::from_utf8(authority) {
+                        Ok(authority) => authority,
+                        Err(_) => {
+                            Self::send_error_response(h3, quic, stream_id, 400);
+                            return;
+                        }
+                    };
+                    match uri::parse_connect_authority(authority) {
+                        Ok(target) => {
+                            info!(
+                                stream_id,
+                                host = %target.host,
+                                port = target.port,
+                                "standard CONNECT"
+                            );
+                            pending_tcp_setups.push((stream_id, target));
+                        }
+                        Err(error) => {
+                            warn!(stream_id, %error, "bad CONNECT authority");
+                            Self::send_error_response(h3, quic, stream_id, 400);
+                        }
+                    }
+                    return;
+                }
                 b"connect-udp" if config.udp_proxy.enabled => {
                     Self::handle_connect_udp(
                         h3,
@@ -973,12 +1022,7 @@ impl Server {
                     return;
                 }
                 b"connect-ip" if config.ip_proxy.enabled => {
-                    Self::handle_connect_ip_response(
-                        h3,
-                        quic,
-                        stream_id,
-                        pending_ip_setups,
-                    );
+                    Self::handle_connect_ip_response(h3, quic, stream_id, pending_ip_setups);
                     return;
                 }
                 _ => {}
@@ -1073,6 +1117,273 @@ impl Server {
         pending_udp_setups.push((stream_id, target));
     }
 
+    /// Drain HTTP/3 request-body data for a standard CONNECT stream and queue
+    /// it for the target TCP writer. Returning false asks the caller to reset
+    /// the tunnel because its bounded buffer was exhausted or closed.
+    fn relay_tcp_request_body(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        pending_tunnels: &mut FxHashMap<u64, PendingTcpTunnel>,
+        tunnels: &mut FxHashMap<u64, TcpTunnel>,
+    ) -> bool {
+        if !pending_tunnels.contains_key(&stream_id) && !tunnels.contains_key(&stream_id) {
+            debug!(stream_id, "H3 data event for a non-TCP tunnel");
+            return true;
+        }
+
+        let mut body = [0_u8; 16 * 1024];
+        loop {
+            let len = match h3.recv_body(quic, stream_id, &mut body) {
+                Ok(len) => len,
+                Err(quiche::h3::Error::Done) => return true,
+                Err(error) => {
+                    warn!(stream_id, %error, "failed to receive CONNECT body");
+                    return false;
+                }
+            };
+            if len == 0 {
+                continue;
+            }
+
+            if let Some(tunnel) = tunnels.get_mut(&stream_id) {
+                if !tunnel.queue_client_data(body[..len].to_vec()) {
+                    warn!(stream_id, "TCP client-to-target buffer exhausted");
+                    return false;
+                }
+                continue;
+            }
+            if let Some(tunnel) = pending_tunnels.get_mut(&stream_id) {
+                if !tunnel.buffer_client_data(body[..len].to_vec()) {
+                    warn!(stream_id, "pending TCP tunnel buffer exhausted");
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Apply an event generated by an asynchronous target TCP task.
+    fn handle_tcp_event(&mut self, event: TcpRelayEvent) {
+        let (connection_index, stream_id) = match &event {
+            TcpRelayEvent::ConnectResult {
+                connection_index,
+                stream_id,
+                ..
+            }
+            | TcpRelayEvent::Data {
+                connection_index,
+                stream_id,
+                ..
+            }
+            | TcpRelayEvent::Eof {
+                connection_index,
+                stream_id,
+            }
+            | TcpRelayEvent::Error {
+                connection_index,
+                stream_id,
+                ..
+            } => (*connection_index, *stream_id),
+        };
+
+        let Some(conn_id) = self.conn_by_index.get(&connection_index).cloned() else {
+            return;
+        };
+        let Some(client) = self.connections.get_mut(&conn_id) else {
+            return;
+        };
+
+        match event {
+            TcpRelayEvent::ConnectResult { result, .. } => {
+                let Some(mut pending) = client.pending_tcp_tunnels.remove(&stream_id) else {
+                    return;
+                };
+
+                match result {
+                    Ok((stream, target_addr)) => {
+                        let Some(h3) = client.h3.as_mut() else {
+                            return;
+                        };
+                        let headers = [quiche::h3::Header::new(b":status", b"200")];
+                        if let Err(error) =
+                            h3.send_response(&mut client.quic, stream_id, &headers, false)
+                        {
+                            warn!(
+                                stream_id,
+                                %error,
+                                "failed to send standard CONNECT response"
+                            );
+                            Self::reset_tcp_stream(client, stream_id);
+                            return;
+                        }
+
+                        let early_data = std::mem::take(&mut pending.early_data);
+                        let client_finished = pending.client_finished;
+                        drop(pending);
+
+                        let mut tunnel = TcpTunnel::from_stream(
+                            connection_index,
+                            stream_id,
+                            target_addr,
+                            stream,
+                            self.tcp_event_tx.clone(),
+                        );
+                        for data in early_data {
+                            if !tunnel.queue_client_data(data) {
+                                warn!(stream_id, "failed to transfer early CONNECT body");
+                                Self::reset_tcp_stream(client, stream_id);
+                                return;
+                            }
+                        }
+                        if client_finished {
+                            tunnel.finish_client();
+                        }
+                        client.tcp_tunnels.insert(stream_id, tunnel);
+                        info!(
+                            stream_id,
+                            target = %target_addr,
+                            "TCP tunnel established"
+                        );
+                    }
+                    Err(failure) => {
+                        warn!(
+                            stream_id,
+                            status = failure.status,
+                            reason = %failure.reason,
+                            "TCP tunnel setup failed"
+                        );
+                        if let Some(h3) = client.h3.as_mut() {
+                            Self::send_error_response(
+                                h3,
+                                &mut client.quic,
+                                stream_id,
+                                failure.status,
+                            );
+                        }
+                    }
+                }
+            }
+            TcpRelayEvent::Data {
+                data, acknowledged, ..
+            } => {
+                let accepted = client
+                    .tcp_tunnels
+                    .get_mut(&stream_id)
+                    .is_some_and(|tunnel| tunnel.set_pending_response(data, acknowledged));
+                if !accepted && client.tcp_tunnels.contains_key(&stream_id) {
+                    warn!(stream_id, "duplicate pending TCP response chunk");
+                    Self::reset_tcp_stream(client, stream_id);
+                }
+            }
+            TcpRelayEvent::Eof { .. } => {
+                if let Some(tunnel) = client.tcp_tunnels.get_mut(&stream_id) {
+                    tunnel.upstream_finished = true;
+                    tunnel.last_activity = Instant::now();
+                }
+            }
+            TcpRelayEvent::Error { reason, .. } => {
+                if client.tcp_tunnels.contains_key(&stream_id) {
+                    warn!(stream_id, %reason, "TCP relay failed");
+                    Self::reset_tcp_stream(client, stream_id);
+                }
+            }
+        }
+    }
+
+    /// Move target TCP response bytes into HTTP/3 with partial-write support.
+    fn flush_tcp_responses(&mut self) {
+        for client in self.connections.values_mut() {
+            let mut failed = Vec::new();
+            let mut completed = Vec::new();
+
+            {
+                let Some(h3) = client.h3.as_mut() else {
+                    continue;
+                };
+
+                for (stream_id, tunnel) in &mut client.tcp_tunnels {
+                    while let Some(response) = tunnel.pending_response.as_mut() {
+                        let remaining = &response.data[response.offset..];
+                        match h3.send_body(&mut client.quic, *stream_id, remaining, false) {
+                            Ok(0) => break,
+                            Ok(written) => {
+                                response.offset += written;
+                                tunnel.last_activity = Instant::now();
+                                if response.offset == response.data.len() {
+                                    tunnel
+                                        .pending_response
+                                        .take()
+                                        .expect("response exists")
+                                        .acknowledge();
+                                }
+                            }
+                            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    stream_id,
+                                    %error,
+                                    "failed to send CONNECT response body"
+                                );
+                                failed.push(*stream_id);
+                                break;
+                            }
+                        }
+                    }
+
+                    if !failed.contains(stream_id)
+                        && tunnel.pending_response.is_none()
+                        && tunnel.upstream_finished
+                        && !tunnel.response_finished
+                    {
+                        match h3.send_body(&mut client.quic, *stream_id, b"", true) {
+                            Ok(_) => tunnel.response_finished = true,
+                            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {}
+                            Err(error) => {
+                                warn!(
+                                    stream_id,
+                                    %error,
+                                    "failed to finish CONNECT response body"
+                                );
+                                failed.push(*stream_id);
+                            }
+                        }
+                    }
+
+                    if tunnel.is_complete() {
+                        completed.push(*stream_id);
+                    }
+                }
+            }
+
+            failed.sort_unstable();
+            failed.dedup();
+            for stream_id in failed {
+                Self::reset_tcp_stream(client, stream_id);
+            }
+            for stream_id in completed {
+                if client.tcp_tunnels.remove(&stream_id).is_some() {
+                    info!(stream_id, "TCP tunnel closed cleanly");
+                }
+            }
+        }
+    }
+
+    fn reset_tcp_stream(client: &mut ClientConnection, stream_id: u64) {
+        client.pending_tcp_tunnels.remove(&stream_id);
+        client.tcp_tunnels.remove(&stream_id);
+        let error = quiche::h3::WireErrorCode::ConnectError as u64;
+        client
+            .quic
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, error)
+            .ok();
+        client
+            .quic
+            .stream_shutdown(stream_id, quiche::Shutdown::Write, error)
+            .ok();
+    }
+
     /// Relay QUIC DATAGRAMs from clients to target UDP sockets and TUN device.
     fn relay_client_datagrams(&mut self, dgram_buf: &mut [u8]) {
         for client in self.connections.values_mut() {
@@ -1164,10 +1475,7 @@ impl Server {
                     continue;
                 }
 
-                debug!(
-                    stream_id = dgram.stream_id,
-                    "datagram for unknown tunnel"
-                );
+                debug!(stream_id = dgram.stream_id, "datagram for unknown tunnel");
             }
         }
     }
@@ -1216,7 +1524,9 @@ impl Server {
         for _ in 1..MAX_TUN_RECV_BATCH {
             let len = match self.tun.as_ref().unwrap().try_recv(buf) {
                 Ok(len) => len,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
                 Err(e) => {
                     debug!(%e, "TUN recv error");
                     break;
@@ -1249,10 +1559,7 @@ impl Server {
         let conn_id = match self.conn_by_index.get(&owner.conn_id) {
             Some(conn_id) => conn_id,
             None => {
-                debug!(
-                    conn_id = owner.conn_id,
-                    "TUN packet for unknown connection"
-                );
+                debug!(conn_id = owner.conn_id, "TUN packet for unknown connection");
                 return true;
             }
         };
@@ -1293,8 +1600,7 @@ impl Server {
     /// Close tunnels that have been idle too long.
     fn cleanup_idle_tunnels(&mut self, timeout: Duration) {
         // Collect idle IP tunnel info so we can clean up after the loop.
-        let mut idle_ip_tunnels: Vec<(quiche::ConnectionId<'static>, u64, u64)> =
-            Vec::new();
+        let mut idle_ip_tunnels: Vec<(quiche::ConnectionId<'static>, u64, u64)> = Vec::new();
 
         for (conn_id, client) in &mut self.connections {
             // Borrow the fields separately so the tunnel maps can be walked
@@ -1302,11 +1608,37 @@ impl Server {
             let ClientConnection {
                 quic,
                 h3,
+                pending_tcp_tunnels,
+                tcp_tunnels,
                 udp_tunnels,
                 ip_tunnels,
                 index,
                 deferred_send: _,
             } = client;
+
+            // Pending connects are bounded by their connect timeout, but the
+            // idle sweep is also a final guard if a resolver stalls.
+            pending_tcp_tunnels.retain(|stream_id, tunnel| {
+                if !tunnel.is_idle(timeout) {
+                    return true;
+                }
+                info!(stream_id, "closing idle pending TCP tunnel");
+                if let Some(h3) = h3.as_mut() {
+                    Self::send_error_response(h3, quic, *stream_id, 504);
+                }
+                false
+            });
+
+            tcp_tunnels.retain(|stream_id, tunnel| {
+                if !tunnel.is_idle(timeout) {
+                    return true;
+                }
+                info!(stream_id, "closing idle TCP tunnel");
+                if let Some(h3) = h3.as_mut() {
+                    h3.send_body(quic, *stream_id, b"", true).ok();
+                }
+                false
+            });
 
             // UDP tunnels: dropping the tunnel aborts its receive task.
             udp_tunnels.retain(|stream_id, tunnel| {
@@ -1394,11 +1726,7 @@ impl Server {
     }
 
     /// Drive all connections: handle timers and flush outgoing packets.
-    async fn drive_connections(
-        &mut self,
-        out: &mut [u8],
-        batch: &mut SendPacketBatch,
-    ) {
+    async fn drive_connections(&mut self, out: &mut [u8], batch: &mut SendPacketBatch) {
         let socket = &mut self.socket;
 
         for (_, client) in &mut self.connections {
@@ -1428,34 +1756,25 @@ impl Server {
                     if deadline > now {
                         break;
                     }
-                    if let Some((packet, send_info)) =
-                        client.deferred_send.take_if_due(now)
-                    {
+                    if let Some((packet, send_info)) = client.deferred_send.take_if_due(now) {
                         generated_bytes += packet.len();
-                        batch.push(
-                            packet,
-                            send_info,
-                            socket.udp_gso_enabled(),
-                            send_quantum,
-                        );
+                        batch.push(packet, send_info, socket.udp_gso_enabled(), send_quantum);
                     }
                 }
 
-                while batch.packet_count() < MAX_BATCH_PACKETS &&
-                    generated_bytes < send_quantum
-                {
+                while batch.packet_count() < MAX_BATCH_PACKETS && generated_bytes < send_quantum {
                     let (write, send_info) = match client.quic.send(out) {
                         Ok(v) => v,
                         Err(quiche::Error::Done) => {
                             quiche_done = true;
                             break;
-                        },
+                        }
                         Err(e) => {
                             error!(%e, "quiche send error");
                             client.quic.close(false, 0x1, b"send error").ok();
                             quiche_done = true;
                             break;
-                        },
+                        }
                     };
 
                     // Respect quiche's pacing decision. Keep one serialized

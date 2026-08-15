@@ -1,12 +1,13 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use base64::Engine as _;
+use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
-use masque::capsule::CapsuleFrame;
+use base64::Engine as _;
 use masque::capsule::decoder::CapsuleDecoder;
+use masque::capsule::CapsuleFrame;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use tracing::{error, info, warn};
@@ -189,10 +190,44 @@ impl Client {
 
     /// Create the HTTP/3 layer on top of the QUIC connection.
     fn init_h3(&mut self) -> Result<()> {
-        let h3_config = quiche::h3::Config::new()?;
+        let mut h3_config = quiche::h3::Config::new()?;
+        h3_config.enable_extended_connect(true);
         let h3 = quiche::h3::Connection::with_transport(&mut self.quic, &h3_config)?;
         self.h3 = Some(h3);
-        Ok(())
+        self.wait_for_server_capabilities(Duration::from_secs(5))
+    }
+
+    /// Wait until the server SETTINGS advertise the capabilities required by
+    /// a standards-compliant CONNECT-UDP client such as Surge.
+    fn wait_for_server_capabilities(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let capabilities_ready = {
+                let h3 = self.h3.as_ref().context("H3 not initialised")?;
+                h3.extended_connect_enabled_by_peer() && h3.dgram_enabled_by_peer(&self.quic)
+            };
+            if capabilities_ready {
+                return Ok(());
+            }
+
+            {
+                let h3 = self.h3.as_mut().context("H3 not initialised")?;
+                loop {
+                    match h3.poll(&mut self.quic) {
+                        Ok(_) => continue,
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) => {
+                            bail!("H3 poll while waiting for SETTINGS: {error}")
+                        }
+                    }
+                }
+            }
+
+            if Instant::now() > deadline {
+                bail!("server did not advertise Extended CONNECT and HTTP Datagram support");
+            }
+            self.drive()?;
+        }
     }
 
     /// Send an HTTP/3 request; returns the stream ID.
@@ -201,6 +236,117 @@ impl Client {
         let stream_id = h3.send_request(&mut self.quic, headers, fin)?;
         self.flush()?;
         Ok(stream_id)
+    }
+
+    /// Queue request headers and a small body before flushing QUIC. This
+    /// exercises servers that receive HEADERS and DATA in the same packet.
+    fn send_request_with_body(
+        &mut self,
+        headers: &[quiche::h3::Header],
+        body: &[u8],
+        fin: bool,
+    ) -> Result<u64> {
+        let h3 = self.h3.as_mut().context("H3 not initialised")?;
+        let stream_id = h3.send_request(&mut self.quic, headers, false)?;
+        let written = h3.send_body(&mut self.quic, stream_id, body, fin)?;
+        if written != body.len() {
+            bail!("short early CONNECT body write: {written}/{}", body.len());
+        }
+        self.flush()?;
+        Ok(stream_id)
+    }
+
+    /// Send an entire HTTP/3 request body, retrying partial and blocked writes.
+    fn send_body_all(&mut self, stream_id: u64, body: &[u8], fin: bool) -> Result<()> {
+        let mut offset = 0;
+        while offset < body.len() {
+            let result = {
+                let h3 = self.h3.as_mut().context("H3 not initialised")?;
+                h3.send_body(&mut self.quic, stream_id, &body[offset..], fin)
+            };
+            match result {
+                Ok(0) | Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                    self.drive()?;
+                }
+                Ok(written) => {
+                    offset += written;
+                    self.flush()?;
+                }
+                Err(error) => bail!("send CONNECT body: {error}"),
+            }
+        }
+
+        if body.is_empty() && fin {
+            loop {
+                let result = {
+                    let h3 = self.h3.as_mut().context("H3 not initialised")?;
+                    h3.send_body(&mut self.quic, stream_id, b"", true)
+                };
+                match result {
+                    Ok(_) => break,
+                    Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                        self.drive()?;
+                    }
+                    Err(error) => bail!("finish CONNECT body: {error}"),
+                }
+            }
+        }
+        self.flush()
+    }
+
+    fn recv_body_bytes(
+        &mut self,
+        stream_id: u64,
+        expected_len: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        let mut received = Vec::with_capacity(expected_len);
+        let mut buffer = [0_u8; BUF_SIZE];
+
+        while received.len() < expected_len {
+            {
+                let h3 = self.h3.as_mut().context("H3 not initialised")?;
+                loop {
+                    match h3.poll(&mut self.quic) {
+                        Ok((sid, quiche::h3::Event::Data)) if sid == stream_id => {}
+                        Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
+                            if received.len() < expected_len {
+                                bail!(
+                                    "CONNECT response finished after {} of {expected_len} bytes",
+                                    received.len()
+                                );
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) => {
+                            bail!("H3 poll for CONNECT body: {error}")
+                        }
+                    }
+                }
+
+                loop {
+                    match h3.recv_body(&mut self.quic, stream_id, &mut buffer) {
+                        Ok(len) => received.extend_from_slice(&buffer[..len]),
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) => bail!("receive CONNECT body: {error}"),
+                    }
+                }
+            }
+
+            if received.len() >= expected_len {
+                break;
+            }
+            if Instant::now() > deadline {
+                bail!(
+                    "CONNECT response timeout after {} of {expected_len} bytes",
+                    received.len()
+                );
+            }
+            self.drive()?;
+        }
+        Ok(received)
     }
 
     /// Poll until we get response headers for any stream, return (stream_id, status).
@@ -358,12 +504,8 @@ impl Client {
             let mut made_progress = false;
             while now < deadline && in_flight.len() < window {
                 payload[..8].copy_from_slice(&next_sequence.to_be_bytes());
-                masque::datagram::encode_payload_into(
-                    stream_id,
-                    &payload,
-                    &mut encoded,
-                )
-                .map_err(|e| anyhow::anyhow!("encode datagram: {e}"))?;
+                masque::datagram::encode_payload_into(stream_id, &payload, &mut encoded)
+                    .map_err(|e| anyhow::anyhow!("encode datagram: {e}"))?;
 
                 match self.quic.dgram_send(&encoded) {
                     Ok(()) => {
@@ -392,7 +534,9 @@ impl Client {
                         }
                         made_progress = true;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
                     Err(e) => bail!("socket recv: {e}"),
                 }
             }
@@ -442,6 +586,32 @@ fn connect_echo_socket(echo_addr: &str) -> Result<UdpSocket> {
 }
 
 fn run_echo_server(bind_addr: &str) -> Result<()> {
+    let tcp_listener = TcpListener::bind(bind_addr)
+        .with_context(|| format!("bind TCP echo server at {bind_addr}"))?;
+    std::thread::spawn(move || {
+        for stream in tcp_listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    std::thread::spawn(move || {
+                        let mut buffer = [0_u8; BUF_SIZE];
+                        loop {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => return,
+                                Ok(len) => {
+                                    if stream.write_all(&buffer[..len]).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
     let socket = UdpSocket::bind(bind_addr)
         .with_context(|| format!("bind UDP echo server at {bind_addr}"))?;
     let mut buf = [0u8; BUF_SIZE];
@@ -502,8 +672,7 @@ fn run_direct_echo_throughput(
             match socket.recv(&mut recv_buf) {
                 Ok(len) => {
                     if len >= 8 {
-                        let sequence =
-                            u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
+                        let sequence = u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
                         if in_flight.remove(&sequence) {
                             received += 1;
                         }
@@ -616,6 +785,19 @@ fn connect_udp_headers(
     Ok(headers)
 }
 
+fn connect_tcp_headers_without_auth(target_authority: &str) -> Vec<quiche::h3::Header> {
+    vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":authority", target_authority.as_bytes()),
+    ]
+}
+
+fn connect_tcp_headers(target_authority: &str) -> Result<Vec<quiche::h3::Header>> {
+    let mut headers = connect_tcp_headers_without_auth(target_authority);
+    append_proxy_authorization(&mut headers)?;
+    Ok(headers)
+}
+
 fn connect_udp_tunnel(server_addr: &str, echo_addr: &str) -> Result<(Client, u64)> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
@@ -634,6 +816,81 @@ fn connect_udp_tunnel(server_addr: &str, echo_addr: &str) -> Result<(Client, u64
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+fn test_server_capabilities(server_addr: &str, _echo_addr: &str) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+    info!("Extended CONNECT and HTTP Datagram SETTINGS advertised");
+    Ok(())
+}
+
+fn test_standard_connect_happy_path(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+
+    let headers = connect_tcp_headers(echo_addr)?;
+    let stream_id = client.send_request(&headers, false)?;
+    let (response_stream_id, status) = client.poll_response(Duration::from_secs(5))?;
+    if response_stream_id != stream_id || status != 200 {
+        bail!(
+            "expected stream {stream_id} status 200, got stream {response_stream_id} status {status}"
+        );
+    }
+
+    let payload = b"standard HTTP/3 CONNECT echo test";
+    client.send_body_all(stream_id, payload, true)?;
+    let echoed = client.recv_body_bytes(stream_id, payload.len(), Duration::from_secs(5))?;
+    if echoed != payload {
+        bail!("standard CONNECT payload mismatch");
+    }
+    info!("standard CONNECT TCP round-trip OK");
+    Ok(())
+}
+
+fn test_standard_connect_early_body(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+
+    let headers = connect_tcp_headers(echo_addr)?;
+    let payload = b"CONNECT headers and body in one QUIC flight";
+    let stream_id = client.send_request_with_body(&headers, payload, true)?;
+    let (_, status) = client.poll_response(Duration::from_secs(5))?;
+    if status != 200 {
+        bail!("expected 200 for early CONNECT body, got {status}");
+    }
+    let echoed = client.recv_body_bytes(
+        stream_id,
+        payload.len(),
+        Duration::from_secs(5),
+    )?;
+    if echoed != payload {
+        bail!("early standard CONNECT payload mismatch");
+    }
+    Ok(())
+}
+
+fn test_standard_connect_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+
+    let headers = connect_tcp_headers_without_auth(echo_addr);
+    client.send_request(&headers, false)?;
+    let (_, status, response_headers) = client.poll_response_headers(Duration::from_secs(5))?;
+    if status != 407 {
+        bail!("expected 407 for unauthenticated standard CONNECT, got {status}");
+    }
+    if !response_headers
+        .iter()
+        .any(|header| header.name() == b"proxy-authenticate")
+    {
+        bail!("standard CONNECT 407 missing Proxy-Authenticate");
+    }
+    Ok(())
+}
 
 fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
@@ -680,8 +937,7 @@ fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
     let headers = connect_udp_headers_without_auth(server_addr, echo_host, echo_port);
     client.send_request(&headers, false)?;
 
-    let (_, status, response_headers) =
-        client.poll_response_headers(Duration::from_secs(5))?;
+    let (_, status, response_headers) = client.poll_response_headers(Duration::from_secs(5))?;
     if status != 407 {
         bail!("expected 407, got {status}");
     }
@@ -744,9 +1000,7 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         direct_latencies.push(started.elapsed().as_secs_f64() * 1e6);
     }
     direct_latencies.sort_by(f64::total_cmp);
-    let percentile = |values: &[f64], p: f64| {
-        values[((values.len() - 1) as f64 * p) as usize]
-    };
+    let percentile = |values: &[f64], p: f64| values[((values.len() - 1) as f64 * p) as usize];
     println!(
         "  RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
         percentile(&direct_latencies, 0.50),
@@ -761,10 +1015,8 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         let seconds = duration.as_secs_f64();
         let tx_pps = sent as f64 / seconds;
         let rx_pps = received as f64 / seconds;
-        let goodput_gbps =
-            received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
-        let response_shortfall =
-            (sent - received) as f64 * 100.0 / sent.max(1) as f64;
+        let goodput_gbps = received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
+        let response_shortfall = (sent - received) as f64 * 100.0 / sent.max(1) as f64;
         println!(
             "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
         );
@@ -1114,6 +1366,34 @@ fn main() {
         return;
     }
 
+    if std::env::var_os("MASQUE_TCP_CHECK").is_some() {
+        for (name, test) in [
+            (
+                "server_capabilities",
+                test_server_capabilities as fn(&str, &str) -> Result<()>,
+            ),
+            (
+                "standard_connect_auth_required",
+                test_standard_connect_auth_required,
+            ),
+            (
+                "standard_connect_happy_path",
+                test_standard_connect_happy_path,
+            ),
+            (
+                "standard_connect_early_body",
+                test_standard_connect_early_body,
+            ),
+        ] {
+            if let Err(error) = test(&server_addr, &echo_addr) {
+                error!(%error, "{name} failed");
+                std::process::exit(1);
+            }
+        }
+        info!("MASQUE TCP compatibility checks passed");
+        return;
+    }
+
     if std::env::var_os("MASQUE_BENCH").is_some() {
         if let Err(e) = benchmark_connect_udp(&server_addr, &echo_addr) {
             error!(%e, "network benchmark failed");
@@ -1123,6 +1403,19 @@ fn main() {
     }
 
     let tests: &[(&str, fn(&str, &str) -> Result<()>)] = &[
+        ("server_capabilities", test_server_capabilities),
+        (
+            "standard_connect_auth_required",
+            test_standard_connect_auth_required,
+        ),
+        (
+            "standard_connect_happy_path",
+            test_standard_connect_happy_path,
+        ),
+        (
+            "standard_connect_early_body",
+            test_standard_connect_early_body,
+        ),
         ("proxy_auth_required", test_proxy_auth_required),
         ("connect_udp_happy_path", test_connect_udp_happy_path),
         ("connect_udp_policy_deny", test_connect_udp_policy_deny),

@@ -1,4 +1,5 @@
-// Tunnel types — shared definitions for CONNECT-UDP and CONNECT-IP tunnels.
+// Tunnel types — shared definitions for CONNECT, CONNECT-UDP, and CONNECT-IP.
 
 pub mod ip;
+pub mod tcp;
 pub mod udp;

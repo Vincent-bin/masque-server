@@ -40,6 +40,11 @@ password_hash = "\$argon2id\$v=19\$m=19456,t=2,p=1\$1xNVXhqKU7jJ6cqTBJKphQ\$GXXA
 max_datagram_size = 1350
 enable_dgram = true
 
+[tcp_proxy]
+enabled = true
+allow_targets = ["127.0.0.0/8"]
+deny_targets = []
+
 [udp_proxy]
 enabled = true
 allow_targets = ["127.0.0.0/8"]
@@ -63,6 +68,14 @@ SERVER_PID=$!
 MASQUE_AUTH_CHECK=1 \
 MASQUE_SERVER_ADDR=127.0.0.1:4433 \
 ECHO_SERVER_ADDR=127.0.0.1:9999 \
+RUST_LOG=warn \
+target/release/masque-e2e
+
+MASQUE_TCP_CHECK=1 \
+MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+ECHO_SERVER_ADDR=127.0.0.1:9999 \
+MASQUE_USERNAME=test \
+MASQUE_PASSWORD=test-password \
 RUST_LOG=warn \
 target/release/masque-e2e
 

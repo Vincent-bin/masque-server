@@ -2,6 +2,7 @@
 
 use crate::fxhash::FxHashMap;
 use crate::tunnel::ip::IpTunnel;
+use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
 use crate::tunnel::udp::UdpTunnel;
 
 /// One serialized QUIC packet waiting for its pacing deadline. The backing
@@ -43,6 +44,10 @@ impl DeferredSend {
 pub struct ClientConnection {
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
+    /// Standard CONNECT tunnels waiting for a target TCP connection.
+    pub pending_tcp_tunnels: FxHashMap<u64, PendingTcpTunnel>,
+    /// Active standard CONNECT TCP tunnels, keyed by stream ID.
+    pub tcp_tunnels: FxHashMap<u64, TcpTunnel>,
     /// Active UDP tunnels, keyed by stream ID.
     pub udp_tunnels: FxHashMap<u64, UdpTunnel>,
     /// Active IP tunnels, keyed by stream ID.
@@ -59,6 +64,8 @@ impl ClientConnection {
         Self {
             quic,
             h3: None,
+            pending_tcp_tunnels: FxHashMap::default(),
+            tcp_tunnels: FxHashMap::default(),
             udp_tunnels: FxHashMap::default(),
             ip_tunnels: FxHashMap::default(),
             index,
@@ -66,9 +73,12 @@ impl ClientConnection {
         }
     }
 
-    /// Total tunnels open on this connection, across both protocols.
+    /// Total active or connecting tunnels open on this connection.
     pub fn tunnel_count(&self) -> usize {
-        self.udp_tunnels.len() + self.ip_tunnels.len()
+        self.pending_tcp_tunnels.len()
+            + self.tcp_tunnels.len()
+            + self.udp_tunnels.len()
+            + self.ip_tunnels.len()
     }
 }
 

@@ -10,7 +10,7 @@ use masque::auth;
 use masque::config::{self, ServerConfig};
 use masque::server::Server;
 
-/// MASQUE proxy server (CONNECT-UDP / CONNECT-IP over HTTP/3).
+/// MASQUE proxy server (CONNECT / CONNECT-UDP / CONNECT-IP over HTTP/3).
 #[derive(Parser)]
 #[command(name = "masque-server")]
 struct Cli {

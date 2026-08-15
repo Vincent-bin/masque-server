@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 
 /// Policy checker for target addresses.
+#[derive(Clone)]
 pub struct TargetPolicy {
     allow: Vec<IpNet>,
     deny: Vec<IpNet>,

@@ -1,6 +1,7 @@
 # masque
 
-A MASQUE proxy server in Rust implementing CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484) over HTTP/3.
+A MASQUE proxy server in Rust implementing standard CONNECT, CONNECT-UDP
+(RFC 9298), and CONNECT-IP (RFC 9484) over HTTP/3.
 
 ## Overview
 
@@ -8,6 +9,7 @@ MASQUE (Multiplexed Application Substrate over QUIC Encryption) is an IETF proto
 
 - **CONNECT-UDP** — proxy UDP traffic through the server (e.g. DNS, QUIC)
 - **CONNECT-IP** — proxy IP traffic through the server (full VPN mode via TUN device)
+- **Standard CONNECT** — proxy TCP byte streams for HTTP/3 proxy clients
 - **Capsule Protocol** (RFC 9297) — TLV framing for ADDRESS_ASSIGN, ROUTE_ADVERTISEMENT
 - **HTTP Datagrams** — efficient datagram transport over QUIC DATAGRAM frames
 
@@ -26,7 +28,7 @@ src/
   error.rs           Error types with HTTP status mapping
   varint.rs          QUIC variable-length integer codec (RFC 9000)
   datagram.rs        HTTP Datagram framing (Quarter Stream ID + Context ID)
-  uri.rs             URI template parser for CONNECT-UDP / CONNECT-IP
+  uri.rs             Target parser for CONNECT / CONNECT-UDP / CONNECT-IP
   policy.rs          Allow/deny target filtering by CIDR
   capsule/
     mod.rs           Capsule frame types and constants
@@ -34,6 +36,7 @@ src/
     decoder.rs       Incremental TLV parser
   tunnel/
     mod.rs
+    tcp.rs           Standard CONNECT tunnel with bounded backpressure
     udp.rs           CONNECT-UDP tunnel (per-target UDP socket)
     ip.rs            CONNECT-IP tunnel (assigned addresses, activity tracking)
   address_pool.rs    IPv4/IPv6 address allocation from CIDR pools
@@ -139,6 +142,12 @@ enable_dgram = true
 enable_udp_gso = false
 enable_udp_gro = true
 
+[tcp_proxy]
+enabled = true
+connect_timeout_secs = 10
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
+
 [udp_proxy]
 enabled = true
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
@@ -162,6 +171,15 @@ valid Argon2id PHC string. Clients authenticate each CONNECT request with
 isolated development environment.
 
 ## Protocol Flow
+
+### Standard CONNECT (TCP)
+
+1. Client sends an authenticated HTTP/3 `CONNECT` with the target in
+   `:authority`
+2. Server resolves the target and applies the TCP allow/deny policy
+3. Server connects to the target and responds `200`
+4. HTTP/3 request and response body bytes are relayed bidirectionally with
+   bounded backpressure
 
 ### CONNECT-UDP
 

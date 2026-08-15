@@ -12,6 +12,9 @@ pub struct UdpTarget {
     pub port: u16,
 }
 
+/// A standard CONNECT target parsed from the `:authority` pseudo-header.
+pub type TcpTarget = UdpTarget;
+
 /// Parsed CONNECT-IP target from the URI path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpTarget {
@@ -37,8 +40,12 @@ pub enum UriError {
 impl std::fmt::Display for UriError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UriError::PathMismatch => write!(f, "path does not match URI template"),
-            UriError::MissingSegment(s) => write!(f, "missing URI segment: {s}"),
+            UriError::PathMismatch => {
+                write!(f, "path does not match URI template")
+            }
+            UriError::MissingSegment(s) => {
+                write!(f, "missing URI segment: {s}")
+            }
             UriError::InvalidPort(s) => write!(f, "invalid port: {s}"),
             UriError::InvalidProtocol(s) => write!(f, "invalid protocol: {s}"),
         }
@@ -54,10 +61,7 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                &s[i + 1..i + 3],
-                16,
-            ) {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 result.push(byte);
                 i += 3;
                 continue;
@@ -104,6 +108,50 @@ pub fn parse_udp_path(path: &str, template: &str) -> Result<UdpTarget, UriError>
     Ok(UdpTarget { host, port })
 }
 
+/// Parse the authority form used by standard HTTP CONNECT.
+///
+/// IPv6 literals must use brackets (for example `[2001:db8::1]:443`).
+pub fn parse_connect_authority(authority: &str) -> Result<TcpTarget, UriError> {
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || authority.contains(['/', '@'])
+    {
+        return Err(UriError::PathMismatch);
+    }
+
+    let (host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .ok_or(UriError::MissingSegment("target_port".into()))?;
+        if host.is_empty() || host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(UriError::PathMismatch);
+        }
+        (host, port)
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or(UriError::MissingSegment("target_port".into()))?;
+        if host.is_empty() || host.contains(':') {
+            return Err(UriError::PathMismatch);
+        }
+        (host, port)
+    };
+
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| UriError::InvalidPort(port_str.into()))?;
+    if port == 0 {
+        return Err(UriError::InvalidPort("0".into()));
+    }
+
+    Ok(TcpTarget {
+        host: host.into(),
+        port,
+    })
+}
+
 /// Parse a CONNECT-IP URI path.
 ///
 /// Both `{target}` and `{ipproto}` are optional per RFC 9484.
@@ -145,8 +193,7 @@ impl UdpTarget {
     /// If the host is already an IP address, no DNS lookup is performed.
     pub fn resolve(&self) -> Result<Vec<SocketAddr>, std::io::Error> {
         use std::net::ToSocketAddrs;
-        let addrs: Vec<SocketAddr> =
-            (self.host.as_str(), self.port).to_socket_addrs()?.collect();
+        let addrs: Vec<SocketAddr> = (self.host.as_str(), self.port).to_socket_addrs()?.collect();
         if addrs.is_empty() {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -167,18 +214,15 @@ impl UdpTarget {
 mod tests {
     use super::*;
 
-    const UDP_TEMPLATE: &str =
-        "/.well-known/masque/udp/{target_host}/{target_port}/";
-    const IP_TEMPLATE: &str =
-        "/.well-known/masque/ip/{target}/{ipproto}/";
+    const UDP_TEMPLATE: &str = "/.well-known/masque/udp/{target_host}/{target_port}/";
+    const IP_TEMPLATE: &str = "/.well-known/masque/ip/{target}/{ipproto}/";
 
     // ── CONNECT-UDP parsing ───────────────────────────────────────────
 
     #[test]
     fn parse_udp_basic() {
         let target =
-            parse_udp_path("/.well-known/masque/udp/192.0.2.1/443/", UDP_TEMPLATE)
-                .unwrap();
+            parse_udp_path("/.well-known/masque/udp/192.0.2.1/443/", UDP_TEMPLATE).unwrap();
         assert_eq!(target.host, "192.0.2.1");
         assert_eq!(target.port, 443);
     }
@@ -186,8 +230,7 @@ mod tests {
     #[test]
     fn parse_udp_hostname() {
         let target =
-            parse_udp_path("/.well-known/masque/udp/dns.example.com/53/", UDP_TEMPLATE)
-                .unwrap();
+            parse_udp_path("/.well-known/masque/udp/dns.example.com/53/", UDP_TEMPLATE).unwrap();
         assert_eq!(target.host, "dns.example.com");
         assert_eq!(target.port, 53);
     }
@@ -206,120 +249,140 @@ mod tests {
 
     #[test]
     fn parse_udp_no_trailing_slash() {
-        let target =
-            parse_udp_path("/.well-known/masque/udp/10.0.0.1/8080", UDP_TEMPLATE)
-                .unwrap();
+        let target = parse_udp_path("/.well-known/masque/udp/10.0.0.1/8080", UDP_TEMPLATE).unwrap();
         assert_eq!(target.host, "10.0.0.1");
         assert_eq!(target.port, 8080);
     }
 
     #[test]
     fn parse_udp_missing_host() {
-        let err = parse_udp_path("/.well-known/masque/udp/", UDP_TEMPLATE)
-            .unwrap_err();
+        let err = parse_udp_path("/.well-known/masque/udp/", UDP_TEMPLATE).unwrap_err();
         assert_eq!(err, UriError::MissingSegment("target_host".into()));
     }
 
     #[test]
     fn parse_udp_missing_port() {
-        let err = parse_udp_path("/.well-known/masque/udp/10.0.0.1/", UDP_TEMPLATE)
-            .unwrap_err();
+        let err = parse_udp_path("/.well-known/masque/udp/10.0.0.1/", UDP_TEMPLATE).unwrap_err();
         assert_eq!(err, UriError::MissingSegment("target_port".into()));
     }
 
     #[test]
     fn parse_udp_invalid_port_string() {
         let err =
-            parse_udp_path("/.well-known/masque/udp/10.0.0.1/abc/", UDP_TEMPLATE)
-                .unwrap_err();
+            parse_udp_path("/.well-known/masque/udp/10.0.0.1/abc/", UDP_TEMPLATE).unwrap_err();
         assert!(matches!(err, UriError::InvalidPort(_)));
     }
 
     #[test]
     fn parse_udp_port_zero() {
-        let err =
-            parse_udp_path("/.well-known/masque/udp/10.0.0.1/0/", UDP_TEMPLATE)
-                .unwrap_err();
+        let err = parse_udp_path("/.well-known/masque/udp/10.0.0.1/0/", UDP_TEMPLATE).unwrap_err();
         assert!(matches!(err, UriError::InvalidPort(_)));
     }
 
     #[test]
     fn parse_udp_port_overflow() {
         let err =
-            parse_udp_path("/.well-known/masque/udp/10.0.0.1/99999/", UDP_TEMPLATE)
-                .unwrap_err();
+            parse_udp_path("/.well-known/masque/udp/10.0.0.1/99999/", UDP_TEMPLATE).unwrap_err();
         assert!(matches!(err, UriError::InvalidPort(_)));
     }
 
     #[test]
     fn parse_udp_wrong_prefix() {
-        let err = parse_udp_path("/other/path/10.0.0.1/443/", UDP_TEMPLATE)
-            .unwrap_err();
+        let err = parse_udp_path("/other/path/10.0.0.1/443/", UDP_TEMPLATE).unwrap_err();
         assert_eq!(err, UriError::PathMismatch);
     }
 
     // ── CONNECT-IP parsing ────────────────────────────────────────────
 
     #[test]
+    fn parse_connect_authority_hostname() {
+        assert_eq!(
+            parse_connect_authority("example.com:443").unwrap(),
+            TcpTarget {
+                host: "example.com".into(),
+                port: 443
+            }
+        );
+    }
+
+    #[test]
+    fn parse_connect_authority_ipv4() {
+        assert_eq!(
+            parse_connect_authority("192.0.2.1:8443").unwrap(),
+            TcpTarget {
+                host: "192.0.2.1".into(),
+                port: 8443
+            }
+        );
+    }
+
+    #[test]
+    fn parse_connect_authority_ipv6() {
+        assert_eq!(
+            parse_connect_authority("[2001:db8::1]:443").unwrap(),
+            TcpTarget {
+                host: "2001:db8::1".into(),
+                port: 443
+            }
+        );
+    }
+
+    #[test]
+    fn parse_connect_authority_rejects_invalid_values() {
+        for authority in [
+            "example.com",
+            "example.com:0",
+            "example.com:99999",
+            "2001:db8::1:443",
+            "[not-v6]:443",
+            "user@example.com:443",
+            "example.com:443/path",
+            "example.com:44 3",
+        ] {
+            assert!(parse_connect_authority(authority).is_err(), "{authority}");
+        }
+    }
+
+    #[test]
     fn parse_ip_full_vpn_mode() {
         // No target, no ipproto → full VPN tunnel
-        let target =
-            parse_ip_path("/.well-known/masque/ip/", IP_TEMPLATE).unwrap();
+        let target = parse_ip_path("/.well-known/masque/ip/", IP_TEMPLATE).unwrap();
         assert_eq!(target.target, None);
         assert_eq!(target.ipproto, None);
     }
 
     #[test]
     fn parse_ip_with_target() {
-        let target = parse_ip_path(
-            "/.well-known/masque/ip/192.0.2.0/",
-            IP_TEMPLATE,
-        )
-        .unwrap();
+        let target = parse_ip_path("/.well-known/masque/ip/192.0.2.0/", IP_TEMPLATE).unwrap();
         assert_eq!(target.target, Some("192.0.2.0".into()));
         assert_eq!(target.ipproto, None);
     }
 
     #[test]
     fn parse_ip_with_target_and_wildcard() {
-        let target = parse_ip_path(
-            "/.well-known/masque/ip/192.0.2.0/*/",
-            IP_TEMPLATE,
-        )
-        .unwrap();
+        let target = parse_ip_path("/.well-known/masque/ip/192.0.2.0/*/", IP_TEMPLATE).unwrap();
         assert_eq!(target.target, Some("192.0.2.0".into()));
         assert_eq!(target.ipproto, None); // wildcard = all protocols
     }
 
     #[test]
     fn parse_ip_with_target_and_proto() {
-        let target = parse_ip_path(
-            "/.well-known/masque/ip/192.0.2.0/6/",
-            IP_TEMPLATE,
-        )
-        .unwrap();
+        let target = parse_ip_path("/.well-known/masque/ip/192.0.2.0/6/", IP_TEMPLATE).unwrap();
         assert_eq!(target.target, Some("192.0.2.0".into()));
         assert_eq!(target.ipproto, Some(6)); // TCP
     }
 
     #[test]
     fn parse_ip_with_ipv6_target() {
-        let target = parse_ip_path(
-            "/.well-known/masque/ip/2001%3Adb8%3A%3A/17/",
-            IP_TEMPLATE,
-        )
-        .unwrap();
+        let target =
+            parse_ip_path("/.well-known/masque/ip/2001%3Adb8%3A%3A/17/", IP_TEMPLATE).unwrap();
         assert_eq!(target.target, Some("2001:db8::".into()));
         assert_eq!(target.ipproto, Some(17)); // UDP
     }
 
     #[test]
     fn parse_ip_invalid_proto() {
-        let err = parse_ip_path(
-            "/.well-known/masque/ip/10.0.0.0/abc/",
-            IP_TEMPLATE,
-        )
-        .unwrap_err();
+        let err = parse_ip_path("/.well-known/masque/ip/10.0.0.0/abc/", IP_TEMPLATE).unwrap_err();
         assert!(matches!(err, UriError::InvalidProtocol(_)));
     }
 
@@ -350,18 +413,12 @@ mod tests {
 
     #[test]
     fn extract_prefix_udp_template() {
-        assert_eq!(
-            extract_prefix(UDP_TEMPLATE),
-            "/.well-known/masque/udp/"
-        );
+        assert_eq!(extract_prefix(UDP_TEMPLATE), "/.well-known/masque/udp/");
     }
 
     #[test]
     fn extract_prefix_ip_template() {
-        assert_eq!(
-            extract_prefix(IP_TEMPLATE),
-            "/.well-known/masque/ip/"
-        );
+        assert_eq!(extract_prefix(IP_TEMPLATE), "/.well-known/masque/ip/");
     }
 
     #[test]

@@ -20,6 +20,21 @@ enable_dgram = true
 enable_udp_gso = false
 enable_udp_gro = true
 
+[tcp_proxy]
+enabled = true
+connect_timeout_secs = 10
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+]
+
 [udp_proxy]
 enabled = true
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"

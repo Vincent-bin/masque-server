@@ -12,6 +12,7 @@ pub struct ServerConfig {
     pub tls: TlsSection,
     pub auth: AuthSection,
     pub quic: QuicSection,
+    pub tcp_proxy: TcpProxySection,
     pub udp_proxy: UdpProxySection,
     pub ip_proxy: IpProxySection,
 }
@@ -82,6 +83,15 @@ pub struct UdpProxySection {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct TcpProxySection {
+    pub enabled: bool,
+    pub connect_timeout_secs: u64,
+    pub allow_targets: Vec<String>,
+    pub deny_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct IpProxySection {
     pub enabled: bool,
     pub uri_template: String,
@@ -100,6 +110,7 @@ impl Default for ServerConfig {
             tls: TlsSection::default(),
             auth: AuthSection::default(),
             quic: QuicSection::default(),
+            tcp_proxy: TcpProxySection::default(),
             udp_proxy: UdpProxySection::default(),
             ip_proxy: IpProxySection::default(),
         }
@@ -157,13 +168,28 @@ impl Default for UdpProxySection {
     fn default() -> Self {
         Self {
             enabled: true,
-            uri_template: "/.well-known/masque/udp/{target_host}/{target_port}/"
-                .into(),
+            uri_template: "/.well-known/masque/udp/{target_host}/{target_port}/".into(),
             allow_targets: vec!["0.0.0.0/0".into()],
+            deny_targets: vec!["127.0.0.0/8".into(), "10.0.0.0/8".into(), "::1/128".into()],
+        }
+    }
+}
+
+impl Default for TcpProxySection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            connect_timeout_secs: 10,
+            allow_targets: vec!["0.0.0.0/0".into(), "::/0".into()],
             deny_targets: vec![
                 "127.0.0.0/8".into(),
                 "10.0.0.0/8".into(),
+                "169.254.0.0/16".into(),
+                "172.16.0.0/12".into(),
+                "192.168.0.0/16".into(),
                 "::1/128".into(),
+                "fc00::/7".into(),
+                "fe80::/10".into(),
             ],
         }
     }
@@ -202,6 +228,8 @@ mod tests {
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
+        assert!(cfg.tcp_proxy.enabled);
+        assert_eq!(cfg.tcp_proxy.connect_timeout_secs, 10);
         assert!(cfg.udp_proxy.enabled);
         assert!(cfg.ip_proxy.enabled);
         assert_eq!(cfg.ip_proxy.tun_mtu, 1280);
@@ -221,10 +249,7 @@ listen_addr = "127.0.0.1:8443"
 idle_timeout_secs = 60
 "#;
         let cfg = parse_toml(toml).unwrap();
-        assert_eq!(
-            cfg.server.listen_addr,
-            "127.0.0.1:8443".parse().unwrap()
-        );
+        assert_eq!(cfg.server.listen_addr, "127.0.0.1:8443".parse().unwrap());
         assert_eq!(cfg.server.idle_timeout_secs, 60);
         // Other fields keep defaults
         assert_eq!(cfg.server.max_connections, 10_000);
@@ -293,6 +318,22 @@ deny_targets = []
     }
 
     #[test]
+    fn parse_tcp_proxy_section() {
+        let toml = r#"
+[tcp_proxy]
+enabled = false
+connect_timeout_secs = 3
+allow_targets = ["192.168.0.0/16"]
+deny_targets = []
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(!cfg.tcp_proxy.enabled);
+        assert_eq!(cfg.tcp_proxy.connect_timeout_secs, 3);
+        assert_eq!(cfg.tcp_proxy.allow_targets, vec!["192.168.0.0/16"]);
+        assert!(cfg.tcp_proxy.deny_targets.is_empty());
+    }
+
+    #[test]
     fn parse_ip_proxy_section() {
         let toml = r#"
 [ip_proxy]
@@ -326,6 +367,21 @@ key_path = "certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
+
+[tcp_proxy]
+enabled = true
+connect_timeout_secs = 10
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+]
 
 [udp_proxy]
 enabled = true
