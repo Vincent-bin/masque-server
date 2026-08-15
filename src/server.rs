@@ -695,8 +695,34 @@ impl Server {
                                 }
                                 continue;
                             }
-                            std_sock.set_nonblocking(true).ok();
-                            match UdpSocket::from_std(std_sock) {
+                            if let Err(e) = std_sock.set_nonblocking(true) {
+                                warn!(stream_id, %e, "UDP nonblocking setup failed");
+                                if let Some(h3) = &mut client.h3 {
+                                    Self::send_error_response(
+                                        h3,
+                                        &mut client.quic,
+                                        stream_id,
+                                        502,
+                                    );
+                                }
+                                continue;
+                            }
+                            let recv_std = match std_sock.try_clone() {
+                                Ok(socket) => socket,
+                                Err(e) => {
+                                    warn!(stream_id, %e, "UDP socket clone failed");
+                                    if let Some(h3) = &mut client.h3 {
+                                        Self::send_error_response(
+                                            h3,
+                                            &mut client.quic,
+                                            stream_id,
+                                            502,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            };
+                            match UdpSocket::from_std(recv_std) {
                                 Ok(tok_sock) => {
                                     let socket = Arc::new(tok_sock);
                                     let recv_socket = Arc::clone(&socket);
@@ -722,8 +748,13 @@ impl Server {
                                             }
                                         }
                                     });
-                                    let tunnel =
-                                        UdpTunnel::from_socket(stream_id, addr, socket, recv_task);
+                                    let tunnel = UdpTunnel::from_socket(
+                                        stream_id,
+                                        addr,
+                                        std_sock,
+                                        socket,
+                                        recv_task,
+                                    );
                                     info!(
                                         stream_id,
                                         target = %addr,
@@ -1416,10 +1447,8 @@ impl Server {
 
                 // Check UDP tunnels first.
                 if let Some(tunnel) = client.udp_tunnels.get_mut(&dgram.stream_id) {
-                    match tunnel.socket.try_send(dgram.payload) {
-                        Ok(_) => {
-                            tunnel.last_activity = std::time::Instant::now();
-                        }
+                    match tunnel.try_send_to_target(dgram.payload) {
+                        Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             debug!(

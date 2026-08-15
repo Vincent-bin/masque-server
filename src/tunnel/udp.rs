@@ -15,8 +15,15 @@ use tracing::debug;
 pub struct UdpTunnel {
     /// The HTTP/3 stream ID this tunnel is bound to.
     pub stream_id: u64,
-    /// Proxy-side UDP socket connected to the target.
+    /// Tokio socket used by the background target-response receiver.
     pub socket: Arc<UdpSocket>,
+    /// A duplicate descriptor used for immediate nonblocking sends.
+    ///
+    /// `tokio::net::UdpSocket::try_send()` is readiness-gated and can return
+    /// `WouldBlock` without issuing a syscall immediately after registration.
+    /// Keeping a standard-library duplicate avoids dropping the first client
+    /// datagram while Tokio is still observing the socket's writable state.
+    send_socket: std::net::UdpSocket,
     /// Resolved target address.
     pub target_addr: SocketAddr,
     /// Timestamp of last datagram relayed (either direction).
@@ -39,8 +46,12 @@ impl UdpTunnel {
             "[::]:0".parse().unwrap()
         };
 
-        let socket = UdpSocket::bind(bind_addr).await?;
-        socket.connect(target_addr).await?;
+        let send_socket = std::net::UdpSocket::bind(bind_addr)?;
+        send_socket.connect(target_addr)?;
+        send_socket.set_nonblocking(true)?;
+        let recv_socket = send_socket.try_clone()?;
+        recv_socket.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(recv_socket)?;
 
         debug!(
             stream_id,
@@ -52,6 +63,7 @@ impl UdpTunnel {
         Ok(Self {
             stream_id,
             socket: Arc::new(socket),
+            send_socket,
             target_addr,
             last_activity: Instant::now(),
             recv_task: None,
@@ -61,12 +73,14 @@ impl UdpTunnel {
     pub(crate) fn from_socket(
         stream_id: u64,
         target_addr: SocketAddr,
+        send_socket: std::net::UdpSocket,
         socket: Arc<UdpSocket>,
         recv_task: JoinHandle<()>,
     ) -> Self {
         Self {
             stream_id,
             socket,
+            send_socket,
             target_addr,
             last_activity: Instant::now(),
             recv_task: Some(recv_task),
@@ -76,6 +90,20 @@ impl UdpTunnel {
     /// Forward a payload from the client to the target.
     pub async fn send_to_target(&mut self, payload: &[u8]) -> std::io::Result<()> {
         self.socket.send(payload).await?;
+        self.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Forward a payload immediately without depending on Tokio's cached
+    /// writable readiness for this newly registered socket.
+    pub fn try_send_to_target(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let sent = self.send_socket.send(payload)?;
+        if sent != payload.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "partial UDP datagram send",
+            ));
+        }
         self.last_activity = Instant::now();
         Ok(())
     }
@@ -103,5 +131,29 @@ impl Drop for UdpTunnel {
         if let Some(task) = self.recv_task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn immediate_nonblocking_send_reaches_target() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let mut tunnel = UdpTunnel::new(0, target_addr).await.unwrap();
+
+        tunnel.try_send_to_target(b"first datagram").unwrap();
+
+        let mut received = [0_u8; 64];
+        let len = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            target.recv(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received[..len], b"first datagram");
     }
 }
