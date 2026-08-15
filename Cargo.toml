@@ -12,7 +12,7 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 ipnet = "2"
-quiche = "0.26"
+quiche = "0.29.3"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

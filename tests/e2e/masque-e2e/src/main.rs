@@ -97,6 +97,7 @@ impl Client {
         config.set_initial_max_stream_data_uni(1_000_000);
         config.set_initial_max_streams_bidi(128);
         config.set_initial_max_streams_uni(100);
+        config.enable_pacing(true);
         config.enable_dgram(true, 1000, 1000);
 
         let quic = quiche::connect(Some("server"), &scid, local, peer, &mut config)?;
@@ -115,7 +116,11 @@ impl Client {
         let mut out = [0u8; MAX_DATAGRAM_SIZE];
         loop {
             match self.quic.send(&mut out) {
-                Ok((len, _)) => {
+                Ok((len, send_info)) => {
+                    let delay = send_info.at.saturating_duration_since(Instant::now());
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
                     self.socket.send(&out[..len])?;
                 }
                 Err(quiche::Error::Done) => return Ok(()),

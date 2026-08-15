@@ -127,6 +127,7 @@ impl Server {
             config.quic.initial_max_streams_bidi,
         );
         quic_config.set_initial_max_streams_uni(100);
+        quic_config.enable_pacing(true);
 
         // DATAGRAM extension
         if config.quic.enable_dgram {
@@ -249,14 +250,21 @@ impl Server {
         let mut next_idle_sweep = Instant::now() + IDLE_SWEEP_INTERVAL;
 
         loop {
-            // Calculate the earliest timer across all connections.
-            let timeout = self
-                .connections
-                .values()
-                .filter_map(|c| c.quic.timeout())
-                .min()
-                .map(|t| t.min(Duration::from_millis(50)))
-                .or(Some(Duration::from_millis(50)));
+            // Calculate the earliest QUIC or pacing timer across all
+            // connections. The 50ms cap also keeps shutdown and housekeeping
+            // responsive while the server is otherwise idle.
+            let now = Instant::now();
+            let mut next_wakeup = Duration::from_millis(50);
+            for client in self.connections.values() {
+                if let Some(timeout) = client.quic.timeout() {
+                    next_wakeup = next_wakeup.min(timeout);
+                }
+                if let Some(deadline) = client.deferred_send.deadline() {
+                    next_wakeup = next_wakeup
+                        .min(deadline.saturating_duration_since(now));
+                }
+            }
+            let timeout = Some(next_wakeup);
 
             // Wait for a packet, signal, or timeout.
             enum Event {
@@ -1131,7 +1139,7 @@ impl Server {
                     if let Some(tunnel) = client.udp_tunnels.get_mut(&dgram.stream_id) {
                         tunnel.last_activity = Instant::now();
 
-                        match client.quic.dgram_send_vec(dgram.datagram) {
+                        match client.quic.dgram_send_buf(dgram.datagram) {
                             Ok(()) => {}
                             // The send queue is full: stop draining and let the
                             // flush at the end of the loop make room.
@@ -1220,7 +1228,7 @@ impl Server {
 
             tunnel.last_activity = Instant::now();
 
-            match client.quic.dgram_send_vec(tunnel.header.encode(pkt)) {
+            match client.quic.dgram_send_buf(tunnel.header.encode(pkt)) {
                 Ok(()) => {}
                 Err(quiche::Error::Done) => return false,
                 // Oversized, or datagrams disabled — dropping this packet says
@@ -1253,6 +1261,7 @@ impl Server {
                 udp_tunnels,
                 ip_tunnels,
                 index,
+                deferred_send: _,
             } = client;
 
             // UDP tunnels: dropping the tunnel aborts its receive task.
@@ -1344,6 +1353,29 @@ impl Server {
                     .min(MAX_DATAGRAM_SIZE);
                 let mut generated_bytes = 0;
                 let mut quiche_done = false;
+                let mut pacing_blocked = false;
+
+                // `quiche::Connection::send()` serializes and accounts a
+                // packet before returning its desired release time. Resume a
+                // packet retained by the previous loop only once that time is
+                // reached.
+                if let Some(deadline) = client.deferred_send.deadline() {
+                    let now = Instant::now();
+                    if deadline > now {
+                        break;
+                    }
+                    if let Some((packet, send_info)) =
+                        client.deferred_send.take_if_due(now)
+                    {
+                        generated_bytes += packet.len();
+                        batch.push(
+                            packet,
+                            send_info,
+                            socket.udp_gso_enabled(),
+                            send_quantum,
+                        );
+                    }
+                }
 
                 while batch.packet_count() < MAX_BATCH_PACKETS &&
                     generated_bytes < send_quantum
@@ -1362,6 +1394,16 @@ impl Server {
                         },
                     };
 
+                    // Respect quiche's pacing decision. Keep one serialized
+                    // future packet per connection and let the outer event
+                    // loop wake exactly at its release time, instead of
+                    // sleeping here and blocking unrelated connections.
+                    if send_info.at > Instant::now() {
+                        client.deferred_send.schedule(&out[..write], send_info);
+                        pacing_blocked = true;
+                        break;
+                    }
+
                     batch.push(
                         &out[..write],
                         send_info,
@@ -1379,7 +1421,7 @@ impl Server {
                     warn!(%e, "socket send error");
                 }
 
-                if quiche_done {
+                if quiche_done || pacing_blocked {
                     break;
                 }
             }

@@ -76,7 +76,7 @@ review `/etc/masque/masque.toml`, and start the service with
 ### Dependencies
 
 - Rust 2024 edition
-- quiche 0.26 (requires BoringSSL — built automatically by quiche)
+- quiche 0.29.3 (requires BoringSSL — built automatically by quiche)
 - tun-rs 2 (TUN device support, requires Linux `CAP_NET_ADMIN` for CONNECT-IP)
 - tokio 1 (async runtime)
 
