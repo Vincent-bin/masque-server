@@ -38,6 +38,8 @@ pub struct QuicSection {
     pub initial_max_streams_bidi: u64,
     pub enable_dgram: bool,
     /// Use UDP segmentation offload for QUIC sends when Linux supports it.
+    /// This is opt-in because some virtual NIC egress paths silently drop
+    /// otherwise valid GSO super-packets.
     pub enable_udp_gso: bool,
     /// Use UDP generic receive offload for QUIC receives when Linux supports it.
     pub enable_udp_gro: bool,
@@ -103,7 +105,10 @@ impl Default for QuicSection {
             max_datagram_size: 1350,
             initial_max_streams_bidi: 128,
             enable_dgram: true,
-            enable_udp_gso: true,
+            // Some virtual NICs advertise UDP GSO but silently drop the
+            // resulting super-packets on their external path. Keep GSO
+            // opt-in until an operator has verified the actual egress path.
+            enable_udp_gso: false,
             enable_udp_gro: true,
         }
     }
@@ -153,7 +158,7 @@ mod tests {
         assert_eq!(cfg.server.listen_addr.port(), 443);
         assert_eq!(cfg.server.idle_timeout_secs, 30);
         assert!(cfg.quic.enable_dgram);
-        assert!(cfg.quic.enable_udp_gso);
+        assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
         assert!(cfg.udp_proxy.enabled);
         assert!(cfg.ip_proxy.enabled);
@@ -202,14 +207,14 @@ key_path = "/etc/masque/key.pem"
 max_datagram_size = 1200
 initial_max_streams_bidi = 64
 enable_dgram = false
-enable_udp_gso = false
+enable_udp_gso = true
 enable_udp_gro = false
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.quic.max_datagram_size, 1200);
         assert_eq!(cfg.quic.initial_max_streams_bidi, 64);
         assert!(!cfg.quic.enable_dgram);
-        assert!(!cfg.quic.enable_udp_gso);
+        assert!(cfg.quic.enable_udp_gso);
         assert!(!cfg.quic.enable_udp_gro);
     }
 

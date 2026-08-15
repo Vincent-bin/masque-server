@@ -12,7 +12,7 @@ key_path = "/etc/masque/certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
-enable_udp_gso = true
+enable_udp_gso = false
 enable_udp_gro = true
 
 [udp_proxy]

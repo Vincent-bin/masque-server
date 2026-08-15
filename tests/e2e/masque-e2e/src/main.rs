@@ -316,6 +316,7 @@ impl Client {
         payload_size: usize,
         duration: Duration,
         window: usize,
+        expiry: Duration,
     ) -> Result<(u64, u64, u64)> {
         if payload_size < 8 {
             bail!("benchmark payload must be at least 8 bytes");
@@ -324,8 +325,7 @@ impl Client {
         self.socket.set_nonblocking(true)?;
         let started = Instant::now();
         let deadline = started + duration;
-        let drain_deadline = deadline + Duration::from_secs(1);
-        let expiry = Duration::from_millis(250);
+        let drain_deadline = deadline + expiry;
         let mut payload = vec![0x5a; payload_size];
         let mut encoded = Vec::with_capacity(payload_size + 16);
         let mut packet_buf = [0u8; BUF_SIZE];
@@ -394,7 +394,7 @@ impl Client {
                     continue;
                 }
                 let sequence = u64::from_be_bytes(dgram.payload[..8].try_into().unwrap());
-                if in_flight.remove(&sequence) && Instant::now() <= deadline {
+                if in_flight.remove(&sequence) {
                     received += 1;
                 }
                 made_progress = true;
@@ -447,14 +447,14 @@ fn run_direct_echo_throughput(
     payload_size: usize,
     duration: Duration,
     window: usize,
+    expiry: Duration,
 ) -> Result<(u64, u64, u64)> {
     let socket = connect_echo_socket(echo_addr)?;
     socket.set_nonblocking(true)?;
 
     let started = Instant::now();
     let deadline = started + duration;
-    let drain_deadline = deadline + Duration::from_secs(1);
-    let expiry = Duration::from_millis(250);
+    let drain_deadline = deadline + expiry;
     let mut payload = vec![0x5a; payload_size];
     let mut recv_buf = [0u8; BUF_SIZE];
     let mut in_flight = InFlight::with_capacity(window);
@@ -489,7 +489,7 @@ fn run_direct_echo_throughput(
                     if len >= 8 {
                         let sequence =
                             u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
-                        if in_flight.remove(&sequence) && Instant::now() <= deadline {
+                        if in_flight.remove(&sequence) {
                             received += 1;
                         }
                     }
@@ -628,13 +628,18 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50);
+    let expiry_ms = std::env::var("MASQUE_BENCH_EXPIRY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1_000);
 
-    if duration_secs == 0 || window == 0 || latency_samples == 0 {
-        bail!("benchmark duration, window, and RTT samples must be non-zero");
+    if duration_secs == 0 || window == 0 || latency_samples == 0 || expiry_ms == 0 {
+        bail!("benchmark duration, window, RTT samples, and expiry must be non-zero");
     }
 
+    let expiry = Duration::from_millis(expiry_ms);
     println!(
-        "CONNECT-UDP loopback benchmark: {duration_secs}s per payload, window {window}"
+        "CONNECT-UDP benchmark: {duration_secs}s per payload, window {window}, expiry {expiry_ms}ms"
     );
 
     println!("Direct UDP echo baseline:");
@@ -666,7 +671,7 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
     let duration = Duration::from_secs(duration_secs);
     for payload_size in [64, 1_200] {
         let (sent, received, expired) =
-            run_direct_echo_throughput(echo_addr, payload_size, duration, window)?;
+            run_direct_echo_throughput(echo_addr, payload_size, duration, window, expiry)?;
         let seconds = duration.as_secs_f64();
         let tx_pps = sent as f64 / seconds;
         let rx_pps = received as f64 / seconds;
@@ -705,7 +710,7 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
     for payload_size in [64, 1_200] {
         let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
         let (sent, received, expired) =
-            client.run_echo_throughput(stream_id, payload_size, duration, window)?;
+            client.run_echo_throughput(stream_id, payload_size, duration, window, expiry)?;
         let seconds = duration.as_secs_f64();
         let tx_pps = sent as f64 / seconds;
         let rx_pps = received as f64 / seconds;

@@ -80,10 +80,11 @@ review `/etc/masque/masque.toml`, and start the service with
 - tun-rs 2 (TUN device support, requires Linux `CAP_NET_ADMIN` for CONNECT-IP)
 - tokio 1 (async runtime)
 
-On Linux, the QUIC listener automatically uses `recvmmsg`/`sendmmsg` and,
-when supported by the kernel, UDP GSO/GRO. Set `quic.enable_udp_gso` or
-`quic.enable_udp_gro` to `false` for an A/B benchmark or to disable an
-offload explicitly. Other platforms use the portable Tokio UDP path.
+On Linux, the QUIC listener automatically uses `recvmmsg`/`sendmmsg` and UDP
+GRO. UDP GSO is available as an opt-in optimization because some virtual NICs
+advertise support but silently drop GSO traffic on their external path. Enable
+`quic.enable_udp_gso` only after an end-to-end A/B test. Other platforms use
+the portable Tokio UDP path.
 
 ## Usage
 
@@ -117,7 +118,7 @@ key_path = "certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
-enable_udp_gso = true
+enable_udp_gso = false
 enable_udp_gro = true
 
 [udp_proxy]
@@ -179,14 +180,21 @@ scripts/network-bench.sh
 
 The network benchmark builds release binaries and reports both a direct Rust
 UDP echo baseline and the MASQUE path, so echo-server or load-generator limits
-are visible. Its duration, in-flight window, and RTT sample count can be tuned:
+are visible. Its duration, in-flight window, response-expiry interval, and RTT
+sample count can be tuned:
 
 ```sh
 MASQUE_BENCH_DURATION_SECS=10 \
 MASQUE_BENCH_WINDOW=256 \
+MASQUE_BENCH_EXPIRY_MS=1000 \
 MASQUE_BENCH_RTT_SAMPLES=100 \
 scripts/network-bench.sh
 ```
+
+For a high-latency or deliberately oversized-window test, set
+`MASQUE_BENCH_EXPIRY_MS` comfortably above the RTT plus expected queueing
+delay. An expiry that is too short measures the benchmark's stale request
+queue rather than the server's sustainable throughput.
 
 ## References
 
