@@ -24,6 +24,13 @@ pub struct ServerSection {
     pub idle_timeout_secs: u64,
     pub max_connections: usize,
     pub max_tunnels_per_connection: usize,
+    /// Independent event loops to run, each with its own `SO_REUSEPORT` socket
+    /// and its own share of the connections.
+    ///
+    /// QUIC's per-packet crypto is what saturates a core, and a connection is
+    /// always handled by one loop, so this is what lets a busy server use more
+    /// than one core. `0` means one per available core. Linux only.
+    pub shards: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -70,6 +77,35 @@ pub struct QuicSection {
     pub enable_udp_gso: bool,
     /// Use UDP generic receive offload for QUIC receives when Linux supports it.
     pub enable_udp_gro: bool,
+    /// Congestion control algorithm: `cubic`, `reno`, or `bbr2`.
+    pub cc_algorithm: String,
+    /// Initial congestion window, in packets.
+    pub initial_congestion_window_packets: usize,
+    /// Connection-level flow control credit advertised at handshake, in bytes.
+    pub initial_max_data: u64,
+    /// Per-stream flow control credit advertised at handshake, in bytes.
+    ///
+    /// This is the window a single CONNECT stream starts with, so it caps
+    /// per-stream throughput at `initial_max_stream_data / RTT` until
+    /// autotuning grows it toward `max_stream_window`.
+    pub initial_max_stream_data: u64,
+    /// Ceiling for connection flow-control autotuning, in bytes.
+    pub max_connection_window: u64,
+    /// Ceiling for per-stream flow-control autotuning, in bytes.
+    pub max_stream_window: u64,
+    /// QUIC DATAGRAM receive queue depth, in datagrams.
+    ///
+    /// Datagrams are never retransmitted, so a deeper queue trades added
+    /// latency under load for fewer drops during bursts.
+    pub dgram_recv_queue_len: usize,
+    /// QUIC DATAGRAM send queue depth, in datagrams.
+    pub dgram_send_queue_len: usize,
+    /// Probe for a larger path MTU than the conservative initial packet size.
+    ///
+    /// Probes stop at `max_datagram_size`, so this only pays off when that
+    /// value is also raised above the path MTU the server would otherwise
+    /// assume (for example to 1500 on a network known to carry it).
+    pub discover_pmtu: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -97,6 +133,12 @@ pub struct IpProxySection {
     pub uri_template: String,
     pub tun_name: String,
     pub tun_mtu: usize,
+    /// Open the TUN device with `IFF_VNET_HDR` so the kernel can hand over a
+    /// whole GSO aggregate per read and accept one per write (Linux only).
+    ///
+    /// This changes the wire format on the device fd, so it is all-or-nothing;
+    /// the server switches both directions together when the kernel accepts it.
+    pub tun_offload: bool,
     pub ipv4_pool: String,
     pub ipv6_pool: String,
 }
@@ -124,6 +166,10 @@ impl Default for ServerSection {
             idle_timeout_secs: 30,
             max_connections: 10_000,
             max_tunnels_per_connection: 100,
+            // Opt-in: sharding changes how connections are distributed, so an
+            // operator should turn it on deliberately after checking their
+            // own traffic rather than inheriting it from an upgrade.
+            shards: 1,
         }
     }
 }
@@ -160,6 +206,25 @@ impl Default for QuicSection {
             // opt-in until an operator has verified the actual egress path.
             enable_udp_gso: false,
             enable_udp_gro: true,
+            // CUBIC, despite BBR2 looking like the better fit for a proxy.
+            // `DeferredSend` holds back a single serialized packet per
+            // connection, so a pacer that spaces every packet individually —
+            // which BBR2 does and quiche's CUBIC pacing largely does not —
+            // caps the server at one packet per event-loop wakeup. Measured on
+            // loopback CONNECT-UDP at 1200B: CUBIC 127k pkt/s at 75us p50 RTT,
+            // BBR2 34k pkt/s at 1228us. Revisit once a pacing-blocked
+            // connection can hold a burst rather than one packet.
+            cc_algorithm: "cubic".into(),
+            initial_congestion_window_packets: 32,
+            initial_max_data: 16 * 1024 * 1024,
+            initial_max_stream_data: 4 * 1024 * 1024,
+            // quiche's own autotuning ceilings, restated so they are visible
+            // and tunable alongside the initial windows.
+            max_connection_window: 24 * 1024 * 1024,
+            max_stream_window: 16 * 1024 * 1024,
+            dgram_recv_queue_len: 2048,
+            dgram_send_queue_len: 2048,
+            discover_pmtu: false,
         }
     }
 }
@@ -202,6 +267,7 @@ impl Default for IpProxySection {
             uri_template: "/.well-known/masque/ip/{target}/{ipproto}/".into(),
             tun_name: "masque0".into(),
             tun_mtu: 1280,
+            tun_offload: true,
             ipv4_pool: "10.89.0.0/16".into(),
             ipv6_pool: "fd00:abcd::/64".into(),
         }
@@ -228,6 +294,10 @@ mod tests {
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
+        assert_eq!(cfg.quic.cc_algorithm, "cubic");
+        assert!(cfg.quic.initial_max_stream_data <= cfg.quic.max_stream_window);
+        assert!(cfg.quic.initial_max_data <= cfg.quic.max_connection_window);
+        assert!(!cfg.quic.discover_pmtu);
         assert!(cfg.tcp_proxy.enabled);
         assert_eq!(cfg.tcp_proxy.connect_timeout_secs, 10);
         assert!(cfg.udp_proxy.enabled);
@@ -301,6 +371,37 @@ enable_udp_gro = false
         assert!(!cfg.quic.enable_dgram);
         assert!(cfg.quic.enable_udp_gso);
         assert!(!cfg.quic.enable_udp_gro);
+        // Tuning knobs absent from the file keep their defaults.
+        assert_eq!(cfg.quic.cc_algorithm, "cubic");
+        assert_eq!(cfg.quic.dgram_send_queue_len, 2048);
+    }
+
+    #[test]
+    fn parse_quic_tuning_knobs() {
+        let toml = r#"
+[quic]
+cc_algorithm = "cubic"
+initial_congestion_window_packets = 10
+initial_max_data = 1000000
+initial_max_stream_data = 500000
+max_connection_window = 2000000
+max_stream_window = 1000000
+dgram_recv_queue_len = 512
+dgram_send_queue_len = 256
+discover_pmtu = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.quic.cc_algorithm, "cubic");
+        assert_eq!(cfg.quic.initial_congestion_window_packets, 10);
+        assert_eq!(cfg.quic.initial_max_data, 1_000_000);
+        assert_eq!(cfg.quic.initial_max_stream_data, 500_000);
+        assert_eq!(cfg.quic.max_connection_window, 2_000_000);
+        assert_eq!(cfg.quic.max_stream_window, 1_000_000);
+        assert_eq!(cfg.quic.dgram_recv_queue_len, 512);
+        assert_eq!(cfg.quic.dgram_send_queue_len, 256);
+        assert!(cfg.quic.discover_pmtu);
+        // Untouched fields still come from the defaults.
+        assert_eq!(cfg.quic.max_datagram_size, 1350);
     }
 
     #[test]
@@ -367,6 +468,15 @@ key_path = "certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
+cc_algorithm = "cubic"
+initial_congestion_window_packets = 32
+initial_max_data = 16777216
+initial_max_stream_data = 4194304
+max_connection_window = 25165824
+max_stream_window = 16777216
+dgram_recv_queue_len = 2048
+dgram_send_queue_len = 2048
+discover_pmtu = false
 
 [tcp_proxy]
 enabled = true

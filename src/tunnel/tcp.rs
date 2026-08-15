@@ -1,20 +1,34 @@
 // Standard HTTP CONNECT tunnel implementation over HTTP/3.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::policy::TargetPolicy;
 use crate::uri::TcpTarget;
 
-const TCP_READ_CHUNK_SIZE: usize = 16 * 1024;
+const TCP_READ_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_BUFFERED_CLIENT_BYTES: usize = 1024 * 1024;
+
+/// Target-to-client bytes a single tunnel may hold in flight, counting both
+/// the relay channel and the queue awaiting HTTP/3 capacity.
+///
+/// The reader reserves against this budget before each read, so it can stay
+/// several chunks ahead of the event loop instead of stopping after every one,
+/// while total memory stays bounded per tunnel.
+pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 256 * 1024;
+
+// The reader reserves a whole chunk before each read, so a budget smaller than
+// one chunk would never be satisfiable and the reader would hang forever.
+const _: () = assert!(MAX_BUFFERED_RESPONSE_BYTES >= TCP_READ_CHUNK_SIZE);
 
 pub struct TcpSetupFailure {
     pub status: u16,
@@ -30,8 +44,7 @@ pub enum TcpRelayEvent {
     Data {
         connection_index: u64,
         stream_id: u64,
-        data: Vec<u8>,
-        acknowledged: oneshot::Sender<()>,
+        data: Bytes,
     },
     Eof {
         connection_index: u64,
@@ -101,38 +114,25 @@ impl Drop for PendingTcpTunnel {
     }
 }
 
+/// One chunk of target output, and how much of it HTTP/3 has taken so far.
 pub struct PendingTcpResponse {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub offset: usize,
-    acknowledged: Option<oneshot::Sender<()>>,
-}
-
-impl PendingTcpResponse {
-    fn new(data: Vec<u8>, acknowledged: oneshot::Sender<()>) -> Self {
-        Self {
-            data,
-            offset: 0,
-            acknowledged: Some(acknowledged),
-        }
-    }
-
-    pub fn acknowledge(mut self) {
-        if let Some(tx) = self.acknowledged.take() {
-            let _ = tx.send(());
-        }
-    }
 }
 
 pub struct TcpTunnel {
     pub stream_id: u64,
     pub target_addr: SocketAddr,
     pub last_activity: Instant,
-    pub pending_response: Option<PendingTcpResponse>,
+    /// Target output waiting for HTTP/3 capacity, oldest first.
+    pending_responses: VecDeque<PendingTcpResponse>,
     pub upstream_finished: bool,
     pub response_finished: bool,
     pub client_finished: bool,
     command_tx: mpsc::UnboundedSender<TcpCommand>,
     queued_client_bytes: Arc<AtomicUsize>,
+    /// Remaining target-to-client byte budget, shared with the reader task.
+    response_credit: Arc<Semaphore>,
     reader_task: Option<JoinHandle<()>>,
     writer_task: Option<JoinHandle<()>>,
 }
@@ -185,11 +185,38 @@ impl TcpTunnel {
             }
         });
 
+        let response_credit = Arc::new(Semaphore::new(MAX_BUFFERED_RESPONSE_BYTES));
+        let reader_credit = Arc::clone(&response_credit);
+
         let reader_task = tokio::spawn(async move {
-            let mut buffer = vec![0_u8; TCP_READ_CHUNK_SIZE];
+            // One backing allocation is split into `Bytes` chunks that share
+            // it, so handing a chunk to the event loop costs no copy.
+            let mut buffer = BytesMut::with_capacity(TCP_READ_CHUNK_SIZE);
             loop {
-                match reader.read(&mut buffer).await {
+                // Reserve the whole chunk up front: the read is then bounded by
+                // the budget rather than by the event loop acknowledging the
+                // previous chunk. Unused reservation is returned below.
+                let Ok(reservation) = Arc::clone(&reader_credit)
+                    .acquire_many_owned(TCP_READ_CHUNK_SIZE as u32)
+                    .await
+                else {
+                    // The tunnel was torn down.
+                    return;
+                };
+                reservation.forget();
+
+                buffer.reserve(TCP_READ_CHUNK_SIZE);
+                // `reserve` may hand back more spare capacity than asked for,
+                // and `read_buf` fills whatever is spare. Cap the read at the
+                // reservation so the credit accounting below cannot underflow.
+                let read = (&mut reader)
+                    .take(TCP_READ_CHUNK_SIZE as u64)
+                    .read_buf(&mut buffer)
+                    .await;
+
+                match read {
                     Ok(0) => {
+                        reader_credit.add_permits(TCP_READ_CHUNK_SIZE);
                         let _ = event_tx
                             .send(TcpRelayEvent::Eof {
                                 connection_index,
@@ -199,24 +226,24 @@ impl TcpTunnel {
                         return;
                     }
                     Ok(len) => {
-                        let (ack_tx, ack_rx) = oneshot::channel();
+                        // Only the bytes actually read stay reserved; the event
+                        // loop returns them as it writes them to HTTP/3.
+                        reader_credit.add_permits(TCP_READ_CHUNK_SIZE - len);
+                        let data = buffer.split_to(len).freeze();
                         if event_tx
                             .send(TcpRelayEvent::Data {
                                 connection_index,
                                 stream_id,
-                                data: buffer[..len].to_vec(),
-                                acknowledged: ack_tx,
+                                data,
                             })
                             .await
                             .is_err()
                         {
                             return;
                         }
-                        if ack_rx.await.is_err() {
-                            return;
-                        }
                     }
                     Err(error) => {
+                        reader_credit.add_permits(TCP_READ_CHUNK_SIZE);
                         let _ = event_tx
                             .send(TcpRelayEvent::Error {
                                 connection_index,
@@ -234,12 +261,13 @@ impl TcpTunnel {
             stream_id,
             target_addr,
             last_activity: Instant::now(),
-            pending_response: None,
+            pending_responses: VecDeque::new(),
             upstream_finished: false,
             response_finished: false,
             client_finished: false,
             command_tx,
             queued_client_bytes,
+            response_credit,
             reader_task: Some(reader_task),
             writer_task: Some(writer_task),
         }
@@ -278,17 +306,40 @@ impl TcpTunnel {
         let _ = self.command_tx.send(TcpCommand::Finish);
     }
 
-    pub fn set_pending_response(
-        &mut self,
-        data: Vec<u8>,
-        acknowledged: oneshot::Sender<()>,
-    ) -> bool {
-        if self.pending_response.is_some() || self.response_finished {
+    /// Queue a chunk of target output for the client.
+    ///
+    /// The reader has already reserved these bytes against the tunnel's budget,
+    /// so this only refuses a chunk that arrives after the response was closed.
+    pub fn queue_response(&mut self, data: Bytes) -> bool {
+        if self.response_finished {
             return false;
         }
-        self.pending_response = Some(PendingTcpResponse::new(data, acknowledged));
+        self.pending_responses.push_back(PendingTcpResponse { data, offset: 0 });
         self.last_activity = Instant::now();
         true
+    }
+
+    /// The oldest chunk still awaiting HTTP/3 capacity.
+    pub fn front_response(&mut self) -> Option<&mut PendingTcpResponse> {
+        self.pending_responses.front_mut()
+    }
+
+    /// Account for `written` bytes taken by HTTP/3, releasing that much of the
+    /// reader's budget and retiring the chunk once it is fully written.
+    pub fn advance_response(&mut self, written: usize) {
+        let Some(response) = self.pending_responses.front_mut() else {
+            return;
+        };
+        response.offset += written;
+        if response.offset >= response.data.len() {
+            self.pending_responses.pop_front();
+        }
+        self.response_credit.add_permits(written);
+        self.last_activity = Instant::now();
+    }
+
+    pub fn has_pending_response(&self) -> bool {
+        !self.pending_responses.is_empty()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -400,5 +451,58 @@ mod tests {
         pending.start_connect(task);
         assert!(pending.buffer_client_data(vec![0; MAX_BUFFERED_CLIENT_BYTES]));
         assert!(!pending.buffer_client_data(vec![0]));
+    }
+
+    /// Build a tunnel over a connected socket pair so the response queue can be
+    /// driven without a live proxy.
+    async fn test_tunnel() -> TcpTunnel {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, _) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        TcpTunnel::from_stream(0, 0, addr, client.unwrap(), event_tx)
+    }
+
+    #[tokio::test]
+    async fn response_queue_keeps_several_chunks_in_flight() {
+        let mut tunnel = test_tunnel().await;
+
+        assert!(tunnel.queue_response(Bytes::from_static(b"first")));
+        assert!(tunnel.queue_response(Bytes::from_static(b"second")));
+        assert!(tunnel.has_pending_response());
+
+        // Chunks are handed to HTTP/3 oldest first.
+        assert_eq!(&tunnel.front_response().unwrap().data[..], b"first");
+        tunnel.advance_response(5);
+        assert_eq!(&tunnel.front_response().unwrap().data[..], b"second");
+        tunnel.advance_response(6);
+        assert!(!tunnel.has_pending_response());
+    }
+
+    #[tokio::test]
+    async fn partial_writes_release_credit_incrementally() {
+        let mut tunnel = test_tunnel().await;
+        let before = tunnel.response_credit.available_permits();
+
+        tunnel.queue_response(Bytes::from_static(b"0123456789"));
+        // Simulate the reader having reserved these bytes.
+        tunnel.response_credit.acquire_many(10).await.unwrap().forget();
+        assert_eq!(tunnel.response_credit.available_permits(), before - 10);
+
+        tunnel.advance_response(4);
+        assert_eq!(tunnel.response_credit.available_permits(), before - 6);
+        assert!(tunnel.has_pending_response());
+        assert_eq!(tunnel.front_response().unwrap().offset, 4);
+
+        tunnel.advance_response(6);
+        assert_eq!(tunnel.response_credit.available_permits(), before);
+        assert!(!tunnel.has_pending_response());
+    }
+
+    #[tokio::test]
+    async fn response_queue_refuses_chunks_after_the_response_closed() {
+        let mut tunnel = test_tunnel().await;
+        tunnel.response_finished = true;
+        assert!(!tunnel.queue_response(Bytes::from_static(b"late")));
     }
 }

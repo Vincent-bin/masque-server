@@ -10,6 +10,7 @@ pub mod ip_packet;
 pub mod policy;
 mod quic_udp;
 pub mod routing;
+mod scheduler;
 pub mod server;
 pub mod tun;
 pub mod tunnel;

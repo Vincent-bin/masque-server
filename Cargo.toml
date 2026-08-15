@@ -32,3 +32,11 @@ libc = "0.2"
 [[bench]]
 name = "core"
 harness = false
+
+# The packet path spans this crate and quiche, so cross-crate inlining is worth
+# the longer build. `panic` is deliberately left at "unwind": the TCP and UDP
+# relay tasks are spawned, so a panic in one tunnel is contained by Tokio today
+# and would take down the whole proxy under "abort".
+[profile.release]
+lto = "fat"
+codegen-units = 1

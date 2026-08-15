@@ -125,6 +125,7 @@ listen_addr = "0.0.0.0:443"
 idle_timeout_secs = 30
 max_connections = 10000
 max_tunnels_per_connection = 100
+shards = 1
 
 [tls]
 cert_path = "certs/server.crt"
@@ -141,6 +142,15 @@ initial_max_streams_bidi = 128
 enable_dgram = true
 enable_udp_gso = false
 enable_udp_gro = true
+cc_algorithm = "cubic"
+initial_congestion_window_packets = 32
+initial_max_data = 16777216
+initial_max_stream_data = 4194304
+max_connection_window = 25165824
+max_stream_window = 16777216
+dgram_recv_queue_len = 2048
+dgram_send_queue_len = 2048
+discover_pmtu = false
 
 [tcp_proxy]
 enabled = true
@@ -159,6 +169,7 @@ enabled = true
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
 tun_name = "masque0"
 tun_mtu = 1280
+tun_offload = true
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
 ```
@@ -169,6 +180,86 @@ valid Argon2id PHC string. Clients authenticate each CONNECT request with
 `Proxy-Authorization: Basic ...`; missing or invalid credentials receive
 `407 Proxy Authentication Required`. Set `auth.enabled = false` only for an
 isolated development environment.
+
+### Performance tuning
+
+The `[quic]` defaults are tuned for a proxy carrying bulk transfers over paths
+it does not control. The knobs worth revisiting per deployment:
+
+| Setting | Default | When to change it |
+| --- | --- | --- |
+| `cc_algorithm` | `cubic` | `bbr2` and `reno` are accepted, but **bbr2 is currently much slower here** — see the note below. |
+| `initial_congestion_window_packets` | `32` | Lower to the IETF-default `10` on links where a 32-packet initial burst causes loss. |
+| `initial_max_stream_data` | 4 MiB | A single CONNECT stream is capped at this ÷ RTT until autotuning grows it. Raise for high bandwidth-delay paths. |
+| `max_stream_window` / `max_connection_window` | 16 / 24 MiB | These are the autotuning ceilings, and the bound on per-connection receive memory. Lower them if `max_connections` × window exceeds your memory budget. |
+| `dgram_recv_queue_len` / `dgram_send_queue_len` | 2048 | Raise if CONNECT-IP or CONNECT-UDP bursts are dropping datagrams; lower to cut latency under load. Datagrams are never retransmitted. |
+| `enable_udp_gso` | `false` | Enable on physical NICs for a large send-path win. Some virtual NICs advertise GSO and then silently drop super-packets, which is why it is opt-in. |
+| `server.shards` | `1` | Independent event loops, each on its own `SO_REUSEPORT` socket. Raise it (or set `0` for one per core) to let a busy server use more than one core — see below. Linux only. |
+| `discover_pmtu` | `false` | Only useful together with a raised `max_datagram_size` (e.g. 1500), since probes stop at that value. |
+| `ip_proxy.tun_offload` | `true` | Linux GSO/GRO on the TUN device. Turn off to rule it out when debugging CONNECT-IP; it falls back automatically if the kernel refuses `IFF_VNET_HDR`. |
+
+Two per-tunnel buffers are compile-time constants rather than config, and they
+bound the proxy's memory alongside `max_connections` × `max_tunnels_per_connection`:
+a standard CONNECT tunnel holds up to 1 MiB of client-to-target data
+(`MAX_BUFFERED_CLIENT_BYTES`) and up to 256 KiB of target-to-client data
+(`MAX_BUFFERED_RESPONSE_BYTES`). The latter is what lets the target reader run
+several 64 KiB chunks ahead of the event loop instead of stopping after each one.
+
+Release builds use fat LTO and a single codegen unit, which matters because
+the packet path spans this crate and quiche. `panic` stays at `unwind` on
+purpose: relay tasks are spawned, so a panic in one tunnel stays contained
+instead of aborting the whole proxy.
+
+#### Sharding across cores
+
+QUIC's per-packet crypto is what saturates a CPU, and a connection is always
+handled by one event loop, so a single-loop server tops out at one core no
+matter how many it has. `server.shards` runs N loops, each binding the listen
+address with `SO_REUSEPORT`; the kernel hashes each 4-tuple to one of them.
+
+Correctness details worth knowing:
+
+- A client that changes address can have its packets steered to a shard that
+  does not own the connection. Rather than dropping them, that shard looks the
+  connection ID up in a shared registry and hands the packet to its owner, so
+  migration keeps working without an eBPF steering program.
+- The TUN device is read by shard 0 only; CONNECT-IP packets for connections
+  owned by other shards are routed to them. The address pool and routing table
+  are shared behind locks that are never taken on the per-packet path.
+
+Measured on a 4-core Ryzen 7940HS with 64 concurrent CONNECT-UDP connections at
+64-byte payloads:
+
+| | throughput | server CPU |
+| --- | --- | --- |
+| `shards = 1` | ~98k pkt/s | 88% of one core |
+| `shards = 4` | ~121k pkt/s | **134%** of one core |
+
+The CPU figure is the real result: a single-shard server is pinned below one
+core however hard it is pushed, and a sharded one is not. The throughput
+figure is *not* a clean scaling measurement — no load generator available here
+could saturate four shards, and run-to-run variance was roughly ±15%. Expect
+the win to matter only on a server that is actually CPU-bound with many
+concurrent connections, and measure your own traffic before raising it, which
+is why the default is `1`.
+
+#### Why not BBR2
+
+A pacing-blocked connection holds back exactly one serialized packet
+(`DeferredSend`) and waits for the event loop to reach its release time. BBR2
+assigns a release time to every packet, so that structure limits the server to
+roughly one packet per wakeup; quiche's CUBIC pacing releases in bursts and
+mostly avoids the path. On a loopback CONNECT-UDP benchmark at 1200B:
+
+| `cc_algorithm` | throughput | RTT p50 |
+| --- | --- | --- |
+| `cubic` | 127k pkt/s (1.23 Gbit/s) | 75 µs |
+| `bbr2` | 34k pkt/s (0.33 Gbit/s) | 1228 µs |
+
+BBR2 should be the better choice for a proxy on lossy paths, so this is a
+limitation of the send path rather than of BBR2. Letting a pacing-blocked
+connection retain a burst instead of a single packet is the fix; until then
+`cubic` is the default.
 
 ## Protocol Flow
 

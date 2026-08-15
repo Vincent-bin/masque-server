@@ -57,6 +57,9 @@ pub struct ClientConnection {
     pub index: u64,
     /// Packet already emitted by quiche but held until `SendInfo::at`.
     pub(crate) deferred_send: DeferredSend,
+    /// The deadline this connection currently holds in the server's timer
+    /// queue, used to tell a live wakeup from one a later deadline superseded.
+    pub(crate) scheduled_deadline: Option<std::time::Instant>,
 }
 
 impl ClientConnection {
@@ -70,6 +73,17 @@ impl ClientConnection {
             ip_tunnels: FxHashMap::default(),
             index,
             deferred_send: DeferredSend::default(),
+            scheduled_deadline: None,
+        }
+    }
+
+    /// The next instant this connection needs the event loop's attention:
+    /// quiche's own timer, or the release time of a packet held back by pacing.
+    pub(crate) fn next_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let quic = self.quic.timeout().map(|timeout| now + timeout);
+        match (quic, self.deferred_send.deadline()) {
+            (Some(quic), Some(pacing)) => Some(quic.min(pacing)),
+            (quic, pacing) => quic.or(pacing),
         }
     }
 

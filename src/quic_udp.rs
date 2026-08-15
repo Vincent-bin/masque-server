@@ -263,14 +263,99 @@ pub(crate) struct QuicUdpSocket {
     udp_gro: bool,
 }
 
+/// Bind a UDP socket, optionally with `SO_REUSEPORT` so several sockets can
+/// share one address and the kernel can spread arriving datagrams across them
+/// by 4-tuple hash.
+///
+/// The option has to be set between `socket()` and `bind()`, which
+/// `UdpSocket::bind` does not expose, so this goes through the raw syscalls.
+#[cfg(target_os = "linux")]
+fn bind_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let domain = match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+
+    // SAFETY: A plain socket creation with constant arguments.
+    let fd = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` is a fresh descriptor this function owns; wrapping it here
+    // means every early return below closes it.
+    let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+
+    let enable: libc::c_int = 1;
+    for option in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+        // SAFETY: `enable` is a valid integer socket-option payload and `fd`
+        // is a live socket.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&enable as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enable) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    let (storage, len) = socket_addr_to_raw(addr);
+    // SAFETY: `storage` is a valid sockaddr of length `len` for this family.
+    let result = unsafe {
+        libc::bind(
+            fd,
+            (&storage as *const libc::sockaddr_storage).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(socket)
+}
+
 impl QuicUdpSocket {
-    pub(crate) async fn bind(
+    /// Bind one socket for a server shard.
+    ///
+    /// With `reuseport`, several shards bind the same address and the kernel
+    /// hashes each 4-tuple to one of them, so a client's packets consistently
+    /// reach the same shard until it migrates.
+    pub(crate) async fn bind_shared(
         addr: SocketAddr,
         max_segment_size: usize,
         enable_gso: bool,
         enable_gro: bool,
+        reuseport: bool,
     ) -> io::Result<Self> {
-        let socket = UdpSocket::bind(addr).await?;
+        let socket = if reuseport {
+            #[cfg(target_os = "linux")]
+            {
+                UdpSocket::from_std(bind_reuseport(addr)?)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "SO_REUSEPORT sharding requires Linux",
+                ));
+            }
+        } else {
+            UdpSocket::bind(addr).await?
+        };
 
         #[cfg(target_os = "linux")]
         let (udp_gso, udp_gro) = {
@@ -771,7 +856,7 @@ mod tests {
     async fn batched_socket_preserves_datagram_boundaries() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender = QuicUdpSocket::bind("127.0.0.1:0".parse().unwrap(), 1350, true, true)
+        let mut sender = QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
             .await
             .unwrap();
 
@@ -790,14 +875,76 @@ mod tests {
         }
     }
 
+    /// Connection sharding is only worth anything if the kernel actually
+    /// spreads distinct 4-tuples across the sockets sharing the port. If this
+    /// fails, every shard but one would sit idle.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reuseport_spreads_source_ports_across_sockets() {
+        const SHARDS: usize = 4;
+        const SENDERS: usize = 64;
+
+        let first = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let target = first.local_addr().unwrap();
+
+        let mut shards = vec![first];
+        for _ in 1..SHARDS {
+            shards.push(
+                QuicUdpSocket::bind_shared(target, 1350, false, false, true)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Each sender gets its own ephemeral port, so each is a distinct
+        // 4-tuple for the kernel to hash.
+        for _ in 0..SENDERS {
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sender.send_to(b"shard probe", target).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut used = 0;
+        let mut delivered = 0;
+        for shard in &shards {
+            let mut batch = RecvPacketBatch::new(SENDERS);
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                shard.recv_batch(&mut batch),
+            )
+            .await
+            {
+                Ok(Ok(received)) if received > 0 => {
+                    used += 1;
+                    batch.for_each_packet_mut(received, |_, _| delivered += 1);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(delivered, SENDERS, "every datagram should reach some shard");
+        assert!(
+            used > 1,
+            "expected the kernel to use more than one of {SHARDS} shards, used {used}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn recvmmsg_and_gro_restore_logical_packets() {
-        let receiver = QuicUdpSocket::bind("127.0.0.1:0".parse().unwrap(), 1350, true, true)
+        let receiver = QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
             .await
             .unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender = QuicUdpSocket::bind("127.0.0.1:0".parse().unwrap(), 1350, true, true)
+        let mut sender = QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
             .await
             .unwrap();
 

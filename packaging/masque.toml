@@ -3,6 +3,11 @@ listen_addr = "0.0.0.0:443"
 idle_timeout_secs = 30
 max_connections = 10000
 max_tunnels_per_connection = 100
+# Independent event loops, each with its own SO_REUSEPORT socket and its own
+# share of the connections. A connection is always handled by one loop, so this
+# is what lets a CPU-bound server use more than one core. 0 = one per core.
+# Linux only; measure before raising it.
+shards = 1
 
 [tls]
 cert_path = "/etc/masque/certs/server.crt"
@@ -17,8 +22,33 @@ password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
+# Verify that the egress path actually carries GSO super-packets before
+# enabling this: some virtual NICs advertise support and then drop them.
 enable_udp_gso = false
 enable_udp_gro = true
+
+# Congestion control. "bbr2" is available but currently much slower here: the
+# server holds back a single paced packet per connection, so BBR2's per-packet
+# pacing caps it at one packet per event-loop wakeup. Measured on loopback
+# CONNECT-UDP at 1200B: cubic 127k pkt/s at 75us p50 RTT, bbr2 34k at 1228us.
+cc_algorithm = "cubic"
+initial_congestion_window_packets = 32
+
+# Flow control. The initial windows cap a stream at window/RTT until quiche
+# autotunes them up toward the max_*_window ceilings.
+initial_max_data = 16777216
+initial_max_stream_data = 4194304
+max_connection_window = 25165824
+max_stream_window = 16777216
+
+# QUIC DATAGRAM queue depth, in datagrams. Datagrams are never retransmitted,
+# so deeper queues trade latency under load for fewer drops during bursts.
+dgram_recv_queue_len = 2048
+dgram_send_queue_len = 2048
+
+# Path MTU discovery probes stop at max_datagram_size, so enabling this only
+# helps if that value is also raised (e.g. to 1500 on a path known to carry it).
+discover_pmtu = false
 
 [tcp_proxy]
 enabled = true
@@ -55,5 +85,9 @@ enabled = true
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
 tun_name = "masque0"
 tun_mtu = 1280
+# Linux GSO/GRO on the TUN device: one read carries a whole aggregate and one
+# write accepts one, instead of a syscall per packet. Ignored on other platforms,
+# and automatically disabled if the kernel refuses IFF_VNET_HDR.
+tun_offload = true
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"

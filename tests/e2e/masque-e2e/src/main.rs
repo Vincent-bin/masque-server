@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -72,6 +74,11 @@ struct Client {
     h3: Option<quiche::h3::Connection>,
     peer: SocketAddr,
     local: SocketAddr,
+    /// Honour quiche's pacing deadlines by sleeping before each send.
+    ///
+    /// The load generator turns this off: it is trying to find the *server's*
+    /// ceiling, and a client that paces itself measures its own instead.
+    pace: bool,
 }
 
 impl Client {
@@ -111,6 +118,7 @@ impl Client {
             h3: None,
             peer,
             local,
+            pace: true,
         })
     }
 
@@ -120,9 +128,11 @@ impl Client {
         loop {
             match self.quic.send(&mut out) {
                 Ok((len, send_info)) => {
-                    let delay = send_info.at.saturating_duration_since(Instant::now());
-                    if !delay.is_zero() {
-                        std::thread::sleep(delay);
+                    if self.pace {
+                        let delay = send_info.at.saturating_duration_since(Instant::now());
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
                     }
                     self.socket.send(&out[..len])?;
                 }
@@ -169,6 +179,44 @@ impl Client {
     fn drive(&mut self) -> Result<()> {
         self.flush()?;
         self.recv_once()?;
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Drive the connection without parking for quiche's full timeout.
+    ///
+    /// `recv_once` waits up to `quic.timeout()`, which is fine for a test that
+    /// is waiting for one reply but caps a load generator at a handful of
+    /// round trips per second. This drains whatever has already arrived and
+    /// moves on.
+    fn drive_load(&mut self) -> Result<()> {
+        self.flush()?;
+        self.socket
+            .set_read_timeout(Some(Duration::from_millis(1)))?;
+
+        let mut buf = [0u8; BUF_SIZE];
+        for _ in 0..256 {
+            match self.socket.recv(&mut buf) {
+                Ok(len) => {
+                    let info = quiche::RecvInfo {
+                        from: self.peer,
+                        to: self.local,
+                    };
+                    match self.quic.recv(&mut buf[..len], info) {
+                        Ok(_) | Err(quiche::Error::Done) => {}
+                        Err(e) => bail!("QUIC recv: {e}"),
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break
+                }
+                Err(e) => bail!("socket recv: {e}"),
+            }
+        }
+
         self.flush()?;
         Ok(())
     }
@@ -957,6 +1005,145 @@ fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
     Ok(())
 }
 
+
+/// Saturating multi-connection load generator.
+///
+/// The single-connection benchmark cannot show anything about how work is
+/// spread across cores: one QUIC connection is handled by one event loop no
+/// matter how the server is built. This drives many independent connections,
+/// each from its own socket and therefore its own 4-tuple, which is what a
+/// connection-sharded server needs in order to use more than one core.
+fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let conns = env_usize("MASQUE_LOAD_CONNS", 32);
+    let duration_secs = env_usize("MASQUE_LOAD_DURATION_SECS", 10) as u64;
+    let payload_size = env_usize("MASQUE_LOAD_PAYLOAD", 1200);
+    let window = env_usize("MASQUE_LOAD_WINDOW", 16);
+
+    if conns == 0 || duration_secs == 0 || payload_size == 0 || window == 0 {
+        bail!("load connections, duration, payload, and window must be non-zero");
+    }
+
+    println!(
+        "Load test: {conns} connections, {duration_secs}s, {payload_size}B payload, \
+         window {window}/conn"
+    );
+
+    let ready = Arc::new(Barrier::new(conns + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let tx_total = Arc::new(AtomicU64::new(0));
+    let rx_total = Arc::new(AtomicU64::new(0));
+    let setup_failures = Arc::new(AtomicU64::new(0));
+
+    let mut workers = Vec::with_capacity(conns);
+    for _ in 0..conns {
+        let server_addr = server_addr.to_string();
+        let echo_addr = echo_addr.to_string();
+        let ready = Arc::clone(&ready);
+        let stop = Arc::clone(&stop);
+        let tx_total = Arc::clone(&tx_total);
+        let rx_total = Arc::clone(&rx_total);
+        let setup_failures = Arc::clone(&setup_failures);
+
+        workers.push(std::thread::spawn(move || {
+            // Establish the tunnel before the barrier so every connection is
+            // pushing traffic during the same measurement window.
+            let tunnel = connect_udp_tunnel(&server_addr, &echo_addr);
+            let (mut client, stream_id) = match tunnel {
+                Ok(tunnel) => tunnel,
+                Err(error) => {
+                    warn!(%error, "load connection setup failed");
+                    setup_failures.fetch_add(1, Ordering::Relaxed);
+                    ready.wait();
+                    return;
+                }
+            };
+
+            // Measure the server's ceiling, not the client's pacer.
+            client.pace = false;
+            let payload = vec![0x5a; payload_size];
+            let mut sent = 0u64;
+            let mut received = 0u64;
+            let mut inflight = 0usize;
+
+            ready.wait();
+
+            while !stop.load(Ordering::Relaxed) {
+                // Top the window up, then flush once for the whole burst
+                // rather than once per datagram.
+                while inflight < window {
+                    let encoded = match masque::datagram::encode_payload(stream_id, &payload) {
+                        Ok(encoded) => encoded,
+                        Err(_) => break,
+                    };
+                    match client.quic.dgram_send(&encoded) {
+                        Ok(()) => {
+                            inflight += 1;
+                            sent += 1;
+                        }
+                        // Send queue full: let the drive below make room.
+                        Err(_) => break,
+                    }
+                }
+                if client.drive_load().is_err() {
+                    break;
+                }
+
+                let mut buf = [0u8; BUF_SIZE];
+                loop {
+                    match client.quic.dgram_recv(&mut buf) {
+                        Ok(_) => {
+                            received += 1;
+                            inflight = inflight.saturating_sub(1);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            tx_total.fetch_add(sent, Ordering::Relaxed);
+            rx_total.fetch_add(received, Ordering::Relaxed);
+        }));
+    }
+
+    ready.wait();
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(duration_secs));
+    stop.store(true, Ordering::Relaxed);
+    for worker in workers {
+        let _ = worker.join();
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let failures = setup_failures.load(Ordering::Relaxed);
+    let established = conns as u64 - failures;
+    let sent = tx_total.load(Ordering::Relaxed);
+    let received = rx_total.load(Ordering::Relaxed);
+    let tx_pps = sent as f64 / elapsed;
+    let rx_pps = received as f64 / elapsed;
+    let goodput = rx_pps * payload_size as f64 * 8.0 / 1e9;
+
+    println!("  connections established: {established}/{conns}");
+    println!(
+        "  tx {:>10.0} pkt/s   echo {:>10.0} pkt/s   app goodput {:.3} Gbit/s   \
+         bidirectional relay {:.3} Gbit/s",
+        tx_pps,
+        rx_pps,
+        goodput,
+        goodput * 2.0
+    );
+    if established == 0 {
+        bail!("no load connections were established");
+    }
+    Ok(())
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
     let duration_secs = std::env::var("MASQUE_BENCH_DURATION_SECS")
         .ok()
@@ -1391,6 +1578,14 @@ fn main() {
             }
         }
         info!("MASQUE TCP compatibility checks passed");
+        return;
+    }
+
+    if std::env::var_os("MASQUE_LOAD").is_some() {
+        if let Err(e) = load_test(&server_addr, &echo_addr) {
+            error!(%e, "load test failed");
+            std::process::exit(1);
+        }
         return;
     }
 
