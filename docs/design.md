@@ -545,6 +545,11 @@ max_tunnels_per_connection = 100
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 
+[auth]
+enabled = true
+username = "masque"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+
 [quic]
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
@@ -571,6 +576,7 @@ ipv6_pool = "fd00:masq::/64"
 
 ```
 masque-server [OPTIONS]
+masque-server hash-password
 
 OPTIONS:
   -c, --config <PATH>       Config file path [default: masque.toml]
@@ -590,7 +596,9 @@ small.
 
 | Crate          | Version | Purpose                                    |
 |----------------|---------|--------------------------------------------|
-| `quiche`       | 0.22+   | QUIC transport + HTTP/3 + DATAGRAM frames  |
+| `quiche`       | 0.29    | QUIC transport + HTTP/3 + DATAGRAM frames  |
+| `argon2`       | 0.5     | Argon2id proxy password hashing             |
+| `base64`       | 0.22    | RFC 7617 Basic credential decoding          |
 | `tokio`        | 1       | Async runtime, UDP sockets, timers         |
 | `tun-rs`       | latest  | TUN device creation and async I/O          |
 | `clap`         | 4       | CLI argument parsing                       |

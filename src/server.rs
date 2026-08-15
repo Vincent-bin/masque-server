@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::address_pool::AddressPool;
+use crate::auth::BasicAuthenticator;
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
 use crate::config::ServerConfig;
@@ -58,6 +59,7 @@ pub struct Server {
     quic_config: quiche::Config,
     h3_config: quiche::h3::Config,
     connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
+    auth: Option<BasicAuthenticator>,
     udp_policy: TargetPolicy,
     address_pool: AddressPool,
     routing_table: RoutingTable,
@@ -84,6 +86,16 @@ pub struct Server {
 impl Server {
     /// Create a new server bound to the configured address.
     pub async fn bind(config: ServerConfig) -> anyhow::Result<Self> {
+        let auth = if config.auth.enabled {
+            Some(BasicAuthenticator::new(
+                &config.auth.username,
+                &config.auth.password_hash,
+            )?)
+        } else {
+            warn!("proxy authentication is disabled");
+            None
+        };
+
         let socket = QuicUdpSocket::bind(
             config.server.listen_addr,
             config.quic.max_datagram_size,
@@ -215,6 +227,7 @@ impl Server {
             quic_config,
             h3_config,
             connections: FxHashMap::default(),
+            auth,
             udp_policy,
             address_pool,
             routing_table: RoutingTable::new(),
@@ -550,6 +563,7 @@ impl Server {
                             stream_id,
                             &list,
                             &self.config,
+                            self.auth.as_ref(),
                             &self.udp_policy,
                             &mut pending_udp_setups,
                             &mut pending_ip_setups,
@@ -886,6 +900,7 @@ impl Server {
         stream_id: u64,
         headers: &[quiche::h3::Header],
         config: &ServerConfig,
+        auth: Option<&BasicAuthenticator>,
         udp_policy: &TargetPolicy,
         pending_udp_setups: &mut Vec<(u64, uri::UdpTarget)>,
         pending_ip_setups: &mut Vec<u64>,
@@ -895,12 +910,19 @@ impl Server {
         let mut method: &[u8] = b"";
         let mut path: &[u8] = b"";
         let mut protocol: &[u8] = b"";
+        let mut proxy_authorization: Option<&[u8]> = None;
+        let mut duplicate_proxy_authorization = false;
 
         for header in headers {
             match header.name() {
                 b":method" => method = header.value(),
                 b":path" => path = header.value(),
                 b":protocol" => protocol = header.value(),
+                b"proxy-authorization" => {
+                    if proxy_authorization.replace(header.value()).is_some() {
+                        duplicate_proxy_authorization = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -913,8 +935,30 @@ impl Server {
             "request received"
         );
 
-        // Check for Extended CONNECT
+        // Authenticate supported proxy requests before parsing their target
+        // or allocating any tunnel resources. Duplicate credentials are
+        // rejected rather than choosing one ambiguously.
         if method == b"CONNECT" {
+            let supported = matches!(
+                protocol,
+                b"connect-udp" if config.udp_proxy.enabled
+            ) || matches!(
+                protocol,
+                b"connect-ip" if config.ip_proxy.enabled
+            );
+            if supported {
+                if let Some(auth) = auth {
+                    if duplicate_proxy_authorization ||
+                        !auth.authenticate(proxy_authorization)
+                    {
+                        warn!(stream_id, "proxy authentication failed");
+                        Self::send_proxy_auth_required(h3, quic, stream_id);
+                        return;
+                    }
+                }
+            }
+
+            // Check for Extended CONNECT.
             match protocol {
                 b"connect-udp" if config.udp_proxy.enabled => {
                     Self::handle_connect_udp(
@@ -1301,6 +1345,26 @@ impl Server {
                     conn_idx,
                 );
             }
+        }
+    }
+
+    /// Send an RFC 7617 Basic proxy-authentication challenge.
+    fn send_proxy_auth_required(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+    ) {
+        let headers = [
+            quiche::h3::Header::new(b":status", b"407"),
+            quiche::h3::Header::new(
+                b"proxy-authenticate",
+                b"Basic realm=\"masque\", charset=\"UTF-8\"",
+            ),
+            quiche::h3::Header::new(b"content-length", b"0"),
+        ];
+
+        if let Err(e) = h3.send_response(quic, stream_id, &headers, true) {
+            warn!(stream_id, %e, "failed to send proxy authentication challenge");
         }
     }
 

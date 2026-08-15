@@ -19,6 +19,7 @@ Built on [quiche](https://github.com/cloudflare/quiche) (Cloudflare's QUIC/HTTP/
 src/
   main.rs            CLI entry point (clap)
   lib.rs             Module declarations
+  auth.rs            HTTP Basic proxy authentication and Argon2id verification
   server.rs          QUIC listener, HTTP/3 event loop, tunnel management
   connection.rs      Per-client connection state
   config.rs          TOML configuration parsing
@@ -69,6 +70,13 @@ cd masque-v0.1.0-linux-x86_64
 sudo ./install.sh
 ```
 
+For a new installation, the installer enables HTTP proxy authentication and
+prints a randomly generated `masque` password once. Set
+`MASQUE_AUTH_USERNAME` and `MASQUE_AUTH_PASSWORD` when invoking the installer
+to supply credentials instead. When upgrading a configuration without an
+`[auth]` section, the installer preserves the existing settings, saves a
+`masque.toml.before-auth` backup, and adds generated credentials.
+
 Then install the TLS certificate and private key under `/etc/masque/certs/`,
 review `/etc/masque/masque.toml`, and start the service with
 `sudo systemctl start masque`.
@@ -97,11 +105,16 @@ masque-server --listen 0.0.0.0:8443 --cert certs/server.crt --key certs/server.k
 
 # Increase log verbosity
 masque-server -vv
+
+# Generate an Argon2id PHC hash for auth.password_hash (reads stdin)
+printf '%s' 'a-strong-password' | masque-server hash-password
 ```
 
 ### Configuration
 
-The server reads a TOML config file (default: `masque.toml`). All sections are optional with sensible defaults:
+The server reads a TOML config file (default: `masque.toml`). Sections use
+sensible defaults, but proxy credentials must be configured unless
+authentication is explicitly disabled:
 
 ```toml
 [server]
@@ -113,6 +126,11 @@ max_tunnels_per_connection = 100
 [tls]
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
+
+[auth]
+enabled = true
+username = "masque"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
 [quic]
 max_datagram_size = 1350
@@ -136,24 +154,33 @@ ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
 ```
 
+Authentication is fail-closed by default: when `auth.enabled = true`, the
+server refuses to start unless the username is valid and `password_hash` is a
+valid Argon2id PHC string. Clients authenticate each CONNECT request with
+`Proxy-Authorization: Basic ...`; missing or invalid credentials receive
+`407 Proxy Authentication Required`. Set `auth.enabled = false` only for an
+isolated development environment.
+
 ## Protocol Flow
 
 ### CONNECT-UDP
 
-1. Client sends Extended CONNECT with `:protocol = connect-udp`
-2. Server parses URI template, checks target against allow/deny policy
-3. Server responds `200` with `Capsule-Protocol: ?1`
-4. Client/server exchange UDP payloads via QUIC DATAGRAM frames
-5. Server relays datagrams to/from the target UDP socket
+1. Client sends authenticated Extended CONNECT with `:protocol = connect-udp`
+2. Server validates proxy credentials before allocating tunnel resources
+3. Server parses URI template, checks target against allow/deny policy
+4. Server responds `200` with `Capsule-Protocol: ?1`
+5. Client/server exchange UDP payloads via QUIC DATAGRAM frames
+6. Server relays datagrams to/from the target UDP socket
 
 ### CONNECT-IP
 
-1. Client sends Extended CONNECT with `:protocol = connect-ip`
-2. Server responds `200`, allocates IPv4 + IPv6 addresses from pool
-3. Server sends `ADDRESS_ASSIGN` capsule with assigned addresses
-4. Server sends `ROUTE_ADVERTISEMENT` capsule with default routes
-5. Client/server exchange IP packets via QUIC DATAGRAM frames
-6. Server validates source addresses and relays through a shared TUN device
+1. Client sends authenticated Extended CONNECT with `:protocol = connect-ip`
+2. Server validates proxy credentials before allocating tunnel resources
+3. Server responds `200`, allocates IPv4 + IPv6 addresses from pool
+4. Server sends `ADDRESS_ASSIGN` capsule with assigned addresses
+5. Server sends `ROUTE_ADVERTISEMENT` capsule with default routes
+6. Client/server exchange IP packets via QUIC DATAGRAM frames
+7. Server validates source addresses and relays through a shared TUN device
 
 ## Testing
 

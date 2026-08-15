@@ -1,4 +1,5 @@
 pub mod address_pool;
+pub mod auth;
 pub mod capsule;
 pub mod config;
 pub mod connection;

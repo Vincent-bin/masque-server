@@ -31,6 +31,11 @@ idle_timeout_secs = 30
 cert_path = "$BENCH_DIR/certs/server.crt"
 key_path = "$BENCH_DIR/certs/server.key"
 
+[auth]
+enabled = true
+username = "test"
+password_hash = "\$argon2id\$v=19\$m=19456,t=2,p=1\$1xNVXhqKU7jJ6cqTBJKphQ\$GXXAINVTW1qhloFtN1IR8lSr7pI7QEY79fq4K6d8scQ"
+
 [quic]
 max_datagram_size = 1350
 enable_dgram = true
@@ -55,8 +60,16 @@ RUST_LOG=warn target/release/masque --config "$BENCH_DIR/masque.toml" \
     >"$BENCH_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
+MASQUE_AUTH_CHECK=1 \
+MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+ECHO_SERVER_ADDR=127.0.0.1:9999 \
+RUST_LOG=warn \
+target/release/masque-e2e
+
 MASQUE_BENCH=1 \
 MASQUE_SERVER_ADDR=127.0.0.1:4433 \
 ECHO_SERVER_ADDR=127.0.0.1:9999 \
+MASQUE_USERNAME=test \
+MASQUE_PASSWORD=test-password \
 RUST_LOG=warn \
 cargo run --release -p masque-e2e

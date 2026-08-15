@@ -10,6 +10,7 @@ use std::path::PathBuf;
 pub struct ServerConfig {
     pub server: ServerSection,
     pub tls: TlsSection,
+    pub auth: AuthSection,
     pub quic: QuicSection,
     pub udp_proxy: UdpProxySection,
     pub ip_proxy: IpProxySection,
@@ -29,6 +30,31 @@ pub struct ServerSection {
 pub struct TlsSection {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AuthSection {
+    pub enabled: bool,
+    pub username: String,
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for AuthSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSection")
+            .field("enabled", &self.enabled)
+            .field("username", &self.username)
+            .field(
+                "password_hash",
+                &if self.password_hash.is_empty() {
+                    ""
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -72,6 +98,7 @@ impl Default for ServerConfig {
         Self {
             server: ServerSection::default(),
             tls: TlsSection::default(),
+            auth: AuthSection::default(),
             quic: QuicSection::default(),
             udp_proxy: UdpProxySection::default(),
             ip_proxy: IpProxySection::default(),
@@ -95,6 +122,18 @@ impl Default for TlsSection {
         Self {
             cert_path: PathBuf::from("certs/server.crt"),
             key_path: PathBuf::from("certs/server.key"),
+        }
+    }
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self {
+            // Fail closed in Server::bind until an operator configures
+            // credentials or explicitly opts out for a private test setup.
+            enabled: true,
+            username: String::new(),
+            password_hash: String::new(),
         }
     }
 }
@@ -157,6 +196,9 @@ mod tests {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.server.listen_addr.port(), 443);
         assert_eq!(cfg.server.idle_timeout_secs, 30);
+        assert!(cfg.auth.enabled);
+        assert!(cfg.auth.username.is_empty());
+        assert!(cfg.auth.password_hash.is_empty());
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
@@ -198,6 +240,24 @@ key_path = "/etc/masque/key.pem"
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.tls.cert_path, PathBuf::from("/etc/masque/cert.pem"));
         assert_eq!(cfg.tls.key_path, PathBuf::from("/etc/masque/key.pem"));
+    }
+
+    #[test]
+    fn parse_auth_section_and_redact_hash_in_debug_output() {
+        let toml = r#"
+[auth]
+enabled = true
+username = "alice"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.auth.enabled);
+        assert_eq!(cfg.auth.username, "alice");
+        assert!(cfg.auth.password_hash.starts_with("$argon2id$"));
+
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("$argon2id$"));
     }
 
     #[test]

@@ -37,6 +37,8 @@ services:
     environment:
       MASQUE_SERVER_ADDR: "172.28.0.20:4433"
       ECHO_SERVER_ADDR: "172.28.0.10:9999"
+      MASQUE_USERNAME: "test"
+      MASQUE_PASSWORD: "test-password"
       RUST_LOG: "masque_e2e=debug"
     depends_on:
       - server

@@ -3,6 +3,8 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use masque::capsule::CapsuleFrame;
 use masque::capsule::decoder::CapsuleDecoder;
 use quiche::h3::NameValue;
@@ -203,6 +205,14 @@ impl Client {
 
     /// Poll until we get response headers for any stream, return (stream_id, status).
     fn poll_response(&mut self, timeout: Duration) -> Result<(u64, u16)> {
+        let (stream_id, status, _) = self.poll_response_headers(timeout)?;
+        Ok((stream_id, status))
+    }
+
+    fn poll_response_headers(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(u64, u16, Vec<quiche::h3::Header>)> {
         let deadline = Instant::now() + timeout;
         loop {
             let h3 = self.h3.as_mut().context("H3 not initialised")?;
@@ -216,7 +226,7 @@ impl Client {
                             .transpose()
                             .map_err(|e| anyhow::anyhow!("bad :status: {e}"))?
                             .context("missing :status")?;
-                        return Ok((sid, status));
+                        return Ok((sid, status, list));
                     }
                     Ok(_) => continue,
                     Err(quiche::h3::Error::Done) => break,
@@ -549,7 +559,38 @@ fn wait_for_server(server_addr: &str) -> Result<()> {
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn connect_udp_headers(
+fn append_proxy_authorization(headers: &mut Vec<quiche::h3::Header>) -> Result<()> {
+    let username = std::env::var_os("MASQUE_USERNAME");
+    let password = std::env::var_os("MASQUE_PASSWORD");
+    let (username, password) = match (username, password) {
+        (None, None) => return Ok(()),
+        (Some(username), Some(password)) => (username, password),
+        _ => bail!("MASQUE_USERNAME and MASQUE_PASSWORD must be set together"),
+    };
+
+    let username = username
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("MASQUE_USERNAME is not valid UTF-8"))?;
+    let password = password
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("MASQUE_PASSWORD is not valid UTF-8"))?;
+    if username.is_empty() || username.contains(':') || username.chars().any(char::is_control) {
+        bail!("MASQUE_USERNAME must be non-empty and contain no ':' or control characters");
+    }
+    if password.is_empty() || password.chars().any(char::is_control) {
+        bail!("MASQUE_PASSWORD must be non-empty and contain no control characters");
+    }
+
+    let user_pass = format!("{username}:{password}");
+    let value = format!("Basic {}", STANDARD.encode(user_pass));
+    headers.push(quiche::h3::Header::new(
+        b"proxy-authorization",
+        value.as_bytes(),
+    ));
+    Ok(())
+}
+
+fn connect_udp_headers_without_auth(
     server_addr: &str,
     target_host: &str,
     target_port: &str,
@@ -565,12 +606,22 @@ fn connect_udp_headers(
     ]
 }
 
+fn connect_udp_headers(
+    server_addr: &str,
+    target_host: &str,
+    target_port: &str,
+) -> Result<Vec<quiche::h3::Header>> {
+    let mut headers = connect_udp_headers_without_auth(server_addr, target_host, target_port);
+    append_proxy_authorization(&mut headers)?;
+    Ok(headers)
+}
+
 fn connect_udp_tunnel(server_addr: &str, echo_addr: &str) -> Result<(Client, u64)> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
     let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
-    let headers = connect_udp_headers(server_addr, echo_host, echo_port);
+    let headers = connect_udp_headers(server_addr, echo_host, echo_port)?;
     let stream_id = client.send_request(&headers, false)?;
     let (_, status) = client.poll_response(Duration::from_secs(5))?;
     if status != 200 {
@@ -592,7 +643,7 @@ fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()>
     // Split echo address into host:port
     let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
 
-    let headers = connect_udp_headers(server_addr, echo_host, echo_port);
+    let headers = connect_udp_headers(server_addr, echo_host, echo_port)?;
     let stream_id = client.send_request(&headers, false)?;
 
     let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
@@ -617,6 +668,36 @@ fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()>
     }
 
     info!("datagram round-trip OK");
+    Ok(())
+}
+
+fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+
+    let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
+    let headers = connect_udp_headers_without_auth(server_addr, echo_host, echo_port);
+    client.send_request(&headers, false)?;
+
+    let (_, status, response_headers) =
+        client.poll_response_headers(Duration::from_secs(5))?;
+    if status != 407 {
+        bail!("expected 407, got {status}");
+    }
+
+    let challenge = response_headers
+        .iter()
+        .find(|header| header.name() == b"proxy-authenticate")
+        .context("407 response missing Proxy-Authenticate")?;
+    if challenge.value() != b"Basic realm=\"masque\", charset=\"UTF-8\"" {
+        bail!(
+            "unexpected Proxy-Authenticate challenge: {}",
+            String::from_utf8_lossy(challenge.value())
+        );
+    }
+
+    info!("unauthenticated CONNECT-UDP correctly rejected with 407");
     Ok(())
 }
 
@@ -738,7 +819,7 @@ fn test_connect_udp_policy_deny(server_addr: &str, _echo_addr: &str) -> Result<(
     client.handshake()?;
     client.init_h3()?;
 
-    let headers = connect_udp_headers(server_addr, "127.0.0.1", "53");
+    let headers = connect_udp_headers(server_addr, "127.0.0.1", "53")?;
     let _stream_id = client.send_request(&headers, false)?;
 
     let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
@@ -753,7 +834,7 @@ fn test_connect_udp_bad_uri(server_addr: &str, _echo_addr: &str) -> Result<()> {
     client.handshake()?;
     client.init_h3()?;
 
-    let headers = vec![
+    let mut headers = vec![
         quiche::h3::Header::new(b":method", b"CONNECT"),
         quiche::h3::Header::new(b":protocol", b"connect-udp"),
         quiche::h3::Header::new(b":scheme", b"https"),
@@ -761,6 +842,7 @@ fn test_connect_udp_bad_uri(server_addr: &str, _echo_addr: &str) -> Result<()> {
         quiche::h3::Header::new(b":path", b"/bad/path"),
         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
     ];
+    append_proxy_authorization(&mut headers)?;
     let _stream_id = client.send_request(&headers, false)?;
 
     let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
@@ -794,15 +876,17 @@ fn test_non_connect_404(server_addr: &str, _echo_addr: &str) -> Result<()> {
 // CONNECT-IP helpers
 // ---------------------------------------------------------------------------
 
-fn connect_ip_headers(server_addr: &str) -> Vec<quiche::h3::Header> {
-    vec![
+fn connect_ip_headers(server_addr: &str) -> Result<Vec<quiche::h3::Header>> {
+    let mut headers = vec![
         quiche::h3::Header::new(b":method", b"CONNECT"),
         quiche::h3::Header::new(b":protocol", b"connect-ip"),
         quiche::h3::Header::new(b":scheme", b"https"),
         quiche::h3::Header::new(b":authority", server_addr.as_bytes()),
         quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/"),
         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-    ]
+    ];
+    append_proxy_authorization(&mut headers)?;
+    Ok(headers)
 }
 
 fn ipv4_checksum(header: &[u8]) -> u16 {
@@ -865,7 +949,7 @@ fn test_connect_ip_handshake(server_addr: &str, _echo_addr: &str) -> Result<()> 
     client.handshake()?;
     client.init_h3()?;
 
-    let headers = connect_ip_headers(server_addr);
+    let headers = connect_ip_headers(server_addr)?;
     let stream_id = client.send_request(&headers, false)?;
 
     let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
@@ -920,7 +1004,7 @@ fn test_connect_ip_round_trip(server_addr: &str, echo_addr: &str) -> Result<()> 
     client.handshake()?;
     client.init_h3()?;
 
-    let headers = connect_ip_headers(server_addr);
+    let headers = connect_ip_headers(server_addr)?;
     let stream_id = client.send_request(&headers, false)?;
 
     let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
@@ -1022,6 +1106,14 @@ fn main() {
         std::process::exit(1);
     }
 
+    if std::env::var_os("MASQUE_AUTH_CHECK").is_some() {
+        if let Err(e) = test_proxy_auth_required(&server_addr, &echo_addr) {
+            error!(%e, "proxy authentication check failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if std::env::var_os("MASQUE_BENCH").is_some() {
         if let Err(e) = benchmark_connect_udp(&server_addr, &echo_addr) {
             error!(%e, "network benchmark failed");
@@ -1031,6 +1123,7 @@ fn main() {
     }
 
     let tests: &[(&str, fn(&str, &str) -> Result<()>)] = &[
+        ("proxy_auth_required", test_proxy_auth_required),
         ("connect_udp_happy_path", test_connect_udp_happy_path),
         ("connect_udp_policy_deny", test_connect_udp_policy_deny),
         ("connect_udp_bad_uri", test_connect_udp_bad_uri),

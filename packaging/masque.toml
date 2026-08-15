@@ -8,6 +8,11 @@ max_tunnels_per_connection = 100
 cert_path = "/etc/masque/certs/server.crt"
 key_path = "/etc/masque/certs/server.key"
 
+[auth]
+enabled = true
+username = "__MASQUE_AUTH_USERNAME__"
+password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
+
 [quic]
 max_datagram_size = 1350
 initial_max_streams_bidi = 128

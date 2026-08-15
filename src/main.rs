@@ -1,9 +1,12 @@
+use std::io::Read;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
+use masque::auth;
 use masque::config::{self, ServerConfig};
 use masque::server::Server;
 
@@ -11,6 +14,9 @@ use masque::server::Server;
 #[derive(Parser)]
 #[command(name = "masque-server")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Config file path.
     #[arg(short, long, default_value = "masque.toml")]
     config: PathBuf,
@@ -32,9 +38,31 @@ struct Cli {
     verbose: u8,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Read a password from standard input and print an Argon2id PHC hash.
+    HashPassword,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Command::HashPassword)) {
+        let mut password = Zeroizing::new(String::new());
+        std::io::stdin().read_to_string(&mut password)?;
+        if password.ends_with('\n') {
+            password.pop();
+            if password.ends_with('\r') {
+                password.pop();
+            }
+        }
+        if password.chars().any(char::is_control) {
+            anyhow::bail!("password must not contain control characters");
+        }
+        println!("{}", auth::hash_password(password.as_bytes())?);
+        return Ok(());
+    }
 
     // Logging
     let default_filter = match cli.verbose {
