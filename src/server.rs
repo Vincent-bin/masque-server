@@ -7,17 +7,19 @@ use std::time::{Duration, Instant};
 
 use std::sync::{Mutex, RwLock};
 
+use tokio::sync::Semaphore;
+
 use quiche::h3::NameValue;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::address_pool::AddressPool;
-use crate::auth::BasicAuthenticator;
+use crate::auth::{AuthPrecheck, BasicAuthenticator};
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
 use crate::config::ServerConfig;
-use crate::connection::ClientConnection;
+use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
 use crate::fxhash::FxHashMap;
 use crate::ip_packet;
@@ -29,16 +31,15 @@ use crate::routing::{RoutingTable, TunnelOwner};
 use crate::scheduler::{DirtySet, TimerQueue};
 use crate::tun::{self, TunManager, TunRecvBatch, TunSendBatch};
 use crate::tunnel::ip::IpTunnel;
+#[cfg(target_os = "linux")]
+use crate::tunnel::target_io;
+use crate::tunnel::target_io::TargetRecvBatch;
 use crate::tunnel::tcp::{spawn_tcp_connect, PendingTcpTunnel, TcpRelayEvent, TcpTunnel};
 use crate::tunnel::udp::UdpTunnel;
 use crate::uri;
 
 /// Unique connection ID length.
 const CONN_ID_LEN: usize = 16;
-
-/// Target datagrams a tunnel's receive task collects per wakeup before handing
-/// them to the main loop.
-const MAX_UDP_RECV_BATCH: usize = 16;
 
 /// Bounded queue used by per-tunnel receive tasks to wake the main loop.
 ///
@@ -64,6 +65,37 @@ const MAX_SHARDS: usize = 32;
 
 /// Queue depth for packets handed between shards.
 const SHARD_FORWARD_QUEUE_CAPACITY: usize = 1024;
+
+/// Queue depth for completed credential verifications.
+const AUTH_RESULT_QUEUE_CAPACITY: usize = 256;
+
+/// Global bound on credential verifications that are running or waiting.
+///
+/// The per-connection limit prevents one QUIC connection from monopolising
+/// this queue. This second bound prevents many short-lived connections from
+/// leaving an unbounded number of Argon2 jobs behind.
+const MAX_PENDING_AUTH_GLOBAL: usize = 256;
+
+/// CONNECT requests one connection may have awaiting verification.
+///
+/// Waiting costs only the parsed request, so this exists to bound how much a
+/// single caller can queue rather than to ration the verification itself —
+/// that is what `Shared::auth_permits` does.
+const MAX_PENDING_AUTH_PER_CONNECTION: usize = 16;
+
+/// Concurrent password verifications allowed across all shards.
+///
+/// Each one costs roughly 19 MiB and tens of milliseconds of CPU, so this caps
+/// both the memory and the CPU an unauthenticated caller can demand. Two per
+/// shard keeps every shard able to make progress, but never more than one per
+/// core: hashing moved off the event loop still competes with it for CPU, and
+/// oversubscribing just trades a stall for scheduler thrash.
+fn auth_concurrency(shards: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    (shards * 2).min(cores.max(2))
+}
 
 /// How often idle tunnels are swept. Tunnels close after `idle_timeout_secs`,
 /// so this is a background chore rather than something that belongs on the
@@ -169,6 +201,8 @@ impl Server {
             tun,
             forward_tx,
             tun_tx,
+            auth_permits: Arc::new(Semaphore::new(auth_concurrency(shard_count))),
+            auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
         });
 
         let mut shards = Vec::with_capacity(shard_count);
@@ -292,6 +326,56 @@ fn build_tun(config: &ServerConfig) -> anyhow::Result<Option<TunManager>> {
     }
 }
 
+/// Wait for the target socket to be readable, then drain a batch of datagrams.
+async fn recv_target_batch(
+    socket: &UdpSocket,
+    batch: &mut TargetRecvBatch,
+) -> std::io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use tokio::io::Interest;
+
+        socket
+            .async_io(Interest::READABLE, || {
+                // SAFETY: The socket is live, connected, and nonblocking for
+                // the duration of this readiness callback.
+                unsafe { target_io::recv_mmsg(socket.as_raw_fd(), batch) }
+            })
+            .await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let len = socket.recv(batch.first_mut()).await?;
+        batch.set_single(len);
+        Ok(1)
+    }
+}
+
+/// The target of a CONNECT request, held while its credentials are verified.
+#[derive(Debug)]
+enum ConnectRequest {
+    Tcp { authority: String },
+    Udp { path: String },
+    Ip,
+}
+
+/// A prechecked CONNECT request whose password still has to be verified.
+struct PendingAuth {
+    stream_id: u64,
+    password: zeroize::Zeroizing<Vec<u8>>,
+    request: ConnectRequest,
+}
+
+/// The result of verifying one request's credentials, sent back to the shard
+/// that parsed it.
+struct AuthOutcome {
+    connection_index: u64,
+    stream_id: u64,
+    request: ConnectRequest,
+    authorized: bool,
+}
+
 /// A QUIC packet that arrived on the wrong shard's socket.
 struct ForwardedPacket {
     data: Vec<u8>,
@@ -331,6 +415,15 @@ struct Shared {
     forward_tx: Vec<mpsc::Sender<ForwardedPacket>>,
     /// Inbox per shard for TUN packets belonging to its connections.
     tun_tx: Vec<mpsc::Sender<Vec<u8>>>,
+    /// Bounds how many password verifications run at once.
+    ///
+    /// Argon2id is memory-hard on purpose, so unbounded concurrency would let
+    /// unauthenticated requests turn into hundreds of megabytes and cores of
+    /// work. The old inline check bounded this at one per shard by blocking
+    /// the event loop; this keeps a bound without the stall.
+    auth_permits: Arc<Semaphore>,
+    /// Bounds both queued and running password verifications across all shards.
+    auth_queue_slots: Arc<Semaphore>,
 }
 
 /// One shard: an independent event loop over its own share of connections.
@@ -341,7 +434,7 @@ struct Shard {
     quic_config: quiche::Config,
     h3_config: quiche::h3::Config,
     connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
-    auth: Option<BasicAuthenticator>,
+    auth: Option<Arc<BasicAuthenticator>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
     config: ServerConfig,
@@ -353,6 +446,8 @@ struct Shard {
     tcp_event_rx: mpsc::Receiver<TcpRelayEvent>,
     forward_rx: mpsc::Receiver<ForwardedPacket>,
     tun_rx: mpsc::Receiver<Vec<u8>>,
+    auth_tx: mpsc::Sender<AuthOutcome>,
+    auth_rx: mpsc::Receiver<AuthOutcome>,
     /// Connections with work pending in the current event-loop round.
     dirty: DirtySet,
     /// Connections ordered by their next QUIC or pacing deadline.
@@ -455,6 +550,7 @@ impl Shard {
 
         let (udp_response_tx, udp_response_rx) = mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
         let (tcp_event_tx, tcp_event_rx) = mpsc::channel(TCP_RELAY_QUEUE_CAPACITY);
+        let (auth_tx, auth_rx) = mpsc::channel(AUTH_RESULT_QUEUE_CAPACITY);
 
         Ok(Self {
             index,
@@ -463,7 +559,7 @@ impl Shard {
             quic_config,
             h3_config,
             connections: FxHashMap::default(),
-            auth,
+            auth: auth.map(Arc::new),
             tcp_policy,
             udp_policy,
             config,
@@ -474,6 +570,8 @@ impl Shard {
             tcp_event_rx,
             forward_rx,
             tun_rx,
+            auth_tx,
+            auth_rx,
             dirty: DirtySet::default(),
             timers: TimerQueue::default(),
         })
@@ -531,6 +629,8 @@ impl Shard {
                 Forwarded(Option<ForwardedPacket>),
                 /// A TUN packet another shard read for one of our tunnels.
                 TunInbound(Option<Vec<u8>>),
+                /// Credentials finished verifying off the event loop.
+                AuthDone(Option<AuthOutcome>),
                 Shutdown,
                 Timeout,
             }
@@ -559,6 +659,9 @@ impl Shard {
                     }
                     packet = self.tun_rx.recv(), if !shutting_down => {
                         Event::TunInbound(packet)
+                    }
+                    outcome = self.auth_rx.recv(), if !shutting_down => {
+                        Event::AuthDone(outcome)
                     }
                     result = tokio::time::timeout(
                         timeout, self.socket.recv_batch(&mut recv_batch)
@@ -644,6 +747,10 @@ impl Shard {
                     self.relay_tun_packet(&packet);
                 }
                 Event::TunInbound(None) => {}
+                Event::AuthDone(Some(outcome)) => {
+                    self.handle_auth_result(outcome);
+                }
+                Event::AuthDone(None) => {}
                 Event::Timeout => {}
             }
 
@@ -927,6 +1034,7 @@ impl Shard {
         let mut pending_ip_setups: Vec<u64> = Vec::new();
         let mut closed_ip_streams: Vec<u64> = Vec::new();
         let mut failed_tcp_streams: Vec<u64> = Vec::new();
+        let mut pending_auth: Vec<PendingAuth> = Vec::new();
 
         // Process HTTP/3 events.
         if let Some(h3) = &mut client.h3 {
@@ -934,18 +1042,29 @@ impl Shard {
                 match h3.poll(&mut client.quic) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                         let tcp_setup_count = pending_tcp_setups.len();
-                        Self::handle_request(
+                        if let Some(pending) = Self::handle_request(
                             h3,
                             &mut client.quic,
                             stream_id,
                             &list,
                             &self.config,
-                            self.auth.as_ref(),
+                            self.auth.as_deref(),
                             &self.udp_policy,
                             &mut pending_tcp_setups,
                             &mut pending_udp_setups,
                             &mut pending_ip_setups,
-                        );
+                        ) {
+                            if client.awaiting_auth.len() >= MAX_PENDING_AUTH_PER_CONNECTION {
+                                warn!(
+                                    stream_id,
+                                    "too many CONNECT requests awaiting authorization"
+                                );
+                                Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                            } else {
+                                client.awaiting_auth.insert(stream_id, AwaitingAuth::new());
+                                pending_auth.push(pending);
+                            }
+                        }
                         if pending_tcp_setups.len() > tcp_setup_count {
                             debug_assert_eq!(
                                 pending_tcp_setups.len(),
@@ -962,6 +1081,11 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Data)) => {
+                        // Unread until the CONNECT is authorized, so a caller
+                        // that never authenticates buffers nothing here.
+                        if client.awaiting_auth.contains_key(&stream_id) {
+                            continue;
+                        }
                         if !Self::relay_tcp_request_body(
                             h3,
                             &mut client.quic,
@@ -973,6 +1097,9 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
+                        if let Some(finished) = client.awaiting_auth.get_mut(&stream_id) {
+                            finished.client_finished = true;
+                        }
                         if let Some(tunnel) = client.pending_tcp_tunnels.get_mut(&stream_id) {
                             tunnel.client_finished = true;
                             tunnel.last_activity = Instant::now();
@@ -989,6 +1116,8 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        // A late verification result for this stream is moot.
+                        client.awaiting_auth.remove(&stream_id);
                         if client.pending_tcp_tunnels.remove(&stream_id).is_some() {
                             info!(stream_id, "pending TCP tunnel reset by client");
                         }
@@ -1021,8 +1150,261 @@ impl Shard {
             Self::reset_tcp_stream(client, stream_id);
         }
 
-        // Handle tunnel setups after releasing the HTTP/3 borrow.
+        // Clean up closed IP tunnels: release addresses, remove routes.
+        for stream_id in closed_ip_streams {
+            Self::teardown_ip_tunnel(
+                &self.shared,
+                client,
+                stream_id,
+                conn_idx,
+            );
+        }
+
+        self.apply_connect_setups(
+            conn_idx,
+            pending_tcp_setups,
+            pending_udp_setups,
+            pending_ip_setups,
+        );
+        self.spawn_auth_verifications(conn_idx, pending_auth);
+    }
+
+    /// Verify prechecked credentials off the event loop.
+    ///
+    /// Argon2id costs tens of milliseconds; running it inline stalled every
+    /// connection on the shard for the duration, and let an unauthenticated
+    /// caller trigger that stall at will.
+    fn spawn_auth_verifications(&mut self, conn_idx: u64, pending: Vec<PendingAuth>) {
+        if pending.is_empty() {
+            return;
+        }
+        let Some(auth) = self.auth.clone() else {
+            return;
+        };
+        let Some(conn_id) = self.conn_by_index.get(&conn_idx).cloned() else {
+            return;
+        };
+
+        for request in pending {
+            let stream_id = request.stream_id;
+            let Some(cancelled) = self
+                .connections
+                .get(&conn_id)
+                .and_then(|client| client.awaiting_auth.get(&stream_id))
+                .map(AwaitingAuth::cancellation_flag)
+            else {
+                // The stream was reset later in the same H3 poll batch.
+                continue;
+            };
+
+            let queue_slot =
+                match Arc::clone(&self.shared.auth_queue_slots).try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        warn!(stream_id, "credential verification queue is full");
+                        if let Some(client) = self.connections.get_mut(&conn_id) {
+                            client.awaiting_auth.remove(&stream_id);
+                            if let Some(h3) = &mut client.h3 {
+                                Self::send_error_response(
+                                    h3,
+                                    &mut client.quic,
+                                    stream_id,
+                                    503,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+            let auth = Arc::clone(&auth);
+            let auth_tx = self.auth_tx.clone();
+            let permits = Arc::clone(&self.shared.auth_permits);
+            let PendingAuth {
+                stream_id,
+                password,
+                request,
+            } = request;
+
+            let task = tokio::spawn(async move {
+                // Admission above bounds the number of these waiting tasks;
+                // this second permit bounds the Argon2 CPU and memory actually
+                // running at once.
+                let Ok(permit) = permits.acquire_owned().await else {
+                    return;
+                };
+
+                let verified = tokio::task::spawn_blocking(move || {
+                    // Aborting an async task cannot stop spawn_blocking after
+                    // it has begun. This check still prevents a job that was
+                    // waiting in Tokio's blocking pool from starting Argon2
+                    // after its stream or connection disappeared.
+                    if cancelled.load(Ordering::Acquire) {
+                        drop(permit);
+                        return None;
+                    }
+                    let authorized = auth.verify(&password);
+                    drop(permit);
+                    Some(authorized)
+                })
+                .await;
+
+                let authorized = match verified {
+                    Ok(Some(authorized)) => authorized,
+                    Ok(None) => return,
+                    Err(_) => false,
+                };
+                let _ = auth_tx
+                    .send(AuthOutcome {
+                        connection_index: conn_idx,
+                        stream_id,
+                        request,
+                        authorized,
+                    })
+                    .await;
+                drop(queue_slot);
+            });
+
+            if let Some(waiting) = self
+                .connections
+                .get_mut(&conn_id)
+                .and_then(|client| client.awaiting_auth.get_mut(&stream_id))
+            {
+                waiting.set_task(task.abort_handle());
+            } else {
+                // The connection cannot normally disappear synchronously here,
+                // but abort defensively rather than detach untracked work.
+                task.abort();
+            }
+        }
+    }
+
+    /// Resume a CONNECT request once its credentials have been verified.
+    fn handle_auth_result(&mut self, outcome: AuthOutcome) {
+        let AuthOutcome {
+            connection_index,
+            stream_id,
+            request,
+            authorized,
+        } = outcome;
+
+        let Some(conn_id) = self.conn_by_index.get(&connection_index).cloned() else {
+            return;
+        };
+        // The connection may have gone away while the hash was running.
+        if !self.connections.contains_key(&conn_id) {
+            return;
+        }
+        self.dirty.mark(connection_index);
+
+        let mut pending_tcp_setups: Vec<(u64, uri::TcpTarget)> = Vec::new();
+        let mut pending_udp_setups: Vec<(u64, uri::UdpTarget)> = Vec::new();
+        let mut pending_ip_setups: Vec<u64> = Vec::new();
+
+        {
+            let client = self
+                .connections
+                .get_mut(&conn_id)
+                .expect("connection checked above");
+            let Some(h3) = client.h3.as_mut() else {
+                return;
+            };
+
+            let awaiting = client.awaiting_auth.remove(&stream_id);
+            let Some(awaiting) = awaiting else {
+                // The stream was reset while the hash was running.
+                return;
+            };
+            let client_finished = awaiting.client_finished;
+
+            if !authorized {
+                warn!(stream_id, "proxy authentication failed");
+                Self::send_proxy_auth_required(h3, &mut client.quic, stream_id);
+                return;
+            }
+
+            // A client that half-closed before being authorized is not going
+            // to use the tunnel, and setting one up would leak it until the
+            // idle sweep.
+            if client_finished && !matches!(request, ConnectRequest::Tcp { .. }) {
+                info!(stream_id, "CONNECT abandoned before authorization");
+                return;
+            }
+
+            Self::dispatch_connect(
+                h3,
+                &mut client.quic,
+                stream_id,
+                &request,
+                &self.config,
+                &self.udp_policy,
+                &mut pending_tcp_setups,
+                &mut pending_udp_setups,
+                &mut pending_ip_setups,
+            );
+
+            // A standard CONNECT buffers request-body bytes that arrive before
+            // the target connection is up, exactly as the inline path does.
+            if !pending_tcp_setups.is_empty() {
+                client
+                    .pending_tcp_tunnels
+                    .insert(stream_id, PendingTcpTunnel::staging(stream_id));
+
+                // Body bytes were left unread while the password verified;
+                // take them now that there is somewhere to put them.
+                if !Self::relay_tcp_request_body(
+                    h3,
+                    &mut client.quic,
+                    stream_id,
+                    &mut client.pending_tcp_tunnels,
+                    &mut client.tcp_tunnels,
+                ) {
+                    warn!(stream_id, "early CONNECT body exceeded its buffer");
+                    Self::reset_tcp_stream(client, stream_id);
+                    return;
+                }
+                if client_finished
+                    && let Some(pending) = client.pending_tcp_tunnels.get_mut(&stream_id)
+                {
+                    pending.client_finished = true;
+                }
+            }
+        }
+
+        self.apply_connect_setups(
+            connection_index,
+            pending_tcp_setups,
+            pending_udp_setups,
+            pending_ip_setups,
+        );
+    }
+
+    /// Apply the tunnel setups a batch of CONNECT requests produced.
+    ///
+    /// Split out of `handle_packet` because a request whose credentials are
+    /// verified off the event loop arrives here later, through
+    /// `handle_auth_result`, rather than in the same pass as its headers.
+    fn apply_connect_setups(
+        &mut self,
+        conn_idx: u64,
+        pending_tcp_setups: Vec<(u64, uri::TcpTarget)>,
+        pending_udp_setups: Vec<(u64, uri::UdpTarget)>,
+        pending_ip_setups: Vec<u64>,
+    ) {
+        if pending_tcp_setups.is_empty()
+            && pending_udp_setups.is_empty()
+            && pending_ip_setups.is_empty()
+        {
+            return;
+        }
+        let Some(conn_id) = self.conn_by_index.get(&conn_idx).cloned() else {
+            return;
+        };
+        let Some(client) = self.connections.get_mut(&conn_id) else {
+            return;
+        };
         let max_tunnels = self.config.server.max_tunnels_per_connection;
+
         for (stream_id, target) in pending_tcp_setups {
             if !client.pending_tcp_tunnels.contains_key(&stream_id) {
                 continue;
@@ -1058,6 +1440,15 @@ impl Shard {
         } else {
             Some(self.udp_response_tx.clone())
         };
+        // The listener itself cannot receive a larger UDP datagram than this,
+        // so matching that effective QUIC limit keeps target responses intact
+        // without allowing a bad configuration to allocate unbounded buffers
+        // per tunnel.
+        let target_datagram_size = self
+            .config
+            .quic
+            .max_datagram_size
+            .clamp(1, MAX_DATAGRAM_SIZE);
         for (stream_id, target) in pending_udp_setups {
             if client.tunnel_count() >= max_tunnels {
                 warn!(
@@ -1136,35 +1527,18 @@ impl Shard {
                                     let recv_socket = Arc::clone(&socket);
                                     let response_tx = udp_response_tx.as_ref().unwrap().clone();
                                     let recv_task = tokio::spawn(async move {
-                                        let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+                                        // One `recvmmsg` per readiness instead
+                                        // of a `recvfrom` per datagram, and one
+                                        // channel send — so a burst costs one
+                                        // syscall and one wakeup of the loop.
+                                        let mut batch =
+                                            TargetRecvBatch::new(target_datagram_size);
                                         loop {
-                                            let mut datagrams = match recv_socket
-                                                .recv(&mut buf)
-                                                .await
-                                            {
-                                                Ok(len) => vec![header.encode(&buf[..len])],
-                                                Err(e) => {
-                                                    debug!(stream_id, %e, "target recv failed");
-                                                    break;
-                                                }
-                                            };
-
-                                            // The socket is readable, so take
-                                            // whatever else the kernel already
-                                            // has rather than paying a wakeup
-                                            // per datagram.
-                                            while datagrams.len() < MAX_UDP_RECV_BATCH {
-                                                match recv_socket.try_recv(&mut buf) {
-                                                    Ok(len) => {
-                                                        datagrams
-                                                            .push(header.encode(&buf[..len]));
-                                                    }
-                                                    Err(e)
-                                                        if e.kind()
-                                                            == std::io::ErrorKind::WouldBlock =>
-                                                    {
-                                                        break
-                                                    }
+                                            let received =
+                                                match recv_target_batch(&recv_socket, &mut batch)
+                                                    .await
+                                                {
+                                                    Ok(received) => received,
                                                     Err(e) => {
                                                         debug!(
                                                             stream_id,
@@ -1173,7 +1547,14 @@ impl Shard {
                                                         );
                                                         break;
                                                     }
-                                                }
+                                                };
+
+                                            let datagrams: Vec<Vec<u8>> = batch
+                                                .datagrams(received)
+                                                .map(|payload| header.encode(payload))
+                                                .collect();
+                                            if datagrams.is_empty() {
+                                                continue;
                                             }
 
                                             let response = UdpResponse {
@@ -1252,15 +1633,6 @@ impl Shard {
             );
         }
 
-        // Clean up closed IP tunnels: release addresses, remove routes.
-        for stream_id in closed_ip_streams {
-            Self::teardown_ip_tunnel(
-                &self.shared,
-                client,
-                stream_id,
-                conn_idx,
-            );
-        }
     }
 
     /// Allocate addresses, register routes, send capsules for a new IP tunnel.
@@ -1398,7 +1770,7 @@ impl Shard {
         pending_tcp_setups: &mut Vec<(u64, uri::TcpTarget)>,
         pending_udp_setups: &mut Vec<(u64, uri::UdpTarget)>,
         pending_ip_setups: &mut Vec<u64>,
-    ) {
+    ) -> Option<PendingAuth> {
         // One pass over the header list, borrowing the values rather than
         // copying each one into an owned String.
         let mut method: &[u8] = b"";
@@ -1436,72 +1808,112 @@ impl Shard {
         // or allocating any tunnel resources. Duplicate credentials are
         // rejected rather than choosing one ambiguously.
         if method == b"CONNECT" {
-            let supported = matches!(
-                protocol,
-                b"connect-udp" if config.udp_proxy.enabled
-            ) || matches!(
-                protocol,
-                b"connect-ip" if config.ip_proxy.enabled
-            ) || (protocol.is_empty() && config.tcp_proxy.enabled);
-            if supported {
-                if let Some(auth) = auth {
-                    if duplicate_proxy_authorization || !auth.authenticate(proxy_authorization) {
-                        warn!(stream_id, "proxy authentication failed");
-                        Self::send_proxy_auth_required(h3, quic, stream_id);
-                        return;
-                    }
-                }
-            }
+            let request = if protocol.is_empty() && config.tcp_proxy.enabled {
+                Some(ConnectRequest::Tcp {
+                    authority: String::from_utf8_lossy(authority).into_owned(),
+                })
+            } else if protocol == b"connect-udp" && config.udp_proxy.enabled {
+                Some(ConnectRequest::Udp {
+                    path: String::from_utf8_lossy(path).into_owned(),
+                })
+            } else if protocol == b"connect-ip" && config.ip_proxy.enabled {
+                Some(ConnectRequest::Ip)
+            } else {
+                None
+            };
 
-            // Check for Extended CONNECT.
-            match protocol {
-                b"" if config.tcp_proxy.enabled => {
-                    let authority = match std::str::from_utf8(authority) {
-                        Ok(authority) => authority,
-                        Err(_) => {
-                            Self::send_error_response(h3, quic, stream_id, 400);
-                            return;
-                        }
-                    };
-                    match uri::parse_connect_authority(authority) {
-                        Ok(target) => {
-                            info!(
-                                stream_id,
-                                host = %target.host,
-                                port = target.port,
-                                "standard CONNECT"
-                            );
-                            pending_tcp_setups.push((stream_id, target));
-                        }
-                        Err(error) => {
-                            warn!(stream_id, %error, "bad CONNECT authority");
-                            Self::send_error_response(h3, quic, stream_id, 400);
-                        }
-                    }
-                    return;
-                }
-                b"connect-udp" if config.udp_proxy.enabled => {
-                    Self::handle_connect_udp(
+            if let Some(request) = request {
+                let Some(auth) = auth else {
+                    Self::dispatch_connect(
                         h3,
                         quic,
                         stream_id,
-                        &String::from_utf8_lossy(path),
+                        &request,
                         config,
                         udp_policy,
+                        pending_tcp_setups,
                         pending_udp_setups,
+                        pending_ip_setups,
                     );
-                    return;
+                    return None;
+                };
+
+                // The cheap half runs here; only a well-formed request for the
+                // configured user reaches the password hash, and that is
+                // deliberately slow enough that it must not run on this thread.
+                if duplicate_proxy_authorization {
+                    warn!(stream_id, "duplicate proxy credentials");
+                    Self::send_proxy_auth_required(h3, quic, stream_id);
+                    return None;
                 }
-                b"connect-ip" if config.ip_proxy.enabled => {
-                    Self::handle_connect_ip_response(h3, quic, stream_id, pending_ip_setups);
-                    return;
+                match auth.precheck(proxy_authorization) {
+                    AuthPrecheck::Rejected => {
+                        warn!(stream_id, "proxy authentication failed");
+                        Self::send_proxy_auth_required(h3, quic, stream_id);
+                        return None;
+                    }
+                    AuthPrecheck::NeedsVerify(password) => {
+                        return Some(PendingAuth {
+                            stream_id,
+                            password,
+                            request,
+                        });
+                    }
                 }
-                _ => {}
             }
         }
 
         // Default: 404 for anything we don't handle.
         Self::send_error_response(h3, quic, stream_id, 404);
+        None
+    }
+
+    /// Act on an authorized CONNECT request.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_connect(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        request: &ConnectRequest,
+        config: &ServerConfig,
+        udp_policy: &TargetPolicy,
+        pending_tcp_setups: &mut Vec<(u64, uri::TcpTarget)>,
+        pending_udp_setups: &mut Vec<(u64, uri::UdpTarget)>,
+        pending_ip_setups: &mut Vec<u64>,
+    ) {
+        match request {
+            ConnectRequest::Tcp { authority } => {
+                match uri::parse_connect_authority(authority) {
+                    Ok(target) => {
+                        info!(
+                            stream_id,
+                            host = %target.host,
+                            port = target.port,
+                            "standard CONNECT"
+                        );
+                        pending_tcp_setups.push((stream_id, target));
+                    }
+                    Err(error) => {
+                        warn!(stream_id, %error, "bad CONNECT authority");
+                        Self::send_error_response(h3, quic, stream_id, 400);
+                    }
+                }
+            }
+            ConnectRequest::Udp { path } => {
+                Self::handle_connect_udp(
+                    h3,
+                    quic,
+                    stream_id,
+                    path,
+                    config,
+                    udp_policy,
+                    pending_udp_setups,
+                );
+            }
+            ConnectRequest::Ip => {
+                Self::handle_connect_ip_response(h3, quic, stream_id, pending_ip_setups);
+            }
+        }
     }
 
     /// Send 200 OK for CONNECT-IP and defer address allocation.
@@ -1877,6 +2289,10 @@ impl Shard {
         dgram_buf: &mut [u8],
         tun_send: &mut TunSendBatch,
     ) {
+        // Which tunnels have datagrams waiting to be written, so the flush at
+        // the end of each connection does not have to scan all of them.
+        let mut staged_udp_tunnels: Vec<u64> = Vec::new();
+
         for index in dirty {
             let Some(conn_id) = self.conn_by_index.get(index) else {
                 continue;
@@ -1884,6 +2300,8 @@ impl Shard {
             let Some(client) = self.connections.get_mut(conn_id) else {
                 continue;
             };
+
+            staged_udp_tunnels.clear();
 
             loop {
                 let len = match client.quic.dgram_recv(dgram_buf) {
@@ -1912,18 +2330,23 @@ impl Shard {
                     continue;
                 }
 
-                // Check UDP tunnels first.
+                // Check UDP tunnels first. Datagrams are staged and written
+                // as a batch once the connection's queue is drained, so a
+                // client burst costs one syscall rather than one per datagram.
                 if let Some(tunnel) = client.udp_tunnels.get_mut(&dgram.stream_id) {
-                    match tunnel.try_send_to_target(dgram.payload) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            debug!(
-                                stream_id = dgram.stream_id,
-                                %e,
-                                "send to target failed"
-                            );
-                        }
+                    if !staged_udp_tunnels.contains(&dgram.stream_id) {
+                        staged_udp_tunnels.push(dgram.stream_id);
+                    }
+                    // A full stage is written straight away so a long burst
+                    // does not grow the staging buffer without bound.
+                    if tunnel.stage_to_target(dgram.payload)
+                        && let Err(e) = tunnel.flush_to_target()
+                    {
+                        debug!(
+                            stream_id = dgram.stream_id,
+                            %e,
+                            "send to target failed"
+                        );
                     }
                     continue;
                 }
@@ -1969,6 +2392,20 @@ impl Shard {
                 }
 
                 debug!(stream_id = dgram.stream_id, "datagram for unknown tunnel");
+            }
+
+            // The queue is drained, so whatever is still staged is a complete
+            // burst and can go out in one syscall per tunnel.
+            for stream_id in &staged_udp_tunnels {
+                let Some(tunnel) = client.udp_tunnels.get_mut(stream_id) else {
+                    continue;
+                };
+                if !tunnel.has_staged() {
+                    continue;
+                }
+                if let Err(e) = tunnel.flush_to_target() {
+                    debug!(stream_id, %e, "send to target failed");
+                }
             }
         }
     }
@@ -2116,6 +2553,7 @@ impl Shard {
                 udp_tunnels,
                 ip_tunnels,
                 index,
+                awaiting_auth: _,
                 deferred_send: _,
                 scheduled_deadline: _,
             } = client;
@@ -2391,6 +2829,25 @@ mod tests {
     }
 
     /// `0` means "one per core", and must still land inside the cap.
+    /// Hashing is bounded so it cannot monopolise the machine, but never so
+    /// tight that a shard has no slot at all.
+    #[test]
+    fn auth_concurrency_is_bounded_by_cores_and_shards() {
+        let cores = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .max(2);
+        for shards in [1_usize, 2, 4, 32] {
+            let permits = super::auth_concurrency(shards);
+            assert!(permits >= 1, "every shard needs to make progress");
+            assert!(
+                permits <= cores,
+                "shards={shards}: {permits} verifications would oversubscribe {cores} cores"
+            );
+            assert!(permits <= shards * 2);
+        }
+    }
+
     #[test]
     fn automatic_shard_count_is_within_bounds() {
         let shards = super::resolve_shard_count(0);

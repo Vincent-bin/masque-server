@@ -1034,6 +1034,9 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     let rx_total = Arc::new(AtomicU64::new(0));
     let setup_failures = Arc::new(AtomicU64::new(0));
 
+    // Include thread creation in the time until the whole concurrent batch is
+    // ready. Individual connection latency is measured inside each worker.
+    let setup_batch_started = Instant::now();
     let mut workers = Vec::with_capacity(conns);
     for _ in 0..conns {
         let server_addr = server_addr.to_string();
@@ -1047,6 +1050,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
         workers.push(std::thread::spawn(move || {
             // Establish the tunnel before the barrier so every connection is
             // pushing traffic during the same measurement window.
+            let setup_started = Instant::now();
             let tunnel = connect_udp_tunnel(&server_addr, &echo_addr);
             let (mut client, stream_id) = match tunnel {
                 Ok(tunnel) => tunnel,
@@ -1054,9 +1058,10 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
                     warn!(%error, "load connection setup failed");
                     setup_failures.fetch_add(1, Ordering::Relaxed);
                     ready.wait();
-                    return;
+                    return None;
                 }
             };
+            let setup = setup_started.elapsed();
 
             // Measure the server's ceiling, not the client's pacer.
             client.pace = false;
@@ -1102,15 +1107,20 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
 
             tx_total.fetch_add(sent, Ordering::Relaxed);
             rx_total.fetch_add(received, Ordering::Relaxed);
+            Some(setup)
         }));
     }
 
     ready.wait();
+    let setup_batch = setup_batch_started.elapsed();
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(duration_secs));
     stop.store(true, Ordering::Relaxed);
+    let mut setup_latencies = Vec::with_capacity(conns);
     for worker in workers {
-        let _ = worker.join();
+        if let Ok(Some(setup)) = worker.join() {
+            setup_latencies.push(setup.as_secs_f64() * 1e3);
+        }
     }
     let elapsed = started.elapsed().as_secs_f64();
 
@@ -1122,7 +1132,24 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     let rx_pps = received as f64 / elapsed;
     let goodput = rx_pps * payload_size as f64 * 8.0 / 1e9;
 
-    println!("  connections established: {established}/{conns}");
+    println!(
+        "  connections established: {established}/{conns} in {:.0} ms ({:.1} conn/s)",
+        setup_batch.as_secs_f64() * 1e3,
+        established as f64 / setup_batch.as_secs_f64().max(f64::EPSILON)
+    );
+    if !setup_latencies.is_empty() {
+        setup_latencies.sort_by(f64::total_cmp);
+        let average = setup_latencies.iter().sum::<f64>() / setup_latencies.len() as f64;
+        let percentile = |p: f64| {
+            setup_latencies[((setup_latencies.len() - 1) as f64 * p) as usize]
+        };
+        println!(
+            "  per-connection setup: avg {average:.1} ms   p50 {:.1} ms   p95 {:.1} ms   p99 {:.1} ms",
+            percentile(0.50),
+            percentile(0.95),
+            percentile(0.99)
+        );
+    }
     println!(
         "  tx {:>10.0} pkt/s   echo {:>10.0} pkt/s   app goodput {:.3} Gbit/s   \
          bidirectional relay {:.3} Gbit/s",

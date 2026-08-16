@@ -1,9 +1,50 @@
 // Per-client QUIC + HTTP/3 connection state.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::fxhash::FxHashMap;
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
 use crate::tunnel::udp::UdpTunnel;
+
+/// One CONNECT stream waiting for its credentials to be verified.
+pub(crate) struct AwaitingAuth {
+    pub(crate) client_finished: bool,
+    cancelled: Arc<AtomicBool>,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl AwaitingAuth {
+    pub(crate) fn new() -> Self {
+        Self {
+            client_finished: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            task: None,
+        }
+    }
+
+    pub(crate) fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    /// Attach the verification task after it has been admitted to the global
+    /// bounded queue.
+    pub(crate) fn set_task(&mut self, task: tokio::task::AbortHandle) {
+        if let Some(previous) = self.task.replace(task) {
+            previous.abort();
+        }
+    }
+}
+
+impl Drop for AwaitingAuth {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
 
 /// One serialized QUIC packet waiting for its pacing deadline. The backing
 /// allocation is retained and reused so pacing does not add a packet-sized
@@ -52,6 +93,12 @@ pub struct ClientConnection {
     pub udp_tunnels: FxHashMap<u64, UdpTunnel>,
     /// Active IP tunnels, keyed by stream ID.
     pub ip_tunnels: FxHashMap<u64, IpTunnel>,
+    /// Streams whose CONNECT is waiting on credential verification.
+    ///
+    /// Request-body bytes for these streams are deliberately left unread in
+    /// quiche, so an unauthenticated caller cannot make the server buffer
+    /// anything; stream flow control bounds them until the tunnel exists.
+    pub(crate) awaiting_auth: FxHashMap<u64, AwaitingAuth>,
     /// Dense index for this connection, used as the `conn_id` in
     /// `TunnelOwner` and to address the connection from background tasks.
     pub index: u64,
@@ -71,6 +118,7 @@ impl ClientConnection {
             tcp_tunnels: FxHashMap::default(),
             udp_tunnels: FxHashMap::default(),
             ip_tunnels: FxHashMap::default(),
+            awaiting_auth: FxHashMap::default(),
             index,
             deferred_send: DeferredSend::default(),
             scheduled_deadline: None,
@@ -131,5 +179,25 @@ mod tests {
         deferred.schedule(b"second", send_info(now));
         let (packet, _) = deferred.take_if_due(now).unwrap();
         assert_eq!(packet, b"second");
+    }
+
+    #[tokio::test]
+    async fn dropping_awaiting_auth_aborts_queued_task() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            std::future::pending::<()>().await;
+        });
+        let mut awaiting = AwaitingAuth::new();
+        let cancelled = awaiting.cancellation_flag();
+        awaiting.set_task(task.abort_handle());
+
+        drop(awaiting);
+
+        assert!(cancelled.load(Ordering::Acquire));
+        let error = task.await.expect_err("dropping auth state must abort its task");
+        assert!(error.is_cancelled());
+        assert_eq!(slots.available_permits(), 1);
     }
 }

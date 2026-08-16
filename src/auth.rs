@@ -38,48 +38,82 @@ impl BasicAuthenticator {
         })
     }
 
-    /// Validate a complete `Proxy-Authorization` field value.
+    /// Validate a complete `Proxy-Authorization` field value, end to end.
+    ///
+    /// Only for tests: the request path must use [`precheck`](Self::precheck)
+    /// plus [`verify`](Self::verify) so the deliberately slow password hash
+    /// stays off the event loop.
+    #[cfg(test)]
     pub(crate) fn authenticate(&self, value: Option<&[u8]>) -> bool {
+        match self.precheck(value) {
+            AuthPrecheck::Rejected => false,
+            AuthPrecheck::NeedsVerify(password) => self.verify(&password),
+        }
+    }
+
+    /// Run every cheap check, stopping before the password hash.
+    ///
+    /// Everything here is microseconds — parsing, base64, and a constant-time
+    /// username comparison — so a malformed or wrong-user request is rejected
+    /// without ever paying for Argon2.
+    pub(crate) fn precheck(&self, value: Option<&[u8]>) -> AuthPrecheck {
         let Some(value) = value else {
-            return false;
+            return AuthPrecheck::Rejected;
         };
         if value.len() > MAX_AUTHORIZATION_LEN {
-            return false;
+            return AuthPrecheck::Rejected;
         }
 
         let Some(separator) = value.iter().position(|byte| byte.is_ascii_whitespace()) else {
-            return false;
+            return AuthPrecheck::Rejected;
         };
         let (scheme, credentials) = value.split_at(separator);
         if !scheme.eq_ignore_ascii_case(b"basic") {
-            return false;
+            return AuthPrecheck::Rejected;
         }
 
         let credentials = trim_ascii_whitespace(credentials);
         if credentials.is_empty() || credentials.iter().any(|byte| byte.is_ascii_whitespace()) {
-            return false;
+            return AuthPrecheck::Rejected;
         }
 
         let decoded = match STANDARD.decode(credentials) {
             Ok(decoded) => Zeroizing::new(decoded),
-            Err(_) => return false,
+            Err(_) => return AuthPrecheck::Rejected,
         };
         let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
-            return false;
+            return AuthPrecheck::Rejected;
         };
         let (username, password_with_colon) = decoded.split_at(colon);
         let password = &password_with_colon[1..];
 
         if !bool::from(username.ct_eq(self.username.as_slice())) {
-            return false;
+            return AuthPrecheck::Rejected;
         }
 
+        AuthPrecheck::NeedsVerify(Zeroizing::new(password.to_vec()))
+    }
+
+    /// Verify a prechecked password against the configured hash.
+    ///
+    /// Argon2id is memory-hard by design — tens of milliseconds and ~19 MiB
+    /// per call — so this must not run on the event loop.
+    pub(crate) fn verify(&self, password: &[u8]) -> bool {
         let parsed = match PasswordHash::new(&self.password_hash) {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
         Argon2::default().verify_password(password, &parsed).is_ok()
     }
+}
+
+/// Result of the cheap half of authentication.
+pub(crate) enum AuthPrecheck {
+    /// Rejected without hashing.
+    Rejected,
+    /// Well formed and the username matches; the password still needs the
+    /// slow verification.
+    NeedsVerify(Zeroizing<Vec<u8>>),
 }
 
 /// Hash a password using Argon2id's current recommended defaults and a fresh
@@ -171,5 +205,47 @@ mod tests {
         let second = hash_password(b"secret").unwrap();
         assert!(first.starts_with("$argon2id$v=19$"));
         assert_ne!(first, second);
+    }
+
+    /// The expensive hash must be reachable only for a well-formed request
+    /// naming the configured user; everything else has to be refused cheaply.
+    #[test]
+    fn precheck_refuses_bad_requests_without_hashing() {
+        let hash = hash_password(b"correct-horse").unwrap();
+        let auth = BasicAuthenticator::new("alice", &hash).unwrap();
+
+        for value in [
+            None,
+            Some(b"".as_slice()),
+            Some(b"Bearer token".as_slice()),
+            Some(b"Basic !!not-base64!!".as_slice()),
+            // Right shape, wrong user.
+            Some(b"Basic Ym9iOmNvcnJlY3QtaG9yc2U=".as_slice()),
+        ] {
+            assert!(
+                matches!(auth.precheck(value), AuthPrecheck::Rejected),
+                "expected a cheap rejection for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn precheck_then_verify_matches_end_to_end_authentication() {
+        let hash = hash_password(b"correct-horse").unwrap();
+        let auth = BasicAuthenticator::new("alice", &hash).unwrap();
+        let good = b"Basic YWxpY2U6Y29ycmVjdC1ob3JzZQ==".as_slice();
+        let bad = b"Basic YWxpY2U6d3JvbmctcGFzcw==".as_slice();
+
+        let AuthPrecheck::NeedsVerify(password) = auth.precheck(Some(good)) else {
+            panic!("valid credentials should reach verification");
+        };
+        assert!(auth.verify(&password));
+        assert!(auth.authenticate(Some(good)));
+
+        let AuthPrecheck::NeedsVerify(password) = auth.precheck(Some(bad)) else {
+            panic!("a wrong password is only detectable by verifying it");
+        };
+        assert!(!auth.verify(&password));
+        assert!(!auth.authenticate(Some(bad)));
     }
 }

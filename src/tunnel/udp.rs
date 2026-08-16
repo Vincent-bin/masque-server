@@ -11,6 +11,10 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+use crate::tunnel::target_io::TARGET_BATCH_SIZE;
+#[cfg(target_os = "linux")]
+use crate::tunnel::target_io;
+
 /// State for a single CONNECT-UDP tunnel.
 pub struct UdpTunnel {
     /// The HTTP/3 stream ID this tunnel is bound to.
@@ -30,6 +34,12 @@ pub struct UdpTunnel {
     pub last_activity: Instant,
     /// Background task that waits for target responses and wakes the server.
     pub(crate) recv_task: Option<JoinHandle<()>>,
+    /// Client datagrams staged for one batched write to the target.
+    ///
+    /// A client burst arrives as several datagrams in one event-loop round;
+    /// staging them turns what was a syscall per datagram into one per burst.
+    send_stage: Vec<Vec<u8>>,
+    staged: usize,
 }
 
 impl UdpTunnel {
@@ -67,6 +77,8 @@ impl UdpTunnel {
             target_addr,
             last_activity: Instant::now(),
             recv_task: None,
+            send_stage: Vec::new(),
+            staged: 0,
         })
     }
 
@@ -84,6 +96,8 @@ impl UdpTunnel {
             target_addr,
             last_activity: Instant::now(),
             recv_task: Some(recv_task),
+            send_stage: Vec::new(),
+            staged: 0,
         }
     }
 
@@ -106,6 +120,66 @@ impl UdpTunnel {
         }
         self.last_activity = Instant::now();
         Ok(())
+    }
+
+    /// Stage a client payload for the next batched write.
+    ///
+    /// Returns true when the batch is full and the caller should flush.
+    pub fn stage_to_target(&mut self, payload: &[u8]) -> bool {
+        if self.staged == self.send_stage.len() {
+            self.send_stage.push(Vec::with_capacity(payload.len().max(1_500)));
+        }
+        let buffer = &mut self.send_stage[self.staged];
+        buffer.clear();
+        buffer.extend_from_slice(payload);
+        self.staged += 1;
+        self.staged >= TARGET_BATCH_SIZE
+    }
+
+    pub fn has_staged(&self) -> bool {
+        self.staged > 0
+    }
+
+    /// Write every staged datagram, in one syscall where the platform allows.
+    ///
+    /// A datagram the socket refuses is dropped rather than retried: UDP has no
+    /// delivery guarantee and the client will retransmit if it cares.
+    pub fn flush_to_target(&mut self) -> std::io::Result<()> {
+        if self.staged == 0 {
+            return Ok(());
+        }
+        let staged = self.staged;
+        self.staged = 0;
+        self.last_activity = Instant::now();
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: The socket is live, connected, and nonblocking.
+            let sent = unsafe {
+                target_io::send_mmsg(self.send_socket.as_raw_fd(), &self.send_stage[..staged])
+            }?;
+            if sent < staged {
+                debug!(
+                    stream_id = self.stream_id,
+                    dropped = staged - sent,
+                    "target socket accepted only part of the batch"
+                );
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            for payload in &self.send_stage[..staged] {
+                match self.send_socket.send(payload) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
     }
 
     /// Wait for a packet from the target.

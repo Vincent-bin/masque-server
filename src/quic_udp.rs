@@ -734,7 +734,7 @@ fn send_mmsg(
     // SAFETY: All pointers in the first `count` headers refer to live storage
     // above for the duration of this nonblocking syscall.
     let result = unsafe {
-        libc::sendmmsg(
+        raw_sendmmsg(
             fd,
             headers.as_mut_ptr(),
             count as libc::c_uint,
@@ -746,6 +746,40 @@ fn send_mmsg(
     } else {
         Ok(result as usize)
     }
+}
+
+/// Issue `sendmmsg(2)` directly instead of through the libc wrapper.
+///
+/// musl implements `sendmmsg` as a loop of `sendmsg`, so linking against it
+/// silently turns a batched send back into one syscall per packet — and the
+/// release artifacts for this project are musl static binaries. Going straight
+/// to the syscall keeps the batching that the whole `SendPacketBatch` design
+/// exists for. `mmsghdr` is laid out the same for userspace and the kernel on
+/// the 64-bit targets built here, so the array is passed through unchanged.
+///
+/// # Safety
+///
+/// `headers` must point to at least `count` initialized `mmsghdr` values whose
+/// interior pointers stay live for the call.
+#[cfg(target_os = "linux")]
+unsafe fn raw_sendmmsg(
+    fd: std::os::fd::RawFd,
+    headers: *mut libc::mmsghdr,
+    count: libc::c_uint,
+    flags: libc::c_int,
+) -> libc::c_int {
+    // SAFETY: Delegated to this function's contract; the argument types match
+    // the kernel's sendmmsg signature.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_sendmmsg,
+            fd as libc::c_long,
+            headers as usize as libc::c_long,
+            count as libc::c_long,
+            flags as libc::c_long,
+        )
+    };
+    result as libc::c_int
 }
 
 #[cfg(target_os = "linux")]
