@@ -1,0 +1,54 @@
+services:
+  echo:
+    image: python:3.12-slim
+    command: ["python3", "/app/echo-server.py"]
+    volumes:
+      - ./echo-server.py:/app/echo-server.py:ro
+    networks:
+      e2e:
+        ipv4_address: 172.28.0.10
+
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/entrypoint.sh"]
+    command: ["-c", "/config/masque-e2e.toml", "-vv"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - ../../certs:/certs:ro
+      - ./masque-e2e.toml:/config/masque-e2e.toml:ro
+      - ./server-entrypoint.sh:/entrypoint.sh:ro
+    depends_on:
+      - echo
+    networks:
+      e2e:
+        ipv4_address: 172.28.0.20
+
+  test:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/client.Dockerfile
+    environment:
+      MASQUE_SERVER_ADDR: "172.28.0.20:4433"
+      ECHO_SERVER_ADDR: "172.28.0.10:9999"
+      MASQUE_USERNAME: "test"
+      MASQUE_PASSWORD: "test-password"
+      RUST_LOG: "masque_e2e=debug"
+    depends_on:
+      - server
+      - echo
+    networks:
+      e2e:
+
+networks:
+  e2e:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

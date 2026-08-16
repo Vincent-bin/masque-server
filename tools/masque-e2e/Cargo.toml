@@ -1,0 +1,17 @@
+[package]
+name = "masque-e2e"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "masque-e2e"
+path = "src/main.rs"
+
+[dependencies]
+masque = { package = "masque-server", path = "../.." }
+quiche = "0.29.3"
+anyhow = "1"
+base64 = "0.22.1"
+ring = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

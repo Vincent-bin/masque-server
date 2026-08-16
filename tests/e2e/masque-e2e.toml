@@ -1,0 +1,25 @@
+[server]
+listen_addr = "0.0.0.0:4433"
+
+[tls]
+cert_path = "/certs/server.crt"
+key_path = "/certs/server.key"
+
+[auth]
+enabled = true
+username = "test"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$1xNVXhqKU7jJ6cqTBJKphQ$GXXAINVTW1qhloFtN1IR8lSr7pI7QEY79fq4K6d8scQ"
+
+[tcp_proxy]
+enabled = true
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = []
+
+[udp_proxy]
+enabled = true
+deny_targets = ["127.0.0.0/8", "::1/128"]
+
+[ip_proxy]
+enabled = true
+ipv4_pool = "10.89.0.0/16"
+ipv6_pool = "fd00:abcd::/64"
