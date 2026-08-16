@@ -6,8 +6,8 @@ compatibility impact before implementation.
 
 ## Development setup
 
-Install stable Rust, Clang, CMake, and the native tools required by `quiche`.
-Then run:
+Install rustup, Clang, CMake, and the native tools required by `quiche`. Rustup
+uses the production toolchain pinned in `rust-toolchain.toml`. Then run:
 
 ```sh
 cargo build --workspace --locked
@@ -19,6 +19,7 @@ Before submitting a change:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo +1.88.0 check --workspace --locked
 cargo test --workspace --locked
 ```
 

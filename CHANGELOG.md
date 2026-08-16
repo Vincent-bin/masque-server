@@ -25,6 +25,10 @@ pre-1.0.
 - Platform network adapters live under `src/net/`.
 - The E2E client lives under `tools/masque-e2e/` and deployment assets under
   `deploy/`.
+- The lockfile uses the latest dependency versions compatible with Rust 1.88.
+- Development and release builds use Rust 1.97.1, while CI separately verifies
+  the declared Rust 1.88 minimum.
+- GitHub Actions are pinned to immutable commit SHAs.
 
 ## 0.1.0-rc.10 - 2026-08-15
 

@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | Formatting | `cargo fmt --all --check` | Stable source formatting |
 | Static analysis | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Rust correctness and maintainability |
+| MSRV | `cargo +1.88.0 check --workspace --locked` | Declared minimum compiler support |
 | Unit/integration | `cargo test --workspace --locked` | Codecs, policy, config, scheduling, tunnels |
 | Release tests | `cargo test --workspace --release --locked` | Optimized-profile behavior |
 | Microbenchmark | `cargo bench --bench core` | Codec, routing, and allocation regressions |
@@ -18,6 +19,7 @@
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo +1.88.0 check --workspace --locked
 cargo test --workspace --locked
 ```
 
