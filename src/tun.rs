@@ -61,10 +61,7 @@ impl TunRecvBatch {
 ///
 /// Takes the device directly rather than a [`TunManager`] so the event loop can
 /// poll it without borrowing the whole server.
-pub async fn recv_batch(
-    device: &AsyncDevice,
-    batch: &mut TunRecvBatch,
-) -> std::io::Result<usize> {
+pub async fn recv_batch(device: &AsyncDevice, batch: &mut TunRecvBatch) -> std::io::Result<usize> {
     #[cfg(target_os = "linux")]
     {
         device
@@ -116,7 +113,8 @@ impl TunSendBatch {
     /// Stage one IP packet for the next write.
     pub fn push(&mut self, packet: &[u8]) {
         if self.used == self.packets.len() {
-            self.packets.push(Vec::with_capacity(TUN_SEND_OFFSET + 1_500));
+            self.packets
+                .push(Vec::with_capacity(TUN_SEND_OFFSET + 1_500));
         }
         let buffer = &mut self.packets[self.used];
         buffer.clear();

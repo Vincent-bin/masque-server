@@ -5,4 +5,4 @@ set -euo pipefail
 # tunnelled traffic can reach the echo server on the Docker network.
 iptables -t nat -A POSTROUTING -s 10.89.0.0/16 -o eth0 -j MASQUERADE
 
-exec masque "$@"
+exec masque-server "$@"

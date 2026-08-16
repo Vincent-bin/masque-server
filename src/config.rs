@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Top-level server configuration.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ServerConfig {
     pub server: ServerSection,
@@ -144,20 +144,6 @@ pub struct IpProxySection {
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerSection::default(),
-            tls: TlsSection::default(),
-            auth: AuthSection::default(),
-            quic: QuicSection::default(),
-            tcp_proxy: TcpProxySection::default(),
-            udp_proxy: UdpProxySection::default(),
-            ip_proxy: IpProxySection::default(),
-        }
-    }
-}
 
 impl Default for ServerSection {
     fn default() -> Self {

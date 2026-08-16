@@ -1,6 +1,6 @@
 [Unit]
 Description=MASQUE HTTP/3 CONNECT, CONNECT-UDP, and CONNECT-IP proxy
-Documentation=https://github.com/Vincent-bin/masque-rs
+Documentation=https://github.com/Vincent-bin/masque-server
 Wants=network-online.target
 After=network-online.target
 

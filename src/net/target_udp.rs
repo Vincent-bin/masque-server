@@ -7,7 +7,6 @@
 //!
 //! The sockets are connected, so no address is carried per message.
 
-
 /// Datagrams moved per syscall in either direction.
 pub const TARGET_BATCH_SIZE: usize = 16;
 
@@ -68,10 +67,12 @@ impl TargetRecvBatch {
     }
 
     /// First buffer, for the portable single-datagram path.
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn first_mut(&mut self) -> &mut [u8] {
         &mut self.buffers[0]
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn set_single(&mut self, len: usize) {
         self.lengths[0] = len;
         #[cfg(target_os = "linux")]
@@ -131,8 +132,7 @@ pub unsafe fn recv_mmsg(
 
     let received = (result as usize).min(TARGET_BATCH_SIZE);
     for index in 0..received {
-        batch.lengths[index] =
-            (headers[index].msg_len as usize).min(batch.buffers[index].len());
+        batch.lengths[index] = (headers[index].msg_len as usize).min(batch.buffers[index].len());
         batch.truncated[index] = headers[index].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
     }
     Ok(received)
@@ -146,10 +146,7 @@ pub unsafe fn recv_mmsg(
 ///
 /// `fd` must be a live, connected, nonblocking UDP socket.
 #[cfg(target_os = "linux")]
-pub unsafe fn send_mmsg(
-    fd: std::os::fd::RawFd,
-    payloads: &[Vec<u8>],
-) -> std::io::Result<usize> {
+pub unsafe fn send_mmsg(fd: std::os::fd::RawFd, payloads: &[Vec<u8>]) -> std::io::Result<usize> {
     use std::os::raw::c_void;
 
     let count = payloads.len().min(TARGET_BATCH_SIZE);

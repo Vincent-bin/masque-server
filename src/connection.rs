@@ -1,7 +1,7 @@
 // Per-client QUIC + HTTP/3 connection state.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fxhash::FxHashMap;
 use crate::tunnel::ip::IpTunnel;
@@ -164,10 +164,7 @@ mod tests {
         let mut deferred = DeferredSend::default();
         deferred.schedule(b"first", send_info(now + Duration::from_millis(10)));
 
-        assert_eq!(
-            deferred.deadline(),
-            Some(now + Duration::from_millis(10))
-        );
+        assert_eq!(deferred.deadline(), Some(now + Duration::from_millis(10)));
         assert!(deferred.take_if_due(now).is_none());
 
         let (packet, _) = deferred
@@ -196,7 +193,9 @@ mod tests {
         drop(awaiting);
 
         assert!(cancelled.load(Ordering::Acquire));
-        let error = task.await.expect_err("dropping auth state must abort its task");
+        let error = task
+            .await
+            .expect_err("dropping auth state must abort its task");
         assert!(error.is_cancelled());
         assert_eq!(slots.available_permits(), 1);
     }

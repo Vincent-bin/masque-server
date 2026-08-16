@@ -61,7 +61,7 @@ RUST_LOG=warn \
 target/release/masque-e2e >"$BENCH_DIR/echo.log" 2>&1 &
 ECHO_PID=$!
 
-RUST_LOG=warn target/release/masque --config "$BENCH_DIR/masque.toml" \
+RUST_LOG=warn target/release/masque-server --config "$BENCH_DIR/masque.toml" \
     >"$BENCH_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 

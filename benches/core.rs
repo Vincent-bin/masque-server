@@ -149,10 +149,7 @@ fn main() {
     // retires bytes it has already consumed.
     let mut capsule_burst = Vec::new();
     for _ in 0..32 {
-        capsule_encoder::encode(
-            &CapsuleFrame::Datagram(vec![0x3c; 64]),
-            &mut capsule_burst,
-        );
+        capsule_encoder::encode(&CapsuleFrame::Datagram(vec![0x3c; 64]), &mut capsule_burst);
     }
     let burst_bytes = capsule_burst.len();
     let mut burst_decoder = CapsuleDecoder::new();

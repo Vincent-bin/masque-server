@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use base64::engine::general_purpose::STANDARD;
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
-use masque::capsule::decoder::CapsuleDecoder;
+use base64::engine::general_purpose::STANDARD;
 use masque::capsule::CapsuleFrame;
+use masque::capsule::decoder::CapsuleDecoder;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use tracing::{error, info, warn};
@@ -211,7 +211,7 @@ impl Client {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    break
+                    break;
                 }
                 Err(e) => bail!("socket recv: {e}"),
             }
@@ -909,11 +909,7 @@ fn test_standard_connect_early_body(server_addr: &str, echo_addr: &str) -> Resul
     if status != 200 {
         bail!("expected 200 for early CONNECT body, got {status}");
     }
-    let echoed = client.recv_body_bytes(
-        stream_id,
-        payload.len(),
-        Duration::from_secs(5),
-    )?;
+    let echoed = client.recv_body_bytes(stream_id, payload.len(), Duration::from_secs(5))?;
     if echoed != payload {
         bail!("early standard CONNECT payload mismatch");
     }
@@ -1005,7 +1001,6 @@ fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
     Ok(())
 }
 
-
 /// Saturating multi-connection load generator.
 ///
 /// The single-connection benchmark cannot show anything about how work is
@@ -1094,14 +1089,9 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
                 }
 
                 let mut buf = [0u8; BUF_SIZE];
-                loop {
-                    match client.quic.dgram_recv(&mut buf) {
-                        Ok(_) => {
-                            received += 1;
-                            inflight = inflight.saturating_sub(1);
-                        }
-                        Err(_) => break,
-                    }
+                while client.quic.dgram_recv(&mut buf).is_ok() {
+                    received += 1;
+                    inflight = inflight.saturating_sub(1);
                 }
             }
 
@@ -1140,9 +1130,8 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     if !setup_latencies.is_empty() {
         setup_latencies.sort_by(f64::total_cmp);
         let average = setup_latencies.iter().sum::<f64>() / setup_latencies.len() as f64;
-        let percentile = |p: f64| {
-            setup_latencies[((setup_latencies.len() - 1) as f64 * p) as usize]
-        };
+        let percentile =
+            |p: f64| setup_latencies[((setup_latencies.len() - 1) as f64 * p) as usize];
         println!(
             "  per-connection setup: avg {average:.1} ms   p50 {:.1} ms   p95 {:.1} ms   p99 {:.1} ms",
             percentile(0.50),
@@ -1624,7 +1613,8 @@ fn main() {
         return;
     }
 
-    let tests: &[(&str, fn(&str, &str) -> Result<()>)] = &[
+    type E2eTest = fn(&str, &str) -> Result<()>;
+    let tests: &[(&str, E2eTest)] = &[
         ("server_capabilities", test_server_capabilities),
         (
             "standard_connect_auth_required",

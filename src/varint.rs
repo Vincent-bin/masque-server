@@ -54,8 +54,7 @@ pub fn decode(buf: &[u8]) -> Result<(u64, usize), Error> {
             u64::from(val)
         }
         4 => {
-            let val =
-                u32::from_be_bytes([first & 0x3f, buf[1], buf[2], buf[3]]);
+            let val = u32::from_be_bytes([first & 0x3f, buf[1], buf[2], buf[3]]);
             u64::from(val)
         }
         8 => u64::from_be_bytes([
@@ -297,8 +296,17 @@ mod tests {
 
     #[test]
     fn roundtrip_all_lengths() {
-        let test_values: &[u64] =
-            &[0, 1, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, MAX_VALUE];
+        let test_values: &[u64] = &[
+            0,
+            1,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            MAX_VALUE,
+        ];
 
         for &v in test_values {
             let mut buf = [0u8; 8];

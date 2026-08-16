@@ -2,14 +2,14 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::policy::TargetPolicy;
@@ -278,14 +278,7 @@ impl TcpTunnel {
             return false;
         }
         let len = data.len();
-        let reserved = self.queued_client_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued
-                    .checked_add(len)
-                    .filter(|new_len| *new_len <= MAX_BUFFERED_CLIENT_BYTES)
-            })
-            .is_ok();
-        if !reserved {
+        if !reserve_bounded(&self.queued_client_bytes, len, MAX_BUFFERED_CLIENT_BYTES) {
             return false;
         }
 
@@ -314,7 +307,8 @@ impl TcpTunnel {
         if self.response_finished {
             return false;
         }
-        self.pending_responses.push_back(PendingTcpResponse { data, offset: 0 });
+        self.pending_responses
+            .push_back(PendingTcpResponse { data, offset: 0 });
         self.last_activity = Instant::now();
         true
     }
@@ -348,6 +342,23 @@ impl TcpTunnel {
 
     pub fn is_idle(&self, timeout: Duration) -> bool {
         self.last_activity.elapsed() > timeout
+    }
+}
+
+/// Atomically reserve `amount` without allowing the counter to exceed `limit`.
+///
+/// This uses the long-standing compare-exchange API so the crate keeps its
+/// Rust 1.88 MSRV; newer `try_update` is not available there.
+fn reserve_bounded(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -388,14 +399,13 @@ async fn resolve_and_connect(
     timeout: Duration,
 ) -> Result<(TcpStream, SocketAddr), TcpSetupFailure> {
     let setup = async {
-        let addrs: Vec<SocketAddr> =
-            tokio::net::lookup_host((target.host.as_str(), target.port))
-                .await
-                .map_err(|error| TcpSetupFailure {
-                    status: 502,
-                    reason: format!("target DNS resolution failed: {error}"),
-                })?
-                .collect();
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((target.host.as_str(), target.port))
+            .await
+            .map_err(|error| TcpSetupFailure {
+                status: 502,
+                reason: format!("target DNS resolution failed: {error}"),
+            })?
+            .collect();
 
         if addrs.is_empty() {
             return Err(TcpSetupFailure {
@@ -486,7 +496,12 @@ mod tests {
 
         tunnel.queue_response(Bytes::from_static(b"0123456789"));
         // Simulate the reader having reserved these bytes.
-        tunnel.response_credit.acquire_many(10).await.unwrap().forget();
+        tunnel
+            .response_credit
+            .acquire_many(10)
+            .await
+            .unwrap()
+            .forget();
         assert_eq!(tunnel.response_credit.available_permits(), before - 10);
 
         tunnel.advance_response(4);

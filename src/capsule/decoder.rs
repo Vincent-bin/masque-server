@@ -53,8 +53,7 @@ impl CapsuleDecoder {
         // Drop the already-decoded prefix before appending, rather than
         // memmoving the remainder after every single capsule.
         if self.consumed > 0
-            && (self.consumed >= COMPACT_THRESHOLD
-                || self.consumed == self.buf.len())
+            && (self.consumed >= COMPACT_THRESHOLD || self.consumed == self.buf.len())
         {
             self.buf.drain(..self.consumed);
             self.consumed = 0;
@@ -92,12 +91,10 @@ impl Default for CapsuleDecoder {
 /// Try to decode one capsule from `buf`. Returns `(frame, bytes_consumed)`.
 fn try_decode_one(buf: &[u8]) -> Result<(CapsuleFrame, usize), DecodeError> {
     // Parse Type varint
-    let (capsule_type, tlen) =
-        varint::decode(buf).map_err(|_| DecodeError::Incomplete)?;
+    let (capsule_type, tlen) = varint::decode(buf).map_err(|_| DecodeError::Incomplete)?;
 
     // Parse Length varint
-    let (length, llen) =
-        varint::decode(&buf[tlen..]).map_err(|_| DecodeError::Incomplete)?;
+    let (length, llen) = varint::decode(&buf[tlen..]).map_err(|_| DecodeError::Incomplete)?;
 
     let header_len = tlen + llen;
     let total_len = header_len + length as usize;
@@ -113,10 +110,7 @@ fn try_decode_one(buf: &[u8]) -> Result<(CapsuleFrame, usize), DecodeError> {
 }
 
 /// Interpret the capsule value bytes based on the type.
-fn parse_capsule_value(
-    capsule_type: u64,
-    value: &[u8],
-) -> Result<CapsuleFrame, DecodeError> {
+fn parse_capsule_value(capsule_type: u64, value: &[u8]) -> Result<CapsuleFrame, DecodeError> {
     match capsule_type {
         CAPSULE_DATAGRAM => Ok(CapsuleFrame::Datagram(value.to_vec())),
 
@@ -143,9 +137,7 @@ fn parse_capsule_value(
 }
 
 /// Parse ADDRESS_ASSIGN / ADDRESS_REQUEST value.
-fn parse_assigned_addresses(
-    mut buf: &[u8],
-) -> Result<Vec<AssignedAddress>, DecodeError> {
+fn parse_assigned_addresses(mut buf: &[u8]) -> Result<Vec<AssignedAddress>, DecodeError> {
     let mut addrs = Vec::new();
 
     while !buf.is_empty() {
@@ -175,9 +167,7 @@ fn parse_assigned_addresses(
                 (IpAddress::V6(Ipv6Addr::from(octets)), 16)
             }
             v => {
-                return Err(DecodeError::Malformed(
-                    format!("invalid ip_version: {v}"),
-                ));
+                return Err(DecodeError::Malformed(format!("invalid ip_version: {v}")));
             }
         };
         buf = &buf[addr_len..];
@@ -188,16 +178,18 @@ fn parse_assigned_addresses(
         let prefix_len = buf[0];
         buf = &buf[1..];
 
-        addrs.push(AssignedAddress { request_id, ip, prefix_len });
+        addrs.push(AssignedAddress {
+            request_id,
+            ip,
+            prefix_len,
+        });
     }
 
     Ok(addrs)
 }
 
 /// Parse ROUTE_ADVERTISEMENT value.
-fn parse_address_ranges(
-    mut buf: &[u8],
-) -> Result<Vec<IpAddressRange>, DecodeError> {
+fn parse_address_ranges(mut buf: &[u8]) -> Result<Vec<IpAddressRange>, DecodeError> {
     let mut ranges = Vec::new();
 
     while !buf.is_empty() {
@@ -210,9 +202,7 @@ fn parse_address_ranges(
         let (start, end, addr_len) = match ip_version {
             4 => {
                 if buf.len() < 8 {
-                    return Err(DecodeError::Malformed(
-                        "truncated IPv4 range".into(),
-                    ));
+                    return Err(DecodeError::Malformed("truncated IPv4 range".into()));
                 }
                 let start = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
                 let end = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
@@ -220,9 +210,7 @@ fn parse_address_ranges(
             }
             6 => {
                 if buf.len() < 32 {
-                    return Err(DecodeError::Malformed(
-                        "truncated IPv6 range".into(),
-                    ));
+                    return Err(DecodeError::Malformed("truncated IPv6 range".into()));
                 }
                 let start: [u8; 16] = buf[..16].try_into().unwrap();
                 let end: [u8; 16] = buf[16..32].try_into().unwrap();
@@ -233,9 +221,7 @@ fn parse_address_ranges(
                 )
             }
             v => {
-                return Err(DecodeError::Malformed(
-                    format!("invalid ip_version: {v}"),
-                ));
+                return Err(DecodeError::Malformed(format!("invalid ip_version: {v}")));
             }
         };
         buf = &buf[addr_len..];
@@ -246,7 +232,11 @@ fn parse_address_ranges(
         let ip_protocol = buf[0];
         buf = &buf[1..];
 
-        ranges.push(IpAddressRange { start, end, ip_protocol });
+        ranges.push(IpAddressRange {
+            start,
+            end,
+            ip_protocol,
+        });
     }
 
     Ok(ranges)
@@ -360,8 +350,7 @@ mod tests {
         let original = CapsuleFrame::RouteAdvertisement(vec![IpAddressRange {
             start: IpAddress::V6(Ipv6Addr::UNSPECIFIED),
             end: IpAddress::V6(Ipv6Addr::new(
-                0xffff, 0xffff, 0xffff, 0xffff,
-                0xffff, 0xffff, 0xffff, 0xffff,
+                0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
             )),
             ip_protocol: 0,
         }]);
@@ -507,8 +496,7 @@ mod tests {
     #[test]
     fn malformed_route_bad_ip_version() {
         let mut wire = Vec::new();
-        crate::varint::encode_to_vec(CAPSULE_ROUTE_ADVERTISEMENT, &mut wire)
-            .unwrap();
+        crate::varint::encode_to_vec(CAPSULE_ROUTE_ADVERTISEMENT, &mut wire).unwrap();
         let value = vec![5]; // invalid ip_version
         crate::varint::encode_to_vec(value.len() as u64, &mut wire).unwrap();
         wire.extend_from_slice(&value);
@@ -521,8 +509,7 @@ mod tests {
     #[test]
     fn malformed_route_truncated_v4_range() {
         let mut wire = Vec::new();
-        crate::varint::encode_to_vec(CAPSULE_ROUTE_ADVERTISEMENT, &mut wire)
-            .unwrap();
+        crate::varint::encode_to_vec(CAPSULE_ROUTE_ADVERTISEMENT, &mut wire).unwrap();
         // ip_version=4, but only 4 bytes (need 8 for start+end)
         let value = vec![4, 0, 0, 0, 0];
         crate::varint::encode_to_vec(value.len() as u64, &mut wire).unwrap();

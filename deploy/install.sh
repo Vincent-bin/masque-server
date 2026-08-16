@@ -6,7 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PACKAGE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 GENERATED_PASSWORD=0
 
 generate_auth_credentials() {

@@ -6,7 +6,6 @@ use std::io;
 #[derive(Debug, thiserror::Error)]
 pub enum MasqueError {
     // ── Transport layer ───────────────────────────────────────────────
-
     #[error("QUIC error: {0}")]
     Quic(#[from] quiche::Error),
 
@@ -14,7 +13,6 @@ pub enum MasqueError {
     H3(#[from] quiche::h3::Error),
 
     // ── Tunnel layer ──────────────────────────────────────────────────
-
     #[error("invalid URI template path: {0}")]
     BadRequest(String),
 
@@ -28,12 +26,10 @@ pub enum MasqueError {
     UpstreamConnect(io::Error),
 
     // ── Capsule layer ─────────────────────────────────────────────────
-
     #[error("malformed capsule: {0}")]
     CapsuleDecode(String),
 
     // ── TUN layer ─────────────────────────────────────────────────────
-
     #[error("TUN device error: {0}")]
     Tun(io::Error),
 
@@ -41,7 +37,6 @@ pub enum MasqueError {
     AddressPoolExhausted,
 
     // ── Generic I/O ───────────────────────────────────────────────────
-
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
@@ -100,7 +95,7 @@ mod tests {
     fn dns_resolution_maps_to_502() {
         let err = MasqueError::DnsResolution {
             host: "bad.example".into(),
-            source: io::Error::new(io::ErrorKind::Other, "nxdomain"),
+            source: io::Error::other("nxdomain"),
         };
         assert_eq!(err.http_status(), 502);
     }
@@ -122,19 +117,13 @@ mod tests {
 
     #[test]
     fn io_error_maps_to_500() {
-        let err = MasqueError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "unexpected",
-        ));
+        let err = MasqueError::Io(io::Error::other("unexpected"));
         assert_eq!(err.http_status(), 500);
     }
 
     #[test]
     fn tun_error_maps_to_500() {
-        let err = MasqueError::Tun(io::Error::new(
-            io::ErrorKind::Other,
-            "device gone",
-        ));
+        let err = MasqueError::Tun(io::Error::other("device gone"));
         assert_eq!(err.http_status(), 500);
     }
 

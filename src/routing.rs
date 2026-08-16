@@ -233,10 +233,7 @@ mod tests {
     #[test]
     fn remove_by_owner_no_match() {
         let mut rt = RoutingTable::new();
-        rt.insert(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            owner(1, 4),
-        );
+        rt.insert(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), owner(1, 4));
         let removed = rt.remove_by_owner(&owner(99, 0));
         assert!(removed.is_empty());
         assert_eq!(rt.len(), 1);

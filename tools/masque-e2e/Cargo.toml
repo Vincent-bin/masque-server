@@ -8,7 +8,7 @@ name = "masque-e2e"
 path = "src/main.rs"
 
 [dependencies]
-masque = { path = "../../.." }
+masque = { package = "masque-server", path = "../.." }
 quiche = "0.29.3"
 anyhow = "1"
 base64 = "0.22.1"

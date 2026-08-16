@@ -890,9 +890,10 @@ mod tests {
     async fn batched_socket_preserves_datagram_boundaries() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender = QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
-            .await
-            .unwrap();
+        let mut sender =
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
+                .await
+                .unwrap();
 
         let mut batch = SendPacketBatch::new();
         batch.push(&[1; 1200], send_info(target), sender.udp_gso, 10_000);
@@ -918,15 +919,10 @@ mod tests {
         const SHARDS: usize = 4;
         const SENDERS: usize = 64;
 
-        let first = QuicUdpSocket::bind_shared(
-            "127.0.0.1:0".parse().unwrap(),
-            1350,
-            false,
-            false,
-            true,
-        )
-        .await
-        .unwrap();
+        let first =
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, true)
+                .await
+                .unwrap();
         let target = first.local_addr().unwrap();
 
         let mut shards = vec![first];
@@ -974,13 +970,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn recvmmsg_and_gro_restore_logical_packets() {
-        let receiver = QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
-            .await
-            .unwrap();
+        let receiver =
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
+                .await
+                .unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender = QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
-            .await
-            .unwrap();
+        let mut sender =
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
+                .await
+                .unwrap();
 
         let mut outgoing = SendPacketBatch::new();
         outgoing.push(&[1; 1200], send_info(target), sender.udp_gso, 10_000);

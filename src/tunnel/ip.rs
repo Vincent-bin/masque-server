@@ -90,7 +90,8 @@ mod tests {
     #[test]
     fn owns_address_v4_no_match() {
         let mut t = IpTunnel::new(0);
-        t.assigned_addrs.push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        t.assigned_addrs
+            .push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         assert!(!t.owns_address(&other));
     }

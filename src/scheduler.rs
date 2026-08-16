@@ -181,7 +181,10 @@ mod tests {
         timers.schedule(2, now + Duration::from_millis(10));
         timers.schedule(3, now + Duration::from_millis(30));
 
-        assert_eq!(timers.next_deadline(), Some(now + Duration::from_millis(10)));
+        assert_eq!(
+            timers.next_deadline(),
+            Some(now + Duration::from_millis(10))
+        );
     }
 
     #[test]
@@ -193,12 +196,17 @@ mod tests {
         timers.schedule(3, now + Duration::from_millis(50));
 
         let mut fired = Vec::new();
-        timers.expire(now + Duration::from_millis(30), |index, _| fired.push(index));
+        timers.expire(now + Duration::from_millis(30), |index, _| {
+            fired.push(index)
+        });
 
         assert_eq!(fired, [2, 1]);
         // The future entry is untouched.
         assert_eq!(timers.len(), 1);
-        assert_eq!(timers.next_deadline(), Some(now + Duration::from_millis(50)));
+        assert_eq!(
+            timers.next_deadline(),
+            Some(now + Duration::from_millis(50))
+        );
     }
 
     #[test]

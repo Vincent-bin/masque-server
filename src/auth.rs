@@ -127,8 +127,7 @@ pub fn hash_password(password: &[u8]) -> anyhow::Result<String> {
     ring::rand::SystemRandom::new()
         .fill(&mut salt_bytes)
         .map_err(|_| anyhow::anyhow!("failed to generate password salt"))?;
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .context("failed to encode password salt")?;
+    let salt = SaltString::encode_b64(&salt_bytes).context("failed to encode password salt")?;
 
     Ok(Argon2::new(
         Algorithm::Argon2id,
@@ -165,7 +164,11 @@ mod tests {
     }
 
     fn authorization(username: &str, password: &str) -> Vec<u8> {
-        format!("Basic {}", STANDARD.encode(format!("{username}:{password}"))).into_bytes()
+        format!(
+            "Basic {}",
+            STANDARD.encode(format!("{username}:{password}"))
+        )
+        .into_bytes()
     }
 
     #[test]

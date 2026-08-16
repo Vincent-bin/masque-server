@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, Clippy, and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component clippy,rustfmt
+          rustup default stable
+
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake shellcheck
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check shell scripts
+        run: shellcheck deploy/install.sh scripts/*.sh tests/e2e/*.sh
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Linux native tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  release-build:
+    name: Linux musl release build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake musl-tools
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install Zig cross-linker
+        run: |
+          python3 -m pip install --user cargo-zigbuild==0.23.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build archive
+        env:
+          TARGET: x86_64-unknown-linux-musl
+          USE_ZIGBUILD: "1"
+          VERSION: ci-${{ github.sha }}
+        run: scripts/package-linux.sh
+
+      - name: Inspect archive
+        run: |
+          tar tzf dist/masque-vci-${GITHUB_SHA}-linux-x86_64.tar.gz
+          cd dist
+          sha256sum --check \
+            masque-vci-${GITHUB_SHA}-linux-x86_64.tar.gz.sha256

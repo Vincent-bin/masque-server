@@ -7,15 +7,15 @@ cd "$(dirname "$0")/.."
 bash scripts/gen-certs.sh
 
 # 2. Build images.
-docker compose -f docker-compose.e2e.yml build
+docker compose -f tests/e2e/compose.yml build
 
 # 3. Run the test suite.
 EXIT_CODE=0
-docker compose -f docker-compose.e2e.yml up \
+docker compose -f tests/e2e/compose.yml up \
     --abort-on-container-exit \
     --exit-code-from test || EXIT_CODE=$?
 
 # 4. Clean up.
-docker compose -f docker-compose.e2e.yml down --volumes --remove-orphans
+docker compose -f tests/e2e/compose.yml down --volumes --remove-orphans
 
 exit "$EXIT_CODE"

@@ -21,7 +21,10 @@ pub fn encode(frame: &CapsuleFrame, buf: &mut Vec<u8>) {
             let value = encode_address_ranges(ranges);
             encode_raw(CAPSULE_ROUTE_ADVERTISEMENT, &value, buf);
         }
-        CapsuleFrame::Unknown { capsule_type, value } => {
+        CapsuleFrame::Unknown {
+            capsule_type,
+            value,
+        } => {
             encode_raw(*capsule_type, value, buf);
         }
     }
@@ -30,8 +33,7 @@ pub fn encode(frame: &CapsuleFrame, buf: &mut Vec<u8>) {
 /// Encode a raw capsule: Type(varint) + Length(varint) + Value.
 fn encode_raw(capsule_type: u64, value: &[u8], buf: &mut Vec<u8>) {
     varint::encode_to_vec(capsule_type, buf).expect("capsule type fits varint");
-    varint::encode_to_vec(value.len() as u64, buf)
-        .expect("capsule length fits varint");
+    varint::encode_to_vec(value.len() as u64, buf).expect("capsule length fits varint");
     buf.extend_from_slice(value);
 }
 
@@ -39,8 +41,7 @@ fn encode_raw(capsule_type: u64, value: &[u8], buf: &mut Vec<u8>) {
 fn encode_assigned_addresses(addrs: &[AssignedAddress]) -> Vec<u8> {
     let mut value = Vec::new();
     for addr in addrs {
-        varint::encode_to_vec(addr.request_id, &mut value)
-            .expect("request_id fits varint");
+        varint::encode_to_vec(addr.request_id, &mut value).expect("request_id fits varint");
         match &addr.ip {
             IpAddress::V4(v4) => {
                 value.push(4); // IP Version
@@ -118,11 +119,11 @@ mod tests {
         // Type=0x01, then Length varint, then:
         //   request_id=1(1B) + ip_version=4(1B) + addr(4B) + prefix(1B) = 7
         assert_eq!(buf[0], 0x01); // type = ADDRESS_ASSIGN
-        assert_eq!(buf[1], 7);    // length
-        assert_eq!(buf[2], 1);    // request_id
-        assert_eq!(buf[3], 4);    // ip version
+        assert_eq!(buf[1], 7); // length
+        assert_eq!(buf[2], 1); // request_id
+        assert_eq!(buf[3], 4); // ip version
         assert_eq!(&buf[4..8], &[10, 89, 0, 1]); // address
-        assert_eq!(buf[8], 32);   // prefix length
+        assert_eq!(buf[8], 32); // prefix length
     }
 
     #[test]
@@ -138,8 +139,8 @@ mod tests {
 
         // request_id=0(1B) + ip_version=6(1B) + addr(16B) + prefix(1B) = 19
         assert_eq!(buf[0], 0x01); // type
-        assert_eq!(buf[1], 19);   // length
-        assert_eq!(buf[3], 6);    // ip version
+        assert_eq!(buf[1], 19); // length
+        assert_eq!(buf[3], 6); // ip version
     }
 
     #[test]
@@ -163,7 +164,7 @@ mod tests {
         encode(&frame, &mut buf);
 
         assert_eq!(buf[0], 0x02); // type = ADDRESS_REQUEST
-        assert_eq!(buf[2], 42);   // request_id
+        assert_eq!(buf[2], 42); // request_id
     }
 
     #[test]
@@ -178,18 +179,19 @@ mod tests {
 
         // ip_version(1B) + start(4B) + end(4B) + protocol(1B) = 10
         assert_eq!(buf[0], 0x03); // type = ROUTE_ADVERTISEMENT
-        assert_eq!(buf[1], 10);   // length
-        assert_eq!(buf[2], 4);    // ip version
+        assert_eq!(buf[1], 10); // length
+        assert_eq!(buf[2], 4); // ip version
         assert_eq!(&buf[3..7], &[0, 0, 0, 0]);
         assert_eq!(&buf[7..11], &[255, 255, 255, 255]);
-        assert_eq!(buf[11], 0);   // protocol
+        assert_eq!(buf[11], 0); // protocol
     }
 
     #[test]
     fn encode_route_advertisement_v6() {
         let start = Ipv6Addr::UNSPECIFIED;
-        let end = Ipv6Addr::new(0xffff, 0xffff, 0xffff, 0xffff,
-                                0xffff, 0xffff, 0xffff, 0xffff);
+        let end = Ipv6Addr::new(
+            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        );
         let frame = CapsuleFrame::RouteAdvertisement(vec![IpAddressRange {
             start: IpAddress::V6(start),
             end: IpAddress::V6(end),
@@ -224,7 +226,7 @@ mod tests {
         // Each address: request_id(1) + version(1) + addr(4) + prefix(1) = 7
         // Two addresses = 14 bytes value
         assert_eq!(buf[0], 0x01); // type
-        assert_eq!(buf[1], 14);   // length
+        assert_eq!(buf[1], 14); // length
     }
 
     #[test]

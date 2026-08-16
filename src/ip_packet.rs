@@ -74,11 +74,7 @@ pub fn dst_addr(packet: &[u8]) -> Result<IpAddr, ParseError> {
 /// Read the address at `v4_offset` (IPv4) or `v6_offset` (IPv6), after the
 /// same header validation `parse` performs.
 #[inline]
-fn addr_at(
-    packet: &[u8],
-    v4_offset: usize,
-    v6_offset: usize,
-) -> Result<IpAddr, ParseError> {
+fn addr_at(packet: &[u8], v4_offset: usize, v6_offset: usize) -> Result<IpAddr, ParseError> {
     let version = *packet.first().ok_or(ParseError::TooShort)? >> 4;
     match version {
         4 => {
@@ -92,16 +88,14 @@ fn addr_at(
             if packet.len() < (ihl as usize) * 4 {
                 return Err(ParseError::Truncated);
             }
-            let octets: [u8; 4] =
-                packet[v4_offset..v4_offset + 4].try_into().unwrap();
+            let octets: [u8; 4] = packet[v4_offset..v4_offset + 4].try_into().unwrap();
             Ok(IpAddr::V4(Ipv4Addr::from(octets)))
         }
         6 => {
             if packet.len() < 40 {
                 return Err(ParseError::TooShort);
             }
-            let octets: [u8; 16] =
-                packet[v6_offset..v6_offset + 16].try_into().unwrap();
+            let octets: [u8; 16] = packet[v6_offset..v6_offset + 16].try_into().unwrap();
             Ok(IpAddr::V6(Ipv6Addr::from(octets)))
         }
         v => Err(ParseError::UnknownVersion(v)),
@@ -283,11 +277,7 @@ mod tests {
 
     #[test]
     fn parse_v4_exactly_20_bytes() {
-        let pkt = make_v4_packet(
-            Ipv4Addr::new(127, 0, 0, 1),
-            Ipv4Addr::new(127, 0, 0, 1),
-            6,
-        );
+        let pkt = make_v4_packet(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(127, 0, 0, 1), 6);
         assert_eq!(pkt.len(), 20);
         assert!(parse(&pkt).is_ok());
     }
@@ -358,11 +348,7 @@ mod tests {
 
     #[test]
     fn src_addr_v4() {
-        let pkt = make_v4_packet(
-            Ipv4Addr::new(10, 0, 0, 5),
-            Ipv4Addr::new(10, 0, 0, 1),
-            17,
-        );
+        let pkt = make_v4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1), 17);
         assert_eq!(
             src_addr(&pkt).unwrap(),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))
@@ -378,11 +364,7 @@ mod tests {
 
     #[test]
     fn addr_shortcuts_agree_with_full_parse() {
-        let v4 = make_v4_packet(
-            Ipv4Addr::new(10, 0, 0, 5),
-            Ipv4Addr::new(8, 8, 8, 8),
-            6,
-        );
+        let v4 = make_v4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(8, 8, 8, 8), 6);
         let v6 = make_v6_packet(
             "fd00::1".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
@@ -400,9 +382,9 @@ mod tests {
             &bad_ihl,
             &truncated_v4,
             &[],
-            &[0x45],           // v4 header cut short
-            &v6[..20],         // v6 header cut short
-            &[0x70, 0, 0, 0],  // unknown version
+            &[0x45],          // v4 header cut short
+            &v6[..20],        // v6 header cut short
+            &[0x70, 0, 0, 0], // unknown version
         ];
 
         for pkt in cases {

@@ -103,7 +103,12 @@ mod tests {
     fn deny_private_ranges() {
         let p = policy(
             &["0.0.0.0/0"],
-            &["127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"],
+            &[
+                "127.0.0.0/8",
+                "10.0.0.0/8",
+                "192.168.0.0/16",
+                "172.16.0.0/12",
+            ],
         );
         assert!(p.is_allowed(Ipv4Addr::new(8, 8, 8, 8).into()));
         assert!(!p.is_allowed(Ipv4Addr::new(10, 1, 2, 3).into()));
@@ -132,18 +137,14 @@ mod tests {
     #[test]
     fn ipv6_allow_all() {
         let p = policy(&["0.0.0.0/0", "::/0"], &[]);
-        assert!(p.is_allowed(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
-        ))));
+        assert!(p.is_allowed(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,))));
     }
 
     #[test]
     fn ipv6_deny_loopback() {
         let p = policy(&["::/0"], &["::1/128"]);
         assert!(!p.is_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(p.is_allowed(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
-        ))));
+        assert!(p.is_allowed(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,))));
     }
 
     #[test]

@@ -52,10 +52,8 @@ pub struct HttpDatagramRef<'a> {
 
 /// Decode an HTTP Datagram without allocating or copying its payload.
 pub fn decode_ref(buf: &[u8]) -> Result<HttpDatagramRef<'_>, DatagramError> {
-    let (qsid, qlen) =
-        varint::decode(buf).map_err(|_| DatagramError::TooShort)?;
-    let (context_id, clen) = varint::decode(&buf[qlen..])
-        .map_err(|_| DatagramError::TooShort)?;
+    let (qsid, qlen) = varint::decode(buf).map_err(|_| DatagramError::TooShort)?;
+    let (context_id, clen) = varint::decode(&buf[qlen..]).map_err(|_| DatagramError::TooShort)?;
 
     Ok(HttpDatagramRef {
         stream_id: qsid * 4,
@@ -77,21 +75,19 @@ pub fn decode(buf: &[u8]) -> Result<HttpDatagram, DatagramError> {
 
 /// Encode an HTTP Datagram into a QUIC DATAGRAM frame payload.
 pub fn encode(dgram: &HttpDatagram) -> Result<Vec<u8>, DatagramError> {
-    if dgram.stream_id % 4 != 0 {
+    if !dgram.stream_id.is_multiple_of(4) {
         return Err(DatagramError::InvalidStreamId(dgram.stream_id));
     }
 
     let qsid = dgram.stream_id / 4;
     let header_len = varint::encoded_len(qsid)
         .map_err(|_| DatagramError::InvalidStreamId(dgram.stream_id))?
-        + varint::encoded_len(dgram.context_id)
-            .map_err(|_| DatagramError::TooShort)?;
+        + varint::encoded_len(dgram.context_id).map_err(|_| DatagramError::TooShort)?;
     let mut buf = Vec::with_capacity(header_len + dgram.payload.len());
 
     varint::encode_to_vec(qsid, &mut buf)
         .map_err(|_| DatagramError::InvalidStreamId(dgram.stream_id))?;
-    varint::encode_to_vec(dgram.context_id, &mut buf)
-        .map_err(|_| DatagramError::TooShort)?;
+    varint::encode_to_vec(dgram.context_id, &mut buf).map_err(|_| DatagramError::TooShort)?;
     buf.extend_from_slice(&dgram.payload);
 
     Ok(buf)
@@ -114,7 +110,7 @@ impl DatagramHeader {
     /// Build the header for `stream_id`, which must be a client-initiated
     /// bidirectional stream.
     pub fn new(stream_id: u64) -> Result<Self, DatagramError> {
-        if stream_id % 4 != 0 {
+        if !stream_id.is_multiple_of(4) {
             return Err(DatagramError::InvalidStreamId(stream_id));
         }
 
@@ -202,7 +198,7 @@ mod tests {
         // stream_id=400 -> qsid=100
         let mut buf = Vec::new();
         varint::encode_to_vec(100, &mut buf).unwrap(); // qsid
-        varint::encode_to_vec(0, &mut buf).unwrap();   // context_id
+        varint::encode_to_vec(0, &mut buf).unwrap(); // context_id
         buf.extend_from_slice(&[0xdd, 0xee]);
 
         let dgram = decode(&buf).unwrap();

@@ -3,14 +3,14 @@ services:
     image: python:3.12-slim
     command: ["python3", "/app/echo-server.py"]
     volumes:
-      - ./tests/e2e/echo-server.py:/app/echo-server.py:ro
+      - ./echo-server.py:/app/echo-server.py:ro
     networks:
       e2e:
         ipv4_address: 172.28.0.10
 
   server:
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile
     entrypoint: ["/entrypoint.sh"]
     command: ["-c", "/config/masque-e2e.toml", "-vv"]
@@ -21,9 +21,9 @@ services:
     sysctls:
       - net.ipv4.ip_forward=1
     volumes:
-      - ./certs:/certs:ro
-      - ./tests/e2e/masque-e2e.toml:/config/masque-e2e.toml:ro
-      - ./tests/e2e/server-entrypoint.sh:/entrypoint.sh:ro
+      - ../../certs:/certs:ro
+      - ./masque-e2e.toml:/config/masque-e2e.toml:ro
+      - ./server-entrypoint.sh:/entrypoint.sh:ro
     depends_on:
       - echo
     networks:
@@ -32,8 +32,8 @@ services:
 
   test:
     build:
-      context: .
-      dockerfile: Dockerfile.e2e
+      context: ../..
+      dockerfile: tests/e2e/client.Dockerfile
     environment:
       MASQUE_SERVER_ADDR: "172.28.0.20:4433"
       ECHO_SERVER_ADDR: "172.28.0.10:9999"

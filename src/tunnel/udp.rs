@@ -11,9 +11,9 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::tunnel::target_io::TARGET_BATCH_SIZE;
 #[cfg(target_os = "linux")]
-use crate::tunnel::target_io;
+use crate::net::target_udp;
+use crate::net::target_udp::TARGET_BATCH_SIZE;
 
 /// State for a single CONNECT-UDP tunnel.
 pub struct UdpTunnel {
@@ -45,10 +45,7 @@ pub struct UdpTunnel {
 impl UdpTunnel {
     /// Create a new UDP tunnel by binding a local socket and connecting it to
     /// the target.
-    pub async fn new(
-        stream_id: u64,
-        target_addr: SocketAddr,
-    ) -> std::io::Result<Self> {
+    pub async fn new(stream_id: u64, target_addr: SocketAddr) -> std::io::Result<Self> {
         // Bind to an ephemeral port. Use 0.0.0.0 for IPv4 targets, [::] for IPv6.
         let bind_addr: SocketAddr = if target_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -127,7 +124,8 @@ impl UdpTunnel {
     /// Returns true when the batch is full and the caller should flush.
     pub fn stage_to_target(&mut self, payload: &[u8]) -> bool {
         if self.staged == self.send_stage.len() {
-            self.send_stage.push(Vec::with_capacity(payload.len().max(1_500)));
+            self.send_stage
+                .push(Vec::with_capacity(payload.len().max(1_500)));
         }
         let buffer = &mut self.send_stage[self.staged];
         buffer.clear();
@@ -157,7 +155,7 @@ impl UdpTunnel {
             use std::os::fd::AsRawFd;
             // SAFETY: The socket is live, connected, and nonblocking.
             let sent = unsafe {
-                target_io::send_mmsg(self.send_socket.as_raw_fd(), &self.send_stage[..staged])
+                target_udp::send_mmsg(self.send_socket.as_raw_fd(), &self.send_stage[..staged])
             }?;
             if sent < staged {
                 debug!(
