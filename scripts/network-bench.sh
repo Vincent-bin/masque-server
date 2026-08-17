@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 BENCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/masque-network-bench.XXXXXX")"
 SERVER_PID=""
 ECHO_PID=""
+HTTP_PID=""
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
@@ -15,6 +16,10 @@ cleanup() {
     if [ -n "$ECHO_PID" ]; then
         kill "$ECHO_PID" 2>/dev/null || true
         wait "$ECHO_PID" 2>/dev/null || true
+    fi
+    if [ -n "$HTTP_PID" ]; then
+        kill "$HTTP_PID" 2>/dev/null || true
+        wait "$HTTP_PID" 2>/dev/null || true
     fi
     rm -rf -- "$BENCH_DIR"
 }
@@ -56,6 +61,11 @@ EOF
 
 cargo build --workspace --release
 
+truncate -s 67108864 "$BENCH_DIR/masque-bench.bin"
+python3 -m http.server 9998 --bind 127.0.0.1 --directory "$BENCH_DIR" \
+    >"$BENCH_DIR/http.log" 2>&1 &
+HTTP_PID=$!
+
 MASQUE_ECHO_SERVER_ADDR=127.0.0.1:9999 \
 RUST_LOG=warn \
 target/release/masque-e2e >"$BENCH_DIR/echo.log" 2>&1 &
@@ -74,6 +84,16 @@ target/release/masque-e2e
 MASQUE_TCP_CHECK=1 \
 MASQUE_SERVER_ADDR=127.0.0.1:4433 \
 ECHO_SERVER_ADDR=127.0.0.1:9999 \
+MASQUE_USERNAME=test \
+MASQUE_PASSWORD=test-password \
+RUST_LOG=warn \
+target/release/masque-e2e
+
+MASQUE_TCP_DOWNLOAD=1 \
+MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+MASQUE_TCP_TARGET=127.0.0.1:9998 \
+MASQUE_TCP_DOWNLOAD_BYTES=67108864 \
+MASQUE_TCP_DOWNLOAD_REPEATS=2 \
 MASQUE_USERNAME=test \
 MASQUE_PASSWORD=test-password \
 RUST_LOG=warn \

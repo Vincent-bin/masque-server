@@ -1,6 +1,10 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -16,6 +20,175 @@ use tracing::{error, info, warn};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const BUF_SIZE: usize = 65535;
+const MAX_HTTP_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
+#[cfg(target_os = "macos")]
+const CLIENT_UDP_RECEIVE_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn tune_udp_receive_buffer(socket: &UdpSocket) {
+    // The macOS UDP default is roughly 768 KiB. A high-BDP download can fill
+    // that between scheduler wakeups, making the benchmark report kernel
+    // socket drops as QUIC/path performance. Keep the requested size below the
+    // default 8 MiB kern.ipc.maxsockbuf ceiling.
+    // SAFETY: the file descriptor and option pointer remain valid throughout
+    // the call, and SO_RCVBUF expects a `c_int` value.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&CLIENT_UDP_RECEIVE_BUFFER_SIZE as *const libc::c_int).cast(),
+            std::mem::size_of_val(&CLIENT_UDP_RECEIVE_BUFFER_SIZE) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not enlarge client UDP receive buffer"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bind_udp_socket_to_requested_interface(socket: &UdpSocket) -> Result<()> {
+    let Some(interface) = std::env::var_os("MASQUE_INTERFACE") else {
+        return Ok(());
+    };
+    let interface = interface
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("MASQUE_INTERFACE is not valid UTF-8"))?;
+    let interface_name =
+        CString::new(interface.as_str()).context("MASQUE_INTERFACE contains an embedded NUL")?;
+
+    // SAFETY: `interface_name` is a live, NUL-terminated C string.
+    let interface_index = unsafe { libc::if_nametoindex(interface_name.as_ptr()) };
+    if interface_index == 0 {
+        bail!("network interface {interface:?} does not exist");
+    }
+
+    // macOS routes sockets through a utun default route even when the intended
+    // proxy egress is the physical NIC. IP_BOUND_IF gives the benchmark client
+    // the same underlay path as a proxy application's own outbound socket.
+    // SAFETY: the file descriptor and pointer are valid for the duration of the
+    // call, and the option value has the `c_uint` type expected by IP_BOUND_IF.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&interface_index as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&interface_index) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("bind UDP socket to interface {interface}"));
+    }
+
+    info!(%interface, interface_index, "bound client socket to interface");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HttpDownloadResponse {
+    header: Vec<u8>,
+    header_complete: bool,
+    status: Option<u16>,
+    content_length: Option<u64>,
+    body_bytes: u64,
+    first_body_at: Option<Instant>,
+}
+
+impl HttpDownloadResponse {
+    fn new() -> Self {
+        Self {
+            header: Vec::with_capacity(4096),
+            header_complete: false,
+            status: None,
+            content_length: None,
+            body_bytes: 0,
+            first_body_at: None,
+        }
+    }
+
+    fn ingest(&mut self, data: &[u8], now: Instant) -> Result<()> {
+        if self.header_complete {
+            self.record_body(data.len(), now);
+            return Ok(());
+        }
+
+        self.header.extend_from_slice(data);
+        let Some(header_end) = self
+            .header
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| offset + 4)
+        else {
+            if self.header.len() > MAX_HTTP_RESPONSE_HEADER_SIZE {
+                bail!("HTTP response header exceeded {MAX_HTTP_RESPONSE_HEADER_SIZE} bytes");
+            }
+            return Ok(());
+        };
+
+        if header_end > MAX_HTTP_RESPONSE_HEADER_SIZE {
+            bail!("HTTP response header exceeded {MAX_HTTP_RESPONSE_HEADER_SIZE} bytes");
+        }
+
+        let header_text = std::str::from_utf8(&self.header[..header_end])
+            .context("HTTP response header is not UTF-8")?;
+        let mut lines = header_text.split("\r\n");
+        let status_line = lines.next().context("missing HTTP status line")?;
+        let status = status_line
+            .split_ascii_whitespace()
+            .nth(1)
+            .context("missing HTTP status code")?
+            .parse::<u16>()
+            .context("invalid HTTP status code")?;
+
+        let mut content_length = None;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .context("invalid HTTP Content-Length")?,
+                );
+            }
+        }
+
+        self.status = Some(status);
+        self.content_length = content_length;
+        self.header_complete = true;
+
+        let body_in_buffer = self.header.len() - header_end;
+        self.header.truncate(header_end);
+        self.record_body(body_in_buffer, now);
+        Ok(())
+    }
+
+    fn record_body(&mut self, len: usize, now: Instant) {
+        if len == 0 {
+            return;
+        }
+        self.first_body_at.get_or_insert(now);
+        self.body_bytes += len as u64;
+    }
+
+    fn expected_body_bytes(&self, configured: Option<u64>) -> Option<u64> {
+        configured.or(self.content_length)
+    }
+}
+
+#[derive(Debug)]
+struct TcpDownloadResult {
+    response: HttpDownloadResponse,
+    finished_at: Instant,
+    stream_finished: bool,
+}
 
 struct InFlight {
     sent_at: HashMap<u64, Instant>,
@@ -86,6 +259,11 @@ impl Client {
         let peer: SocketAddr = server_addr.parse().context("parse server addr")?;
 
         let socket = UdpSocket::bind("0.0.0.0:0")?;
+        #[cfg(target_os = "macos")]
+        {
+            tune_udp_receive_buffer(&socket);
+            bind_udp_socket_to_requested_interface(&socket)?;
+        }
         socket.connect(peer)?;
         let local = socket.local_addr()?;
 
@@ -101,16 +279,23 @@ impl Client {
         config.set_max_idle_timeout(30_000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
+        // A 1 MiB receive window caps a 140 ms path at roughly 60 Mbit/s until
+        // autotuning catches up. Match the production server's window ceilings
+        // so this client measures CONNECT throughput rather than its own flow
+        // control configuration.
+        config.set_initial_max_data(25_165_824);
+        config.set_initial_max_stream_data_bidi_local(16_777_216);
+        config.set_initial_max_stream_data_bidi_remote(4_194_304);
+        config.set_initial_max_stream_data_uni(4_194_304);
+        config.set_max_connection_window(25_165_824);
+        config.set_max_stream_window(16_777_216);
         config.set_initial_max_streams_bidi(128);
         config.set_initial_max_streams_uni(100);
         config.enable_pacing(true);
         config.enable_dgram(true, 1000, 1000);
 
-        let quic = quiche::connect(Some("server"), &scid, local, peer, &mut config)?;
+        let server_name = std::env::var("MASQUE_SERVER_NAME").unwrap_or_else(|_| "server".into());
+        let quic = quiche::connect(Some(&server_name), &scid, local, peer, &mut config)?;
 
         Ok(Client {
             socket,
@@ -619,6 +804,139 @@ impl Client {
         self.socket.set_nonblocking(false)?;
         Ok((sent, received, expired))
     }
+
+    /// Receive a large byte stream through a standard HTTP/3 CONNECT tunnel.
+    ///
+    /// The payload inside the tunnel is an HTTP/1.1 response. Headers are
+    /// parsed incrementally and excluded from the goodput figure. The socket is
+    /// drained until it would block on every loop iteration, avoiding the
+    /// one-packet-per-wakeup behavior that made older benchmarks latency-bound.
+    fn run_tcp_download(
+        &mut self,
+        stream_id: u64,
+        configured_body_bytes: Option<u64>,
+        timeout: Duration,
+    ) -> Result<TcpDownloadResult> {
+        self.socket.set_nonblocking(true)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut packet_buf = [0_u8; BUF_SIZE];
+        let mut body_buf = [0_u8; BUF_SIZE];
+        let mut response = HttpDownloadResponse::new();
+        let mut stream_finished = false;
+
+        loop {
+            let mut made_progress = false;
+
+            self.flush()?;
+
+            // Drain a bounded burst from the UDP socket. The bound prevents a
+            // permanently busy socket from starving HTTP/3 body consumption
+            // and the resulting flow-control updates.
+            for _ in 0..2048 {
+                match self.socket.recv(&mut packet_buf) {
+                    Ok(len) => {
+                        let info = quiche::RecvInfo {
+                            from: self.peer,
+                            to: self.local,
+                        };
+                        match self.quic.recv(&mut packet_buf[..len], info) {
+                            Ok(_) | Err(quiche::Error::Done) => {}
+                            Err(error) => bail!("QUIC receive during TCP download: {error}"),
+                        }
+                        made_progress = true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+
+            {
+                let h3 = self.h3.as_mut().context("H3 not initialised")?;
+                loop {
+                    match h3.poll(&mut self.quic) {
+                        Ok((sid, quiche::h3::Event::Data)) if sid == stream_id => loop {
+                            match h3.recv_body(&mut self.quic, stream_id, &mut body_buf) {
+                                Ok(len) => {
+                                    response.ingest(&body_buf[..len], Instant::now())?;
+                                    made_progress = true;
+                                }
+                                Err(quiche::h3::Error::Done) => break,
+                                Err(error) => bail!("receive CONNECT download body: {error}"),
+                            }
+                        },
+                        Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
+                            stream_finished = true;
+                            made_progress = true;
+                        }
+                        Ok((sid, quiche::h3::Event::Reset(code))) if sid == stream_id => {
+                            bail!("CONNECT download stream reset with code {code}");
+                        }
+                        Ok(_) => {
+                            made_progress = true;
+                        }
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) => bail!("poll CONNECT download stream: {error}"),
+                    }
+                }
+            }
+
+            self.flush()?;
+
+            if let Some(expected) = response.expected_body_bytes(configured_body_bytes) {
+                if response.body_bytes > expected {
+                    bail!(
+                        "received {} HTTP body bytes, expected {expected}",
+                        response.body_bytes
+                    );
+                }
+                if response.body_bytes == expected {
+                    break;
+                }
+            }
+
+            if stream_finished {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "CONNECT download timed out after receiving {} body bytes",
+                    response.body_bytes
+                );
+            }
+
+            if !made_progress {
+                if self.quic.timeout().is_some_and(|timeout| timeout.is_zero()) {
+                    self.quic.on_timeout();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        self.socket.set_nonblocking(false)?;
+
+        if !response.header_complete {
+            bail!("CONNECT tunnel closed before a complete HTTP response header arrived");
+        }
+        if response.status != Some(200) {
+            bail!("HTTP origin returned status {:?}", response.status);
+        }
+        if let Some(expected) = response.expected_body_bytes(configured_body_bytes)
+            && response.body_bytes != expected
+        {
+            bail!(
+                "CONNECT download finished after {} of {expected} body bytes",
+                response.body_bytes
+            );
+        }
+
+        Ok(TcpDownloadResult {
+            response,
+            finished_at: Instant::now(),
+            stream_finished,
+        })
+    }
 }
 
 fn connect_echo_socket(echo_addr: &str) -> Result<UdpSocket> {
@@ -913,6 +1231,159 @@ fn test_standard_connect_early_body(server_addr: &str, echo_addr: &str) -> Resul
     if echoed != payload {
         bail!("early standard CONNECT payload mismatch");
     }
+    Ok(())
+}
+
+fn benchmark_standard_connect_download(server_addr: &str) -> Result<()> {
+    let target = std::env::var("MASQUE_TCP_TARGET")
+        .context("MASQUE_TCP_TARGET must be set to origin-host:port")?;
+    let path = std::env::var("MASQUE_TCP_PATH").unwrap_or_else(|_| "/masque-bench.bin".into());
+    let configured_body_bytes = std::env::var("MASQUE_TCP_DOWNLOAD_BYTES")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .context("MASQUE_TCP_DOWNLOAD_BYTES must be an integer")
+        })
+        .transpose()?;
+    let timeout_secs = std::env::var("MASQUE_TCP_TIMEOUT_SECS")
+        .unwrap_or_else(|_| "120".into())
+        .parse::<u64>()
+        .context("MASQUE_TCP_TIMEOUT_SECS must be an integer")?;
+    let repeats = std::env::var("MASQUE_TCP_DOWNLOAD_REPEATS")
+        .unwrap_or_else(|_| "1".into())
+        .parse::<u32>()
+        .context("MASQUE_TCP_DOWNLOAD_REPEATS must be an integer")?;
+
+    if target.is_empty()
+        || target
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        bail!("MASQUE_TCP_TARGET contains invalid characters");
+    }
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
+        bail!("MASQUE_TCP_PATH must be an absolute path without control characters");
+    }
+    if configured_body_bytes == Some(0) || timeout_secs == 0 || repeats == 0 {
+        bail!("download size, timeout, and repeat count must be non-zero");
+    }
+    if repeats > 16 {
+        bail!("MASQUE_TCP_DOWNLOAD_REPEATS must not exceed 16");
+    }
+
+    let connection_started = Instant::now();
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+    let quic_setup = Instant::now().saturating_duration_since(connection_started);
+
+    for sample in 1..=repeats {
+        let sample_started = Instant::now();
+        let stats_before = client.quic.stats();
+        let counters_before = (
+            stats_before.recv,
+            stats_before.recv_bytes,
+            stats_before.lost,
+            stats_before.lost_bytes,
+            stats_before.data_blocked_recv_count,
+            stats_before.stream_data_blocked_recv_count,
+        );
+
+        let headers = connect_tcp_headers(&target)?;
+        let stream_id = client.send_request(&headers, false)?;
+        let (response_stream_id, status) = client.poll_response(Duration::from_secs(10))?;
+        if response_stream_id != stream_id || status != 200 {
+            bail!(
+                "expected CONNECT stream {stream_id} status 200, got stream {response_stream_id} status {status}"
+            );
+        }
+        let connect_finished = Instant::now();
+
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {target}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        );
+        let request_started = Instant::now();
+        client.send_body_all(stream_id, request.as_bytes(), true)?;
+        let result = client.run_tcp_download(
+            stream_id,
+            configured_body_bytes,
+            Duration::from_secs(timeout_secs),
+        )?;
+
+        if let (Some(configured), Some(advertised)) =
+            (configured_body_bytes, result.response.content_length)
+            && configured != advertised
+        {
+            bail!(
+                "configured body size {configured} differs from origin Content-Length {advertised}"
+            );
+        }
+
+        let first_body_at = result
+            .response
+            .first_body_at
+            .context("HTTP response contained no body")?;
+        let body_bytes = result.response.body_bytes;
+        let connect_elapsed = connect_finished.saturating_duration_since(sample_started);
+        let ttfb = first_body_at.saturating_duration_since(request_started);
+        let request_elapsed = result
+            .finished_at
+            .saturating_duration_since(request_started);
+        let transfer_elapsed = result.finished_at.saturating_duration_since(first_body_at);
+        let sample_elapsed = result.finished_at.saturating_duration_since(sample_started);
+
+        let mbps = |elapsed: Duration| -> f64 {
+            if elapsed.is_zero() {
+                return 0.0;
+            }
+            body_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0
+        };
+
+        let stats = client.quic.stats();
+        let path_stats = client.quic.path_stats().find(|path| path.active);
+        let (rtt_ms, client_cwnd, pmtu, client_delivery_rate_mbps) = path_stats
+            .map(|path| {
+                (
+                    path.rtt.as_secs_f64() * 1000.0,
+                    path.cwnd,
+                    path.pmtu,
+                    path.delivery_rate as f64 * 8.0 / 1_000_000.0,
+                )
+            })
+            .unwrap_or((0.0, 0, 0, 0.0));
+
+        println!(
+            "TCP_DOWNLOAD_RESULT sample={sample} body_bytes={body_bytes} quic_setup_ms={:.3} \
+connect_ms={:.3} ttfb_ms={:.3} request_ms={:.3} transfer_ms={:.3} sample_ms={:.3} \
+request_mbps={:.3} transfer_mbps={:.3} sample_mbps={:.3} rtt_ms={rtt_ms:.3} \
+client_cwnd={client_cwnd} pmtu={pmtu} \
+client_delivery_rate_mbps={client_delivery_rate_mbps:.3} recv_packets={} \
+recv_wire_bytes={} client_lost_packets={} client_lost_bytes={} \
+data_blocked_received={} stream_blocked_received={} stream_finished={}",
+            quic_setup.as_secs_f64() * 1000.0,
+            connect_elapsed.as_secs_f64() * 1000.0,
+            ttfb.as_secs_f64() * 1000.0,
+            request_elapsed.as_secs_f64() * 1000.0,
+            transfer_elapsed.as_secs_f64() * 1000.0,
+            sample_elapsed.as_secs_f64() * 1000.0,
+            mbps(request_elapsed),
+            mbps(transfer_elapsed),
+            mbps(sample_elapsed),
+            stats.recv.saturating_sub(counters_before.0),
+            stats.recv_bytes.saturating_sub(counters_before.1),
+            stats.lost.saturating_sub(counters_before.2),
+            stats.lost_bytes.saturating_sub(counters_before.3),
+            stats
+                .data_blocked_recv_count
+                .saturating_sub(counters_before.4),
+            stats
+                .stream_data_blocked_recv_count
+                .saturating_sub(counters_before.5),
+            result.stream_finished,
+        );
+    }
+
     Ok(())
 }
 
@@ -1564,6 +2035,14 @@ fn main() {
     if std::env::var_os("MASQUE_AUTH_CHECK").is_some() {
         if let Err(e) = test_proxy_auth_required(&server_addr, &echo_addr) {
             error!(%e, "proxy authentication check failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if std::env::var_os("MASQUE_TCP_DOWNLOAD").is_some() {
+        if let Err(e) = benchmark_standard_connect_download(&server_addr) {
+            error!(%e, "standard CONNECT download benchmark failed");
             std::process::exit(1);
         }
         return;
