@@ -16,8 +16,8 @@ Extended CONNECT are advertised during connection setup.
 
 ## Authentication
 
-Every CONNECT form passes through the same proxy authentication pipeline. The
-client supplies:
+With `auth.mode = "basic"` (the default), every CONNECT form passes through the
+same proxy authentication pipeline. The client supplies:
 
 ```text
 Proxy-Authorization: Basic BASE64(username:password)
@@ -33,6 +33,12 @@ proxy-authenticate: Basic realm="masque", charset="UTF-8"
 
 Authentication is per request, so one authenticated tunnel does not authorize
 later streams that omit the header.
+
+With `auth.mode = "client_cert"` there is no per-request step: the client is
+identified once, from its TLS client certificate, during the QUIC handshake. An
+unregistered key never reaches the request path — it is refused with a TLS
+`access_denied` alert. See
+[Cloudflare-compatible clients](#cloudflare-compatible-clients).
 
 ## Standard CONNECT
 
@@ -69,12 +75,20 @@ by the Capsule Protocol unless they affect tunnel state.
 
 ## CONNECT-IP
 
-The request contains `:protocol = connect-ip` and follows the configured URI
-template. A successful setup allocates addresses and returns `200`, followed
-by:
+The request contains a `:protocol` from `ip_proxy.connect_protocols` — the
+registered `connect-ip`, or Cloudflare's `cf-connect-ip` — and follows the
+configured URI template. A successful setup assigns addresses and returns `200`,
+followed by:
 
 - `ADDRESS_ASSIGN` capsules for assigned IPv4 and IPv6 addresses; and
 - `ROUTE_ADVERTISEMENT` capsules for reachable prefixes.
+
+Addresses come from the pool, unless the client authenticated with a certificate
+whose `[[clients]]` entry pins them. A pinned client receives exactly its pinned
+addresses and nothing from the pool. Reconnection may briefly overlap a stale
+connection carrying the same enrolled key; the newest tunnel atomically takes
+over the return route, while reference-counted leases keep later cleanup from
+freeing an address that is still live.
 
 IP packets use HTTP Datagrams with Context ID `0`. Before writing a client
 packet to TUN, the server checks the source address against the tunnel's
@@ -104,3 +118,57 @@ Clients must support HTTP/3 proxy CONNECT and the relevant MASQUE extension.
 Configuration syntaxes in products such as Surge are client-specific and are
 not part of the RFCs. Test authentication, target policy, TCP, UDP, and DNS
 separately when qualifying a client.
+
+## Cloudflare-compatible clients
+
+VPN-style MASQUE clients modelled on Cloudflare WARP — for example
+[usque](https://github.com/Diniboy1123/usque) and
+[mihomo](https://wiki.metacubex.one/config/proxies/masque/) — diverge from
+RFC 9484 in ways the server accommodates. Everything below is on by default
+except the authentication mode.
+
+**`:protocol` is `cf-connect-ip`.** Cloudflare's endpoint uses that instead of
+the registered `connect-ip`, and these clients send only it. Both are in
+`ip_proxy.connect_protocols` by default. This is not optional: usque and mihomo
+are independent implementations, and both were observed sending byte-identical
+requests — `:protocol: cf-connect-ip`, `:authority: cloudflareaccess.com`,
+`:path: /` — so a server accepting only `connect-ip` answers `404` to every
+client in this family.
+
+**`:authority` and `:path` are fixed.** The request arrives as
+`:authority: cloudflareaccess.com` and `:path: /`, with no URI Template
+variables. The CONNECT-IP path ignores both, so `ip_proxy.uri_template` does not
+apply to these clients.
+
+**Authentication is a TLS client certificate.** No `Proxy-Authorization` is
+ever sent, so `auth.mode = "basic"` refuses these clients with `407`. Use
+`auth.mode = "client_cert"` and enroll each client's public key; see
+[Authentication](configuration.md#authentication).
+
+**Extended CONNECT is not required of the server.** Cloudflare does not
+advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and these clients tolerate its
+absence. This server advertises it anyway, which is compatible.
+
+**Addresses come from the client's own configuration, not from
+`ADDRESS_ASSIGN`.** Cloudflare sends no capsules at all; the client learns its
+tunnel addresses from its config file and configures its interface from those.
+Two consequences:
+
+- The address must be pinned per client with `[[clients]].ipv4` / `.ipv6`, and
+  the client's configuration must carry the same values. A pool-allocated
+  address would leave the two sides disagreeing, and the server would drop every
+  client packet as a spoofed source.
+- `ADDRESS_ASSIGN` is still sent, and it must agree with the pinned addresses.
+  These clients ignore it for interface configuration but do use it to filter
+  inbound packets, so an address the client is not expecting causes silent drops
+  in the other direction too.
+
+`masque-server enroll-client` generates both sides at once, which is the
+reliable way to keep them consistent.
+
+**Keepalive interacts with the idle timeout.** These clients default to a 30s
+keepalive period. Keep `server.idle_timeout_secs` above it; the default is 60.
+
+**HTTP/2 fallback is not supported.** Some of these clients can carry
+CONNECT-IP over TCP and HTTP/2 instead of QUIC. This server is HTTP/3 only, so
+those clients must use their default QUIC transport.

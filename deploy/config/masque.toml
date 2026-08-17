@@ -1,6 +1,9 @@
 [server]
 listen_addr = "0.0.0.0:443"
-idle_timeout_secs = 30
+# Keep this above the client's keepalive period. VPN-style MASQUE clients
+# commonly default to 30s, and matching that exactly makes a quiet tunnel race
+# its own keepalive against the timeout.
+idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
 # Independent event loops, each with its own SO_REUSEPORT socket and its own
@@ -15,8 +18,36 @@ key_path = "/etc/masque/certs/server.key"
 
 [auth]
 enabled = true
+# "basic"       — RFC 7617 Proxy-Authorization, checked per request.
+# "client_cert" — a TLS client certificate, matched against [[clients]] below.
+#
+# Pick "client_cert" for VPN-style clients modelled on Cloudflare WARP MASQUE
+# (for example usque): they authenticate during the QUIC handshake and never
+# send Proxy-Authorization, so they cannot work against "basic".
+mode = "basic"
 username = "__MASQUE_AUTH_USERNAME__"
 password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
+
+# Clients allowed in when mode = "client_cert". Generate an entry, then reload
+# or restart the service:
+#
+#   masque-server enroll-client --name laptop --endpoint <public-ip>:443 \
+#       --ipv4 10.89.0.2 --ipv6 fd00:abcd::2
+#
+# That prints this block plus the client's own configuration file. The pinned
+# addresses are required for clients that configure their tunnel interface from
+# their config file rather than from the ADDRESS_ASSIGN capsule — the two sides
+# must agree, or every packet is dropped as spoofed.
+#
+# The client JSON stores only the endpoint IP. The command also prints the
+# matching usque --connect-port/-P argument; do not omit it on non-443 servers.
+# An --out path is created as a new 0600 file on Unix and is never overwritten.
+#
+# [[clients]]
+# name = "laptop"
+# public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+# ipv4 = "10.89.0.2"
+# ipv6 = "fd00:abcd::2"
 
 [quic]
 max_datagram_size = 1350
@@ -83,6 +114,11 @@ deny_targets = [
 [ip_proxy]
 enabled = true
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
+# Accepted `:protocol` values. RFC 9484 registers "connect-ip"; Cloudflare's
+# endpoint uses "cf-connect-ip" and clients built against it send only that.
+# Both are accepted by default, which costs nothing: an RFC client never sends
+# the second one.
+connect_protocols = ["connect-ip", "cf-connect-ip"]
 tun_name = "masque0"
 tun_mtu = 1280
 # Linux GSO/GRO on the TUN device: one read carries a whole aggregate and one

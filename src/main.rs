@@ -1,5 +1,6 @@
 use std::io::Read;
-use std::path::PathBuf;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -8,11 +9,12 @@ use zeroize::Zeroizing;
 
 use masque::auth;
 use masque::config::{self, ServerConfig};
+use masque::enroll;
 use masque::server::Server;
 
 /// MASQUE proxy server (CONNECT / CONNECT-UDP / CONNECT-IP over HTTP/3).
 #[derive(Parser)]
-#[command(name = "masque-server")]
+#[command(name = "masque-server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -42,6 +44,117 @@ struct Cli {
 enum Command {
     /// Read a password from standard input and print an Argon2id PHC hash.
     HashPassword,
+    /// Generate a client key pair for `auth.mode = "client_cert"`.
+    ///
+    /// Prints the `[[clients]]` block to add to the server config, and the JSON
+    /// configuration for the client. Nothing is written to the server config
+    /// automatically: enrolling a client is a deliberate act.
+    EnrollClient {
+        /// Label for this client, used in the server's logs.
+        #[arg(long)]
+        name: String,
+
+        /// Address:port clients dial. The IP is written to JSON; the port is
+        /// printed as the client's --connect-port argument.
+        #[arg(long)]
+        endpoint: SocketAddr,
+
+        /// Fixed tunnel IPv4 for this client, inside `ip_proxy.ipv4_pool`.
+        ///
+        /// Required for clients that configure their own tunnel interface
+        /// instead of reading the `ADDRESS_ASSIGN` capsule.
+        #[arg(long)]
+        ipv4: Option<Ipv4Addr>,
+
+        /// Fixed tunnel IPv6 for this client, inside `ip_proxy.ipv6_pool`.
+        #[arg(long)]
+        ipv6: Option<Ipv6Addr>,
+
+        /// Write the client JSON here instead of printing it.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+}
+
+fn usque_port_instruction(port: u16) -> String {
+    format!("# Start usque with --connect-port {port} (short form: -P {port}).")
+}
+
+/// Generate and print one client enrollment.
+fn enroll_client(
+    cert_path: &Path,
+    name: &str,
+    endpoint: SocketAddr,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
+    tun_mtu: usize,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let pair = enroll::generate_client_key()?;
+    let server_key = enroll::server_public_key_pem(cert_path)?;
+
+    let client_json = Zeroizing::new(enroll::client_config_json(
+        &pair.private_key_b64,
+        &server_key,
+        endpoint.ip(),
+        ipv4,
+        ipv6,
+    ));
+
+    println!("# Add to the server config, then reload or restart the server:\n");
+    print!(
+        "{}",
+        enroll::clients_toml_block(name, &pair.public_key_b64, ipv4, ipv6)
+    );
+
+    match out {
+        Some(path) => {
+            enroll::write_client_config(&path, client_json.as_str())?;
+            println!("\n# Client configuration written to {}", path.display());
+        }
+        None => {
+            println!("\n# Client configuration (contains the private key — treat as a secret):\n");
+            print!("{}", client_json.as_str());
+        }
+    }
+
+    // usque's JSON schema stores only the endpoint IP; its connection port is
+    // a launch flag. Always print it so a non-443 deployment cannot silently
+    // fall back to the client's default port.
+    println!("\n{}", usque_port_instruction(endpoint.port()));
+
+    // The same enrollment, spelled for mihomo-style clients. Emitted alongside
+    // rather than behind a flag: the encodings differ in ways that are easy to
+    // get subtly wrong by hand, and a wrong key only shows up as a handshake
+    // failure much later.
+    println!(
+        "\n# Or, for a mihomo-style client, add to its config.yaml \
+         (also contains the private key):\n"
+    );
+    print!(
+        "{}",
+        Zeroizing::new(enroll::mihomo_proxy_yaml(
+            name,
+            &pair.private_key_b64,
+            &enroll::pem_to_base64_der(&server_key),
+            endpoint,
+            ipv4,
+            ipv6,
+            tun_mtu,
+        ))
+        .as_str()
+    );
+
+    if ipv4.is_none() && ipv6.is_none() {
+        eprintln!(
+            "\nwarning: no fixed address was pinned. Clients that configure their tunnel \
+             interface from this file rather than from the ADDRESS_ASSIGN capsule need \
+             --ipv4 and/or --ipv6, or the two sides will disagree and every packet will \
+             be dropped."
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -96,8 +209,55 @@ async fn main() -> anyhow::Result<()> {
         cfg.tls.key_path = key;
     }
 
+    // Enrollment only needs the server certificate, so it runs off the same
+    // config the server would use rather than asking for the path again.
+    if let Some(Command::EnrollClient {
+        name,
+        endpoint,
+        ipv4,
+        ipv6,
+        out,
+    }) = cli.command
+    {
+        return enroll_client(
+            &cfg.tls.cert_path,
+            &name,
+            endpoint,
+            ipv4,
+            ipv6,
+            cfg.ip_proxy.tun_mtu,
+            out,
+        );
+    }
+
     info!(?cfg, "configuration loaded");
 
-    let mut server = Server::bind(cfg).await?;
+    // Pass the path so SIGHUP can re-read the [[clients]] roster. Only a
+    // config that was actually loaded from disk is reloadable; defaults have
+    // no file to re-read.
+    let reload_path = cli.config.exists().then_some(cli.config);
+    let mut server = Server::bind_with_reload(cfg, reload_path).await?;
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::{Cli, usque_port_instruction};
+
+    #[test]
+    fn cli_reports_the_package_version() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn enrollment_preserves_a_non_default_endpoint_port_as_a_client_flag() {
+        let instruction = usque_port_instruction(8449);
+        assert!(instruction.contains("--connect-port 8449"));
+        assert!(instruction.contains("-P 8449"));
+    }
 }

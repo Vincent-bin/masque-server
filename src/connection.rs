@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::client_identity::ClientIdentity;
 use crate::fxhash::FxHashMap;
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
@@ -102,6 +103,13 @@ pub struct ClientConnection {
     /// Dense index for this connection, used as the `conn_id` in
     /// `TunnelOwner` and to address the connection from background tasks.
     pub index: u64,
+    /// The roster entry this connection's TLS client certificate resolved to,
+    /// when client-certificate authentication is in use.
+    ///
+    /// Resolved once at handshake completion: the key cannot change for the
+    /// life of the connection, so re-parsing the certificate per request would
+    /// be wasted work.
+    pub(crate) identity: Option<Arc<ClientIdentity>>,
     /// Packet already emitted by quiche but held until `SendInfo::at`.
     pub(crate) deferred_send: DeferredSend,
     /// The deadline this connection currently holds in the server's timer
@@ -120,6 +128,7 @@ impl ClientConnection {
             ip_tunnels: FxHashMap::default(),
             awaiting_auth: FxHashMap::default(),
             index,
+            identity: None,
             deferred_send: DeferredSend::default(),
             scheduled_deadline: None,
         }

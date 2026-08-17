@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use std::sync::{Mutex, RwLock};
 
+use anyhow::Context as _;
 use tokio::sync::Semaphore;
 
 use tokio::net::UdpSocket;
@@ -18,10 +19,11 @@ use tracing::{debug, error, info, warn};
 
 use self::authentication::AuthOutcome;
 use self::request::{PendingAuth, PendingConnectSetups, RequestContext};
-use crate::address_pool::AddressPool;
+use crate::address_pool::{AddressPool, PoolError};
 use crate::auth::BasicAuthenticator;
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
+use crate::client_identity::{ClientIdentity, ClientRegistry, IdentityError, SharedRoster};
 use crate::config::ServerConfig;
 use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
@@ -127,14 +129,72 @@ pub struct Server {
     shards: Vec<Shard>,
 }
 
+/// Build only the roster selected by the active authentication mode.
+///
+/// Keeping this decision separate from binding makes the "ignored outside
+/// client_cert" contract testable without opening sockets or loading TLS keys.
+fn active_client_registry(config: &ServerConfig) -> anyhow::Result<ClientRegistry> {
+    if !config.auth.client_cert_enabled() {
+        return Ok(ClientRegistry::default());
+    }
+
+    let clients = ClientRegistry::from_config(&config.clients)?;
+    if clients.is_empty() {
+        anyhow::bail!(
+            "auth.mode = \"client_cert\" needs at least one [[clients]] entry; \
+             run `masque-server enroll-client` to create one"
+        );
+    }
+    Ok(clients)
+}
+
+/// Capture only the startup state that a roster reload is allowed to use.
+fn roster_reload_settings(
+    config: &ServerConfig,
+    config_path: Option<std::path::PathBuf>,
+) -> Option<RosterReload> {
+    config_path.map(|path| RosterReload {
+        path,
+        client_cert_enabled: config.auth.client_cert_enabled(),
+        ip_proxy_enabled: config.ip_proxy.enabled,
+    })
+}
+
 impl Server {
     /// Create a new server bound to the configured address.
     pub async fn bind(config: ServerConfig) -> anyhow::Result<Self> {
-        if config.auth.enabled {
-            // Surface a bad credential configuration once, before any shard
-            // binds the listen port.
+        Self::bind_with_reload(config, None).await
+    }
+
+    /// Bind, and allow `SIGHUP` to re-read the `[[clients]]` roster from
+    /// `config_path`.
+    ///
+    /// Revoking a client otherwise costs a restart, which drops every other
+    /// client's tunnel to remove one.
+    pub async fn bind_with_reload(
+        config: ServerConfig,
+        config_path: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
+        // Surface a bad credential or active roster configuration once, before
+        // any shard binds the listen port. A roster outside client-cert mode is
+        // deliberately not parsed or allowed to reserve pool addresses: the
+        // configuration contract says it is ignored in that mode.
+        let clients = active_client_registry(&config)?;
+        if config.auth.client_cert_enabled() {
+            info!(
+                clients = clients.len(),
+                "client certificate authentication enabled"
+            );
+        } else if !config.clients.is_empty() {
+            warn!(
+                "[[clients]] entries are ignored unless auth.mode = \"client_cert\" \
+                 and auth.enabled = true"
+            );
+        }
+
+        if config.auth.basic_enabled() {
             BasicAuthenticator::new(&config.auth.username, &config.auth.password_hash)?;
-        } else {
+        } else if !config.auth.client_cert_enabled() {
             warn!("proxy authentication is disabled");
         }
 
@@ -169,8 +229,24 @@ impl Server {
             );
         }
 
-        let address_pool = AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
-            .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
+        let mut address_pool =
+            AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
+                .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
+
+        // Withhold every pinned address from dynamic allocation up front, so a
+        // client that connects while a pinned peer is offline cannot take the
+        // address that peer needs.
+        if config.ip_proxy.enabled {
+            for (addr, owner) in clients.static_reservations() {
+                address_pool.reserve_static(addr, owner).map_err(|e| {
+                    anyhow::anyhow!(
+                        "client address {addr} cannot be reserved ({e}); pinned addresses \
+                         must lie inside ip_proxy.ipv4_pool / ipv6_pool and must not be the \
+                         pool's gateway address"
+                    )
+                })?;
+            }
+        }
 
         let tun = build_tun(&config)?;
 
@@ -193,6 +269,11 @@ impl Server {
             tun_rx.push(rx);
         }
 
+        // A live switch from Basic to client-certificate authentication is not
+        // possible: the TLS context is fixed when each shard binds. Capture the
+        // startup mode so SIGHUP can be consumed safely but cannot fake a switch.
+        let roster_reload = roster_reload_settings(&config, config_path);
+
         let shared = Arc::new(Shared {
             address_pool: Mutex::new(address_pool),
             routing_table: RwLock::new(RoutingTable::new()),
@@ -205,6 +286,8 @@ impl Server {
             tun_tx,
             auth_permits: Arc::new(Semaphore::new(auth_concurrency(shard_count))),
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
+            clients: Arc::new(SharedRoster::new(clients)),
+            roster_reload,
         });
 
         let mut shards = Vec::with_capacity(shard_count);
@@ -226,8 +309,51 @@ impl Server {
         Ok(Self { shards })
     }
 
+    /// Reload the roster whenever `SIGHUP` arrives.
+    ///
+    /// One task for the whole server rather than one per shard: the roster is
+    /// shared, so reloading it once is enough, and the shards pick the change
+    /// up through its generation counter on their next sweep.
+    #[cfg(unix)]
+    fn spawn_roster_reloader(shared: Arc<Shared>) {
+        if shared.roster_reload.is_none() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(signal) => signal,
+                    Err(e) => {
+                        warn!(%e, "cannot listen for SIGHUP; roster reload is unavailable");
+                        return;
+                    }
+                };
+
+            while sighup.recv().await.is_some() {
+                // A failed reload leaves the running roster untouched, so the
+                // server keeps serving the clients it already admitted.
+                match reload_roster(&shared) {
+                    Ok((generation, clients)) => {
+                        info!(generation, clients, "roster reloaded")
+                    }
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "roster reload failed, keeping the previous one")
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    fn spawn_roster_reloader(_shared: Arc<Shared>) {}
+
     /// Run every shard until they all stop.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        if let Some(shard) = self.shards.first() {
+            Self::spawn_roster_reloader(Arc::clone(&shard.shared));
+        }
+
         // A single shard keeps the current behaviour of running on the caller's
         // task, which keeps the common case free of a spawn and a join.
         if self.shards.len() == 1 {
@@ -277,6 +403,189 @@ fn resolve_shard_count(configured: usize) -> usize {
         .map(|count| count.get())
         .unwrap_or(1)
         .min(MAX_SHARDS)
+}
+
+/// Re-read the `[[clients]]` roster from disk and install it.
+///
+/// Only the roster is reloaded. Everything else — listen address, TLS key,
+/// pools, tuning — is fixed at bind time, and pretending otherwise would make
+/// a reload's effect depend on which fields happened to be reloadable.
+///
+/// Nothing is changed unless the whole new roster validates, so a typo leaves
+/// the running server exactly as it was.
+fn reload_roster(shared: &Shared) -> anyhow::Result<(u64, usize)> {
+    let Some(reload) = shared.roster_reload.as_ref() else {
+        anyhow::bail!("no configuration file to reload");
+    };
+    if !reload.client_cert_enabled {
+        anyhow::bail!(
+            "roster reload is unavailable because the server did not start in client_cert mode"
+        );
+    }
+
+    let text = std::fs::read_to_string(&reload.path)
+        .with_context(|| format!("failed to read {}", reload.path.display()))?;
+    let config = crate::config::parse_toml(&text)
+        .with_context(|| format!("failed to parse {}", reload.path.display()))?;
+
+    if !config.auth.client_cert_enabled() {
+        anyhow::bail!(
+            "refusing to reload: auth.mode is no longer \"client_cert\", which cannot be \
+             changed without a restart"
+        );
+    }
+
+    let registry = active_client_registry(&config)?;
+
+    // Reservations are recomputed before the swap: if a pinned address became
+    // invalid, the roster is rejected rather than half-applied.
+    if reload.ip_proxy_enabled {
+        shared
+            .address_pool
+            .lock()
+            .expect("address pool poisoned")
+            .set_static_reservations(registry.static_reservations())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to reload: a pinned client address cannot be reserved ({e})"
+                )
+            })?;
+    }
+
+    let count = registry.len();
+    Ok((shared.clients.replace(registry), count))
+}
+
+/// Take every address pinned to `identity`, or none of them.
+///
+/// All or nothing: a client configured for dual stack that came up with only
+/// half its addresses would silently lose one family, which is harder to
+/// diagnose than a refused tunnel.
+fn claim_static_addresses(
+    shared: &Shared,
+    identity: &ClientIdentity,
+) -> Result<Vec<IpAddr>, PoolError> {
+    let mut pool = shared.address_pool.lock().expect("address pool poisoned");
+    let mut claimed = Vec::new();
+
+    for addr in identity.static_addresses() {
+        if let Err(e) = pool.claim(addr, &identity.key) {
+            pool.release_all(&claimed);
+            return Err(e);
+        }
+        claimed.push(addr);
+    }
+
+    Ok(claimed)
+}
+
+/// Take one address per configured family from the dynamic pool.
+///
+/// A family whose pool is absent or exhausted is skipped: a v4-only pool should
+/// still produce a working v4 tunnel.
+fn allocate_pool_addresses(shared: &Shared) -> Vec<IpAddr> {
+    let mut pool = shared.address_pool.lock().expect("address pool poisoned");
+    let mut addresses = Vec::with_capacity(2);
+
+    if let Ok(v4) = pool.allocate_v4() {
+        addresses.push(IpAddr::V4(v4));
+    }
+    if let Ok(v6) = pool.allocate_v6() {
+        addresses.push(IpAddr::V6(v6));
+    }
+
+    addresses
+}
+
+/// Build a QUIC config that demands a client certificate and admits only keys
+/// on the roster.
+///
+/// quiche's own `Config` cannot express this. Its `verify_peer(true)` asks
+/// BoringSSL to validate the chain, which these certificates always fail: they
+/// are self-signed, minted fresh per connection, and carry an empty subject.
+/// `verify_peer(false)` on a server does not ask for a certificate at all. So
+/// the TLS context is built by hand, with a callback that ignores the chain and
+/// checks the key instead.
+///
+/// Rejecting inside the callback means an unregistered client is turned away
+/// with a TLS alert during the handshake, before it can open a stream — the
+/// same shape of failure the Cloudflare endpoint produces for an unenrolled
+/// key.
+fn build_client_cert_quic_config(
+    config: &ServerConfig,
+    roster: Arc<SharedRoster>,
+) -> anyhow::Result<quiche::Config> {
+    let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
+        .map_err(|e| anyhow::anyhow!("failed to create TLS context: {e}"))?;
+
+    builder
+        .set_certificate_chain_file(&config.tls.cert_path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load tls.cert_path {}: {e}",
+                config.tls.cert_path.display()
+            )
+        })?;
+    builder
+        .set_private_key_file(&config.tls.key_path, boring::ssl::SslFiletype::PEM)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load tls.key_path {}: {e}",
+                config.tls.key_path.display()
+            )
+        })?;
+
+    // PEER asks for the certificate; FAIL_IF_NO_PEER_CERT makes it mandatory.
+    // Without the second flag a client that simply omits its certificate would
+    // complete the handshake and reach the request path with no identity.
+    //
+    // This is the *custom* verify hook, not the legacy `SSL_CTX_set_verify`
+    // callback: the legacy one runs as a step inside BoringSSL's X.509 chain
+    // verification, which never happens here because no CA store is configured,
+    // so it is simply never consulted. `SSL_CTX_set_custom_verify` replaces
+    // chain verification outright and is always called.
+    let mode = boring::ssl::SslVerifyMode::PEER | boring::ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+    builder.set_custom_verify_callback(mode, move |ssl| {
+        // ACCESS_DENIED rather than a certificate-specific alert: the
+        // certificate is structurally fine, it is the identity behind it that
+        // is not authorized. Clients in this family surface that alert as a
+        // login failure, which is the right thing to tell the operator.
+        let denied = Err(boring::ssl::SslVerifyError::Invalid(
+            boring::ssl::SslAlert::ACCESS_DENIED,
+        ));
+
+        let Some(cert) = ssl.peer_certificate() else {
+            warn!("rejecting client that presented no certificate");
+            return denied;
+        };
+        let Ok(der) = cert.to_der() else {
+            warn!("rejecting client certificate that could not be re-encoded");
+            return denied;
+        };
+
+        match roster.load().identify(&der) {
+            Ok(identity) => {
+                debug!(client = %identity.name, "client certificate accepted");
+                Ok(())
+            }
+            Err(IdentityError::UnknownKey(key)) => {
+                // Logged in full so an operator can enroll the client by
+                // pasting this straight into a `[[clients]]` entry.
+                warn!(
+                    public_key = %key,
+                    "rejecting client: public key is not in the [[clients]] roster"
+                );
+                denied
+            }
+            Err(e) => {
+                warn!(%e, "rejecting client certificate");
+                denied
+            }
+        }
+    });
+
+    quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
+        .map_err(|e| anyhow::anyhow!("failed to build QUIC config: {e}"))
 }
 
 /// Create the TUN device if the IP proxy is enabled.
@@ -360,6 +669,16 @@ struct ForwardedPacket {
     from: SocketAddr,
 }
 
+/// Immutable facts needed to reload only the client roster.
+struct RosterReload {
+    path: std::path::PathBuf,
+    /// Whether the bound TLS context actually requests client certificates.
+    client_cert_enabled: bool,
+    /// The IP proxy state this process actually bound with. The value in a
+    /// subsequently edited file is intentionally ignored until restart.
+    ip_proxy_enabled: bool,
+}
+
 /// State every shard shares.
 ///
 /// None of it is on the per-packet path: the pool and routing table are touched
@@ -402,6 +721,14 @@ struct Shared {
     auth_permits: Arc<Semaphore>,
     /// Bounds both queued and running password verifications across all shards.
     auth_queue_slots: Arc<Semaphore>,
+    /// Pre-registered client identities, shared by every shard's TLS context.
+    ///
+    /// Replaceable at runtime so a client can be revoked without restarting
+    /// the process and dropping every other client's tunnel.
+    clients: Arc<SharedRoster>,
+    /// Present when the server started from a config file. The captured startup
+    /// mode prevents SIGHUP from pretending to change the bound TLS context.
+    roster_reload: Option<RosterReload>,
 }
 
 /// One shard: an independent event loop over its own share of connections.
@@ -413,6 +740,12 @@ struct Shard {
     h3_config: quiche::h3::Config,
     connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
     auth: Option<Arc<BasicAuthenticator>>,
+    /// Set when clients authenticate with a certificate instead of credentials.
+    ///
+    /// The TLS context already refuses unregistered keys, so this exists to
+    /// attach the resolved identity to the connection and as a second check
+    /// that no connection slips through without one.
+    client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
     config: ServerConfig,
@@ -443,7 +776,7 @@ impl Shard {
         forward_rx: mpsc::Receiver<ForwardedPacket>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
-        let auth = if config.auth.enabled {
+        let auth = if config.auth.basic_enabled() {
             Some(BasicAuthenticator::new(
                 &config.auth.username,
                 &config.auth.password_hash,
@@ -468,11 +801,23 @@ impl Shard {
             "listening"
         );
 
-        let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+        let client_certs = if config.auth.client_cert_enabled() {
+            Some(Arc::clone(&shared.clients))
+        } else {
+            None
+        };
 
-        // TLS
-        quic_config.load_cert_chain_from_pem_file(config.tls.cert_path.to_str().unwrap_or(""))?;
-        quic_config.load_priv_key_from_pem_file(config.tls.key_path.to_str().unwrap_or(""))?;
+        let mut quic_config = match &client_certs {
+            Some(registry) => build_client_cert_quic_config(&config, Arc::clone(registry))?,
+            None => {
+                let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+                quic_config
+                    .load_cert_chain_from_pem_file(config.tls.cert_path.to_str().unwrap_or(""))?;
+                quic_config
+                    .load_priv_key_from_pem_file(config.tls.key_path.to_str().unwrap_or(""))?;
+                quic_config
+            }
+        };
 
         quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
 
@@ -537,6 +882,7 @@ impl Shard {
             h3_config,
             connections: FxHashMap::default(),
             auth: auth.map(Arc::new),
+            client_certs,
             tcp_policy,
             udp_policy,
             config,
@@ -575,6 +921,8 @@ impl Shard {
         let mut drain_deadline: Option<Instant> = None;
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
         let mut next_idle_sweep = Instant::now() + IDLE_SWEEP_INTERVAL;
+        // The roster generation this shard has already enforced.
+        let mut applied_roster_generation = self.shared.clients.generation();
         // The connections serviced in the current round. Held across
         // iterations so its allocation is reused.
         let mut serviced: Vec<u64> = Vec::new();
@@ -759,6 +1107,13 @@ impl Shard {
             if now >= next_idle_sweep {
                 next_idle_sweep = now + IDLE_SWEEP_INTERVAL;
                 if !shutting_down {
+                    // Cheap in the common case: one atomic read, and a scan
+                    // only when the roster actually changed.
+                    let generation = self.shared.clients.generation();
+                    if generation != applied_roster_generation {
+                        applied_roster_generation = generation;
+                        self.enforce_roster();
+                    }
                     self.cleanup_idle_tunnels(idle_timeout);
                     // The sweep writes to the connections it closes tunnels on,
                     // so pick up any it just marked.
@@ -994,6 +1349,39 @@ impl Shard {
         if let Err(e) = client.quic.recv(buf, recv_info) {
             debug!(%e, "quiche recv error");
             return;
+        }
+
+        // Resolve the client's certificate to a roster entry once, at the
+        // handshake boundary. The TLS callback has already refused unknown
+        // keys, so this is about attaching the identity that later decides
+        // which addresses the tunnel gets — and about refusing to serve a
+        // connection whose identity we somehow cannot name.
+        if let Some(registry) = &self.client_certs
+            && client.identity.is_none()
+            && client.quic.is_established()
+        {
+            match client
+                .quic
+                .peer_cert()
+                .map(|der| registry.load().identify(der))
+            {
+                Some(Ok(identity)) => {
+                    info!(client = %identity.name, %from, "client authenticated by certificate");
+                    client.identity = Some(identity);
+                }
+                other => {
+                    match other {
+                        Some(Err(e)) => warn!(%e, "closing connection with unusable certificate"),
+                        // Unreachable while the context sets
+                        // FAIL_IF_NO_PEER_CERT, but the cost of being wrong is
+                        // an unauthenticated tunnel.
+                        None => warn!("closing connection that presented no certificate"),
+                        Some(Ok(_)) => unreachable!(),
+                    }
+                    let _ = client.quic.close(false, 0x0100, b"unauthorized");
+                    return;
+                }
+            }
         }
 
         // Upgrade to HTTP/3 once QUIC handshake completes.
@@ -1378,13 +1766,35 @@ impl Shard {
     ) {
         let mut tunnel = IpTunnel::new(stream_id);
 
-        // Allocate an IPv4 address if the pool has one.
-        let (v4_result, v6_result) = {
-            let mut address_pool = shared.address_pool.lock().expect("address pool poisoned");
-            (address_pool.allocate_v4(), address_pool.allocate_v6())
+        // A client pinned to fixed addresses gets exactly those, and nothing
+        // from the pool: its tunnel interface is configured out of band with
+        // the same values, so an extra dynamic address would be advertised to a
+        // client that has no interface to receive it on.
+        let pinned = client
+            .identity
+            .as_ref()
+            .filter(|identity| identity.has_static_addresses());
+
+        let addresses = match pinned {
+            Some(identity) => match claim_static_addresses(shared, identity) {
+                Ok(addresses) => addresses,
+                Err(e) => {
+                    warn!(
+                        stream_id,
+                        client = %identity.name,
+                        %e,
+                        "cannot attach IP tunnel to this client's fixed addresses"
+                    );
+                    if let Some(h3) = &mut client.h3 {
+                        Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                    }
+                    return;
+                }
+            },
+            None => allocate_pool_addresses(shared),
         };
 
-        if v4_result.is_err() && v6_result.is_err() {
+        if addresses.is_empty() {
             warn!(stream_id, "address pool exhausted for IP tunnel");
             if let Some(h3) = &mut client.h3 {
                 Self::send_error_response(h3, &mut client.quic, stream_id, 503);
@@ -1392,50 +1802,69 @@ impl Shard {
             return;
         }
 
-        let mut assigned = Vec::new();
-
-        if let Ok(v4_addr) = v4_result {
-            let ip = IpAddr::V4(v4_addr);
-            tunnel.assigned_addrs.push(ip);
-            shared
-                .routing_table
-                .write()
-                .expect("routing table poisoned")
-                .insert(
-                    ip,
-                    TunnelOwner {
-                        conn_id: conn_idx,
-                        stream_id,
-                    },
-                );
-            assigned.push(AssignedAddress {
-                request_id: 0,
-                ip: IpAddress::V4(v4_addr),
-                prefix_len: 32,
+        let mut assigned = Vec::with_capacity(addresses.len());
+        for ip in &addresses {
+            tunnel.assigned_addrs.push(*ip);
+            assigned.push(match *ip {
+                IpAddr::V4(v4) => AssignedAddress {
+                    request_id: 0,
+                    ip: IpAddress::V4(v4),
+                    prefix_len: 32,
+                },
+                IpAddr::V6(v6) => AssignedAddress {
+                    request_id: 0,
+                    ip: IpAddress::V6(v6),
+                    prefix_len: 128,
+                },
             });
-            info!(stream_id, addr = %v4_addr, "assigned IPv4 to IP tunnel");
         }
 
-        if let Ok(v6_addr) = v6_result {
-            let ip = IpAddr::V6(v6_addr);
-            tunnel.assigned_addrs.push(ip);
+        // Do not acknowledge the CONNECT until every address has been leased.
+        // HTTP/3 permits only one response header block, so a 200 sent before
+        // allocation cannot later be corrected to a 503.
+        let headers = [
+            quiche::h3::Header::new(b":status", b"200"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        let Some(h3) = &mut client.h3 else {
+            shared
+                .address_pool
+                .lock()
+                .expect("address pool poisoned")
+                .release_all(&addresses);
+            warn!(
+                stream_id,
+                "HTTP/3 state disappeared during CONNECT-IP setup"
+            );
+            return;
+        };
+        if let Err(e) = h3.send_response(&mut client.quic, stream_id, &headers, false) {
+            shared
+                .address_pool
+                .lock()
+                .expect("address pool poisoned")
+                .release_all(&addresses);
+            warn!(stream_id, %e, "failed to send CONNECT-IP 200");
+            return;
+        }
+
+        // A reconnect using the same registered key may briefly overlap its
+        // stale predecessor. Inserting replaces the return route atomically;
+        // remove_owned() prevents the predecessor's later cleanup from deleting
+        // this newer route.
+        for ip in &addresses {
             shared
                 .routing_table
                 .write()
                 .expect("routing table poisoned")
                 .insert(
-                    ip,
+                    *ip,
                     TunnelOwner {
                         conn_id: conn_idx,
                         stream_id,
                     },
                 );
-            assigned.push(AssignedAddress {
-                request_id: 0,
-                ip: IpAddress::V6(v6_addr),
-                prefix_len: 128,
-            });
-            info!(stream_id, addr = %v6_addr, "assigned IPv6 to IP tunnel");
+            info!(stream_id, addr = %ip, pinned = pinned.is_some(), "assigned address to IP tunnel");
         }
 
         // Send ADDRESS_ASSIGN and ROUTE_ADVERTISEMENT back to back: one buffer,
@@ -1461,9 +1890,7 @@ impl Shard {
             &mut capsules,
         );
 
-        if let Some(h3) = &mut client.h3
-            && let Err(e) = h3.send_body(&mut client.quic, stream_id, &capsules, false)
-        {
+        if let Err(e) = h3.send_body(&mut client.quic, stream_id, &capsules, false) {
             warn!(stream_id, %e, "failed to send CONNECT-IP capsules");
         }
 
@@ -2040,6 +2467,40 @@ impl Shard {
     }
 
     /// Close tunnels that have been idle too long.
+    /// Disconnect connections whose roster entry was removed or changed.
+    ///
+    /// A revoked client keeping its tunnel until it happens to reconnect would
+    /// make revocation meaningless, so the connection is closed rather than
+    /// merely barred from opening new streams. An entry that was edited counts
+    /// as revoked too: its pinned addresses were decided at setup time, so the
+    /// client has to come back to pick up the new ones.
+    fn enforce_roster(&mut self) {
+        let Some(roster) = self.client_certs.as_ref() else {
+            return;
+        };
+        let current = roster.load();
+
+        let mut revoked: Vec<quiche::ConnectionId<'static>> = Vec::new();
+        for (conn_id, client) in &self.connections {
+            let Some(identity) = client.identity.as_deref() else {
+                continue;
+            };
+            if !current.still_authorizes(identity) {
+                info!(client = %identity.name, "disconnecting client removed from the roster");
+                revoked.push(conn_id.clone());
+            }
+        }
+
+        for conn_id in revoked {
+            if let Some(client) = self.connections.get_mut(&conn_id) {
+                // A local close; the teardown that frees addresses and routes
+                // runs from the normal closed-connection path.
+                let _ = client.quic.close(true, 0x0100, b"revoked");
+                self.dirty.mark(client.index);
+            }
+        }
+    }
+
     fn cleanup_idle_tunnels(&mut self, timeout: Duration) {
         // Collect idle IP tunnel info so we can clean up after the loop.
         let mut idle_ip_tunnels: Vec<(quiche::ConnectionId<'static>, u64, u64)> = Vec::new();
@@ -2059,6 +2520,7 @@ impl Shard {
                 awaiting_auth: _,
                 deferred_send: _,
                 scheduled_deadline: _,
+                identity: _,
             } = client;
 
             // Closing a tunnel writes a response or a FIN to the connection,
@@ -2286,7 +2748,60 @@ impl Shard {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::ServerConfig;
+    use crate::config::{AuthMode, ClientEntry, ServerConfig};
+
+    fn invalid_roster_entry() -> ClientEntry {
+        ClientEntry {
+            name: "unused".into(),
+            public_key: "not-a-public-key".into(),
+            ipv4: Some("not-an-ip".into()),
+            ipv6: None,
+        }
+    }
+
+    #[test]
+    fn roster_is_not_parsed_outside_client_certificate_mode() {
+        let mut config = ServerConfig::default();
+        config.auth.mode = AuthMode::Basic;
+        config.clients.push(invalid_roster_entry());
+        assert!(super::active_client_registry(&config).unwrap().is_empty());
+
+        config.auth.enabled = false;
+        config.auth.mode = AuthMode::ClientCert;
+        assert!(super::active_client_registry(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_client_certificate_roster_is_fail_closed() {
+        let mut config = ServerConfig::default();
+        config.auth.mode = AuthMode::ClientCert;
+        assert!(super::active_client_registry(&config).is_err());
+
+        config.clients.push(invalid_roster_entry());
+        assert!(super::active_client_registry(&config).is_err());
+    }
+
+    #[test]
+    fn roster_reload_uses_the_auth_and_ip_proxy_state_from_startup() {
+        let path = std::path::PathBuf::from("masque.toml");
+        let mut config = ServerConfig::default();
+
+        // Basic mode still consumes HUP safely (the systemd unit always exposes
+        // ExecReload), but the captured startup bit prevents an edited file from
+        // pretending the already-bound TLS context switched modes.
+        let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
+        assert!(!reload.client_cert_enabled);
+
+        config.auth.mode = AuthMode::ClientCert;
+        config.ip_proxy.enabled = false;
+        let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
+        assert_eq!(reload.path, path);
+        assert!(reload.client_cert_enabled);
+        assert!(!reload.ip_proxy_enabled);
+
+        // Programmatic servers have no source file to re-read.
+        assert!(super::roster_reload_settings(&config, None).is_none());
+    }
 
     /// The default algorithm name is only validated when a server starts, and
     /// a quiche rename would turn that into a startup failure in production.

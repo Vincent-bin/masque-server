@@ -9,6 +9,8 @@ packets through the host. The principal risks are:
 
 - unauthenticated resource exhaustion;
 - password guessing and memory-hard hash amplification;
+- disclosure or misdistribution of an enrolled client's private key, which is a
+  bearer credential;
 - access to loopback, metadata, management, or private networks;
 - unbounded buffering under a slow client or target;
 - malformed packet or capsule parsing;
@@ -29,6 +31,16 @@ work that has not started and discards results for work already running.
 Use a unique, high-entropy password. Basic credentials are protected by QUIC
 TLS in transit but are reusable bearer secrets at the HTTP layer. Rotate them
 after suspected client or log compromise.
+
+With `auth.mode = "client_cert"` the cost profile is different: identity is
+established once during the handshake, by public key, so there is no per-request
+verification to bound and no password to brute-force. An unenrolled key is
+refused with a TLS alert before it can open a stream, which keeps unauthorized
+callers off the request path entirely. The trade-off is that authorization is
+per connection rather than per request — every stream on an established
+connection is already authorized. See
+[TLS and credentials](#tls-and-credentials) for what counts as a credential
+under that mode.
 
 ## Target policy
 
@@ -60,11 +72,62 @@ packet loss into seconds of latency and make memory exhaustion easier.
 
 ## TLS and credentials
 
-- Use a certificate trusted by clients and covering the exact proxy hostname.
 - Keep the private key and configuration `root:masque` mode `0640`.
 - Do not pass passwords as command-line arguments.
 - Do not commit real certificates, hashes, passwords, IPs, or server inventory.
 - Avoid trace logging in production except during a short controlled incident.
+
+The right server certificate depends on the authentication mode, because the
+two modes establish server identity in completely different ways.
+
+### With `auth.mode = "basic"`
+
+Clients validate the certificate normally. Use one trusted by them and covering
+the exact proxy hostname, and renew it before expiry as usual.
+
+### With `auth.mode = "client_cert"`
+
+Clients in this family skip chain validation entirely — the SNI they send names
+a vendor endpoint rather than this server — and instead pin the leaf public key
+they were enrolled with. Chain, hostname, and expiry therefore play no part in
+their trust decision.
+
+A self-signed certificate is appropriate here, and is what `scripts/gen-certs.sh`
+produces. Pinning trusts exactly one key distributed out of band rather than
+every public CA, so the trusted set is smaller than under PKI. A CA-issued
+certificate brings no benefit to these clients and introduces a hazard: ACME
+renewal rotates the key by default, and a new key invalidates every client's
+pin. If you use one anyway, renew with a stable key.
+
+Consequences worth planning for:
+
+- **Replacing the certificate is a flag day.** Every enrolled client pins the
+  old key and stops connecting. Re-enroll and redistribute, or renew with the
+  same key to preserve the pin.
+- **A client's `--insecure`-style flag disables pinning** and exposes it to
+  interception. Use it only to diagnose a pin mismatch, never in production.
+- **Compromise of the server private key** allows impersonating this server to
+  every client, exactly as it would under PKI.
+
+### What is and is not a credential
+
+- `[[clients]]` holds only **public** keys. A leaked server configuration does
+  not let anyone connect.
+- The **client private key** — in the enrolled JSON or `proxies:` entry — is a
+  bearer credential: whoever holds it is that client. With `--out`,
+  `enroll-client` writes the JSON as `0600` and refuses to overwrite an existing
+  path. Distribute it over a confidential channel and treat the command's
+  terminal output, including the mihomo entry, as secret.
+- Skipping chain validation does not weaken proof of possession. TLS 1.3 makes
+  the client sign the handshake transcript with the certificate's private key,
+  and that signature is verified by the TLS stack; the roster check replaces
+  only the X.509 trust decision. Knowing a client's public key is therefore not
+  enough to impersonate it.
+- Roster entries do not expire on their own. Revoke a client by deleting its
+  `[[clients]]` entry and sending `SIGHUP`: the server disconnects that
+  client's live connections and refuses its next handshake, without restarting
+  and without disturbing other tunnels. A reload that fails validation keeps
+  the previous roster, so a bad edit cannot lock everyone out.
 
 ## Linux privilege
 

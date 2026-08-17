@@ -9,6 +9,9 @@ Type=simple
 User=masque
 Group=masque
 ExecStart=/usr/local/bin/masque-server --config /etc/masque/masque.toml
+# Re-reads the [[clients]] roster only, so revoking a client does not drop
+# every other client's tunnel. Everything else still needs a restart.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576

@@ -1,9 +1,11 @@
 pub mod address_pool;
 pub mod auth;
 pub mod capsule;
+pub mod client_identity;
 pub mod config;
 pub mod connection;
 pub mod datagram;
+pub mod enroll;
 pub mod error;
 pub mod fxhash;
 pub mod ip_packet;
