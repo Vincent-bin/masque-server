@@ -15,6 +15,11 @@ pub struct ServerConfig {
     pub tcp_proxy: TcpProxySection,
     pub udp_proxy: UdpProxySection,
     pub ip_proxy: IpProxySection,
+    /// Pre-registered clients, identified by their TLS client certificate key.
+    ///
+    /// Only consulted when `auth.mode = "client_cert"`. Written as repeated
+    /// `[[clients]]` tables.
+    pub clients: Vec<ClientEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -40,10 +45,27 @@ pub struct TlsSection {
     pub key_path: PathBuf,
 }
 
+/// How clients prove who they are.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// RFC 7617 `Proxy-Authorization: Basic`, verified per request.
+    #[default]
+    Basic,
+    /// A TLS client certificate, matched against the `[[clients]]` roster by
+    /// public key during the QUIC handshake.
+    ///
+    /// This is what Cloudflare's WARP MASQUE endpoint does, and what clients
+    /// built against it (usque) expect: they never send `Proxy-Authorization`.
+    ClientCert,
+}
+
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AuthSection {
+    /// Master switch. `false` disables authentication whatever `mode` says.
     pub enabled: bool,
+    pub mode: AuthMode,
     pub username: String,
     pub password_hash: String,
 }
@@ -52,6 +74,7 @@ impl std::fmt::Debug for AuthSection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthSection")
             .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
             .field("username", &self.username)
             .field(
                 "password_hash",
@@ -63,6 +86,43 @@ impl std::fmt::Debug for AuthSection {
             )
             .finish()
     }
+}
+
+impl AuthSection {
+    /// Whether `Proxy-Authorization` is required on every CONNECT request.
+    pub fn basic_enabled(&self) -> bool {
+        self.enabled && self.mode == AuthMode::Basic
+    }
+
+    /// Whether a client certificate is required to complete the handshake.
+    pub fn client_cert_enabled(&self) -> bool {
+        self.enabled && self.mode == AuthMode::ClientCert
+    }
+}
+
+/// One pre-registered client.
+///
+/// This replaces the vendor enrollment API for self-hosted setups: the
+/// operator generates a key pair, records its public key here, and hands the
+/// private key to the client out of band.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClientEntry {
+    /// Label used in logs. Optional, but makes the logs readable.
+    pub name: String,
+    /// The client's ECDSA P-256 public key, as base64 SubjectPublicKeyInfo DER
+    /// or a `-----BEGIN PUBLIC KEY-----` PEM block.
+    pub public_key: String,
+    /// Fixed IPv4 handed to this client's CONNECT-IP tunnels. Must fall inside
+    /// `ip_proxy.ipv4_pool`.
+    ///
+    /// Clients that configure their tunnel interface from a vendor API rather
+    /// than from the `ADDRESS_ASSIGN` capsule need the server to assign the
+    /// same address every time, otherwise the two disagree and every packet is
+    /// dropped as spoofed.
+    pub ipv4: Option<String>,
+    /// Fixed IPv6, inside `ip_proxy.ipv6_pool`.
+    pub ipv6: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -131,6 +191,12 @@ pub struct TcpProxySection {
 pub struct IpProxySection {
     pub enabled: bool,
     pub uri_template: String,
+    /// Accepted `:protocol` values for an Extended CONNECT IP request.
+    ///
+    /// RFC 9484 registers `connect-ip`. Cloudflare's endpoint uses
+    /// `cf-connect-ip` instead, and clients written against it send only that,
+    /// so both are accepted by default; an RFC client never sends the latter.
+    pub connect_protocols: Vec<String>,
     pub tun_name: String,
     pub tun_mtu: usize,
     /// Open the TUN device with `IFF_VNET_HDR` so the kernel can hand over a
@@ -149,7 +215,10 @@ impl Default for ServerSection {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:443".parse().unwrap(),
-            idle_timeout_secs: 30,
+            // Comfortably above the 30s keepalive period MASQUE VPN clients
+            // commonly default to, so a tunnel that is merely quiet does not
+            // race its own keepalive to the timeout.
+            idle_timeout_secs: 60,
             max_connections: 10_000,
             max_tunnels_per_connection: 100,
             // Opt-in: sharding changes how connections are distributed, so an
@@ -175,6 +244,7 @@ impl Default for AuthSection {
             // Fail closed in Server::bind until an operator configures
             // credentials or explicitly opts out for a private test setup.
             enabled: true,
+            mode: AuthMode::Basic,
             username: String::new(),
             password_hash: String::new(),
         }
@@ -251,6 +321,7 @@ impl Default for IpProxySection {
         Self {
             enabled: true,
             uri_template: "/.well-known/masque/ip/{target}/{ipproto}/".into(),
+            connect_protocols: vec!["connect-ip".into(), "cf-connect-ip".into()],
             tun_name: "masque0".into(),
             tun_mtu: 1280,
             tun_offload: true,
@@ -273,10 +344,14 @@ mod tests {
     fn defaults_are_sensible() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.server.listen_addr.port(), 443);
-        assert_eq!(cfg.server.idle_timeout_secs, 30);
+        assert_eq!(cfg.server.idle_timeout_secs, 60);
         assert!(cfg.auth.enabled);
+        assert_eq!(cfg.auth.mode, AuthMode::Basic);
+        assert!(cfg.auth.basic_enabled());
+        assert!(!cfg.auth.client_cert_enabled());
         assert!(cfg.auth.username.is_empty());
         assert!(cfg.auth.password_hash.is_empty());
+        assert!(cfg.clients.is_empty());
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
@@ -289,6 +364,12 @@ mod tests {
         assert!(cfg.udp_proxy.enabled);
         assert!(cfg.ip_proxy.enabled);
         assert_eq!(cfg.ip_proxy.tun_mtu, 1280);
+        // Cloudflare's non-standard identifier is accepted out of the box; an
+        // RFC 9484 client never sends it, so this costs nothing.
+        assert_eq!(
+            cfg.ip_proxy.connect_protocols,
+            vec!["connect-ip", "cf-connect-ip"]
+        );
     }
 
     #[test]
@@ -339,6 +420,63 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("$argon2id$"));
+    }
+
+    #[test]
+    fn parse_client_cert_auth_mode_with_roster() {
+        let toml = r#"
+[auth]
+enabled = true
+mode = "client_cert"
+
+[[clients]]
+name = "laptop"
+public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdGVzdA=="
+ipv4 = "10.89.0.2"
+ipv6 = "fd00:abcd::2"
+
+[[clients]]
+name = "phone"
+public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb3RoZXI="
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.auth.mode, AuthMode::ClientCert);
+        assert!(cfg.auth.client_cert_enabled());
+        // The Basic pipeline must stand down, or a client certificate would not
+        // be enough on its own.
+        assert!(!cfg.auth.basic_enabled());
+
+        assert_eq!(cfg.clients.len(), 2);
+        assert_eq!(cfg.clients[0].name, "laptop");
+        assert_eq!(cfg.clients[0].ipv4.as_deref(), Some("10.89.0.2"));
+        assert_eq!(cfg.clients[0].ipv6.as_deref(), Some("fd00:abcd::2"));
+        // A roster entry without fixed addresses falls back to the pool.
+        assert_eq!(cfg.clients[1].ipv4, None);
+        assert_eq!(cfg.clients[1].ipv6, None);
+    }
+
+    #[test]
+    fn disabling_auth_overrides_the_mode() {
+        let cfg = parse_toml("[auth]\nenabled = false\nmode = \"client_cert\"\n").unwrap();
+        assert!(!cfg.auth.client_cert_enabled());
+        assert!(!cfg.auth.basic_enabled());
+    }
+
+    #[test]
+    fn parse_unknown_auth_mode_is_rejected() {
+        // A typo here would otherwise silently fall back to Basic and lock out
+        // every client certificate.
+        assert!(parse_toml("[auth]\nmode = \"mtls\"\n").is_err());
+    }
+
+    #[test]
+    fn parse_custom_connect_protocols() {
+        let toml = r#"
+[ip_proxy]
+connect_protocols = ["connect-ip"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.ip_proxy.connect_protocols, vec!["connect-ip"]);
     }
 
     #[test]
@@ -442,7 +580,7 @@ ipv6_pool = "fd01::/64"
         let toml = r#"
 [server]
 listen_addr = "0.0.0.0:443"
-idle_timeout_secs = 30
+idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
 
@@ -488,6 +626,7 @@ deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
 [ip_proxy]
 enabled = true
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
+connect_protocols = ["connect-ip", "cf-connect-ip"]
 tun_name = "masque0"
 tun_mtu = 1280
 ipv4_pool = "10.89.0.0/16"

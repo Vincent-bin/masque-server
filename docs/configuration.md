@@ -13,12 +13,29 @@ file is the canonical deployable example and is tested by the release flow.
 ```text
 masque-server [OPTIONS]
 masque-server hash-password
+masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 
   -c, --config <PATH>       Config file [default: masque.toml]
   -l, --listen <ADDR>       Override server.listen_addr
       --cert <PATH>         Override tls.cert_path
       --key <PATH>          Override tls.key_path
   -v, --verbose             Increase verbosity; repeat for trace logging
+  -V, --version             Print the server version
+```
+
+`hash-password` reads a password on stdin and prints an Argon2id hash for
+`auth.password_hash`. `enroll-client` generates a client key pair for
+`auth.mode = "client_cert"`; it reads `tls.cert_path` from `--config`, so pass
+the same config the server uses. Both are described under
+[Authentication](#authentication).
+
+```text
+enroll-client options:
+      --name <NAME>         Label for this client, used in the server's logs
+      --endpoint <ADDR:PORT>  What clients dial; must be reachable from them
+      --ipv4 <ADDR>         Fixed tunnel IPv4, inside ip_proxy.ipv4_pool
+      --ipv6 <ADDR>         Fixed tunnel IPv6, inside ip_proxy.ipv6_pool
+  -o, --out <PATH>          Write the client JSON here instead of stdout
 ```
 
 `RUST_LOG` overrides the default tracing filter.
@@ -28,7 +45,7 @@ masque-server hash-password
 ```toml
 [server]
 listen_addr = "0.0.0.0:443"
-idle_timeout_secs = 30
+idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
 shards = 1
@@ -58,23 +75,198 @@ as group `masque`; install both files as `root:masque` with mode `0640`.
 
 ## Authentication
 
+`auth.mode` selects how clients prove who they are. The two modes are mutually
+exclusive — `client_cert` makes the TLS handshake demand a certificate, so a
+credential-based client cannot even connect, and vice versa. Serving both kinds
+of client requires two server instances.
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | Master switch. `false` disables authentication whatever `mode` says |
+| `mode` | `basic` (default) or `client_cert` |
+| `username` | `basic` only |
+| `password_hash` | `basic` only; Argon2id PHC string |
+| `[[clients]]` | `client_cert` only; the roster of allowed clients |
+
+Choose `basic` for standards-compliant MASQUE clients. Choose `client_cert` for
+VPN-style clients modelled on Cloudflare WARP, such as usque and mihomo, which
+never send credentials; see
+[Cloudflare-compatible clients](protocols.md#cloudflare-compatible-clients).
+
+### `mode = "basic"` (default)
+
+Credentials are checked on every CONNECT request, so one authorized tunnel does
+not authorize later streams that omit the header.
+
 ```toml
 [auth]
 enabled = true
+mode = "basic"
 username = "proxy-user"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 ```
 
-Generate a hash without placing the password in process arguments:
+Generate the hash without placing the password in process arguments, which
+would expose it to every user on the host through the process list:
 
 ```sh
 printf '%s' 'a-strong-password' | masque-server hash-password
 ```
 
-Clients send `Proxy-Authorization: Basic ...` on every CONNECT request.
-Missing or invalid credentials receive `407 Proxy Authentication Required`.
-Set `enabled = false` only in an isolated test environment or behind another
-trusted authentication boundary.
+Clients send `Proxy-Authorization: Basic BASE64(user:password)` on each
+request. Missing, malformed, duplicated, or wrong credentials receive
+`407 Proxy Authentication Required`.
+
+The server refuses to start if `username` is empty or contains `:`, or if
+`password_hash` is not a valid Argon2id PHC string.
+
+### `mode = "client_cert"`
+
+Clients authenticate once, with a TLS client certificate, during the QUIC
+handshake. Nothing is checked per request: every stream on an established
+connection is already authorized. Standard CONNECT and CONNECT-UDP keep working
+if their sections are enabled — the mode changes who may connect, not what they
+may ask for.
+
+```toml
+[auth]
+enabled = true
+mode = "client_cert"
+
+[[clients]]
+name = "laptop"
+public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+ipv4 = "10.89.0.2"
+ipv6 = "fd00:abcd::2"
+
+[[clients]]
+name = "phone"
+public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+ipv4 = "10.89.0.3"
+ipv6 = "fd00:abcd::3"
+```
+
+| `[[clients]]` key | Meaning |
+| --- | --- |
+| `name` | Label used in the server's logs. Optional but makes them readable |
+| `public_key` | The client's ECDSA P-256 public key: base64 SubjectPublicKeyInfo DER, or a `-----BEGIN PUBLIC KEY-----` block |
+| `ipv4` | Fixed CONNECT-IP address, inside `ip_proxy.ipv4_pool` |
+| `ipv6` | Fixed CONNECT-IP address, inside `ip_proxy.ipv6_pool` |
+
+#### Enrolling a client
+
+There is no enrollment API to call. The operator generates the key pair and
+distributes it:
+
+```sh
+masque-server --config masque.toml enroll-client \
+    --name laptop --endpoint 203.0.113.9:443 \
+    --ipv4 10.89.0.2 --ipv6 fd00:abcd::2 --out client.json
+```
+
+This prints three things: the `[[clients]]` block for this file, a JSON
+configuration for usque-style clients, and a `proxies:` entry for mihomo-style
+clients. The client halves contain the private key — treat the output as a
+secret. Generating both spellings matters because the same key is encoded
+differently for each: usque takes the server key as PEM and addresses bare,
+mihomo takes it as bare base64 and addresses in CIDR form.
+
+The generated mihomo entry uses the active `ip_proxy.tun_mtu` value from the
+same server configuration, so a non-default MTU stays consistent on both ends.
+
+`--out` writes the JSON to a file created as a new `0600` file on Unix; an
+existing path is never overwritten. Without it the JSON goes to the terminal.
+
+Nothing is written to the server configuration automatically. Append the
+`[[clients]]` block yourself, then run `systemctl reload masque` or restart.
+
+The usque JSON schema stores the endpoint IP but not its port, so enrollment
+also prints the matching launch argument — `--connect-port 443` for the example
+above, `--connect-port 8449` for a server on 8449. Omitting it silently falls
+back to the client's default port.
+
+#### How the certificate is checked
+
+Only the public key inside the certificate is compared against the roster. The
+certificate itself is a disposable envelope: these clients self-sign a fresh
+one per connection with an empty subject and 24-hour validity, so its chain,
+name, and dates carry nothing worth verifying.
+
+A key that is not on the roster is refused during the handshake with a TLS
+`access_denied` alert, before it can open a stream. The rejected key is logged
+in exactly the form you can paste into a `[[clients]]` entry, so enrolling a new
+client needs no separate key extraction step.
+
+The **server** certificate must use an ECDSA key, because these clients pin its
+public key and reject any other key type. `scripts/gen-certs.sh` produces a
+suitable P-256 certificate. Replacing the server certificate invalidates every
+client configuration that pinned the old key.
+
+#### Pinned addresses
+
+`ipv4` / `ipv6` bypass the dynamic pool and give that client the same address
+every time. This is required for clients that configure their tunnel interface
+from their own configuration rather than from the `ADDRESS_ASSIGN` capsule: if
+the two sides disagree, traffic is dropped in both directions — inbound as a
+spoofed source, outbound by the client's own filtering. Omit them only for
+clients that do read `ADDRESS_ASSIGN`.
+
+Pinned addresses are withheld from dynamic allocation for the process lifetime,
+so an offline client keeps its address. When a replacement connection arrives
+before its stale predecessor times out, the same authenticated identity may
+reclaim the addresses immediately and the newest tunnel owns their return
+route — a network change does not cost a minute of downtime.
+
+Dynamic allocation begins at network address `+2`; `+1` belongs to the server's
+own TUN interface.
+
+#### Revoking a client
+
+Edit the roster and send `SIGHUP`:
+
+```sh
+systemctl reload masque            # or: kill -HUP $(pidof masque-server)
+```
+
+The server re-reads `[[clients]]` from the same file it was started with,
+disconnects any live connection whose entry was removed or changed, and leaves
+every other tunnel untouched. A removed client's next attempt is refused at the
+handshake like any unenrolled key. Adding an entry works the same way, so a
+client can be re-enrolled without a restart either.
+
+Only the roster is reloaded. Listen address, TLS material, pools, and tuning are
+fixed at bind time; changing those still needs a restart. A reload that does not
+validate — an unparseable key, a pinned address outside the pool, `auth.mode` no
+longer `client_cert` — is rejected as a whole and the running roster stays in
+force, so a typo cannot lock everyone out.
+
+Editing an existing entry counts as revocation: the client is disconnected and
+must reconnect to pick up its new pinned addresses, which are chosen when the
+tunnel is set up.
+
+Reload is unavailable when the server was started without a config file, since
+there is nothing to re-read.
+
+#### Startup validation
+
+The server refuses to start when:
+
+- `mode = "client_cert"` and no `[[clients]]` entry exists — an empty roster
+  admits nobody, which looks exactly like a broken TLS setup;
+- a `public_key` is unparseable or is not ECDSA P-256;
+- two entries share a `public_key`, or pin the same address;
+- a pinned address falls outside its pool, or is the pool's gateway address —
+  checked only while `ip_proxy.enabled = true`, since there is no pool to
+  validate against otherwise.
+
+`[[clients]]` entries outside this mode are ignored, do not reserve addresses,
+and produce a startup warning.
+
+### Disabling authentication
+
+`auth.enabled = false` turns off both modes and logs a warning. This is only
+appropriate in an isolated test environment or behind another trusted
+authentication boundary.
 
 ## QUIC and UDP
 
@@ -154,12 +346,19 @@ different.
 [ip_proxy]
 enabled = true
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
+connect_protocols = ["connect-ip", "cf-connect-ip"]
 tun_name = "masque0"
 tun_mtu = 1280
 tun_offload = true
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
 ```
+
+`connect_protocols` lists the accepted `:protocol` values. RFC 9484 registers
+`connect-ip`; Cloudflare's endpoint uses `cf-connect-ip` and clients built
+against it send only that. Both are accepted by default, which costs nothing
+because an RFC client never sends the second one. Narrow the list to
+`["connect-ip"]` to accept only standards-compliant clients.
 
 CONNECT-IP is Linux-only. Pools must not overlap host, container, VPN, or
 upstream networks. The host is responsible for routing, forwarding, firewall,

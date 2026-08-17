@@ -41,6 +41,22 @@ impl PendingConnectSetups {
     }
 }
 
+/// Whether `protocol` names CONNECT-IP according to the configured list.
+///
+/// RFC 9484 registers `connect-ip`, but Cloudflare's endpoint uses
+/// `cf-connect-ip`, and clients written against it send only that. The value is
+/// compared case-sensitively: `:protocol` is a registered token, not a header
+/// name.
+///
+/// An empty `protocol` never matches, however the list is configured, because
+/// that is a standard CONNECT and belongs to the TCP path.
+fn accepts_connect_ip(configured: &[String], protocol: &[u8]) -> bool {
+    !protocol.is_empty()
+        && configured
+            .iter()
+            .any(|accepted| accepted.as_bytes() == protocol)
+}
+
 /// Shared request dependencies passed together to keep dispatch APIs focused.
 pub(super) struct RequestContext<'a> {
     pub(super) config: &'a ServerConfig,
@@ -102,7 +118,9 @@ impl Shard {
                 Some(ConnectRequest::Udp {
                     path: String::from_utf8_lossy(path).into_owned(),
                 })
-            } else if protocol == b"connect-ip" && context.config.ip_proxy.enabled {
+            } else if context.config.ip_proxy.enabled
+                && accepts_connect_ip(&context.config.ip_proxy.connect_protocols, protocol)
+            {
                 Some(ConnectRequest::Ip)
             } else {
                 None
@@ -181,31 +199,14 @@ impl Shard {
                 );
             }
             ConnectRequest::Ip => {
-                Self::handle_connect_ip_response(h3, quic, stream_id, &mut pending.ip);
+                // Address allocation can fail (pool exhaustion, bad fixed
+                // lease), so defer the response with the setup. Sending 200
+                // here would make a later 503 both illegal and invisible to
+                // the client.
+                info!(stream_id, "CONNECT-IP request accepted for setup");
+                pending.ip.push(stream_id);
             }
         }
-    }
-
-    /// Send 200 OK for CONNECT-IP and defer address allocation.
-    fn handle_connect_ip_response(
-        h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
-        stream_id: u64,
-        pending_ip_setups: &mut Vec<u64>,
-    ) {
-        info!(stream_id, "CONNECT-IP request accepted");
-
-        let headers = vec![
-            quiche::h3::Header::new(b":status", b"200"),
-            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        ];
-
-        if let Err(e) = h3.send_response(quic, stream_id, &headers, false) {
-            warn!(stream_id, %e, "failed to send CONNECT-IP 200");
-            return;
-        }
-
-        pending_ip_setups.push(stream_id);
     }
 
     /// Parse and authorize CONNECT-UDP, respond, then defer socket creation.
@@ -255,5 +256,55 @@ impl Shard {
         }
 
         pending_udp_setups.push((stream_id, target));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accepts_connect_ip;
+    use crate::config::IpProxySection;
+
+    fn defaults() -> Vec<String> {
+        IpProxySection::default().connect_protocols
+    }
+
+    #[test]
+    fn default_list_accepts_both_the_registered_and_cloudflare_identifiers() {
+        assert!(accepts_connect_ip(&defaults(), b"connect-ip"));
+        assert!(accepts_connect_ip(&defaults(), b"cf-connect-ip"));
+    }
+
+    #[test]
+    fn other_protocols_are_not_treated_as_connect_ip() {
+        assert!(!accepts_connect_ip(&defaults(), b"connect-udp"));
+        assert!(!accepts_connect_ip(&defaults(), b"websocket"));
+        // A prefix or suffix of an accepted token must not match.
+        assert!(!accepts_connect_ip(&defaults(), b"connect"));
+        assert!(!accepts_connect_ip(&defaults(), b"cf-connect-ip-v2"));
+    }
+
+    #[test]
+    fn absent_protocol_stays_with_the_tcp_path() {
+        // An empty `:protocol` is a standard CONNECT; claiming it here would
+        // divert every plain CONNECT into the IP tunnel.
+        assert!(!accepts_connect_ip(&defaults(), b""));
+        assert!(!accepts_connect_ip(&[String::new()], b""));
+    }
+
+    #[test]
+    fn matching_is_case_sensitive() {
+        // `:protocol` carries a registered token, not a header name.
+        assert!(!accepts_connect_ip(&defaults(), b"CONNECT-IP"));
+        assert!(!accepts_connect_ip(&defaults(), b"CF-Connect-IP"));
+    }
+
+    #[test]
+    fn an_operator_can_narrow_the_list() {
+        let strict = vec!["connect-ip".to_string()];
+        assert!(accepts_connect_ip(&strict, b"connect-ip"));
+        assert!(!accepts_connect_ip(&strict, b"cf-connect-ip"));
+
+        // Or drop CONNECT-IP support without disabling the proxy section.
+        assert!(!accepts_connect_ip(&[], b"connect-ip"));
     }
 }

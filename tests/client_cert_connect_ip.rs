@@ -1,0 +1,1062 @@
+//! End-to-end coverage for the Cloudflare-compatible CONNECT-IP path.
+//!
+//! These tests drive a real QUIC client against a real server, because the
+//! parts that were most likely to be wrong are the parts unit tests cannot
+//! reach: whether BoringSSL actually asks for a client certificate when the
+//! chain is unverifiable, and whether a request shaped the way Cloudflare's
+//! clients shape it survives quiche's HTTP/3 layer.
+//!
+//! The client is deliberately built to mimic that family of clients rather than
+//! an RFC 9484 one: a self-signed certificate with an empty subject, serial 0,
+//! and 24 hours of validity; `:protocol: cf-connect-ip`; a hardcoded authority;
+//! and `:path: /`.
+
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use boring::asn1::Asn1Time;
+use boring::bn::BigNum;
+use boring::ec::{EcGroup, EcKey};
+use boring::hash::MessageDigest;
+use boring::nid::Nid;
+use boring::pkey::{PKey, Private};
+use boring::x509::{X509, X509Builder, X509NameBuilder};
+use quiche::h3::NameValue as _;
+
+use masque::capsule::decoder::{CapsuleDecoder, DecodeError};
+use masque::capsule::{CapsuleFrame, IpAddress};
+use masque::config::{AuthMode, ClientEntry, ServerConfig};
+use masque::datagram::DatagramHeader;
+use masque::server::Server;
+
+const MAX_DATAGRAM_SIZE: usize = 1350;
+const CLIENT_IPV4: &str = "10.89.0.2";
+const CLIENT_IPV6: &str = "fd00:abcd::2";
+
+/// QUIC maps a TLS alert to `CRYPTO_ERROR` (0x100) plus the alert number.
+/// Alert 49 is `access_denied`.
+const ACCESS_DENIED_CRYPTO_ERROR: u64 = 0x100 + 49;
+
+/// The tunnel MTU these clients use, matching `ip_proxy.tun_mtu`.
+const TUN_MTU: usize = 1280;
+
+/// Connection ID length this client uses, matching what these clients set.
+/// It is also QUIC's maximum, which makes it the tightest case for datagram
+/// sizing.
+const CLIENT_CONN_ID_LEN: usize = quiche::MAX_CONN_ID_LEN;
+
+/// Connection ID length the server issues (`server::CONN_ID_LEN`).
+const SERVER_CONN_ID_LEN: usize = 16;
+
+// ── Key and certificate material ─────────────────────────────────────
+
+fn p256_key() -> PKey<Private> {
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+    PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
+}
+
+fn public_key_b64(key: &PKey<Private>) -> String {
+    STANDARD.encode(key.public_key_to_der().unwrap())
+}
+
+/// A self-signed certificate. `subject` empty reproduces what these clients
+/// present: no distinguished name at all, so only the key identifies them.
+fn self_signed(key: &PKey<Private>, subject: Option<&str>) -> X509 {
+    let mut builder = X509Builder::new().unwrap();
+    builder.set_version(2).unwrap();
+    builder
+        .set_serial_number(&BigNum::from_u32(0).unwrap().to_asn1_integer().unwrap())
+        .unwrap();
+    if let Some(cn) = subject {
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", cn).unwrap();
+        let name = name.build();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+    }
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    builder.set_pubkey(key).unwrap();
+    builder.sign(key, MessageDigest::sha256()).unwrap();
+    builder.build()
+}
+
+/// Write a key pair out as the PEM files quiche loads.
+fn write_pem(dir: &Path, stem: &str, key: &PKey<Private>, cert: &X509) -> (PathBuf, PathBuf) {
+    let cert_path = dir.join(format!("{stem}.crt"));
+    let key_path = dir.join(format!("{stem}.key"));
+    std::fs::write(&cert_path, cert.to_pem().unwrap()).unwrap();
+    // SEC1 ("EC PRIVATE KEY"), which is what BoringSSL expects here.
+    std::fs::write(
+        &key_path,
+        key.ec_key().unwrap().private_key_to_pem().unwrap(),
+    )
+    .unwrap();
+    (cert_path, key_path)
+}
+
+/// A scratch directory removed when the test ends.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "masque-it-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+// ── Server under test ────────────────────────────────────────────────
+
+/// Reserve a loopback UDP port and release it for the server to take.
+///
+/// `Server::bind` does not report the port it landed on, so the port has to be
+/// chosen before it starts.
+fn free_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn server_config(
+    cert: PathBuf,
+    key: PathBuf,
+    port: u16,
+    clients: Vec<ClientEntry>,
+) -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.server.listen_addr = SocketAddr::from(([127, 0, 0, 1], port));
+    config.server.shards = 1;
+    config.tls.cert_path = cert;
+    config.tls.key_path = key;
+    config.auth.enabled = true;
+    config.auth.mode = AuthMode::ClientCert;
+    config.clients = clients;
+    // The tunnels under test are CONNECT-IP only, and the TCP and UDP paths
+    // would otherwise resolve and dial real targets.
+    config.tcp_proxy.enabled = false;
+    config.udp_proxy.enabled = false;
+    config
+}
+
+/// Run a server on its own runtime thread for the duration of the test.
+///
+/// The thread is detached: the runtime is dropped when the process exits, and
+/// the OS reclaims the port.
+fn spawn_server(config: ServerConfig) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            match Server::bind(config).await {
+                Ok(mut server) => {
+                    let _ = server.run().await;
+                }
+                Err(e) => panic!("server failed to bind: {e:#}"),
+            }
+        });
+    });
+}
+
+// ── Client ───────────────────────────────────────────────────────────
+
+struct Client {
+    socket: UdpSocket,
+    quic: quiche::Connection,
+    h3: Option<quiche::h3::Connection>,
+}
+
+impl Client {
+    /// Connect with a client certificate, the way these clients authenticate.
+    ///
+    /// `verify_peer(false)` mirrors them too: the SNI they send does not match
+    /// the endpoint, so they skip chain validation and pin the server's public
+    /// key instead.
+    fn connect(peer: SocketAddr, cert: &Path, key: &Path) -> anyhow::Result<Self> {
+        let socket = UdpSocket::bind("127.0.0.1:0")?;
+        socket.connect(peer)?;
+        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let local = socket.local_addr()?;
+
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+        config.verify_peer(false);
+        config.load_cert_chain_from_pem_file(cert.to_str().unwrap())?;
+        config.load_priv_key_from_pem_file(key.to_str().unwrap())?;
+        config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+        config.set_max_idle_timeout(10_000);
+        config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+        config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+        config.set_initial_max_data(1_048_576);
+        config.set_initial_max_stream_data_bidi_local(262_144);
+        config.set_initial_max_stream_data_bidi_remote(262_144);
+        config.set_initial_max_stream_data_uni(262_144);
+        config.set_initial_max_streams_bidi(16);
+        config.set_initial_max_streams_uni(16);
+        config.enable_dgram(true, 256, 256);
+
+        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut scid)
+            .map_err(|_| anyhow::anyhow!("RNG failed"))?;
+
+        // The SNI these clients send names the vendor's endpoint rather than
+        // this server, which is exactly why they cannot verify the chain.
+        let quic = quiche::connect(
+            Some("consumer-masque.cloudflareclient.com"),
+            &quiche::ConnectionId::from_ref(&scid),
+            local,
+            peer,
+            &mut config,
+        )?;
+
+        Ok(Self {
+            socket,
+            quic,
+            h3: None,
+        })
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        let mut out = [0u8; MAX_DATAGRAM_SIZE];
+        loop {
+            match self.quic.send(&mut out) {
+                Ok((len, _)) => {
+                    self.socket.send(&out[..len])?;
+                }
+                Err(quiche::Error::Done) => return Ok(()),
+                Err(e) => anyhow::bail!("QUIC send: {e}"),
+            }
+        }
+    }
+
+    fn recv_once(&mut self) -> anyhow::Result<()> {
+        let mut buf = [0u8; 65535];
+        let len = match self.socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let info = quiche::RecvInfo {
+            from: self.socket.peer_addr()?,
+            to: self.socket.local_addr()?,
+        };
+        match self.quic.recv(&mut buf[..len], info) {
+            Ok(_) | Err(quiche::Error::Done) => Ok(()),
+            Err(e) => anyhow::bail!("QUIC recv: {e}"),
+        }
+    }
+
+    fn drive(&mut self) -> anyhow::Result<()> {
+        self.flush()?;
+        self.recv_once()?;
+        self.flush()
+    }
+
+    fn handshake(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.drive()?;
+            if self.quic.is_established() {
+                return Ok(());
+            }
+            if self.quic.is_closed() {
+                anyhow::bail!("connection closed during handshake");
+            }
+        }
+        anyhow::bail!("handshake timed out")
+    }
+
+    /// Drive until the peer tears the connection down, or give up.
+    ///
+    /// A rejected client cannot be detected at `is_established()`: under TLS
+    /// 1.3 the server sends its own Finished before it has seen the client's
+    /// certificate, so the client reaches "established" and only then receives
+    /// the alert. What matters is that the connection does not survive.
+    fn wait_for_close(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.quic.is_closed() || self.quic.peer_error().is_some() {
+                return true;
+            }
+            if self.drive().is_err() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn init_h3(&mut self) -> anyhow::Result<()> {
+        let mut config = quiche::h3::Config::new()?;
+        config.enable_extended_connect(true);
+        self.h3 = Some(quiche::h3::Connection::with_transport(
+            &mut self.quic,
+            &config,
+        )?);
+        Ok(())
+    }
+
+    /// Send the CONNECT-IP request exactly as Cloudflare's clients send it.
+    fn send_connect_ip(&mut self, protocol: &str) -> anyhow::Result<u64> {
+        let headers = [
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", protocol.as_bytes()),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            // These clients send an empty User-Agent, which has to survive
+            // QPACK and the server's header scan.
+            quiche::h3::Header::new(b"user-agent", b""),
+        ];
+
+        let h3 = self.h3.as_mut().unwrap();
+        let stream_id = h3.send_request(&mut self.quic, &headers, false)?;
+        self.flush()?;
+        Ok(stream_id)
+    }
+
+    /// Wait for the response status on `stream_id`.
+    fn response_status(&mut self, stream_id: u64, timeout: Duration) -> anyhow::Result<u16> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            loop {
+                let h3 = self.h3.as_mut().unwrap();
+                match h3.poll(&mut self.quic) {
+                    Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
+                        for header in &list {
+                            if header.name() == b":status" {
+                                let status = std::str::from_utf8(header.value())?;
+                                return Ok(status.parse()?);
+                            }
+                        }
+                        anyhow::bail!("response had no :status");
+                    }
+                    Ok(_) => continue,
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => anyhow::bail!("H3 poll: {e}"),
+                }
+            }
+            self.drive()?;
+        }
+        anyhow::bail!("no response within {timeout:?}")
+    }
+
+    /// Collect capsules from the response body until `wanted` of them arrive.
+    fn capsules(&mut self, stream_id: u64, wanted: usize, timeout: Duration) -> Vec<CapsuleFrame> {
+        let deadline = Instant::now() + timeout;
+        let mut decoder = CapsuleDecoder::new();
+        let mut frames = Vec::new();
+        let mut buf = [0u8; 4096];
+
+        while Instant::now() < deadline && frames.len() < wanted {
+            loop {
+                let h3 = self.h3.as_mut().unwrap();
+                match h3.poll(&mut self.quic) {
+                    Ok(_) => continue,
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(_) => break,
+                }
+            }
+            loop {
+                let h3 = self.h3.as_mut().unwrap();
+                match h3.recv_body(&mut self.quic, stream_id, &mut buf) {
+                    Ok(len) => match decoder.decode(&buf[..len]) {
+                        Ok(mut decoded) => frames.append(&mut decoded),
+                        Err(DecodeError::Incomplete) => {}
+                        Err(e) => panic!("capsule decode failed: {e:?}"),
+                    },
+                    Err(_) => break,
+                }
+            }
+            let _ = self.drive();
+        }
+
+        frames
+    }
+}
+
+// ── Fixtures ─────────────────────────────────────────────────────────
+
+/// A running server plus everything a client needs to reach it.
+struct Fixture {
+    _dir: TempDir,
+    peer: SocketAddr,
+    client_cert: PathBuf,
+    client_key: PathBuf,
+    stranger_cert: PathBuf,
+    stranger_key: PathBuf,
+}
+
+/// Start a server that knows one client, pinned to fixed addresses, and mint a
+/// second unregistered key pair to test rejection with.
+fn fixture(tag: &str) -> Fixture {
+    let dir = TempDir::new(tag);
+
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+
+    let stranger_key = p256_key();
+    let (stranger_cert, stranger_key_path) = write_pem(
+        dir.path(),
+        "stranger",
+        &stranger_key,
+        &self_signed(&stranger_key, None),
+    );
+
+    let port = free_port();
+    spawn_server(server_config(
+        cert_path,
+        key_path,
+        port,
+        vec![ClientEntry {
+            name: "laptop".into(),
+            public_key: public_key_b64(&client_key),
+            ipv4: Some(CLIENT_IPV4.into()),
+            ipv6: Some(CLIENT_IPV6.into()),
+        }],
+    ));
+
+    let peer = SocketAddr::from(([127, 0, 0, 1], port));
+    // The server binds on another thread; give it a moment to take the port.
+    std::thread::sleep(Duration::from_millis(300));
+
+    Fixture {
+        _dir: dir,
+        peer,
+        client_cert,
+        client_key: client_key_path,
+        stranger_cert,
+        stranger_key: stranger_key_path,
+    }
+}
+
+// ── Roster reload fixture ────────────────────────────────────────────
+
+/// Render a server configuration file with the given roster entries.
+fn server_config_file(cert: &Path, key: &Path, port: u16, clients: &[(&str, &str)]) -> String {
+    let mut text = format!(
+        "[server]\nlisten_addr = \"127.0.0.1:{port}\"\nshards = 1\n\n\
+         [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
+         [auth]\nenabled = true\nmode = \"client_cert\"\n\n\
+         [tcp_proxy]\nenabled = false\n\n[udp_proxy]\nenabled = false\n\n\
+         [ip_proxy]\nenabled = true\nipv4_pool = \"10.89.0.0/24\"\n\
+         ipv6_pool = \"fd00:abcd::/64\"\n",
+        cert.display(),
+        key.display()
+    );
+    for (name, public_key) in clients {
+        text.push_str(&format!(
+            "\n[[clients]]\nname = \"{name}\"\npublic_key = \"{public_key}\"\n"
+        ));
+    }
+    text
+}
+
+/// Ask this process to reload, the way an operator would.
+fn raise_sighup() {
+    let status = std::process::Command::new("kill")
+        .args(["-HUP", &std::process::id().to_string()])
+        .status()
+        .expect("failed to send SIGHUP");
+    assert!(status.success(), "kill -HUP failed");
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+/// Revoking a client must drop the tunnel it already holds, without restarting
+/// the server and without disturbing anyone else.
+///
+/// Removing an entry only from future handshakes would leave the revoked client
+/// connected for as long as it cared to stay, which is not revocation at all.
+#[test]
+fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
+    let dir = TempDir::new("revoke");
+
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let doomed_key = p256_key();
+    let (doomed_cert, doomed_key_path) = write_pem(
+        dir.path(),
+        "doomed",
+        &doomed_key,
+        &self_signed(&doomed_key, None),
+    );
+    let keeper_key = p256_key();
+    let (keeper_cert, keeper_key_path) = write_pem(
+        dir.path(),
+        "keeper",
+        &keeper_key,
+        &self_signed(&keeper_key, None),
+    );
+
+    let port = free_port();
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        server_config_file(
+            &cert_path,
+            &key_path,
+            port,
+            &[
+                ("doomed", &public_key_b64(&doomed_key)),
+                ("keeper", &public_key_b64(&keeper_key)),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let config =
+        masque::config::parse_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let reload_path = config_path.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut server = Server::bind_with_reload(config, Some(reload_path))
+                .await
+                .expect("server failed to bind");
+            let _ = server.run().await;
+        });
+    });
+    // Let the server bind and install its signal handler before raising one.
+    std::thread::sleep(Duration::from_millis(600));
+
+    let peer = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut doomed = Client::connect(peer, &doomed_cert, &doomed_key_path).unwrap();
+    doomed.handshake(Duration::from_secs(5)).unwrap();
+    doomed.init_h3().unwrap();
+    let doomed_stream = doomed.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        doomed
+            .response_status(doomed_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    let mut keeper = Client::connect(peer, &keeper_cert, &keeper_key_path).unwrap();
+    keeper.handshake(Duration::from_secs(5)).unwrap();
+    keeper.init_h3().unwrap();
+    let keeper_stream = keeper.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        keeper
+            .response_status(keeper_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    // Revoke one client and reload.
+    std::fs::write(
+        &config_path,
+        server_config_file(
+            &cert_path,
+            &key_path,
+            port,
+            &[("keeper", &public_key_b64(&keeper_key))],
+        ),
+    )
+    .unwrap();
+    raise_sighup();
+
+    assert!(
+        doomed.wait_for_close(Duration::from_secs(10)),
+        "a revoked client must lose the tunnel it already holds"
+    );
+
+    // The other client must be untouched: revocation is targeted, not a
+    // restart in disguise.
+    assert!(
+        !keeper.wait_for_close(Duration::from_secs(2)),
+        "revoking one client must not disturb the others"
+    );
+    assert!(!keeper.quic.is_closed());
+}
+
+/// A reload that does not validate must leave the running roster in force
+/// rather than locking everyone out.
+#[test]
+fn a_broken_reload_keeps_the_previous_roster() {
+    let dir = TempDir::new("badreload");
+
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+
+    let port = free_port();
+    let config_path = dir.path().join("masque.toml");
+    let good = server_config_file(
+        &cert_path,
+        &key_path,
+        port,
+        &[("laptop", &public_key_b64(&client_key))],
+    );
+    std::fs::write(&config_path, &good).unwrap();
+
+    let config = masque::config::parse_toml(&good).unwrap();
+    let reload_path = config_path.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut server = Server::bind_with_reload(config, Some(reload_path))
+                .await
+                .expect("server failed to bind");
+            let _ = server.run().await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(600));
+
+    let peer = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut client = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let stream = client.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    // An unparseable public key: the roster must be rejected as a whole.
+    std::fs::write(
+        &config_path,
+        server_config_file(&cert_path, &key_path, port, &[("laptop", "!!not base64!!")]),
+    )
+    .unwrap();
+    raise_sighup();
+
+    assert!(
+        !client.wait_for_close(Duration::from_secs(3)),
+        "a rejected reload must not disconnect an authorized client"
+    );
+
+    // And a client presenting the still-valid key is still admitted.
+    let mut second = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+    second.handshake(Duration::from_secs(5)).unwrap();
+    second.init_h3().unwrap();
+    let stream = second.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        second
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap(),
+        200,
+        "the previous roster must still be in force after a failed reload"
+    );
+}
+
+/// The whole point of the exercise: a client that authenticates with a
+/// certificate and asks for `cf-connect-ip` gets a working tunnel, assigned the
+/// addresses its roster entry pins it to.
+#[test]
+fn registered_client_gets_its_pinned_addresses_over_cf_connect_ip() {
+    let fixture = fixture("happy");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+
+    let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+    let status = client
+        .response_status(stream_id, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(status, 200, "cf-connect-ip must be accepted");
+
+    let capsules = client.capsules(stream_id, 2, Duration::from_secs(5));
+    let assigned = capsules
+        .iter()
+        .find_map(|frame| match frame {
+            CapsuleFrame::AddressAssign(addrs) => Some(addrs),
+            _ => None,
+        })
+        .expect("server must send ADDRESS_ASSIGN");
+
+    // Pinned, not pool-allocated: a client that configures its interface out of
+    // band only works if the server hands back the same addresses every time.
+    let addresses: Vec<IpAddress> = assigned.iter().map(|a| a.ip.clone()).collect();
+    assert!(
+        addresses.contains(&IpAddress::V4(CLIENT_IPV4.parse::<Ipv4Addr>().unwrap())),
+        "expected the pinned IPv4, got {addresses:?}"
+    );
+    assert!(
+        addresses.contains(&IpAddress::V6(CLIENT_IPV6.parse::<Ipv6Addr>().unwrap())),
+        "expected the pinned IPv6, got {addresses:?}"
+    );
+
+    // The default route tells the client it may send everything through here.
+    assert!(
+        capsules
+            .iter()
+            .any(|frame| matches!(frame, CapsuleFrame::RouteAdvertisement(_))),
+        "expected ROUTE_ADVERTISEMENT, got {capsules:?}"
+    );
+}
+
+/// The registered `connect-ip` spelling has to keep working: accepting
+/// Cloudflare's identifier must not come at the cost of RFC 9484 clients.
+#[test]
+fn registered_client_may_also_use_the_rfc_protocol_identifier() {
+    let fixture = fixture("rfc");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+
+    let stream_id = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+}
+
+/// A full-MTU IP packet must fit into a single QUIC DATAGRAM.
+///
+/// These clients run a 1280-byte tunnel MTU and disable path-MTU discovery, so
+/// they will emit 1280-byte packets from the first moment. If the framed packet
+/// does not fit, pings and handshakes still work while bulk traffic silently
+/// disappears — the hardest possible failure mode to attribute.
+///
+/// The margin is tighter than it looks: QUIC subtracts the peer's connection ID
+/// from every packet's payload budget, and these clients use a 20-byte
+/// connection ID, which is the largest QUIC allows.
+#[test]
+fn a_full_mtu_ip_packet_fits_in_one_datagram() {
+    let fixture = fixture("mtu");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    // Frame a packet the size of the configured tunnel MTU, the way the client
+    // would: quarter stream ID, context ID 0, then the raw IP packet.
+    let packet = vec![0x45u8; TUN_MTU];
+    let framed = DatagramHeader::new(stream_id).unwrap().encode(&packet);
+    assert!(framed.len() > TUN_MTU, "framing must add the header");
+
+    let writable = client
+        .quic
+        .dgram_max_writable_len()
+        .expect("server must advertise DATAGRAM support");
+
+    // The client's own budget is measured against the server's 16-byte
+    // connection ID, while the server's return path is measured against this
+    // client's 20-byte one. Requiring the difference as headroom means the
+    // assertion covers both directions, not just the roomier one.
+    let return_path_headroom = CLIENT_CONN_ID_LEN - SERVER_CONN_ID_LEN;
+    assert!(
+        writable >= framed.len() + return_path_headroom,
+        "a {TUN_MTU}-byte packet frames to {} bytes but only {writable} are writable \
+         ({return_path_headroom} of which the tighter return path needs); raise \
+         quic.max_datagram_size or lower ip_proxy.tun_mtu",
+        framed.len()
+    );
+
+    // Budget arithmetic is one thing; quiche actually accepting the write is
+    // the behaviour that matters.
+    client
+        .quic
+        .dgram_send(&framed)
+        .expect("a full-MTU packet must be sendable as one datagram");
+    client.flush().unwrap();
+}
+
+/// A network change often makes the replacement QUIC connection arrive before
+/// the dead one reaches its idle timeout. Because both connections prove
+/// possession of the same enrolled key, the replacement must be allowed to
+/// take over the pinned return route immediately rather than waiting up to a
+/// minute for the stale lease to disappear.
+#[test]
+fn registered_client_can_reconnect_while_the_old_tunnel_is_still_present() {
+    let fixture = fixture("reconnect");
+
+    let mut old = Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    old.handshake(Duration::from_secs(5)).unwrap();
+    old.init_h3().unwrap();
+    let old_stream = old.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        old.response_status(old_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    // Keep `old` alive while a second connection using the same enrolled key
+    // claims exactly the same fixed addresses.
+    let mut replacement =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    replacement.handshake(Duration::from_secs(5)).unwrap();
+    replacement.init_h3().unwrap();
+    let stream_id = replacement.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        replacement
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    let capsules = replacement.capsules(stream_id, 2, Duration::from_secs(5));
+    let assigned = capsules
+        .iter()
+        .find_map(|frame| match frame {
+            CapsuleFrame::AddressAssign(addrs) => Some(addrs),
+            _ => None,
+        })
+        .expect("replacement tunnel must receive its fixed addresses");
+    assert!(
+        assigned
+            .iter()
+            .any(|addr| { addr.ip == IpAddress::V4(CLIENT_IPV4.parse::<Ipv4Addr>().unwrap()) })
+    );
+
+    // Prevent an over-eager optimizer from ending the old connection's lifetime
+    // before the replacement has completed.
+    assert!(!old.quic.is_closed());
+}
+
+/// Address exhaustion must be decided before the success response. The old
+/// ordering sent 200 first and then attempted an impossible second 503 header
+/// block, leaving the caller with a successful but unusable tunnel.
+#[test]
+fn exhausted_address_pool_returns_503_instead_of_an_early_200() {
+    let dir = TempDir::new("exhausted");
+
+    let server_key = p256_key();
+    let (server_cert, server_key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let first_key = p256_key();
+    let (first_cert, first_key_path) = write_pem(
+        dir.path(),
+        "first",
+        &first_key,
+        &self_signed(&first_key, None),
+    );
+    let second_key = p256_key();
+    let (second_cert, second_key_path) = write_pem(
+        dir.path(),
+        "second",
+        &second_key,
+        &self_signed(&second_key, None),
+    );
+
+    let port = free_port();
+    let mut config = server_config(
+        server_cert,
+        server_key_path,
+        port,
+        vec![
+            ClientEntry {
+                name: "first".into(),
+                public_key: public_key_b64(&first_key),
+                ipv4: None,
+                ipv6: None,
+            },
+            ClientEntry {
+                name: "second".into(),
+                public_key: public_key_b64(&second_key),
+                ipv4: None,
+                ipv6: None,
+            },
+        ],
+    );
+    // network=.0, TUN gateway=.1, and the sole client address=.2.
+    config.ip_proxy.ipv4_pool = "10.89.0.0/30".into();
+    config.ip_proxy.ipv6_pool.clear();
+    spawn_server(config);
+    let peer = SocketAddr::from(([127, 0, 0, 1], port));
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut first = Client::connect(peer, &first_cert, &first_key_path).unwrap();
+    first.handshake(Duration::from_secs(5)).unwrap();
+    first.init_h3().unwrap();
+    let first_stream = first.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        first
+            .response_status(first_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    let capsules = first.capsules(first_stream, 2, Duration::from_secs(5));
+    let assigned = capsules
+        .iter()
+        .find_map(|frame| match frame {
+            CapsuleFrame::AddressAssign(addrs) => Some(addrs),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        assigned
+            .iter()
+            .any(|addr| { addr.ip == IpAddress::V4("10.89.0.2".parse::<Ipv4Addr>().unwrap()) })
+    );
+
+    let mut second = Client::connect(peer, &second_cert, &second_key_path).unwrap();
+    second.handshake(Duration::from_secs(5)).unwrap();
+    second.init_h3().unwrap();
+    let second_stream = second.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        second
+            .response_status(second_stream, Duration::from_secs(5))
+            .unwrap(),
+        503
+    );
+
+    assert!(!first.quic.is_closed());
+}
+
+/// An unregistered key must never get a tunnel. The rejection lands as a TLS
+/// alert, so the connection is torn down rather than answering the request.
+#[test]
+fn unregistered_client_certificate_is_refused() {
+    let fixture = fixture("stranger");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.stranger_cert, &fixture.stranger_key).unwrap();
+
+    // The handshake may reach "established" locally before the alert arrives,
+    // so its result is not the thing under test.
+    let _ = client.handshake(Duration::from_secs(2));
+    assert!(
+        client.wait_for_close(Duration::from_secs(5)),
+        "a key outside the roster must not keep a usable connection"
+    );
+
+    // The rejection has to come from TLS, not from the server's own
+    // belt-and-braces check after the handshake: only a TLS alert stops the
+    // client before it can open a stream, and only `access_denied` tells the
+    // operator their key is not enrolled rather than that TLS itself is broken.
+    assert_eq!(
+        client.quic.peer_error().map(|e| (e.is_app, e.error_code)),
+        Some((false, ACCESS_DENIED_CRYPTO_ERROR)),
+        "expected a CRYPTO_ERROR carrying TLS alert access_denied"
+    );
+}
+
+/// A client that offers no certificate at all must be refused too — the
+/// `FAIL_IF_NO_PEER_CERT` half of the verify mode. Without it, omitting the
+/// certificate would skip the verify callback entirely and reach the request
+/// path with no identity.
+#[test]
+fn client_without_a_certificate_is_refused() {
+    let fixture = fixture("nocert");
+
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.connect(fixture.peer).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let local = socket.local_addr().unwrap();
+
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+    config.verify_peer(false);
+    config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .unwrap();
+    config.set_max_idle_timeout(10_000);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_initial_max_data(1_048_576);
+    config.set_initial_max_stream_data_bidi_local(262_144);
+    config.set_initial_max_streams_bidi(16);
+
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut scid).unwrap();
+    let quic = quiche::connect(
+        Some("consumer-masque.cloudflareclient.com"),
+        &quiche::ConnectionId::from_ref(&scid),
+        local,
+        fixture.peer,
+        &mut config,
+    )
+    .unwrap();
+
+    let mut client = Client {
+        socket,
+        quic,
+        h3: None,
+    };
+    let _ = client.handshake(Duration::from_secs(2));
+    assert!(
+        client.wait_for_close(Duration::from_secs(5)),
+        "a client with no certificate must not keep a usable connection"
+    );
+}

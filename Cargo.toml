@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "masque-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "High-performance MASQUE proxy for CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/3"
@@ -27,6 +27,10 @@ path = "src/main.rs"
 anyhow = "1"
 argon2 = { version = "0.5.3", features = ["std", "zeroize"] }
 base64 = "0.22.1"
+# Same BoringSSL binding quiche links against, so the two share one library.
+# Needed to build the TLS context by hand: requesting a client certificate
+# without verifying its chain has no equivalent in quiche's own Config API.
+boring = "4.3"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 ipnet = "2"
