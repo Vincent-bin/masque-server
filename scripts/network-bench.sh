@@ -29,14 +29,16 @@ bash scripts/gen-certs.sh "$BENCH_DIR/certs"
 
 cat >"$BENCH_DIR/masque.toml" <<EOF
 [server]
-listen_addr = "127.0.0.1:4433"
 idle_timeout_secs = 30
 
 [tls]
 cert_path = "$BENCH_DIR/certs/server.crt"
 key_path = "$BENCH_DIR/certs/server.key"
 
-[auth]
+[[listeners]]
+listen_addr = "127.0.0.1:4433"
+
+[listeners.auth]
 enabled = true
 username = "test"
 password_hash = "\$argon2id\$v=19\$m=19456,t=2,p=1\$1xNVXhqKU7jJ6cqTBJKphQ\$GXXAINVTW1qhloFtN1IR8lSr7pI7QEY79fq4K6d8scQ"

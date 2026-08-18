@@ -7,6 +7,58 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-18
+
+### Added
+
+- `[[listeners]]` runs one or more listening sockets from one process, each with
+  its own `listen_addr`, `shards`, and authentication mode. This is what allows
+  one server to accept both standards-compliant MASQUE clients, which send
+  `Proxy-Authorization`, and Cloudflare-style clients, which authenticate with
+  a TLS client certificate: `auth.mode` decides which TLS context a socket is
+  bound with, so the two modes cannot share a socket. They do share everything
+  behind them — one `[[clients]]` roster, one TUN device, one CONNECT-IP
+  address pool, one routing table — which two processes could not.
+- Startup and `check-config` reject two listeners that contend for one address.
+  A listener with more than one shard binds with `SO_REUSEPORT`, so a second
+  listener on that address would join the load-balancing group and be handed
+  connections meant for the other authentication mode. Wildcards count:
+  `0.0.0.0` claims every IPv4 address on its port, and `::` is assumed to claim
+  IPv4 as well, since whether it does is the kernel's `IPV6_V6ONLY` default.
+  Addresses are compared in canonical form, so an IPv4-mapped spelling such as
+  `[::ffff:127.0.0.1]` cannot present itself as a different address from the
+  IPv4 one it resolves to, and the error names which conflict it found rather
+  than blaming a wildcard that may not be involved. Non-zero link-local IPv6
+  scope IDs remain part of the interface identity. Port `0` is exempt: it asks
+  the kernel for whichever port is free, so several listeners may use it; all
+  shards of one listener share the selected port, and startup prevents that port
+  from joining another listener's `SO_REUSEPORT` group.
+- `check-config` prints the resolved listeners, their shard counts, and the
+  authentication each one demands, so the deployed modes can be read without
+  re-deriving them from the TOML. Shard counts are the resolved ones, so
+  `shards = 0` reports the per-core count rather than zero.
+- The installer offers a `dual` authentication mode that writes a two-listener
+  configuration, generating Basic credentials for one port and enrolling the
+  first certificate client on the other. On upgrade it reports every mode an
+  existing configuration runs, `disabled` included, so a server that
+  authenticates on one port and not another cannot read as if it did both.
+
+### Changed
+
+- Shards are numbered across the whole server rather than within a listener,
+  and the 32-shard cap now applies to that total. `shards = 0` (one per core)
+  is rejected when more than one listener is configured.
+- The `[[clients]]` roster and its `SIGHUP` reload follow "any listener uses
+  `client_cert`" rather than the single `auth.mode`.
+- The concurrent password-verification budget is sized from the shards that
+  verify passwords rather than from every shard, so a client-certificate
+  listener cannot widen what unauthenticated callers may demand of a Basic one.
+- **Breaking:** every configuration must define at least one `[[listeners]]`
+  entry with its own `[listeners.auth]`. Top-level `[auth]`,
+  `[server].listen_addr`, and `[server].shards` are rejected, and the `--listen`
+  override has been removed. The installer deliberately does not migrate 0.2
+  files; convert and validate them explicitly before upgrading.
+
 ## 0.2.0 - 2026-08-18
 
 ### Added

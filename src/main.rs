@@ -23,10 +23,6 @@ struct Cli {
     #[arg(short, long, default_value = "masque.toml")]
     config: PathBuf,
 
-    /// Override listen address.
-    #[arg(short, long)]
-    listen: Option<String>,
-
     /// TLS certificate path.
     #[arg(long)]
     cert: Option<PathBuf>,
@@ -46,7 +42,7 @@ enum Command {
     HashPassword,
     /// Validate the configuration without binding sockets or creating a TUN.
     CheckConfig,
-    /// Generate a client key pair for `auth.mode = "client_cert"`.
+    /// Generate a client key pair for a listener using client-certificate auth.
     ///
     /// Prints the `[[clients]]` block to add to the server config, and the JSON
     /// configuration for the client. Nothing is written to the server config
@@ -76,6 +72,22 @@ enum Command {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+}
+
+/// How a listener's authentication reads in `check-config` output.
+///
+/// Deliberately the effective answer rather than the configured `mode`:
+/// `enabled = false` turns any mode off, and reporting the mode it would have
+/// used would describe a listener that demands nothing as if it demanded
+/// something.
+fn auth_label(auth: &config::AuthSection) -> &'static str {
+    if auth.client_cert_enabled() {
+        "client_cert"
+    } else if auth.basic_enabled() {
+        "basic"
+    } else {
+        "disabled"
+    }
 }
 
 fn usque_port_instruction(port: u16) -> String {
@@ -205,9 +217,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // CLI overrides
-    if let Some(listen) = cli.listen {
-        cfg.server.listen_addr = listen.parse()?;
-    }
     if let Some(cert) = cli.cert {
         cfg.tls.cert_path = cert;
     }
@@ -237,12 +246,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if matches!(cli.command, Some(Command::CheckConfig)) {
-        validate_config(&cfg)?;
+        let listeners = validate_config(&cfg)?;
         println!(
             "configuration is compatible with masque-server {}: {}",
             env!("CARGO_PKG_VERSION"),
             cli.config.display()
         );
+        // Which sockets come up, and what each demands of a client. Worth
+        // printing for one listener and necessary for several: authentication
+        // belongs to each listener, so there is no single server-wide mode.
+        //
+        // Reported from the validated plan rather than the parsed file, so the
+        // shard count is the resolved one — `shards = 0` means one per core and
+        // a large value is capped, neither of which the file shows.
+        for listener in listeners {
+            println!(
+                "listener {} auth={} shards={}",
+                listener.listen_addr,
+                auth_label(&listener.auth),
+                listener.shards
+            );
+        }
         return Ok(());
     }
 

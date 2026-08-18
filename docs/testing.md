@@ -12,7 +12,8 @@
 | Microbenchmark | `cargo bench --bench core` | Codec, routing, and allocation regressions |
 | Network benchmark | `scripts/network-bench.sh` | Local direct-vs-MASQUE throughput and RTT |
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
-| Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth and CONNECT-IP setup |
+| Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, and both authentication modes served from one process |
+| Config preflight | `cargo test --test check_config` | `check-config` accepts what a server accepts, including multi-listener files |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 
 ## Local tests
@@ -100,22 +101,23 @@ addresses — so use the generated blocks rather than transcribing.
 git clone https://github.com/Diniboy1123/usque && cd usque && go build .
 ```
 
-**2. Configure the server.** `auth.mode = "client_cert"`, and a certificate with
-an ECDSA key so the client can pin it:
+**2. Configure the server.** Use `auth.mode = "client_cert"` on its listener,
+and a certificate with an ECDSA key so the client can pin it:
 
 ```sh
 scripts/gen-certs.sh certs
 ```
 
 ```toml
-[server]
-listen_addr = "0.0.0.0:4433"
-
 [tls]
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 
-[auth]
+[[listeners]]
+listen_addr = "0.0.0.0:4433"
+shards = 1
+
+[listeners.auth]
 enabled = true
 mode = "client_cert"
 

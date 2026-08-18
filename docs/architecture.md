@@ -37,7 +37,8 @@ TUN packet ----------->|                       |
 `Server` validates configuration, creates shared policy and routing state, and
 starts one or more `Shard` instances. A shard owns:
 
-- one `SO_REUSEPORT` QUIC UDP socket;
+- one QUIC UDP socket, bound with `SO_REUSEPORT` when its listener has more
+  than one shard;
 - its QUIC and HTTP/3 connections;
 - tunnel state for those connections;
 - connection and pacing timers; and
@@ -91,10 +92,11 @@ When work arrives, only affected connections enter the dirty set. The shard
 drives those connections, stages output using quiche's send quantum, emits a
 bounded UDP batch, and reschedules their next deadlines.
 
-## Sharding
+## Listeners and sharding
 
-`server.shards = N` creates N independent listeners on the same address using
-`SO_REUSEPORT`. The kernel normally keeps a client 4-tuple on one listener.
+`shards = N` on a listener creates N independent event loops on that listener's
+address using `SO_REUSEPORT`. The kernel normally keeps a client 4-tuple on one
+of them.
 
 QUIC permits address migration, so a packet can arrive on a shard that does
 not own its connection. A shared connection-ID registry identifies the owner,
@@ -104,6 +106,27 @@ without dropping legitimate migration traffic.
 
 One connection still uses one shard. Sharding improves aggregate throughput
 across multiple connections; it cannot parallelize a single QUIC connection.
+
+`[[listeners]]` runs one or more listeners in one process. Startup resolves each
+entry into a small listener plan containing its address, shard count, and
+authentication. Every shard also references the same process-wide
+`ServerConfig`, so proxy policies, QUIC/TLS tuning, limits, and CONNECT-IP state
+are shared rather than copied per listener. The authentication mode decides
+which TLS context `build_quic_config` returns, and that is fixed when the socket
+binds.
+
+Shards are numbered across the whole server rather than within a listener,
+which is what lets the cross-shard queues, the connection-ID registry, and the
+TUN ownership map stay single and listener-agnostic. Everything in `Shared` is
+server-wide: the address pool, the routing table, the TUN device, the client
+roster, and the credential-verification budget. A forwarded packet is re-handled
+by its owner using that shard's own local address, so a reply always leaves the
+socket the connection actually lives on — including when the owner belongs to a
+different listener.
+
+One shard reads the TUN device and distributes packets to the connections that
+own their addresses. Shard 0 is an arbitrary but stable choice, unrelated to
+which listener it serves.
 
 ## Authentication pipeline
 

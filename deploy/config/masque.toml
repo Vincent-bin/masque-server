@@ -1,22 +1,24 @@
 [server]
-listen_addr = "0.0.0.0:443"
 # Keep this above the client's keepalive period. VPN-style MASQUE clients
 # commonly default to 30s, and matching that exactly makes a quiet tunnel race
 # its own keepalive against the timeout.
 idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
-# Independent event loops, each with its own SO_REUSEPORT socket and its own
-# share of the connections. A connection is always handled by one loop, so this
-# is what lets a CPU-bound server use more than one core. 0 = one per core.
-# Linux only; measure before raising it.
-shards = 1
 
 [tls]
 cert_path = "/etc/masque/certs/server.crt"
 key_path = "/etc/masque/certs/server.key"
 
-[auth]
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+# Independent event loops, each with its own SO_REUSEPORT socket and its own
+# share of the connections. A connection is always handled by one loop, so this
+# is what lets a CPU-bound server use more than one core. 0 = one per core for a
+# single listener. Linux only; measure before raising it.
+shards = 1
+
+[listeners.auth]
 enabled = true
 # "basic"       — RFC 7617 Proxy-Authorization, checked per request.
 # "client_cert" — a TLS client certificate, matched against [[clients]] below.
@@ -24,6 +26,9 @@ enabled = true
 # Pick "client_cert" for VPN-style clients modelled on Cloudflare WARP MASQUE
 # (for example usque): they authenticate during the QUIC handshake and never
 # send Proxy-Authorization, so they cannot work against "basic".
+#
+# To serve both kinds of client, add the second listener shown at the end of
+# this file. Every listener has its own explicit authentication table.
 mode = "basic"
 username = "__MASQUE_AUTH_USERNAME__"
 password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
@@ -127,3 +132,26 @@ tun_mtu = 1280
 tun_offload = true
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
+
+# ── Additional listener ─────────────────────────────────────────────
+#
+# One socket can serve only one authentication mode: auth.mode decides which
+# TLS context is built before clients connect. Add another [[listeners]] entry
+# to serve another mode in the same process. Everything behind the sockets stays
+# shared — TLS files, proxy policies, one [[clients]] roster, one TUN device,
+# one CONNECT-IP address pool, and one routing table.
+#
+# Two listeners may not contend for the same address. That is refused at startup
+# rather than left to the kernel: a listener with shards > 1 binds with
+# SO_REUSEPORT, so a second listener on that address would join its
+# load-balancing group and be handed connections meant for the other mode.
+# Wildcards count — 0.0.0.0 claims every IPv4 address on its port, and :: is
+# assumed to claim IPv4 too, since IPV6_V6ONLY is the kernel's to decide.
+#
+# [[listeners]]
+# listen_addr = "0.0.0.0:4443"
+# shards = 1
+#
+# [listeners.auth]
+# enabled = true
+# mode = "client_cert"

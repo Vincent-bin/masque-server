@@ -28,7 +28,7 @@ use quiche::h3::NameValue as _;
 
 use masque::capsule::decoder::{CapsuleDecoder, DecodeError};
 use masque::capsule::{CapsuleFrame, IpAddress};
-use masque::config::{AuthMode, ClientEntry, ServerConfig};
+use masque::config::{AuthMode, AuthSection, ClientEntry, ListenerSection, ServerConfig};
 use masque::datagram::DatagramHeader;
 use masque::server::Server;
 
@@ -129,31 +129,29 @@ impl Drop for TempDir {
 
 // ── Server under test ────────────────────────────────────────────────
 
-/// Reserve a loopback UDP port and release it for the server to take.
+/// The loopback address that asks the kernel for whichever port is free.
 ///
-/// `Server::bind` does not report the port it landed on, so the port has to be
-/// chosen before it starts.
-fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Servers under test bind this and report back what they got, rather than
+/// picking a port in advance. Reserving one and releasing it leaves a window in
+/// which a parallel test can take it, and the whole point of a probe socket is
+/// that it must be closed before the server can have the port.
+fn ephemeral_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
 fn server_config(
     cert: PathBuf,
     key: PathBuf,
-    port: u16,
+    listen_addr: SocketAddr,
     clients: Vec<ClientEntry>,
 ) -> ServerConfig {
     let mut config = ServerConfig::default();
-    config.server.listen_addr = SocketAddr::from(([127, 0, 0, 1], port));
-    config.server.shards = 1;
     config.tls.cert_path = cert;
     config.tls.key_path = key;
-    config.auth.enabled = true;
-    config.auth.mode = AuthMode::ClientCert;
+    config.listeners[0].listen_addr = listen_addr;
+    config.listeners[0].shards = 1;
+    config.listeners[0].auth.enabled = true;
+    config.listeners[0].auth.mode = AuthMode::ClientCert;
     config.clients = clients;
     // The tunnels under test are CONNECT-IP only, and the TCP and UDP paths
     // would otherwise resolve and dial real targets.
@@ -162,11 +160,17 @@ fn server_config(
     config
 }
 
-/// Run a server on its own runtime thread for the duration of the test.
+/// Run a server on its own runtime thread and return the addresses it bound.
 ///
 /// The thread is detached: the runtime is dropped when the process exits, and
-/// the OS reclaims the port.
-fn spawn_server(config: ServerConfig) {
+/// the OS reclaims the ports.
+///
+/// Waiting for the real addresses rather than sleeping is what makes a
+/// `127.0.0.1:0` listener usable: the port is never held by anything but the
+/// server, so no parallel test can take it in between, and a caller cannot
+/// start talking to a socket that is not up yet.
+fn spawn_server(config: ServerConfig) -> Vec<SocketAddr> {
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -175,12 +179,19 @@ fn spawn_server(config: ServerConfig) {
         runtime.block_on(async move {
             match Server::bind(config).await {
                 Ok(mut server) => {
+                    // A failed send means the test gave up; run anyway and let
+                    // the detached thread die with the process.
+                    let _ = bound_tx.send(server.listen_addrs());
                     let _ = server.run().await;
                 }
                 Err(e) => panic!("server failed to bind: {e:#}"),
             }
         });
     });
+
+    bound_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not report its listen addresses")
 }
 
 // ── Client ───────────────────────────────────────────────────────────
@@ -198,6 +209,16 @@ impl Client {
     /// the endpoint, so they skip chain validation and pin the server's public
     /// key instead.
     fn connect(peer: SocketAddr, cert: &Path, key: &Path) -> anyhow::Result<Self> {
+        Self::connect_with(peer, Some((cert, key)))
+    }
+
+    /// Connect without a client certificate, the way a standards-compliant
+    /// MASQUE client that authenticates with `Proxy-Authorization` does.
+    fn connect_anonymous(peer: SocketAddr) -> anyhow::Result<Self> {
+        Self::connect_with(peer, None)
+    }
+
+    fn connect_with(peer: SocketAddr, identity: Option<(&Path, &Path)>) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -205,8 +226,10 @@ impl Client {
 
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.verify_peer(false);
-        config.load_cert_chain_from_pem_file(cert.to_str().unwrap())?;
-        config.load_priv_key_from_pem_file(key.to_str().unwrap())?;
+        if let Some((cert, key)) = identity {
+            config.load_cert_chain_from_pem_file(cert.to_str().unwrap())?;
+            config.load_priv_key_from_pem_file(key.to_str().unwrap())?;
+        }
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
         config.set_max_idle_timeout(10_000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -329,7 +352,16 @@ impl Client {
 
     /// Send the CONNECT-IP request exactly as Cloudflare's clients send it.
     fn send_connect_ip(&mut self, protocol: &str) -> anyhow::Result<u64> {
-        let headers = [
+        self.send_connect_ip_with_credentials(protocol, None)
+    }
+
+    /// The same request, optionally carrying `Proxy-Authorization`.
+    fn send_connect_ip_with_credentials(
+        &mut self,
+        protocol: &str,
+        credentials: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        let mut headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", protocol.as_bytes()),
             quiche::h3::Header::new(b":scheme", b"https"),
@@ -340,6 +372,12 @@ impl Client {
             // QPACK and the server's header scan.
             quiche::h3::Header::new(b"user-agent", b""),
         ];
+        if let Some(credentials) = credentials {
+            headers.push(quiche::h3::Header::new(
+                b"proxy-authorization",
+                credentials.as_bytes(),
+            ));
+        }
 
         let h3 = self.h3.as_mut().unwrap();
         let stream_id = h3.send_request(&mut self.quic, &headers, false)?;
@@ -448,22 +486,17 @@ fn fixture(tag: &str) -> Fixture {
         &self_signed(&stranger_key, None),
     );
 
-    let port = free_port();
-    spawn_server(server_config(
+    let peer = spawn_server(server_config(
         cert_path,
         key_path,
-        port,
+        ephemeral_addr(),
         vec![ClientEntry {
             name: "laptop".into(),
             public_key: public_key_b64(&client_key),
             ipv4: Some(CLIENT_IPV4.into()),
             ipv6: Some(CLIENT_IPV6.into()),
         }],
-    ));
-
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
-    // The server binds on another thread; give it a moment to take the port.
-    std::thread::sleep(Duration::from_millis(300));
+    ))[0];
 
     Fixture {
         _dir: dir,
@@ -475,17 +508,117 @@ fn fixture(tag: &str) -> Fixture {
     }
 }
 
+// ── Multi-listener fixture ───────────────────────────────────────────
+
+const BASIC_USERNAME: &str = "alice";
+const BASIC_PASSWORD: &str = "correct horse battery staple";
+
+/// A server running both authentication modes at once, on two ports.
+struct DualFixture {
+    _dir: TempDir,
+    basic_peer: SocketAddr,
+    cert_peer: SocketAddr,
+    client_cert: PathBuf,
+    client_key: PathBuf,
+    /// A ready-made `Proxy-Authorization` value for the Basic listener.
+    credentials: String,
+}
+
+/// Start one process listening on two ports: Basic on the first,
+/// client-certificate on the second.
+///
+/// `auth.mode` fixes the TLS context when a socket is bound, so this is the
+/// only shape in which one process can serve both.
+fn dual_fixture(tag: &str) -> DualFixture {
+    let dir = TempDir::new(tag);
+
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert_path;
+    config.tls.key_path = key_path;
+    // Only CONNECT-IP is under test here; the other forms would dial real
+    // targets.
+    config.tcp_proxy.enabled = false;
+    config.udp_proxy.enabled = false;
+    // Both on port 0: the server asks the kernel for distinct free ports and
+    // reports which. They do not count as contending before bind, because
+    // neither has a port yet; startup detects and retries a reuseport collision.
+    config.listeners = vec![
+        ListenerSection {
+            listen_addr: ephemeral_addr(),
+            shards: 1,
+            auth: AuthSection {
+                enabled: true,
+                mode: AuthMode::Basic,
+                username: BASIC_USERNAME.into(),
+                password_hash: masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap(),
+            },
+        },
+        ListenerSection {
+            listen_addr: ephemeral_addr(),
+            shards: 1,
+            auth: AuthSection {
+                enabled: true,
+                mode: AuthMode::ClientCert,
+                username: String::new(),
+                password_hash: String::new(),
+            },
+        },
+    ];
+    config.clients = vec![ClientEntry {
+        name: "laptop".into(),
+        public_key: public_key_b64(&client_key),
+        ipv4: Some(CLIENT_IPV4.into()),
+        ipv6: Some(CLIENT_IPV6.into()),
+    }];
+
+    // One shard each, in configuration order.
+    let bound = spawn_server(config);
+    assert_eq!(bound.len(), 2, "one shard per listener");
+
+    DualFixture {
+        _dir: dir,
+        basic_peer: bound[0],
+        cert_peer: bound[1],
+        client_cert,
+        client_key: client_key_path,
+        credentials: format!(
+            "Basic {}",
+            STANDARD.encode(format!("{BASIC_USERNAME}:{BASIC_PASSWORD}"))
+        ),
+    }
+}
+
 // ── Roster reload fixture ────────────────────────────────────────────
 
 /// Render a server configuration file with the given roster entries.
-fn server_config_file(cert: &Path, key: &Path, port: u16, clients: &[(&str, &str)]) -> String {
+///
+/// The listen address is `127.0.0.1:0`; the server reports the port it took.
+/// Only the roster is reloaded, so rewriting this file leaves the bound socket
+/// alone and the port stays valid across a reload.
+fn server_config_file(cert: &Path, key: &Path, clients: &[(&str, &str)]) -> String {
     let mut text = format!(
-        "[server]\nlisten_addr = \"127.0.0.1:{port}\"\nshards = 1\n\n\
-         [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
-         [auth]\nenabled = true\nmode = \"client_cert\"\n\n\
+        "[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
          [tcp_proxy]\nenabled = false\n\n[udp_proxy]\nenabled = false\n\n\
          [ip_proxy]\nenabled = true\nipv4_pool = \"10.89.0.0/24\"\n\
-         ipv6_pool = \"fd00:abcd::/64\"\n",
+         ipv6_pool = \"fd00:abcd::/64\"\n\n\
+         [[listeners]]\nlisten_addr = \"127.0.0.1:0\"\nshards = 1\n\n\
+         [listeners.auth]\nenabled = true\nmode = \"client_cert\"\n",
         cert.display(),
         key.display()
     );
@@ -495,6 +628,36 @@ fn server_config_file(cert: &Path, key: &Path, port: u16, clients: &[(&str, &str
         ));
     }
     text
+}
+
+/// Start a reloadable server and return the addresses it bound.
+///
+/// Separate from [`spawn_server`] because these tests need the `SIGHUP` handler,
+/// which `run` installs after `bind` returns — so the caller still has to give
+/// it a moment before raising one.
+fn spawn_reloadable_server(config: ServerConfig, reload_path: PathBuf) -> Vec<SocketAddr> {
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut server = Server::bind_with_reload(config, Some(reload_path))
+                .await
+                .expect("server failed to bind");
+            let _ = bound_tx.send(server.listen_addrs());
+            let _ = server.run().await;
+        });
+    });
+
+    let bound = bound_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not report its listen addresses");
+    // Bound is not the same as ready to reload: `run` installs the SIGHUP
+    // handler, and a signal raised before that would be the default action.
+    std::thread::sleep(Duration::from_millis(600));
+    bound
 }
 
 /// Ask this process to reload, the way an operator would.
@@ -507,6 +670,64 @@ fn raise_sighup() {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+/// Resolving `:0` once per shard would turn each shard into a different
+/// listener. The first socket must select the port and every later socket in
+/// that listener must join the exact same reuseport group. Separate listeners
+/// must still receive separate ports.
+#[cfg(target_os = "linux")]
+#[test]
+fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
+    let dir = TempDir::new("ephemeral-shards");
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert_path;
+    config.tls.key_path = key_path;
+    config.tcp_proxy.enabled = false;
+    config.udp_proxy.enabled = false;
+    config.ip_proxy.enabled = false;
+    config.listeners = vec![
+        ListenerSection {
+            listen_addr: ephemeral_addr(),
+            shards: 2,
+            auth: AuthSection {
+                enabled: false,
+                ..Default::default()
+            },
+        },
+        ListenerSection {
+            listen_addr: ephemeral_addr(),
+            shards: 2,
+            auth: AuthSection {
+                enabled: false,
+                ..Default::default()
+            },
+        },
+    ];
+
+    let bound = spawn_server(config);
+    assert_eq!(bound.len(), 4);
+    assert_ne!(bound[0].port(), 0);
+    assert_eq!(
+        bound[0], bound[1],
+        "one listener's shards must share a port"
+    );
+    assert_eq!(
+        bound[2], bound[3],
+        "one listener's shards must share a port"
+    );
+    assert_ne!(
+        bound[0], bound[2],
+        "separate listeners must not join one reuseport group"
+    );
+}
 
 /// Revoking a client must drop the tunnel it already holds, without restarting
 /// the server and without disturbing anyone else.
@@ -540,14 +761,12 @@ fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
         &self_signed(&keeper_key, None),
     );
 
-    let port = free_port();
     let config_path = dir.path().join("masque.toml");
     std::fs::write(
         &config_path,
         server_config_file(
             &cert_path,
             &key_path,
-            port,
             &[
                 ("doomed", &public_key_b64(&doomed_key)),
                 ("keeper", &public_key_b64(&keeper_key)),
@@ -558,23 +777,8 @@ fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
 
     let config =
         masque::config::parse_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    let reload_path = config_path.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            let mut server = Server::bind_with_reload(config, Some(reload_path))
-                .await
-                .expect("server failed to bind");
-            let _ = server.run().await;
-        });
-    });
-    // Let the server bind and install its signal handler before raising one.
-    std::thread::sleep(Duration::from_millis(600));
+    let peer = spawn_reloadable_server(config, config_path.clone())[0];
 
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
     let mut doomed = Client::connect(peer, &doomed_cert, &doomed_key_path).unwrap();
     doomed.handshake(Duration::from_secs(5)).unwrap();
     doomed.init_h3().unwrap();
@@ -603,7 +807,6 @@ fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
         server_config_file(
             &cert_path,
             &key_path,
-            port,
             &[("keeper", &public_key_b64(&keeper_key))],
         ),
     )
@@ -645,33 +848,17 @@ fn a_broken_reload_keeps_the_previous_roster() {
         &self_signed(&client_key, None),
     );
 
-    let port = free_port();
     let config_path = dir.path().join("masque.toml");
     let good = server_config_file(
         &cert_path,
         &key_path,
-        port,
         &[("laptop", &public_key_b64(&client_key))],
     );
     std::fs::write(&config_path, &good).unwrap();
 
     let config = masque::config::parse_toml(&good).unwrap();
-    let reload_path = config_path.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            let mut server = Server::bind_with_reload(config, Some(reload_path))
-                .await
-                .expect("server failed to bind");
-            let _ = server.run().await;
-        });
-    });
-    std::thread::sleep(Duration::from_millis(600));
+    let peer = spawn_reloadable_server(config, config_path.clone())[0];
 
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
     let mut client = Client::connect(peer, &client_cert, &client_key_path).unwrap();
     client.handshake(Duration::from_secs(5)).unwrap();
     client.init_h3().unwrap();
@@ -686,7 +873,7 @@ fn a_broken_reload_keeps_the_previous_roster() {
     // An unparseable public key: the roster must be rejected as a whole.
     std::fs::write(
         &config_path,
-        server_config_file(&cert_path, &key_path, port, &[("laptop", "!!not base64!!")]),
+        server_config_file(&cert_path, &key_path, &[("laptop", "!!not base64!!")]),
     )
     .unwrap();
     raise_sighup();
@@ -756,6 +943,123 @@ fn registered_client_gets_its_pinned_addresses_over_cf_connect_ip() {
             .any(|frame| matches!(frame, CapsuleFrame::RouteAdvertisement(_))),
         "expected ROUTE_ADVERTISEMENT, got {capsules:?}"
     );
+}
+
+/// One process, two listeners, two authentication modes.
+///
+/// `auth.mode` decides which TLS context a shard builds, and that is settled
+/// when its socket is bound — so a Cloudflare-style client and a
+/// standards-compliant one cannot share a listener. They can share a process,
+/// and this is the test that says so.
+///
+/// It also pins the reason for sharing one: the address pool is per server, not
+/// per listener, so the two clients cannot be handed the same tunnel address.
+#[test]
+fn two_listeners_serve_both_authentication_modes_from_one_process() {
+    let fixture = dual_fixture("dual");
+
+    // The certificate listener: authenticated during the handshake, pinned
+    // addresses from the roster.
+    let mut cert_client =
+        Client::connect(fixture.cert_peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    cert_client.handshake(Duration::from_secs(5)).unwrap();
+    cert_client.init_h3().unwrap();
+
+    let stream_id = cert_client.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        cert_client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200,
+        "the certificate listener must accept the enrolled client"
+    );
+    let cert_addresses = assigned_addresses(&mut cert_client, stream_id);
+    assert!(
+        cert_addresses.contains(&IpAddress::V4(CLIENT_IPV4.parse::<Ipv4Addr>().unwrap())),
+        "expected the pinned IPv4, got {cert_addresses:?}"
+    );
+
+    // The Basic listener, at the same time, in the same process: no client
+    // certificate at all, credentials on the request instead.
+    let mut basic_client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    basic_client.handshake(Duration::from_secs(5)).unwrap();
+    basic_client.init_h3().unwrap();
+
+    let stream_id = basic_client
+        .send_connect_ip_with_credentials("connect-ip", Some(&fixture.credentials))
+        .unwrap();
+    assert_eq!(
+        basic_client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200,
+        "the Basic listener must accept correct credentials"
+    );
+    let basic_addresses = assigned_addresses(&mut basic_client, stream_id);
+    assert!(
+        !basic_addresses.is_empty(),
+        "the Basic listener must assign an address from the pool"
+    );
+
+    // One pool behind both listeners. Two processes could not do this: each
+    // would allocate from its own copy and hand out the same addresses.
+    for address in &basic_addresses {
+        assert!(
+            !cert_addresses.contains(address),
+            "listeners handed out the same address {address:?}; the pool is not shared"
+        );
+    }
+}
+
+/// Each listener enforces its own mode and only its own.
+#[test]
+fn a_listener_enforces_only_its_own_authentication_mode() {
+    let fixture = dual_fixture("dual-refuse");
+
+    // Basic listener, no credentials: refused at the request, not the
+    // handshake, because this listener never asks for a certificate.
+    let mut client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let stream_id = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        407,
+        "the Basic listener must still demand credentials"
+    );
+
+    // Certificate listener, same anonymous client: refused during the
+    // handshake, before it can open a stream.
+    let mut client = Client::connect_anonymous(fixture.cert_peer).unwrap();
+    let _ = client.handshake(Duration::from_secs(5));
+    assert!(
+        client.wait_for_close(Duration::from_secs(5)),
+        "the certificate listener must not serve a client without a certificate"
+    );
+
+    // And credentials are no substitute for a certificate on that listener.
+    let mut client = Client::connect_anonymous(fixture.cert_peer).unwrap();
+    let _ = client.handshake(Duration::from_secs(5));
+    assert!(
+        client.wait_for_close(Duration::from_secs(5)),
+        "Basic credentials must not open the certificate listener"
+    );
+}
+
+/// Collect the addresses the server assigned on `stream_id`.
+fn assigned_addresses(client: &mut Client, stream_id: u64) -> Vec<IpAddress> {
+    client
+        .capsules(stream_id, 2, Duration::from_secs(5))
+        .iter()
+        .find_map(|frame| match frame {
+            CapsuleFrame::AddressAssign(addrs) => {
+                Some(addrs.iter().map(|a| a.ip.clone()).collect())
+            }
+            _ => None,
+        })
+        .expect("server must send ADDRESS_ASSIGN")
 }
 
 /// The registered `connect-ip` spelling has to keep working: accepting
@@ -919,11 +1223,10 @@ fn exhausted_address_pool_returns_503_instead_of_an_early_200() {
         &self_signed(&second_key, None),
     );
 
-    let port = free_port();
     let mut config = server_config(
         server_cert,
         server_key_path,
-        port,
+        ephemeral_addr(),
         vec![
             ClientEntry {
                 name: "first".into(),
@@ -942,9 +1245,7 @@ fn exhausted_address_pool_returns_503_instead_of_an_early_200() {
     // network=.0, TUN gateway=.1, and the sole client address=.2.
     config.ip_proxy.ipv4_pool = "10.89.0.0/30".into();
     config.ip_proxy.ipv6_pool.clear();
-    spawn_server(config);
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
-    std::thread::sleep(Duration::from_millis(300));
+    let peer = spawn_server(config)[0];
 
     let mut first = Client::connect(peer, &first_cert, &first_key_path).unwrap();
     first.handshake(Duration::from_secs(5)).unwrap();

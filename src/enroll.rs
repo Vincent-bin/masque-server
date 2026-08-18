@@ -293,6 +293,14 @@ mod tests {
         boring::pkey::PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
     }
 
+    fn parse_with_listener(fragment: &str) -> config::ServerConfig {
+        config::parse_toml(&format!(
+            "{fragment}\n[[listeners]]\nlisten_addr = \"127.0.0.1:443\"\n\
+             [listeners.auth]\nenabled = false\n"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn generated_public_key_is_accepted_by_the_roster_parser() {
         let pair = generate_client_key().unwrap();
@@ -340,7 +348,7 @@ mod tests {
             Some("fd00:abcd::2".parse().unwrap()),
         );
 
-        let parsed = config::parse_toml(&block).unwrap();
+        let parsed = parse_with_listener(&block);
         assert_eq!(parsed.clients.len(), 1);
         assert_eq!(parsed.clients[0].name, "my laptop");
         assert_eq!(parsed.clients[0].public_key, pair.public_key_b64);
@@ -356,7 +364,7 @@ mod tests {
         assert!(!block.contains("ipv4"));
         assert!(!block.contains("ipv6"));
 
-        let parsed = config::parse_toml(&block).unwrap();
+        let parsed = parse_with_listener(&block);
         assert_eq!(parsed.clients[0].ipv4, None);
         assert_eq!(parsed.clients[0].ipv6, None);
     }

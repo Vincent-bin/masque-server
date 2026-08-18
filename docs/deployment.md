@@ -29,21 +29,30 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
 ```
 
 Although the script arrives on standard input, interactive answers are read
-from `/dev/tty`. A new installation offers two mutually exclusive modes:
+from `/dev/tty`. A new installation offers three modes:
 
 - `basic` generates a high-entropy password unless one is provided and prints
   the credentials once;
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
-  entry, writes the usque JSON to a new `0600` file, and prints the mihomo block.
+  entry, writes the usque JSON to a new `0600` file, and prints the mihomo block;
+- `dual` does both, writing a
+  [two-listener configuration](configuration.md#listeners) that serves
+  credentials on one port and certificates on another. The authentication mode
+  decides what the TLS handshake demands, so the two cannot share a socket.
+
+Dual mode asks for a second port, defaulting to `4443`, and writes two explicit
+`[[listeners]]` entries, each with its own `[listeners.auth]` table.
 
 Client-certificate enrollment needs the server's ECDSA certificate immediately
-because the generated client configuration pins its public key. Supply the PEM
-full chain and unencrypted private key when prompted. Basic mode may defer TLS
-installation, but the service cannot start until both files exist.
+because the generated client configuration pins its public key, so `client_cert`
+and `dual` both require it. Supply the PEM full chain and unencrypted private
+key when prompted. Basic mode may defer TLS installation, but the service cannot
+start until both files exist.
 
 The final output includes the installed version, authentication mode, service
-state, and complete effective TOML with the password hash redacted. It also
-includes a generated Basic password or, in `client_cert` mode, client private
+state, the resolved listeners with the authentication each demands, and the
+complete effective TOML with the password hash redacted. It also includes a
+generated Basic password or, in `client_cert` and `dual` modes, client private
 key material. Treat the terminal output as a secret and do not capture it in a
 public provisioning log.
 
@@ -52,10 +61,11 @@ The following environment variables make provisioning non-interactive:
 | Variable | Meaning |
 | --- | --- |
 | `MASQUE_VERSION` | Exact published version/tag instead of the latest stable release |
-| `MASQUE_AUTH_MODE` | `basic` or `client_cert` |
+| `MASQUE_AUTH_MODE` | `basic`, `client_cert`, or `dual` |
 | `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
+| `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |
 | `MASQUE_TLS_CERT` / `MASQUE_TLS_KEY` | Source PEM certificate and key copied into `/etc/masque/certs` |
 | `MASQUE_CLIENT_NAME` | First certificate-authenticated client label |
 | `MASQUE_CLIENT_ENDPOINT` | Required public server endpoint in `IP:port` form |
@@ -80,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.2.0` selects `v0.2.0`. This is also how to install a
+`MASQUE_VERSION=0.3.0` selects `v0.3.0`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
@@ -94,6 +104,11 @@ On success, only the binary and packaged systemd unit are upgraded; the TOML
 and every TLS path it references remain unchanged. If the requested service
 restart then fails, the installer restores the previous binary, unit, enabled
 state, and active state.
+
+Version 0.3 does not migrate the 0.2 single-listener format. Before upgrading,
+move every socket into `[[listeners]]` with an explicit `[listeners.auth]` and
+remove top-level `[auth]`, `[server].listen_addr`, and `[server].shards`. The
+candidate rejects an old file and exits before replacing anything.
 
 ## Install a downloaded archive
 
@@ -115,7 +130,7 @@ If no password is supplied, the installer creates a random one and displays it
 once. Store it immediately in a password manager.
 
 For an interactive new installation, `sudo ./install.sh` asks whether to use
-Basic or client-certificate authentication. The package installer enables but
+Basic, client-certificate, or dual authentication. The package installer enables but
 does not start the service unless `MASQUE_START_SERVICE=1`; the bootstrap above
 sets it to `1` by default.
 
@@ -195,8 +210,8 @@ The candidate first runs the equivalent of:
 masque-server --config /etc/masque/masque.toml check-config
 ```
 
-This validates the parts of startup that do not need live resources. A legacy
-configuration that no longer satisfies fail-closed authentication, a bad
+This validates the parts of startup that do not need live resources. A 0.2
+configuration, a file that no longer satisfies fail-closed authentication, a bad
 certificate/key pair, an unsupported QUIC setting, or an invalid client/address
 pool therefore stops the upgrade before replacement. Edit and validate such a
 configuration deliberately; the installer never migrates it automatically.

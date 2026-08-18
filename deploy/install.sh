@@ -22,6 +22,7 @@ CONFIG_CHANGED=0
 FRESH_CONFIG=0
 CONFIG_TMP=
 CONFIG_REWRITE_TMP=
+CHECK_CONFIG_OUTPUT=
 ENROLL_OUTPUT=
 CLIENT_BLOCK_TMP=
 CLIENT_CONFIG_OUT=
@@ -129,7 +130,11 @@ parse_start_requested() {
 }
 
 can_prompt() {
-    [ -r /dev/tty ] && [ -w /dev/tty ]
+    # Device-node permissions alone are not enough: CI containers often expose
+    # /dev/tty without giving the process a controlling terminal. Actually open
+    # it so a non-interactive install falls back to defaults instead of failing
+    # on the first prompt.
+    (: </dev/tty >/dev/tty) 2>/dev/null
 }
 
 prompt_value() {
@@ -158,10 +163,24 @@ normalize_auth_mode() {
         2|cert|certs|client-cert|client_cert)
             printf '%s\n' client_cert
             ;;
+        3|dual|both)
+            printf '%s\n' dual
+            ;;
         *)
-            die "authentication mode must be 'basic' or 'client_cert'"
+            die "authentication mode must be 'basic', 'client_cert', or 'dual'"
             ;;
     esac
+}
+
+# Whether this mode enrolls a certificate client and therefore needs the server
+# TLS material at install time.
+mode_uses_client_certs() {
+    [ "$AUTH_MODE" = client_cert ] || [ "$AUTH_MODE" = dual ]
+}
+
+# Whether this mode issues Basic credentials.
+mode_uses_basic() {
+    [ "$AUTH_MODE" = basic ] || [ "$AUTH_MODE" = dual ]
 }
 
 choose_auth_mode() {
@@ -173,6 +192,7 @@ choose_auth_mode() {
                 echo "Choose an authentication mode:"
                 echo "  1) Basic          username and password on every CONNECT request"
                 echo "  2) Client cert    TLS client certificate for usque/mihomo-style clients"
+                echo "  3) Dual           both, on two ports of one server"
             } >/dev/tty
             requested_mode=$(prompt_value "Authentication mode" 1)
         else
@@ -182,40 +202,27 @@ choose_auth_mode() {
     AUTH_MODE=$(normalize_auth_mode "$requested_mode")
 }
 
+# Report what the deployed configuration actually authenticates with.
+#
+# Taken from `check-config`, which validates and resolves the listeners the same
+# way the server does, rather than reimplement that logic in shell.
+# Every distinct mode is reported, `disabled` included. Summarising a
+# basic + disabled server as "basic" would tell an administrator that every port
+# demands credentials when one of them accepts anyone, which is the reading that
+# leaves an open proxy in place.
 detect_existing_auth_mode() {
-    detected_enabled=$(awk '
-        /^[[:space:]]*\[/ {
-            in_auth = ($0 ~ /^[[:space:]]*\[auth\][[:space:]]*(#.*)?$/)
-            next
-        }
-        in_auth && /^[[:space:]]*enabled[[:space:]]*=/ {
-            line = $0
-            sub(/^[^=]*=[[:space:]]*/, "", line)
-            sub(/[[:space:]]*(#.*)?$/, "", line)
-            print line
-            exit
-        }
-    ' "$CONFIG_PATH")
-    if [ "$detected_enabled" = false ]; then
-        AUTH_MODE=disabled
-        return
-    fi
+    detected_modes=$(printf '%s\n' "$CHECK_CONFIG_OUTPUT" |
+        sed -n 's/^listener [^ ]* auth=\([a-z_]*\) .*$/\1/p' | sort -u)
 
-    detected_mode=$(awk '
-        /^[[:space:]]*\[/ {
-            in_auth = ($0 ~ /^[[:space:]]*\[auth\][[:space:]]*(#.*)?$/)
-            next
-        }
-        in_auth && /^[[:space:]]*mode[[:space:]]*=/ {
-            line = $0
-            sub(/^[^=]*=[[:space:]]*/, "", line)
-            sub(/[[:space:]]*(#.*)?$/, "", line)
-            gsub(/"/, "", line)
-            print line
-            exit
-        }
-    ' "$CONFIG_PATH")
-    AUTH_MODE=$(normalize_auth_mode "${detected_mode:-basic}")
+    AUTH_MODE=
+    for detected_mode in $detected_modes; do
+        if [ -z "$AUTH_MODE" ]; then
+            AUTH_MODE=$detected_mode
+        else
+            AUTH_MODE="$AUTH_MODE + $detected_mode"
+        fi
+    done
+    [ -n "$AUTH_MODE" ] || AUTH_MODE=unknown
 }
 
 generate_auth_credentials() {
@@ -256,7 +263,7 @@ install_tls_material() {
     if [ "$prompt_for_tls" -eq 1 ] && [ -z "$cert_source" ] &&
         { [ ! -r "$TLS_CERT_PATH" ] || [ ! -r "$TLS_KEY_PATH" ]; } &&
         can_prompt; then
-        if [ "$AUTH_MODE" = client_cert ]; then
+        if mode_uses_client_certs; then
             echo "Client-certificate enrollment needs the server certificate now." \
                 >/dev/tty
             cert_source=$(prompt_value "PEM full-chain certificate path" "")
@@ -280,9 +287,9 @@ install_tls_material() {
         fi
     fi
 
-    if [ "$prompt_for_tls" -eq 1 ] && [ "$AUTH_MODE" = client_cert ] &&
+    if [ "$prompt_for_tls" -eq 1 ] && mode_uses_client_certs &&
         { [ ! -r "$TLS_CERT_PATH" ] || [ ! -r "$TLS_KEY_PATH" ]; }; then
-        die "client_cert requires $TLS_CERT_PATH and $TLS_KEY_PATH; set MASQUE_TLS_CERT and MASQUE_TLS_KEY"
+        die "$AUTH_MODE requires $TLS_CERT_PATH and $TLS_KEY_PATH; set MASQUE_TLS_CERT and MASQUE_TLS_KEY"
     fi
 }
 
@@ -294,7 +301,7 @@ create_config_tmp() {
 render_new_config() {
     create_config_tmp
     case "$AUTH_MODE" in
-        basic)
+        basic|dual)
             generate_auth_credentials
             sed \
                 -e "s|__MASQUE_AUTH_USERNAME__|$AUTH_USERNAME|" \
@@ -314,21 +321,52 @@ render_new_config() {
     fi
 }
 
-configure_fresh_listen_port() {
-    listen_port=${MASQUE_LISTEN_PORT:-}
-    if [ -z "$listen_port" ]; then
+# Append the certificate listener to the Basic listener already rendered from
+# the package template.
+append_certificate_listener() {
+    cert_port=$1
+
+    cat >>"$CONFIG_TMP" <<EOF
+
+# TLS client certificates on this socket, Basic credentials on the first. The
+# authentication mode fixes what the TLS handshake demands, so the two cannot
+# share a socket; everything behind them — the client roster, the TUN device,
+# the CONNECT-IP address pool — is shared by the one process.
+[[listeners]]
+listen_addr = "0.0.0.0:$cert_port"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "client_cert"
+EOF
+}
+
+# Read and validate one UDP port.
+choose_listen_port() {
+    port_prompt=$1
+    port_default=$2
+    port_value=$3
+
+    if [ -z "$port_value" ]; then
         if can_prompt; then
-            listen_port=$(prompt_value "Public UDP listen port" 443)
+            port_value=$(prompt_value "$port_prompt" "$port_default")
         else
-            listen_port=443
+            port_value=$port_default
         fi
     fi
-    case "$listen_port" in
-        ""|*[!0-9]*) die "MASQUE_LISTEN_PORT must be an integer from 1 to 65535" ;;
+    case "$port_value" in
+        ""|*[!0-9]*) die "$port_prompt must be an integer from 1 to 65535" ;;
     esac
-    if [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then
-        die "MASQUE_LISTEN_PORT must be an integer from 1 to 65535"
+    if [ "$port_value" -lt 1 ] || [ "$port_value" -gt 65535 ]; then
+        die "$port_prompt must be an integer from 1 to 65535"
     fi
+    printf '%s\n' "$port_value"
+}
+
+configure_fresh_listen_port() {
+    listen_port=$(choose_listen_port "Public UDP listen port" 443 \
+        "${MASQUE_LISTEN_PORT:-}")
 
     CONFIG_REWRITE_TMP=$(mktemp /etc/masque/.masque-listen.XXXXXX)
     chmod 0600 "$CONFIG_REWRITE_TMP"
@@ -340,6 +378,16 @@ configure_fresh_listen_port() {
     fi
     mv -- "$CONFIG_REWRITE_TMP" "$CONFIG_TMP"
     CONFIG_REWRITE_TMP=
+
+    if [ "$AUTH_MODE" = dual ]; then
+        cert_listen_port=$(choose_listen_port \
+            "Public UDP listen port for certificate clients" 4443 \
+            "${MASQUE_CERT_LISTEN_PORT:-}")
+        if [ "$cert_listen_port" = "$listen_port" ]; then
+            die "the two listeners need different ports; both asked for $listen_port"
+        fi
+        append_certificate_listener "$cert_listen_port"
+    fi
 }
 
 normalize_optional_address() {
@@ -445,13 +493,19 @@ print_redacted_config() {
     echo "--- end configuration ---"
 }
 
+# Preflight a configuration with the candidate binary.
+#
+# The output is kept in CHECK_CONFIG_OUTPUT as well as shown: it carries the
+# resolved listener list, which is where the deployed authentication modes are
+# read from rather than re-derived from the TOML.
 check_config_compatibility() {
     config_to_check=$1
     candidate_version=$("$CANDIDATE_BIN" --version)
     echo "Checking configuration compatibility with $candidate_version ..."
-    if ! "$CANDIDATE_BIN" --config "$config_to_check" check-config; then
+    if ! CHECK_CONFIG_OUTPUT=$("$CANDIDATE_BIN" --config "$config_to_check" check-config); then
         die "configuration compatibility check failed; no binary or systemd unit was replaced"
     fi
+    printf '%s\n' "$CHECK_CONFIG_OUTPUT"
 }
 
 snapshot_installed_files() {
@@ -535,7 +589,7 @@ if [ "$FRESH_CONFIG" -eq 1 ]; then
     render_new_config
     configure_fresh_listen_port
 
-    if [ "$AUTH_MODE" = client_cert ]; then
+    if mode_uses_client_certs; then
         enroll_first_client
     fi
 
@@ -560,7 +614,19 @@ echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
 echo "  Logs:           journalctl -u masque -f"
 
-if [ "$AUTH_MODE" = basic ] && [ "$CONFIG_CHANGED" -eq 1 ]; then
+# The per-socket truth behind the summary line above, so a server that
+# authenticates on one port and not another cannot read as if it did both.
+listener_summary=$(printf '%s\n' "$CHECK_CONFIG_OUTPUT" | sed -n 's/^listener /  /p')
+if [ -n "$listener_summary" ]; then
+    echo
+    echo "Listeners:"
+    printf '%s\n' "$listener_summary"
+fi
+
+# CONFIG_CHANGED first: only a freshly rendered configuration has credentials to
+# print, and on an upgrade AUTH_MODE is a summary of what was found rather than
+# one of the modes this installer writes.
+if [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     echo
     echo "Basic client credentials:"
     echo "  Username: $AUTH_USERNAME"
