@@ -321,6 +321,62 @@ fn listen_override_still_applies_without_listeners() {
     );
 }
 
+/// The reported shard count is the one that will run, not the one written down.
+/// `shards = 0` means "one per core", so echoing the file back would tell an
+/// operator the server runs no event loops at all.
+#[test]
+fn check_config_reports_the_resolved_shard_count() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[server]
+listen_addr = "127.0.0.1:8449"
+shards = 0
+
+[tls]
+cert_path = "{}"
+key_path = "{}"
+
+[auth]
+enabled = false
+
+[ip_proxy]
+enabled = false
+"#,
+            cert_path.display(),
+            key_path.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+
+    // Sharding needs SO_REUSEPORT, so the resolved count is one per core on
+    // Linux and exactly one elsewhere. Either way it is never the configured 0.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "check-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("listener 127.0.0.1:8449 auth=disabled shards="),
+        "unexpected listener line: {stdout}"
+    );
+    assert!(
+        !stdout.contains("shards=0"),
+        "the configured 0 must not be reported as the shard count: {stdout}"
+    );
+}
+
 #[test]
 fn check_config_rejects_an_unknown_congestion_controller() {
     let dir = TempDir::new();

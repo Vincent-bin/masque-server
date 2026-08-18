@@ -205,33 +205,23 @@ choose_auth_mode() {
 # default a `[[listeners]]` entry may inherit, so reading that section alone
 # would describe one mode for a server that runs two — and re-deriving the
 # resolution in shell would be a second implementation to keep in step.
+# Every distinct mode is reported, `disabled` included. Summarising a
+# basic + disabled server as "basic" would tell an administrator that every port
+# demands credentials when one of them accepts anyone, which is the reading that
+# leaves an open proxy in place.
 detect_existing_auth_mode() {
     detected_modes=$(printf '%s\n' "$CHECK_CONFIG_OUTPUT" |
         sed -n 's/^listener [^ ]* auth=\([a-z_]*\) .*$/\1/p' | sort -u)
 
-    if [ -z "$detected_modes" ]; then
-        AUTH_MODE=unknown
-        return
-    fi
-
-    detected_basic=0
-    detected_cert=0
+    AUTH_MODE=
     for detected_mode in $detected_modes; do
-        case "$detected_mode" in
-            basic) detected_basic=1 ;;
-            client_cert) detected_cert=1 ;;
-        esac
+        if [ -z "$AUTH_MODE" ]; then
+            AUTH_MODE=$detected_mode
+        else
+            AUTH_MODE="$AUTH_MODE + $detected_mode"
+        fi
     done
-
-    if [ "$detected_basic" -eq 1 ] && [ "$detected_cert" -eq 1 ]; then
-        AUTH_MODE=dual
-    elif [ "$detected_cert" -eq 1 ]; then
-        AUTH_MODE=client_cert
-    elif [ "$detected_basic" -eq 1 ]; then
-        AUTH_MODE=basic
-    else
-        AUTH_MODE=disabled
-    fi
+    [ -n "$AUTH_MODE" ] || AUTH_MODE=unknown
 }
 
 generate_auth_credentials() {
@@ -642,7 +632,19 @@ echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
 echo "  Logs:           journalctl -u masque -f"
 
-if mode_uses_basic && [ "$CONFIG_CHANGED" -eq 1 ]; then
+# The per-socket truth behind the summary line above, so a server that
+# authenticates on one port and not another cannot read as if it did both.
+listener_summary=$(printf '%s\n' "$CHECK_CONFIG_OUTPUT" | sed -n 's/^listener /  /p')
+if [ -n "$listener_summary" ]; then
+    echo
+    echo "Listeners:"
+    printf '%s\n' "$listener_summary"
+fi
+
+# CONFIG_CHANGED first: only a freshly rendered configuration has credentials to
+# print, and on an upgrade AUTH_MODE is a summary of what was found rather than
+# one of the modes this installer writes.
+if [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     echo
     echo "Basic client credentials:"
     echo "  Username: $AUTH_USERNAME"

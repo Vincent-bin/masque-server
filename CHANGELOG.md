@@ -25,13 +25,18 @@ pre-1.0.
   connections meant for the other authentication mode. Wildcards count:
   `0.0.0.0` claims every IPv4 address on its port, and `::` is assumed to claim
   IPv4 as well, since whether it does is the kernel's `IPV6_V6ONLY` default.
-- `check-config` prints the resolved listeners and the authentication each one
-  demands, so the deployed modes can be read without re-deriving them from the
-  TOML.
+  Addresses are compared in canonical form, so an IPv4-mapped spelling such as
+  `[::ffff:127.0.0.1]` cannot present itself as a different address from the
+  IPv4 one it resolves to.
+- `check-config` prints the resolved listeners, their shard counts, and the
+  authentication each one demands, so the deployed modes can be read without
+  re-deriving them from the TOML. Shard counts are the resolved ones, so
+  `shards = 0` reports the per-core count rather than zero.
 - The installer offers a `dual` authentication mode that writes a two-listener
   configuration, generating Basic credentials for one port and enrolling the
-  first certificate client on the other. It reports the modes of an existing
-  multi-listener configuration correctly on upgrade.
+  first certificate client on the other. On upgrade it reports every mode an
+  existing configuration runs, `disabled` included, so a server that
+  authenticates on one port and not another cannot read as if it did both.
 
 ### Changed
 

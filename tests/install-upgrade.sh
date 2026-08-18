@@ -130,6 +130,57 @@ assert_sha_unchanged() {
     [ "$actual" = "$expected" ] || die "$path changed unexpectedly"
 }
 
+# A fresh dual installation writes a two-listener configuration and provisions
+# both authentication modes. This runs first, while the runner still has no
+# configuration; the upgrade cases below overwrite everything it leaves behind.
+DUAL_CLIENT_JSON=$TEST_TMP/dual-client.json
+MASQUE_AUTH_MODE=dual \
+    MASQUE_AUTH_USERNAME=proxy-user \
+    MASQUE_AUTH_PASSWORD=a-strong-password \
+    MASQUE_LISTEN_PORT=8449 \
+    MASQUE_CERT_LISTEN_PORT=8450 \
+    MASQUE_CLIENT_NAME=laptop \
+    MASQUE_CLIENT_ENDPOINT=203.0.113.9:8450 \
+    MASQUE_CLIENT_CONFIG_OUT="$DUAL_CLIENT_JSON" \
+    MASQUE_START_SERVICE=0 \
+    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/dual.log" 2>&1 ||
+    die "fresh dual installation failed; see $TEST_TMP/dual.log"
+
+[ "$(grep -c '^\[\[listeners\]\]$' "$CONFIG_PATH")" -eq 2 ] ||
+    die "dual mode did not write two listeners"
+grep -q '^listen_addr = "0.0.0.0:8449"$' "$CONFIG_PATH" ||
+    die "the Basic listener did not take MASQUE_LISTEN_PORT"
+grep -q '^listen_addr = "0.0.0.0:8450"$' "$CONFIG_PATH" ||
+    die "the certificate listener did not take MASQUE_CERT_LISTEN_PORT"
+# [[listeners]] names the sockets, so [server] must not still name one.
+grep -q '^\[server\]$' "$CONFIG_PATH" ||
+    die "the [server] section disappeared from the dual configuration"
+! grep -q '^listen_addr = "0.0.0.0:443"$' "$CONFIG_PATH" ||
+    die "the ignored [server].listen_addr was left in the dual configuration"
+grep -q '^\[\[clients\]\]$' "$CONFIG_PATH" ||
+    die "dual mode did not enroll the first certificate client"
+[ -s "$DUAL_CLIENT_JSON" ] || die "dual mode did not write the client JSON"
+
+# The server itself must agree about what those listeners are.
+"$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/dual-check.log" 2>&1 ||
+    die "the dual configuration failed check-config"
+grep -q '^listener 0.0.0.0:8449 auth=basic shards=1$' "$TEST_TMP/dual-check.log" ||
+    die "the Basic listener was not reported by check-config"
+grep -q '^listener 0.0.0.0:8450 auth=client_cert shards=1$' "$TEST_TMP/dual-check.log" ||
+    die "the certificate listener was not reported by check-config"
+# Nothing should warn about settings the rendered file no longer contains.
+! grep -q 'are ignored because' "$TEST_TMP/dual-check.log" ||
+    die "the dual configuration left ignored [server] settings behind"
+
+# A reinstall over it is an upgrade, and must report both modes rather than one.
+MASQUE_START_SERVICE=0 "$PACKAGE_DIR/install.sh" \
+    >"$TEST_TMP/dual-upgrade.log" 2>&1 ||
+    die "upgrading over the dual configuration failed"
+grep -q 'Authentication: basic + client_cert' "$TEST_TMP/dual-upgrade.log" ||
+    die "the upgrade summary did not report both authentication modes"
+
+rm -f -- "$CONFIG_PATH"
+
 # An incompatible existing configuration must fail before replacement.
 write_old_installation
 write_config not-a-controller

@@ -24,7 +24,7 @@ use crate::auth::BasicAuthenticator;
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
 use crate::client_identity::{ClientIdentity, ClientRegistry, IdentityError, SharedRoster};
-use crate::config::ServerConfig;
+use crate::config::{ResolvedListener, ServerConfig};
 use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
 use crate::fxhash::FxHashMap;
@@ -213,10 +213,28 @@ fn address_covers(wildcard: IpAddr, other: IpAddr) -> bool {
     }
 }
 
+/// Reduce an address to the one form two listeners can be compared in.
+///
+/// `::ffff:127.0.0.1` and `127.0.0.1` name the same interface, so comparing
+/// them as written lets a pair through that the kernel then refuses with
+/// `EADDRINUSE` — or worse, accepts under `SO_REUSEPORT`, leaving one listener
+/// shadowing traffic meant for the other's authentication mode.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 /// Whether two listeners would contend for the same packets.
 fn listen_addresses_overlap(a: SocketAddr, b: SocketAddr) -> bool {
-    a.port() == b.port()
-        && (a.ip() == b.ip() || address_covers(a.ip(), b.ip()) || address_covers(b.ip(), a.ip()))
+    if a.port() != b.port() {
+        return false;
+    }
+    // Canonical form first, so an IPv4-mapped spelling cannot present itself as
+    // a different address from the IPv4 one it resolves to.
+    let (a, b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
+    a == b || address_covers(a, b) || address_covers(b, a)
 }
 
 /// Expand the configured listeners into one plan each, rejecting the
@@ -335,8 +353,20 @@ fn active_client_registry(
 /// existing configuration with a candidate binary before replacing the
 /// running version. Runtime-only failures such as an occupied UDP port or a
 /// missing kernel TUN device are still reported when the server starts.
-pub fn validate_config(config: &ServerConfig) -> anyhow::Result<()> {
-    validate_server_config(config).map(|_| ())
+/// Returns the listeners the server would actually run, with their shard counts
+/// resolved — `shards = 0` expanded to one per core and the cap applied — so a
+/// caller reports what will run rather than what was asked for.
+pub fn validate_config(config: &ServerConfig) -> anyhow::Result<Vec<ResolvedListener>> {
+    let validated = validate_server_config(config)?;
+    Ok(validated
+        .listeners
+        .iter()
+        .map(|plan| ResolvedListener {
+            listen_addr: plan.config.server.listen_addr,
+            shards: plan.shards,
+            auth: plan.config.auth.clone(),
+        })
+        .collect())
 }
 
 fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServerConfig> {
@@ -3326,6 +3356,36 @@ mod tests {
                 "{pair:?} do not contend for the same packets"
             );
         }
+    }
+
+    /// `::ffff:127.0.0.1` is `127.0.0.1`. Comparing the two spellings as
+    /// written let the pair through, and the kernel then either refused to bind
+    /// or — with SO_REUSEPORT — accepted both and let one listener shadow the
+    /// other's traffic.
+    #[test]
+    fn ipv4_mapped_addresses_are_compared_as_ipv4() {
+        for pair in [
+            ["127.0.0.1:443", "[::ffff:127.0.0.1]:443"],
+            // The mapped wildcard is still the IPv4 wildcard.
+            ["[::ffff:0.0.0.0]:443", "127.0.0.1:443"],
+            ["[::ffff:127.0.0.1]:443", "0.0.0.0:443"],
+        ] {
+            let config = config_with(vec![
+                listener(pair[0], AuthMode::Basic),
+                listener(pair[1], AuthMode::ClientCert),
+            ]);
+            assert!(
+                super::plan_listeners(&config).is_err(),
+                "{pair:?} name the same interface"
+            );
+        }
+
+        // A genuine IPv6 address that merely looks similar is still distinct.
+        let config = config_with(vec![
+            listener("127.0.0.1:443", AuthMode::Basic),
+            listener("[::1]:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&config).is_ok());
     }
 
     #[test]

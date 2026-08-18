@@ -267,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if matches!(cli.command, Some(Command::CheckConfig)) {
-        validate_config(&cfg)?;
+        let listeners = validate_config(&cfg)?;
         println!(
             "configuration is compatible with masque-server {}: {}",
             env!("CARGO_PKG_VERSION"),
@@ -277,7 +277,11 @@ async fn main() -> anyhow::Result<()> {
         // printing for one listener and necessary for several: `[auth]` is only
         // the default a listener may inherit, so reading it alone would
         // describe one mode for a server that runs two.
-        for listener in cfg.resolved_listeners() {
+        //
+        // Reported from the validated plan rather than the parsed file, so the
+        // shard count is the resolved one — `shards = 0` means one per core and
+        // a large value is capped, neither of which the file shows.
+        for listener in listeners {
             println!(
                 "listener {} auth={} shards={}",
                 listener.listen_addr,

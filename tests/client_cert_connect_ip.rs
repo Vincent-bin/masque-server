@@ -134,11 +134,18 @@ impl Drop for TempDir {
 /// `Server::bind` does not report the port it landed on, so the port has to be
 /// chosen before it starts.
 fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    free_ports::<1>()[0]
+}
+
+/// Reserve several distinct loopback UDP ports at once.
+///
+/// Every socket is held until all of them are bound, because calling
+/// [`free_port`] twice in a row can return the same port: the first is released
+/// before the second is asked for, so nothing stops the kernel handing it out
+/// again.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let sockets: [UdpSocket; N] = std::array::from_fn(|_| UdpSocket::bind("127.0.0.1:0").unwrap());
+    std::array::from_fn(|index| sockets[index].local_addr().unwrap().port())
 }
 
 fn server_config(
@@ -542,8 +549,9 @@ fn dual_fixture(tag: &str) -> DualFixture {
         &self_signed(&client_key, None),
     );
 
-    let basic_port = free_port();
-    let cert_port = free_port();
+    // Both at once: two separate calls could hand back the same port, and the
+    // server would then refuse to start with an overlapping-listener error.
+    let [basic_port, cert_port] = free_ports::<2>();
 
     let mut config = ServerConfig::default();
     config.tls.cert_path = cert_path;

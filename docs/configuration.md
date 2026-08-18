@@ -248,6 +248,11 @@ as well, because whether it really does is the kernel's `IPV6_V6ONLY` default �
 option, so `[::]:443` beside `0.0.0.0:443` is refused everywhere rather than
 binding on some hosts and failing on others.
 
+Addresses are compared in canonical form, so `[::ffff:127.0.0.1]:443` and
+`127.0.0.1:443` are recognised as the same interface rather than passing the
+check and then failing to bind — or, under `SO_REUSEPORT`, binding successfully
+and leaving one listener shadowing the other's traffic.
+
 `shards = 0` (one per core) is rejected when more than one listener is
 configured; give each listener an explicit count. The 32-shard cap applies to
 the server's total, not to any one listener. The budget for concurrent password
@@ -258,7 +263,9 @@ certificate listener does not widen what unauthenticated callers can demand.
 it is refused rather than silently ignored when `[[listeners]]` is present.
 
 Run `masque-server --config masque.toml check-config` to validate a
-multi-listener file before restarting. It prints the resolved listeners:
+multi-listener file before restarting. It prints the resolved listeners, with
+the shard counts the server will actually run rather than the ones written down
+— `shards = 0` expanded to one per core, and any excess capped:
 
 ```
 configuration is compatible with masque-server 0.3.0: /etc/masque/masque.toml
