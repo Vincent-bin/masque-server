@@ -78,6 +78,22 @@ enum Command {
     },
 }
 
+/// How a listener's authentication reads in `check-config` output.
+///
+/// Deliberately the effective answer rather than the configured `mode`:
+/// `enabled = false` turns any mode off, and reporting the mode it would have
+/// used would describe a listener that demands nothing as if it demanded
+/// something.
+fn auth_label(auth: &config::AuthSection) -> &'static str {
+    if auth.client_cert_enabled() {
+        "client_cert"
+    } else if auth.basic_enabled() {
+        "basic"
+    } else {
+        "disabled"
+    }
+}
+
 fn usque_port_instruction(port: u16) -> String {
     format!("# Start usque with --connect-port {port} (short form: -P {port}).")
 }
@@ -206,6 +222,20 @@ async fn main() -> anyhow::Result<()> {
 
     // CLI overrides
     if let Some(listen) = cli.listen {
+        // `[[listeners]]` is the whole list of sockets, so `[server].listen_addr`
+        // is not one of them and overriding it would change nothing. Silently
+        // accepting the flag would be the worst outcome: it is reached for to
+        // narrow a server's exposure, and appearing to work while the
+        // configured listeners stay bound is exactly the failure it was meant
+        // to prevent.
+        if !cfg.listeners.is_empty() {
+            anyhow::bail!(
+                "--listen cannot choose among the {} listeners configured in {}; \
+                 edit the [[listeners]] entry instead",
+                cfg.listeners.len(),
+                cli.config.display()
+            );
+        }
         cfg.server.listen_addr = listen.parse()?;
     }
     if let Some(cert) = cli.cert {
@@ -243,6 +273,18 @@ async fn main() -> anyhow::Result<()> {
             env!("CARGO_PKG_VERSION"),
             cli.config.display()
         );
+        // Which sockets come up, and what each demands of a client. Worth
+        // printing for one listener and necessary for several: `[auth]` is only
+        // the default a listener may inherit, so reading it alone would
+        // describe one mode for a server that runs two.
+        for listener in cfg.resolved_listeners() {
+            println!(
+                "listener {} auth={} shards={}",
+                listener.listen_addr,
+                auth_label(&listener.auth),
+                listener.shards
+            );
+        }
         return Ok(());
     }
 

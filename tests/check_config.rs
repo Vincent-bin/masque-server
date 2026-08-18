@@ -4,6 +4,7 @@
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -20,13 +21,18 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        // The tests share a process and run in parallel, so the clock alone
+        // does not separate them: two that start within the same nanosecond
+        // would build the same path and the second `create_dir` would fail.
+        static SEQUENCE: AtomicU32 = AtomicU32::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "masque-check-config-{}-{nonce}",
-            std::process::id()
+            "masque-check-config-{}-{nonce}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
@@ -242,6 +248,75 @@ fn check_config_rejects_two_listeners_on_the_same_address() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("two listeners are configured for"),
         "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--listen` overrides `[server].listen_addr`, which a multi-listener
+/// configuration does not use. Silently accepting it would be the worst
+/// outcome: the flag is reached for to narrow a server's exposure, so appearing
+/// to work while the configured listeners stay bound is the failure it was
+/// meant to prevent.
+#[test]
+fn listen_override_is_refused_against_a_multi_listener_configuration() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        dual_listener_config_text("0.0.0.0:8449", "0.0.0.0:8450", &cert_path, &key_path),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--listen")
+        .arg("127.0.0.1:8451")
+        .arg("check-config")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "--listen must not silently leave 0.0.0.0 bound"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--listen cannot choose among"),
+        "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The override still works for the single-listener form it describes.
+#[test]
+fn listen_override_still_applies_without_listeners() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        config_text(
+            "127.0.0.1:8449".parse().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--listen")
+        .arg("127.0.0.1:8452")
+        .arg("check-config")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "check-config failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -19,10 +19,19 @@ pre-1.0.
   bound with, so the two modes cannot share a socket. They do share everything
   behind them — one `[[clients]]` roster, one TUN device, one CONNECT-IP
   address pool, one routing table — which two processes could not.
-- Startup and `check-config` reject two listeners on one address. A listener
-  with more than one shard binds with `SO_REUSEPORT`, so a second listener on
-  that address would join the load-balancing group and be handed connections
-  meant for the other authentication mode.
+- Startup and `check-config` reject two listeners that contend for one address.
+  A listener with more than one shard binds with `SO_REUSEPORT`, so a second
+  listener on that address would join the load-balancing group and be handed
+  connections meant for the other authentication mode. Wildcards count:
+  `0.0.0.0` claims every IPv4 address on its port, and `::` is assumed to claim
+  IPv4 as well, since whether it does is the kernel's `IPV6_V6ONLY` default.
+- `check-config` prints the resolved listeners and the authentication each one
+  demands, so the deployed modes can be read without re-deriving them from the
+  TOML.
+- The installer offers a `dual` authentication mode that writes a two-listener
+  configuration, generating Basic credentials for one port and enrolling the
+  first certificate client on the other. It reports the modes of an existing
+  multi-listener configuration correctly on upgrade.
 
 ### Changed
 
@@ -31,6 +40,12 @@ pre-1.0.
   is rejected when more than one listener is configured.
 - The `[[clients]]` roster and its `SIGHUP` reload follow "any listener uses
   `client_cert`" rather than the single `auth.mode`.
+- The concurrent password-verification budget is sized from the shards that
+  verify passwords rather than from every shard, so a client-certificate
+  listener cannot widen what unauthenticated callers may demand of a Basic one.
+- `--listen` is refused against a `[[listeners]]` configuration, which does not
+  use `[server].listen_addr`. Silently ignoring it would leave the configured
+  listeners bound when the flag was reached for to narrow exposure.
 - Configurations without `[[listeners]]` are unchanged: `[server]` and `[auth]`
   still describe one listener, and `[server].listen_addr` and `[server].shards`
   are ignored only when `[[listeners]]` names sockets itself.

@@ -146,10 +146,15 @@ ipv6_pool = "fd00:abcd::/64"
 # TUN devices and two pools, and overlapping pools hand the same tunnel address
 # to two clients.
 #
-# Two listeners may not name the same address. That is refused at startup
+# Two listeners may not contend for the same address. That is refused at startup
 # rather than left to the kernel: a listener with shards > 1 binds with
 # SO_REUSEPORT, so a second listener on that address would join its
 # load-balancing group and be handed connections meant for the other mode.
+# Wildcards count — 0.0.0.0 claims every IPv4 address on its port, and :: is
+# assumed to claim IPv4 too, since IPV6_V6ONLY is the kernel's to decide.
+#
+# Also delete listen_addr and shards from [server] above: [[listeners]] names
+# the sockets, so those two settings no longer do anything.
 #
 # Move the username and password_hash from [auth] above into the Basic
 # listener, then run `masque-server --config <this file> check-config`.

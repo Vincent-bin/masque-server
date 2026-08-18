@@ -97,11 +97,20 @@ const MAX_PENDING_AUTH_PER_CONNECTION: usize = 16;
 /// shard keeps every shard able to make progress, but never more than one per
 /// core: hashing moved off the event loop still competes with it for CPU, and
 /// oversubscribing just trades a stall for scheduler thrash.
-fn auth_concurrency(shards: usize) -> usize {
+///
+/// `shards` counts only the shards that verify passwords. A client-certificate
+/// listener never reaches this path — its shards hold no `BasicAuthenticator` —
+/// so counting them would let a large certificate deployment raise the budget
+/// that exists to ration what unauthenticated callers can demand of a small
+/// Basic one.
+fn auth_concurrency(basic_shards: usize) -> usize {
     let cores = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
-    (shards * 2).min(cores.max(2))
+    // Never zero: with no Basic listener nothing acquires a permit, but a
+    // semaphore that cannot be acquired would turn any future caller into a
+    // hang rather than a rejection.
+    (basic_shards * 2).clamp(1, cores.max(2))
 }
 
 /// How often idle tunnels are swept. Tunnels close after `idle_timeout_secs`,
@@ -175,6 +184,41 @@ fn any_client_cert_listener(config: &ServerConfig) -> bool {
         .any(|listener| listener.auth.client_cert_enabled())
 }
 
+/// Shards that verify passwords, which is what the verification budget rations.
+///
+/// A client-certificate listener's shards hold no `BasicAuthenticator` and
+/// never reach that path, so counting them would let a large certificate
+/// deployment widen what unauthenticated callers can demand of a small Basic
+/// one.
+fn basic_shard_count(listeners: &[ListenerPlan]) -> usize {
+    listeners
+        .iter()
+        .filter(|plan| plan.config.auth.basic_enabled())
+        .map(|plan| plan.shards)
+        .sum()
+}
+
+/// Whether binding `wildcard` also claims `other`.
+///
+/// `::` is treated as covering IPv4 too. Whether it really does is the kernel's
+/// `IPV6_V6ONLY` default — `0` on Linux unless `net.ipv6.bindv6only` says
+/// otherwise, and the two wildcards were observed to collide on macOS. Nothing
+/// here sets that option, so assuming the wider meaning is what keeps the
+/// answer from depending on the host: the pair is refused everywhere instead of
+/// failing to bind on some hosts and quietly splitting traffic on others.
+fn address_covers(wildcard: IpAddr, other: IpAddr) -> bool {
+    match wildcard {
+        IpAddr::V4(v4) => v4.is_unspecified() && other.is_ipv4(),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
+/// Whether two listeners would contend for the same packets.
+fn listen_addresses_overlap(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port()
+        && (a.ip() == b.ip() || address_covers(a.ip(), b.ip()) || address_covers(b.ip(), a.ip()))
+}
+
 /// Expand the configured listeners into one plan each, rejecting the
 /// combinations that cannot be served.
 fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
@@ -183,17 +227,29 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
     let mut total_shards = 0usize;
 
     for listener in &listeners {
-        // Two listeners on one address is not merely a bind failure to let the
-        // kernel report. A listener with more than one shard opens its socket
-        // with SO_REUSEPORT, so a second listener on the same address would
-        // join that load-balancing group and the kernel would hand it
+        // Two listeners over one address is not merely a bind failure to let
+        // the kernel report. A listener with more than one shard opens its
+        // socket with SO_REUSEPORT, so a second listener on the same address
+        // would join that load-balancing group and the kernel would hand it
         // connections meant for a different authentication mode.
-        if plans
-            .iter()
-            .any(|plan| plan.config.server.listen_addr == listener.listen_addr)
-        {
+        //
+        // Wildcards count: `0.0.0.0` claims every IPv4 address on its port, and
+        // `::` claims everything on its port. An overlapping pair is refused
+        // rather than left to fail at bind time with an EADDRINUSE that says
+        // nothing about which two listeners disagreed.
+        if let Some(existing) = plans.iter().find(|plan| {
+            listen_addresses_overlap(plan.config.server.listen_addr, listener.listen_addr)
+        }) {
+            let existing = existing.config.server.listen_addr;
+            if existing == listener.listen_addr {
+                anyhow::bail!(
+                    "two listeners are configured for {existing}; \
+                     each listener needs its own address"
+                );
+            }
             anyhow::bail!(
-                "two listeners are configured for {}; each listener needs its own address",
+                "listeners {existing} and {} overlap; a wildcard address claims every \
+                 address of its family on that port, and :: may claim IPv4 as well",
                 listener.listen_addr
             );
         }
@@ -287,14 +343,25 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
 
+    // [[listeners]] is the whole list, so `[server]`'s own socket settings are
+    // dead. Warned about only when they were set to something other than the
+    // default, which is what "I left the old listen address behind and expect
+    // it to still serve" looks like; a file that simply never mentions them has
+    // nothing to correct. Only a warning either way: which sockets actually
+    // came up is spelled out by the "listening" line each listener logs, and by
+    // `check-config`.
     if !config.listeners.is_empty() {
-        // [[listeners]] is the whole list, so these are dead settings. Only
-        // worth a warning: which sockets actually came up is spelled out by the
-        // "listening" line each listener logs, and by `check-config`.
-        warn!(
-            "[[listeners]] replaces [server].listen_addr and [server].shards, \
-             which are ignored"
-        );
+        let defaults = crate::config::ServerSection::default();
+        if config.server.listen_addr != defaults.listen_addr
+            || config.server.shards != defaults.shards
+        {
+            warn!(
+                listen_addr = %config.server.listen_addr,
+                shards = config.server.shards,
+                "[server].listen_addr and [server].shards are ignored because \
+                 [[listeners]] names the sockets"
+            );
+        }
     }
 
     // Surface a bad credential or active roster configuration first. A roster
@@ -440,6 +507,8 @@ impl Server {
             address_pool,
         } = validate_server_config(&config)?;
 
+        let basic_shards = basic_shard_count(&listeners);
+
         let tun = build_tun(&config)?;
 
         let mut key_bytes = [0u8; 32];
@@ -481,7 +550,7 @@ impl Server {
             tun,
             forward_tx,
             tun_tx,
-            auth_permits: Arc::new(Semaphore::new(auth_concurrency(total_shards))),
+            auth_permits: Arc::new(Semaphore::new(auth_concurrency(basic_shards))),
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
             clients: Arc::new(SharedRoster::new(clients)),
             roster_reload,
@@ -1066,6 +1135,9 @@ struct Shared {
     /// unauthenticated requests turn into hundreds of megabytes and cores of
     /// work. The old inline check bounded this at one per shard by blocking
     /// the event loop; this keeps a bound without the stall.
+    ///
+    /// Sized from the shards that verify passwords, so adding a
+    /// client-certificate listener does not widen what a Basic one will accept.
     auth_permits: Arc<Semaphore>,
     /// Bounds both queued and running password verifications across all shards.
     auth_queue_slots: Arc<Semaphore>,
@@ -3216,6 +3288,46 @@ mod tests {
         assert!(super::plan_listeners(&config).is_err());
     }
 
+    /// A wildcard claims every address of its family on its port, so an
+    /// overlapping pair must be refused rather than left to fail at bind time.
+    #[test]
+    fn wildcard_listeners_cannot_overlap_a_specific_address() {
+        let config = config_with(vec![
+            listener("0.0.0.0:443", AuthMode::Basic),
+            listener("127.0.0.1:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&config).is_err());
+    }
+
+    /// `::` may claim IPv4 too, depending on `IPV6_V6ONLY`, which nothing here
+    /// sets. Refusing the pair everywhere beats binding on some hosts and
+    /// failing on others.
+    #[test]
+    fn the_ipv6_wildcard_is_assumed_to_claim_ipv4() {
+        let config = config_with(vec![
+            listener("[::]:443", AuthMode::Basic),
+            listener("0.0.0.0:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&config).is_err());
+
+        // Nothing wider than it needs to be: distinct ports, distinct specific
+        // addresses, and a v6 loopback beside the v4 wildcard all still stand.
+        for pair in [
+            ["0.0.0.0:443", "0.0.0.0:4443"],
+            ["127.0.0.1:443", "127.0.0.2:443"],
+            ["[::1]:443", "0.0.0.0:443"],
+        ] {
+            let config = config_with(vec![
+                listener(pair[0], AuthMode::Basic),
+                listener(pair[1], AuthMode::ClientCert),
+            ]);
+            assert!(
+                super::plan_listeners(&config).is_ok(),
+                "{pair:?} do not contend for the same packets"
+            );
+        }
+    }
+
     #[test]
     fn automatic_sharding_is_rejected_for_multiple_listeners() {
         let mut config = ServerConfig::default();
@@ -3301,6 +3413,40 @@ mod tests {
             );
             assert!(permits <= shards * 2);
         }
+
+        // No Basic listener means nothing acquires a permit, but a semaphore
+        // that can never be acquired would hang a future caller.
+        assert_eq!(super::auth_concurrency(0), 1);
+    }
+
+    /// The verification budget rations what unauthenticated callers can demand
+    /// of the Basic listeners. A certificate listener never reaches that path,
+    /// so its shards must not widen the budget.
+    #[test]
+    fn certificate_shards_do_not_enlarge_the_verification_budget() {
+        // One shard each: multi-shard listeners need SO_REUSEPORT, so a larger
+        // certificate listener cannot be planned off Linux. One is enough — the
+        // point is that certificate shards are not counted at all.
+        let config = config_with(vec![
+            listener("0.0.0.0:443", AuthMode::Basic),
+            listener("0.0.0.0:4443", AuthMode::ClientCert),
+        ]);
+        let plans = super::plan_listeners(&config).unwrap();
+
+        let total_shards: usize = plans.iter().map(|plan| plan.shards).sum();
+        assert_eq!(total_shards, 2);
+        assert_eq!(super::basic_shard_count(&plans), 1);
+
+        // The Basic listener gets the budget one Basic shard gets, whatever the
+        // certificate listener contributes to the server's size.
+        assert_eq!(super::auth_concurrency(super::basic_shard_count(&plans)), 2);
+
+        // And a server with no Basic listener rations nothing away, but still
+        // hands out a permit rather than a semaphore that cannot be acquired.
+        let certs_only = config_with(vec![listener("0.0.0.0:4443", AuthMode::ClientCert)]);
+        let plans = super::plan_listeners(&certs_only).unwrap();
+        assert_eq!(super::basic_shard_count(&plans), 0);
+        assert_eq!(super::auth_concurrency(0), 1);
     }
 
     #[test]

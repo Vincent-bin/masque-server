@@ -58,8 +58,11 @@ target/release/masque-server --config ./masque.toml enroll-client \
 Append the generated `[[clients]]` block to the server configuration, then
 reload or restart the service. The generated client configuration contains a
 private key and must be handled as a secret. Basic and client-certificate
-authentication are mutually exclusive within one server instance; see
-[Authentication](docs/configuration.md#authentication) for the complete setup.
+authentication are mutually exclusive on one socket, because the mode decides
+what the TLS handshake demands. To serve both kinds of client, give each mode
+its own `[[listeners]]` entry in the same process; see
+[Authentication](docs/configuration.md#authentication) and
+[Multiple listeners](docs/configuration.md#multiple-listeners).
 
 ## One-command Linux install
 
@@ -69,11 +72,13 @@ On Linux x86_64, download, verify, and install the latest stable release with:
 curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
 ```
 
-For a new configuration the installer prompts for `basic` or `client_cert`
-authentication and optional TLS file locations. Basic mode generates a random
-password when none is supplied. Client-certificate mode enrolls the first
+For a new configuration the installer prompts for `basic`, `client_cert`, or
+`dual` authentication and optional TLS file locations. Basic mode generates a
+random password when none is supplied. Client-certificate mode enrolls the first
 client, adds its `[[clients]]` entry, writes its secret JSON as mode `0600`, and
-prints the matching usque and mihomo configuration. At the end it prints the
+prints the matching usque and mihomo configuration. Dual mode does both, writing
+a two-listener configuration that serves credentials on one port and
+certificates on another. At the end it prints the
 installed version, service state, and effective server configuration with the
 password hash redacted.
 

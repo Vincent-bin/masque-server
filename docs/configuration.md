@@ -235,18 +235,36 @@ listeners in one process rather than two processes — two processes would need
 two TUN devices and two address pools, and overlapping pools hand the same
 tunnel address to two clients.
 
-The server refuses to start when two listeners name the same address. This is
-not left to the kernel to report: a listener with more than one shard opens its
-socket with `SO_REUSEPORT`, so a second listener on that address would join the
-load-balancing group and be handed connections meant for the other
+The server refuses to start when two listeners contend for the same address.
+This is not left to the kernel to report: a listener with more than one shard
+opens its socket with `SO_REUSEPORT`, so a second listener on that address would
+join the load-balancing group and be handed connections meant for the other
 authentication mode.
 
+Wildcards count as contention. `0.0.0.0` claims every IPv4 address on its port,
+so it conflicts with `127.0.0.1` on that port. `::` is treated as claiming IPv4
+as well, because whether it really does is the kernel's `IPV6_V6ONLY` default —
+`0` on Linux unless `net.ipv6.bindv6only` says otherwise. Nothing here sets that
+option, so `[::]:443` beside `0.0.0.0:443` is refused everywhere rather than
+binding on some hosts and failing on others.
+
 `shards = 0` (one per core) is rejected when more than one listener is
-configured; give each listener an explicit count. The `MAX_SHARDS` cap of 32
-applies to the server's total, not to any one listener.
+configured; give each listener an explicit count. The 32-shard cap applies to
+the server's total, not to any one listener. The budget for concurrent password
+verification is sized from the Basic listeners' shards alone, so adding a
+certificate listener does not widen what unauthenticated callers can demand.
+
+`--listen` overrides `[server].listen_addr`, which this form does not use, so
+it is refused rather than silently ignored when `[[listeners]]` is present.
 
 Run `masque-server --config masque.toml check-config` to validate a
-multi-listener file before restarting.
+multi-listener file before restarting. It prints the resolved listeners:
+
+```
+configuration is compatible with masque-server 0.3.0: /etc/masque/masque.toml
+listener 0.0.0.0:443 auth=basic shards=1
+listener 0.0.0.0:4443 auth=client_cert shards=1
+```
 
 The usque JSON schema stores the endpoint IP but not its port, so enrollment
 also prints the matching launch argument — `--connect-port 443` for the example
