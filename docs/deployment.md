@@ -36,13 +36,12 @@ from `/dev/tty`. A new installation offers three modes:
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
   entry, writes the usque JSON to a new `0600` file, and prints the mihomo block;
 - `dual` does both, writing a
-  [two-listener configuration](configuration.md#multiple-listeners) that serves
+  [two-listener configuration](configuration.md#listeners) that serves
   credentials on one port and certificates on another. The authentication mode
   decides what the TLS handshake demands, so the two cannot share a socket.
 
-Dual mode asks for a second port, defaulting to `4443`, and removes
-`[server].listen_addr` and `[server].shards` from the written file because
-`[[listeners]]` names the sockets instead.
+Dual mode asks for a second port, defaulting to `4443`, and writes two explicit
+`[[listeners]]` entries, each with its own `[listeners.auth]` table.
 
 Client-certificate enrollment needs the server's ECDSA certificate immediately
 because the generated client configuration pins its public key, so `client_cert`
@@ -91,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.2.0` selects `v0.2.0`. This is also how to install a
+`MASQUE_VERSION=0.3.0` selects `v0.3.0`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
@@ -105,6 +104,11 @@ On success, only the binary and packaged systemd unit are upgraded; the TOML
 and every TLS path it references remain unchanged. If the requested service
 restart then fails, the installer restores the previous binary, unit, enabled
 state, and active state.
+
+Version 0.3 does not migrate the 0.2 single-listener format. Before upgrading,
+move every socket into `[[listeners]]` with an explicit `[listeners.auth]` and
+remove top-level `[auth]`, `[server].listen_addr`, and `[server].shards`. The
+candidate rejects an old file and exits before replacing anything.
 
 ## Install a downloaded archive
 
@@ -206,8 +210,8 @@ The candidate first runs the equivalent of:
 masque-server --config /etc/masque/masque.toml check-config
 ```
 
-This validates the parts of startup that do not need live resources. A legacy
-configuration that no longer satisfies fail-closed authentication, a bad
+This validates the parts of startup that do not need live resources. A 0.2
+configuration, a file that no longer satisfies fail-closed authentication, a bad
 certificate/key pair, an unsupported QUIC setting, or an invalid client/address
 pool therefore stops the upgrade before replacement. Edit and validate such a
 configuration deliberately; the installer never migrates it automatically.

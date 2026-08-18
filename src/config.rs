@@ -5,53 +5,48 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Top-level server configuration.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    #[serde(default)]
     pub server: ServerSection,
+    #[serde(default)]
     pub tls: TlsSection,
-    pub auth: AuthSection,
+    #[serde(default)]
     pub quic: QuicSection,
+    #[serde(default)]
     pub tcp_proxy: TcpProxySection,
+    #[serde(default)]
     pub udp_proxy: UdpProxySection,
+    #[serde(default)]
     pub ip_proxy: IpProxySection,
     /// Pre-registered clients, identified by their TLS client certificate key.
     ///
-    /// Only consulted when `auth.mode = "client_cert"`. Written as repeated
-    /// `[[clients]]` tables.
+    /// Only consulted when a listener uses `auth.mode = "client_cert"`.
+    /// Written as repeated `[[clients]]` tables.
+    #[serde(default)]
     pub clients: Vec<ClientEntry>,
     /// Every socket this server listens on, written as repeated `[[listeners]]`
     /// tables.
     ///
-    /// This is the whole list, not an addition to `[server].listen_addr`: a
-    /// configuration that names any listener here stops deriving one from
-    /// `[server]`. Leaving it empty keeps the single-listener form, which is
-    /// what every configuration written before this existed uses.
-    ///
     /// Separate listeners are what allow one process to serve two
-    /// authentication modes at once — `auth.mode` fixes the TLS context, so a
-    /// Basic listener and a client-certificate listener cannot share a socket.
+    /// authentication modes at once — a listener's `auth.mode` fixes its TLS
+    /// context, so Basic and client-certificate modes cannot share a socket.
+    /// The field intentionally has no serde default: every configuration file
+    /// must name at least one listener explicitly.
     pub listeners: Vec<ListenerSection>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
-    pub listen_addr: SocketAddr,
     pub idle_timeout_secs: u64,
     pub max_connections: usize,
     pub max_tunnels_per_connection: usize,
-    /// Independent event loops to run, each with its own `SO_REUSEPORT` socket
-    /// and its own share of the connections.
-    ///
-    /// QUIC's per-packet crypto is what saturates a core, and a connection is
-    /// always handled by one loop, so this is what lets a busy server use more
-    /// than one core. `0` means one per available core. Linux only.
-    pub shards: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TlsSection {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
@@ -73,7 +68,7 @@ pub enum AuthMode {
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthSection {
     /// Master switch. `false` disables authentication whatever `mode` says.
     pub enabled: bool,
@@ -118,60 +113,29 @@ impl AuthSection {
 /// silently become `0.0.0.0:443` and collide with whichever listener meant to
 /// take that port.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ListenerSection {
     pub listen_addr: SocketAddr,
-    /// Independent event loops for this listener. See [`ServerSection::shards`].
+    /// Independent event loops for this listener. Each shard owns a
+    /// `SO_REUSEPORT` socket and a disjoint share of the connections. `0` means
+    /// one per available core and is accepted only for a single listener.
     #[serde(default = "default_listener_shards")]
     pub shards: usize,
-    /// Authentication for this listener. Omitted means the top-level `[auth]`.
-    ///
-    /// An override replaces `[auth]` outright rather than merging field by
-    /// field: half-inherited credentials would be an authentication decision
-    /// assembled from two places, which is not something to leave implicit.
-    #[serde(default)]
-    pub auth: Option<AuthSection>,
+    /// Authentication for this listener. Required so a socket's trust boundary
+    /// is never inherited from a distant part of the file.
+    pub auth: AuthSection,
 }
 
 fn default_listener_shards() -> usize {
     1
 }
 
-/// A listener whose authentication has been resolved against the top-level
-/// `[auth]` default.
-///
-/// Distinct from [`ListenerSection`] so the inheritance happens exactly once,
-/// where it can be tested, rather than at each place that reads a listener.
+/// A validated listener with `shards = 0` resolved to an explicit count.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedListener {
     pub listen_addr: SocketAddr,
     pub shards: usize,
     pub auth: AuthSection,
-}
-
-impl ServerConfig {
-    /// Every listener this configuration asks for, in the order it named them.
-    ///
-    /// An empty `[[listeners]]` desugars to the single listener described by
-    /// `[server]` and `[auth]`, so the two configuration forms produce the same
-    /// shape and the rest of the server only ever handles a list.
-    pub fn resolved_listeners(&self) -> Vec<ResolvedListener> {
-        if self.listeners.is_empty() {
-            return vec![ResolvedListener {
-                listen_addr: self.server.listen_addr,
-                shards: self.server.shards,
-                auth: self.auth.clone(),
-            }];
-        }
-
-        self.listeners
-            .iter()
-            .map(|listener| ResolvedListener {
-                listen_addr: listener.listen_addr,
-                shards: listener.shards,
-                auth: listener.auth.clone().unwrap_or_else(|| self.auth.clone()),
-            })
-            .collect()
-    }
 }
 
 /// One pre-registered client.
@@ -180,7 +144,7 @@ impl ServerConfig {
 /// operator generates a key pair, records its public key here, and hands the
 /// private key to the client out of band.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClientEntry {
     /// Label used in logs. Optional, but makes the logs readable.
     pub name: String,
@@ -200,7 +164,7 @@ pub struct ClientEntry {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct QuicSection {
     pub max_datagram_size: usize,
     pub initial_max_streams_bidi: u64,
@@ -243,7 +207,7 @@ pub struct QuicSection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UdpProxySection {
     pub enabled: bool,
     pub uri_template: String,
@@ -252,7 +216,7 @@ pub struct UdpProxySection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TcpProxySection {
     pub enabled: bool,
     pub connect_timeout_secs: u64,
@@ -261,7 +225,7 @@ pub struct TcpProxySection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IpProxySection {
     pub enabled: bool,
     pub uri_template: String,
@@ -285,20 +249,34 @@ pub struct IpProxySection {
 
 // ── Defaults ──────────────────────────────────────────────────────────
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerSection::default(),
+            tls: TlsSection::default(),
+            quic: QuicSection::default(),
+            tcp_proxy: TcpProxySection::default(),
+            udp_proxy: UdpProxySection::default(),
+            ip_proxy: IpProxySection::default(),
+            clients: Vec::new(),
+            listeners: vec![ListenerSection {
+                listen_addr: "0.0.0.0:443".parse().unwrap(),
+                shards: default_listener_shards(),
+                auth: AuthSection::default(),
+            }],
+        }
+    }
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:443".parse().unwrap(),
             // Comfortably above the 30s keepalive period MASQUE VPN clients
             // commonly default to, so a tunnel that is merely quiet does not
             // race its own keepalive to the timeout.
             idle_timeout_secs: 60,
             max_connections: 10_000,
             max_tunnels_per_connection: 100,
-            // Opt-in: sharding changes how connections are distributed, so an
-            // operator should turn it on deliberately after checking their
-            // own traffic rather than inheriting it from an upgrade.
-            shards: 1,
         }
     }
 }
@@ -414,19 +392,30 @@ pub fn parse_toml(toml_str: &str) -> Result<ServerConfig, toml::de::Error> {
 mod tests {
     use super::*;
 
+    const DISABLED_LISTENER: &str = r#"
+[[listeners]]
+listen_addr = "127.0.0.1:8443"
+
+[listeners.auth]
+enabled = false
+"#;
+
+    fn parse_with_listener(toml: &str) -> ServerConfig {
+        parse_toml(&format!("{toml}\n{DISABLED_LISTENER}")).unwrap()
+    }
+
     #[test]
     fn defaults_are_sensible() {
         let cfg = ServerConfig::default();
-        assert_eq!(cfg.server.listen_addr.port(), 443);
         assert_eq!(cfg.server.idle_timeout_secs, 60);
-        assert!(cfg.auth.enabled);
-        assert_eq!(cfg.auth.mode, AuthMode::Basic);
-        assert!(cfg.auth.basic_enabled());
-        assert!(!cfg.auth.client_cert_enabled());
-        assert!(cfg.auth.username.is_empty());
-        assert!(cfg.auth.password_hash.is_empty());
         assert!(cfg.clients.is_empty());
-        assert!(cfg.listeners.is_empty());
+        assert_eq!(cfg.listeners.len(), 1);
+        assert_eq!(cfg.listeners[0].listen_addr.port(), 443);
+        assert_eq!(cfg.listeners[0].shards, 1);
+        assert!(cfg.listeners[0].auth.basic_enabled());
+        assert!(!cfg.listeners[0].auth.client_cert_enabled());
+        assert!(cfg.listeners[0].auth.username.is_empty());
+        assert!(cfg.listeners[0].auth.password_hash.is_empty());
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
@@ -448,49 +437,53 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_toml_gives_defaults() {
-        let cfg = parse_toml("").unwrap();
-        assert_eq!(cfg, ServerConfig::default());
+    fn configuration_file_requires_listeners() {
+        let error = parse_toml("").unwrap_err().to_string();
+        assert!(error.contains("listeners"), "unexpected error: {error}");
     }
 
     #[test]
     fn parse_partial_server_section() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [server]
-listen_addr = "127.0.0.1:8443"
-idle_timeout_secs = 60
-"#;
-        let cfg = parse_toml(toml).unwrap();
-        assert_eq!(cfg.server.listen_addr, "127.0.0.1:8443".parse().unwrap());
-        assert_eq!(cfg.server.idle_timeout_secs, 60);
+idle_timeout_secs = 75
+"#,
+        );
+        assert_eq!(cfg.server.idle_timeout_secs, 75);
         // Other fields keep defaults
         assert_eq!(cfg.server.max_connections, 10_000);
     }
 
     #[test]
     fn parse_tls_section() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [tls]
 cert_path = "/etc/masque/cert.pem"
 key_path = "/etc/masque/key.pem"
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert_eq!(cfg.tls.cert_path, PathBuf::from("/etc/masque/cert.pem"));
         assert_eq!(cfg.tls.key_path, PathBuf::from("/etc/masque/key.pem"));
     }
 
     #[test]
-    fn parse_auth_section_and_redact_hash_in_debug_output() {
+    fn parse_listener_auth_and_redact_hash_in_debug_output() {
         let toml = r#"
-[auth]
+[[listeners]]
+listen_addr = "127.0.0.1:8443"
+
+[listeners.auth]
 enabled = true
 username = "alice"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
 "#;
         let cfg = parse_toml(toml).unwrap();
-        assert!(cfg.auth.enabled);
-        assert_eq!(cfg.auth.username, "alice");
-        assert!(cfg.auth.password_hash.starts_with("$argon2id$"));
+        let auth = &cfg.listeners[0].auth;
+        assert!(auth.enabled);
+        assert_eq!(auth.username, "alice");
+        assert!(auth.password_hash.starts_with("$argon2id$"));
 
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -500,7 +493,10 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
     #[test]
     fn parse_client_cert_auth_mode_with_roster() {
         let toml = r#"
-[auth]
+[[listeners]]
+listen_addr = "127.0.0.1:8443"
+
+[listeners.auth]
 enabled = true
 mode = "client_cert"
 
@@ -515,11 +511,12 @@ name = "phone"
 public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb3RoZXI="
 "#;
         let cfg = parse_toml(toml).unwrap();
-        assert_eq!(cfg.auth.mode, AuthMode::ClientCert);
-        assert!(cfg.auth.client_cert_enabled());
+        let auth = &cfg.listeners[0].auth;
+        assert_eq!(auth.mode, AuthMode::ClientCert);
+        assert!(auth.client_cert_enabled());
         // The Basic pipeline must stand down, or a client certificate would not
         // be enough on its own.
-        assert!(!cfg.auth.basic_enabled());
+        assert!(!auth.basic_enabled());
 
         assert_eq!(cfg.clients.len(), 2);
         assert_eq!(cfg.clients[0].name, "laptop");
@@ -532,54 +529,40 @@ public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb3RoZXI="
 
     #[test]
     fn disabling_auth_overrides_the_mode() {
-        let cfg = parse_toml("[auth]\nenabled = false\nmode = \"client_cert\"\n").unwrap();
-        assert!(!cfg.auth.client_cert_enabled());
-        assert!(!cfg.auth.basic_enabled());
+        let cfg = parse_toml(
+            "[[listeners]]\nlisten_addr = \"127.0.0.1:8443\"\n\
+             [listeners.auth]\nenabled = false\nmode = \"client_cert\"\n",
+        )
+        .unwrap();
+        assert!(!cfg.listeners[0].auth.client_cert_enabled());
+        assert!(!cfg.listeners[0].auth.basic_enabled());
     }
 
     #[test]
     fn parse_unknown_auth_mode_is_rejected() {
         // A typo here would otherwise silently fall back to Basic and lock out
         // every client certificate.
-        assert!(parse_toml("[auth]\nmode = \"mtls\"\n").is_err());
+        assert!(
+            parse_toml(
+                "[[listeners]]\nlisten_addr = \"127.0.0.1:8443\"\n\
+                 [listeners.auth]\nmode = \"mtls\"\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn a_configuration_without_listeners_desugars_to_one() {
+    fn listeners_are_explicit_and_can_use_different_authentication_modes() {
         let cfg = parse_toml(
             r#"
-[server]
-listen_addr = "127.0.0.1:8443"
-shards = 3
+[[listeners]]
+listen_addr = "0.0.0.0:8443"
 
-[auth]
-mode = "client_cert"
-"#,
-        )
-        .unwrap();
-
-        let listeners = cfg.resolved_listeners();
-        assert_eq!(listeners.len(), 1);
-        assert_eq!(listeners[0].listen_addr, "127.0.0.1:8443".parse().unwrap());
-        assert_eq!(listeners[0].shards, 3);
-        assert_eq!(listeners[0].auth, cfg.auth);
-    }
-
-    #[test]
-    fn listeners_replace_the_single_listener_form() {
-        let cfg = parse_toml(
-            r#"
-[server]
-listen_addr = "0.0.0.0:443"
-
-[auth]
+[listeners.auth]
 enabled = true
 mode = "basic"
 username = "alice"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
-
-[[listeners]]
-listen_addr = "0.0.0.0:8443"
 
 [[listeners]]
 listen_addr = "0.0.0.0:4443"
@@ -591,111 +574,56 @@ mode = "client_cert"
         )
         .unwrap();
 
-        let listeners = cfg.resolved_listeners();
-        assert_eq!(listeners.len(), 2, "[server].listen_addr must not add one");
-
-        // No override: the top-level [auth] is inherited whole.
-        assert_eq!(listeners[0].listen_addr, "0.0.0.0:8443".parse().unwrap());
-        assert_eq!(listeners[0].shards, 1, "shards default to one per listener");
-        assert!(listeners[0].auth.basic_enabled());
-        assert_eq!(listeners[0].auth.username, "alice");
-
-        // An override replaces [auth] rather than merging into it, so the
-        // inherited username does not follow the mode across.
-        assert_eq!(listeners[1].listen_addr, "0.0.0.0:4443".parse().unwrap());
-        assert_eq!(listeners[1].shards, 2);
-        assert!(listeners[1].auth.client_cert_enabled());
-        assert!(listeners[1].auth.username.is_empty());
-    }
-
-    /// The whole point of the list: one process, two authentication modes.
-    #[test]
-    fn listeners_can_disagree_about_the_authentication_mode() {
-        let cfg = parse_toml(
-            r#"
-[[listeners]]
-listen_addr = "0.0.0.0:443"
-
-[listeners.auth]
-mode = "basic"
-username = "alice"
-password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
-
-[[listeners]]
-listen_addr = "0.0.0.0:4443"
-
-[listeners.auth]
-mode = "client_cert"
-"#,
-        )
-        .unwrap();
-
-        let listeners = cfg.resolved_listeners();
-        assert!(listeners[0].auth.basic_enabled());
-        assert!(!listeners[0].auth.client_cert_enabled());
-        assert!(listeners[1].auth.client_cert_enabled());
-        assert!(!listeners[1].auth.basic_enabled());
+        assert_eq!(cfg.listeners.len(), 2);
+        assert_eq!(cfg.listeners[0].shards, 1, "shards default to one");
+        assert!(cfg.listeners[0].auth.basic_enabled());
+        assert_eq!(cfg.listeners[0].auth.username, "alice");
+        assert_eq!(cfg.listeners[1].shards, 2);
+        assert!(cfg.listeners[1].auth.client_cert_enabled());
+        assert!(!cfg.listeners[1].auth.basic_enabled());
     }
 
     #[test]
-    fn a_listener_without_an_address_is_rejected() {
-        // Defaulting this would silently put the listener on 0.0.0.0:443,
-        // where it would fight whichever listener meant to take that port.
-        assert!(parse_toml("[[listeners]]\nshards = 2\n").is_err());
+    fn a_listener_requires_an_address_and_authentication() {
+        assert!(
+            parse_toml("[[listeners]]\nshards = 2\n[listeners.auth]\nenabled = false\n").is_err()
+        );
+        assert!(parse_toml("[[listeners]]\nlisten_addr = \"127.0.0.1:443\"\n").is_err());
     }
 
     #[test]
-    fn parse_unknown_listener_auth_mode_is_rejected() {
-        let toml = r#"
-[[listeners]]
-listen_addr = "0.0.0.0:443"
+    fn legacy_single_listener_fields_are_rejected() {
+        let top_level_auth = format!("[auth]\nenabled = false\n{DISABLED_LISTENER}");
+        assert!(parse_toml(&top_level_auth).is_err());
 
-[listeners.auth]
-mode = "mtls"
-"#;
-        assert!(parse_toml(toml).is_err());
-    }
-
-    #[test]
-    fn listener_password_hashes_are_redacted_in_debug_output() {
-        let cfg = parse_toml(
-            r#"
-[[listeners]]
-listen_addr = "0.0.0.0:443"
-
-[listeners.auth]
-password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
-"#,
-        )
-        .unwrap();
-
-        // `info!(?cfg, ...)` logs the whole configuration at startup.
-        let debug = format!("{cfg:?}");
-        assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains("$argon2id$"));
+        let server_listener =
+            format!("[server]\nlisten_addr = \"127.0.0.1:443\"\nshards = 1\n{DISABLED_LISTENER}");
+        assert!(parse_toml(&server_listener).is_err());
     }
 
     #[test]
     fn parse_custom_connect_protocols() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [ip_proxy]
 connect_protocols = ["connect-ip"]
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert_eq!(cfg.ip_proxy.connect_protocols, vec!["connect-ip"]);
     }
 
     #[test]
     fn parse_quic_section() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [quic]
 max_datagram_size = 1200
 initial_max_streams_bidi = 64
 enable_dgram = false
 enable_udp_gso = true
 enable_udp_gro = false
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert_eq!(cfg.quic.max_datagram_size, 1200);
         assert_eq!(cfg.quic.initial_max_streams_bidi, 64);
         assert!(!cfg.quic.enable_dgram);
@@ -708,7 +636,8 @@ enable_udp_gro = false
 
     #[test]
     fn parse_quic_tuning_knobs() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [quic]
 cc_algorithm = "cubic"
 initial_congestion_window_packets = 10
@@ -719,8 +648,8 @@ max_stream_window = 1000000
 dgram_recv_queue_len = 512
 dgram_send_queue_len = 256
 discover_pmtu = true
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert_eq!(cfg.quic.cc_algorithm, "cubic");
         assert_eq!(cfg.quic.initial_congestion_window_packets, 10);
         assert_eq!(cfg.quic.initial_max_data, 1_000_000);
@@ -736,13 +665,14 @@ discover_pmtu = true
 
     #[test]
     fn parse_udp_proxy_section() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [udp_proxy]
 enabled = false
 allow_targets = ["192.168.0.0/16"]
 deny_targets = []
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert!(!cfg.udp_proxy.enabled);
         assert_eq!(cfg.udp_proxy.allow_targets, vec!["192.168.0.0/16"]);
         assert!(cfg.udp_proxy.deny_targets.is_empty());
@@ -750,14 +680,15 @@ deny_targets = []
 
     #[test]
     fn parse_tcp_proxy_section() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [tcp_proxy]
 enabled = false
 connect_timeout_secs = 3
 allow_targets = ["192.168.0.0/16"]
 deny_targets = []
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert!(!cfg.tcp_proxy.enabled);
         assert_eq!(cfg.tcp_proxy.connect_timeout_secs, 3);
         assert_eq!(cfg.tcp_proxy.allow_targets, vec!["192.168.0.0/16"]);
@@ -766,15 +697,16 @@ deny_targets = []
 
     #[test]
     fn parse_ip_proxy_section() {
-        let toml = r#"
+        let cfg = parse_with_listener(
+            r#"
 [ip_proxy]
 enabled = false
 tun_name = "tun7"
 tun_mtu = 1400
 ipv4_pool = "172.16.0.0/12"
 ipv6_pool = "fd01::/64"
-"#;
-        let cfg = parse_toml(toml).unwrap();
+"#,
+        );
         assert!(!cfg.ip_proxy.enabled);
         assert_eq!(cfg.ip_proxy.tun_name, "tun7");
         assert_eq!(cfg.ip_proxy.tun_mtu, 1400);
@@ -785,7 +717,6 @@ ipv6_pool = "fd01::/64"
     fn parse_full_config() {
         let toml = r#"
 [server]
-listen_addr = "0.0.0.0:443"
 idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
@@ -837,6 +768,16 @@ tun_name = "masque0"
 tun_mtu = 1280
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
+
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "basic"
+username = ""
+password_hash = ""
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg, ServerConfig::default());
@@ -845,29 +786,36 @@ ipv6_pool = "fd00:abcd::/64"
     #[test]
     fn parse_invalid_listen_addr() {
         let toml = r#"
-[server]
+[[listeners]]
 listen_addr = "not-an-address"
+
+[listeners.auth]
+enabled = false
 "#;
         assert!(parse_toml(toml).is_err());
     }
 
     #[test]
     fn parse_invalid_type() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [server]
 idle_timeout_secs = "not a number"
-"#;
-        assert!(parse_toml(toml).is_err());
+{DISABLED_LISTENER}
+"#
+        );
+        assert!(parse_toml(&toml).is_err());
     }
 
     #[test]
-    fn parse_unknown_field_is_ignored() {
-        // serde ignores unknown fields by default — good for forward compat.
-        let toml = r#"
+    fn parse_unknown_field_is_rejected() {
+        let toml = format!(
+            r#"
 [server]
 unknown_field = 42
-"#;
-        let cfg = parse_toml(toml).unwrap();
-        assert_eq!(cfg.server.listen_addr.port(), 443); // defaults preserved
+{DISABLED_LISTENER}
+"#
+        );
+        assert!(parse_toml(&toml).is_err());
     }
 }

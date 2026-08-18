@@ -107,12 +107,13 @@ without dropping legitimate migration traffic.
 One connection still uses one shard. Sharding improves aggregate throughput
 across multiple connections; it cannot parallelize a single QUIC connection.
 
-`[[listeners]]` runs several listeners in one process. Each is materialized
-into its own `ServerConfig`, so a shard reads one listener's settings and never
-has to know it is one listener among several; the multi-listener change does
-not reach the request or packet paths. The authentication mode is the reason
-this exists: `auth.mode` decides which TLS context `build_quic_config` returns,
-and that is fixed when the socket binds.
+`[[listeners]]` runs one or more listeners in one process. Startup resolves each
+entry into a small listener plan containing its address, shard count, and
+authentication. Every shard also references the same process-wide
+`ServerConfig`, so proxy policies, QUIC/TLS tuning, limits, and CONNECT-IP state
+are shared rather than copied per listener. The authentication mode decides
+which TLS context `build_quic_config` returns, and that is fixed when the socket
+binds.
 
 Shards are numbered across the whole server rather than within a listener,
 which is what lets the cross-shard queues, the connection-ID registry, and the

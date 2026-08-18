@@ -14,6 +14,8 @@ a staging environment.
 - CONNECT-IP ([RFC 9484]) with Linux TUN integration
 - HTTP Basic authentication with Argon2id password verification, or TLS client
   certificate authentication against a public-key roster
+- Multiple listeners in one process, each with its own Basic or client-certificate
+  authentication mode while sharing proxy policies, client roster, and TUN state
 - CIDR allow and deny policies for TCP and UDP targets
 - Bounded queues and backpressure across authentication and tunnel I/O
 - Linux `recvmmsg`/`sendmmsg`, UDP GRO, optional UDP GSO, and TUN offload
@@ -28,8 +30,8 @@ Build the server:
 cargo build --release --bin masque-server
 ```
 
-Authentication is enabled by default. For the default `basic` mode, generate an
-Argon2id password hash:
+Each `[[listeners]]` entry has an explicit `[listeners.auth]` table. For a
+`basic` listener, generate an Argon2id password hash:
 
 ```sh
 printf '%s' 'replace-this-password' | \
@@ -46,8 +48,9 @@ target/release/masque-server --config ./masque.toml
 Authentication is fail-closed. In `basic` mode the server refuses to start until
 a valid username and Argon2id hash are configured.
 
-Alternatively, set `auth.mode = "client_cert"` to authenticate clients during
-the TLS handshake. Generate each client's P-256 key and configuration with:
+Alternatively, set `mode = "client_cert"` in `[listeners.auth]` to authenticate
+clients during the TLS handshake. Generate each client's P-256 key and
+configuration with:
 
 ```sh
 target/release/masque-server --config ./masque.toml enroll-client \
@@ -62,7 +65,7 @@ authentication are mutually exclusive on one socket, because the mode decides
 what the TLS handshake demands. To serve both kinds of client, give each mode
 its own `[[listeners]]` entry in the same process; see
 [Authentication](docs/configuration.md#authentication) and
-[Multiple listeners](docs/configuration.md#multiple-listeners).
+[Listeners](docs/configuration.md#listeners).
 
 ## One-command Linux install
 
@@ -90,6 +93,11 @@ incompatible configuration aborts before replacement; a failed service restart
 restores the prior binary, unit, and service state. See
 [Deployment](docs/deployment.md#one-command-install) for non-interactive
 variables, certificate requirements, and installing a specific release.
+
+The 0.3 configuration format is intentionally not compatible with 0.2. Convert
+old `[auth]` and `[server]` listener keys into explicit `[[listeners]]` and
+`[listeners.auth]` entries before rerunning the installer; it does not migrate
+them automatically.
 
 ## Install a downloaded release on Linux
 

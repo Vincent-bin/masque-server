@@ -90,6 +90,15 @@ const MAX_PENDING_AUTH_GLOBAL: usize = 256;
 /// that is what `Shared::auth_permits` does.
 const MAX_PENDING_AUTH_PER_CONNECTION: usize = 16;
 
+/// How many fresh kernel-selected ports to try when an ephemeral listener
+/// happens to overlap another listener.
+///
+/// `SO_REUSEPORT` makes such an overlap legal at the kernel boundary, so the
+/// server has to detect it itself or two authentication modes can accidentally
+/// join one load-balancing group. A collision is rare; a bounded retry keeps a
+/// pathological host configuration from turning startup into an infinite loop.
+const MAX_EPHEMERAL_BIND_ATTEMPTS: usize = 32;
+
 /// Concurrent password verifications allowed across all shards.
 ///
 /// Each one costs roughly 19 MiB and tens of milliseconds of CPU, so this caps
@@ -138,10 +147,10 @@ struct UdpResponse {
 /// than dropped.
 ///
 /// A server may have several listeners, which is what lets one process serve
-/// more than one authentication mode: `auth.mode` decides which TLS context a
-/// shard builds, and that is fixed once its socket is bound. Shards are
-/// numbered across the whole server, so everything shared between them — the
-/// address pool, the routing table, the TUN device, the cross-shard queues —
+/// more than one authentication mode: each listener's `auth.mode` decides which
+/// TLS context a shard builds, and that is fixed once its socket is bound.
+/// Shards are numbered across the whole server, so everything shared between
+/// them — the address pool, routing table, TUN device, and cross-shard queues —
 /// stays single and needs no knowledge of which listener a shard serves.
 pub struct Server {
     shards: Vec<Shard>,
@@ -160,16 +169,9 @@ struct ValidatedServerConfig {
     address_pool: AddressPool,
 }
 
-/// One listener's fully materialised configuration and shard count.
+/// One listener after its shard count has been resolved.
 struct ListenerPlan {
-    /// The whole configuration with this listener's address, shard count, and
-    /// authentication substituted in.
-    ///
-    /// A shard reads exactly one of these and never has to know it is one
-    /// listener among several, which is what keeps the multi-listener change
-    /// out of the request and packet paths entirely.
-    config: ServerConfig,
-    shards: usize,
+    listener: ResolvedListener,
 }
 
 /// Whether any listener authenticates with a client certificate.
@@ -179,7 +181,7 @@ struct ListenerPlan {
 /// listener's mode.
 fn any_client_cert_listener(config: &ServerConfig) -> bool {
     config
-        .resolved_listeners()
+        .listeners
         .iter()
         .any(|listener| listener.auth.client_cert_enabled())
 }
@@ -193,8 +195,8 @@ fn any_client_cert_listener(config: &ServerConfig) -> bool {
 fn basic_shard_count(listeners: &[ListenerPlan]) -> usize {
     listeners
         .iter()
-        .filter(|plan| plan.config.auth.basic_enabled())
-        .map(|plan| plan.shards)
+        .filter(|plan| plan.listener.auth.basic_enabled())
+        .map(|plan| plan.listener.shards)
         .sum()
 }
 
@@ -226,6 +228,29 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Whether two socket addresses name the same interface after normalising an
+/// IPv4-mapped IPv6 spelling.
+///
+/// A non-zero scope ID is part of a link-local IPv6 interface identity. In
+/// particular, `fe80::1%2` and `fe80::1%3` may coexist on two links even though
+/// `ip()` alone returns the same address for both. Scope IDs on global addresses
+/// and flow information are ignored because they do not distinguish bind
+/// targets. A zero link-local scope remains conservative because the kernel may
+/// resolve it to the same interface as an explicit one.
+fn same_canonical_address(a: SocketAddr, b: SocketAddr) -> bool {
+    let (canonical_a, canonical_b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
+    if canonical_a != canonical_b {
+        return false;
+    }
+
+    match (canonical_a, a, b) {
+        (IpAddr::V6(ip), SocketAddr::V6(a), SocketAddr::V6(b)) if ip.is_unicast_link_local() => {
+            a.scope_id() == 0 || b.scope_id() == 0 || a.scope_id() == b.scope_id()
+        }
+        _ => true,
+    }
+}
+
 /// How two listeners contend for the same packets, if they do.
 ///
 /// Distinguished so the diagnostic can say which of them it is: told that a
@@ -246,8 +271,9 @@ fn listen_address_conflict(a: SocketAddr, b: SocketAddr) -> Option<AddressConfli
     if a.port() != b.port() {
         return None;
     }
-    // Port 0 asks the kernel for whichever port is free, so two listeners that
-    // both do cannot land on the same one.
+    // Port 0 has no fixed address to compare yet. Binding resolves it and checks
+    // the result against both already-bound and still-planned listeners; this is
+    // necessary because SO_REUSEPORT can make the kernel reuse a selected port.
     if a.port() == 0 {
         return None;
     }
@@ -258,7 +284,7 @@ fn listen_address_conflict(a: SocketAddr, b: SocketAddr) -> Option<AddressConfli
     // Canonical form, so an IPv4-mapped spelling cannot present itself as a
     // different address from the IPv4 one it resolves to.
     let (canonical_a, canonical_b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
-    if canonical_a == canonical_b {
+    if same_canonical_address(a, b) {
         return Some(AddressConflict::SameAddress);
     }
     if address_covers(canonical_a, canonical_b) || address_covers(canonical_b, canonical_a) {
@@ -270,11 +296,14 @@ fn listen_address_conflict(a: SocketAddr, b: SocketAddr) -> Option<AddressConfli
 /// Expand the configured listeners into one plan each, rejecting the
 /// combinations that cannot be served.
 fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
-    let listeners = config.resolved_listeners();
-    let mut plans: Vec<ListenerPlan> = Vec::with_capacity(listeners.len());
+    if config.listeners.is_empty() {
+        anyhow::bail!("at least one [[listeners]] entry is required");
+    }
+
+    let mut plans: Vec<ListenerPlan> = Vec::with_capacity(config.listeners.len());
     let mut total_shards = 0usize;
 
-    for listener in &listeners {
+    for listener in &config.listeners {
         // Two listeners over one address is not merely a bind failure to let
         // the kernel report. A listener with more than one shard opens its
         // socket with SO_REUSEPORT, so a second listener on the same address
@@ -286,7 +315,7 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
         // rather than left to fail at bind time with an EADDRINUSE that says
         // nothing about which two listeners disagreed.
         let conflict = plans.iter().find_map(|plan| {
-            let existing = plan.config.server.listen_addr;
+            let existing = plan.listener.listen_addr;
             listen_address_conflict(existing, listener.listen_addr)
                 .map(|conflict| (existing, conflict))
         });
@@ -311,7 +340,7 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
         // "One per core" has no single answer once the cores are shared between
         // listeners, and quietly giving every listener a full set would
         // oversubscribe the machine by the number of listeners.
-        if listener.shards == 0 && listeners.len() > 1 {
+        if listener.shards == 0 && config.listeners.len() > 1 {
             anyhow::bail!(
                 "listener {} uses shards = 0 (one per core), which has no meaning \
                  alongside other listeners; give each listener an explicit count",
@@ -331,18 +360,12 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
         }
 
         total_shards += shards;
-
-        let mut listener_config = config.clone();
-        listener_config.server.listen_addr = listener.listen_addr;
-        listener_config.server.shards = shards;
-        listener_config.auth = listener.auth.clone();
-        // A shard's configuration describes only its own listener, so the list
-        // cannot be misread as something it should act on.
-        listener_config.listeners.clear();
-
         plans.push(ListenerPlan {
-            config: listener_config,
-            shards,
+            listener: ResolvedListener {
+                listen_addr: listener.listen_addr,
+                shards,
+                auth: listener.auth.clone(),
+            },
         });
     }
 
@@ -375,7 +398,7 @@ fn active_client_registry(
     let clients = ClientRegistry::from_config(&config.clients)?;
     if clients.is_empty() {
         anyhow::bail!(
-            "auth.mode = \"client_cert\" needs at least one [[clients]] entry; \
+            "listener auth.mode = \"client_cert\" needs at least one [[clients]] entry; \
              run `masque-server enroll-client` to create one"
         );
     }
@@ -397,38 +420,13 @@ pub fn validate_config(config: &ServerConfig) -> anyhow::Result<Vec<ResolvedList
     Ok(validated
         .listeners
         .iter()
-        .map(|plan| ResolvedListener {
-            listen_addr: plan.config.server.listen_addr,
-            shards: plan.shards,
-            auth: plan.config.auth.clone(),
-        })
+        .map(|plan| plan.listener.clone())
         .collect())
 }
 
 fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServerConfig> {
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
-
-    // [[listeners]] is the whole list, so `[server]`'s own socket settings are
-    // dead. Warned about only when they were set to something other than the
-    // default, which is what "I left the old listen address behind and expect
-    // it to still serve" looks like; a file that simply never mentions them has
-    // nothing to correct. Only a warning either way: which sockets actually
-    // came up is spelled out by the "listening" line each listener logs, and by
-    // `check-config`.
-    if !config.listeners.is_empty() {
-        let defaults = crate::config::ServerSection::default();
-        if config.server.listen_addr != defaults.listen_addr
-            || config.server.shards != defaults.shards
-        {
-            warn!(
-                listen_addr = %config.server.listen_addr,
-                shards = config.server.shards,
-                "[server].listen_addr and [server].shards are ignored because \
-                 [[listeners]] names the sockets"
-            );
-        }
-    }
 
     // Surface a bad credential or active roster configuration first. A roster
     // outside client-cert mode is deliberately not parsed or allowed to
@@ -441,19 +439,22 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
         );
     } else if !config.clients.is_empty() {
         warn!(
-            "[[clients]] entries are ignored unless auth.mode = \"client_cert\" \
-             and auth.enabled = true"
+            "[[clients]] entries are ignored unless a listener has auth.mode = \
+             \"client_cert\" and auth.enabled = true"
         );
     }
 
     // Credentials are per listener, so a mistake in the second one has to name
     // the listener it came from or it cannot be found in a multi-listener file.
     for plan in &listeners {
-        let addr = plan.config.server.listen_addr;
-        if plan.config.auth.basic_enabled() {
-            BasicAuthenticator::new(&plan.config.auth.username, &plan.config.auth.password_hash)
-                .with_context(|| format!("listener {addr}"))?;
-        } else if !plan.config.auth.client_cert_enabled() {
+        let addr = plan.listener.listen_addr;
+        if plan.listener.auth.basic_enabled() {
+            BasicAuthenticator::new(
+                &plan.listener.auth.username,
+                &plan.listener.auth.password_hash,
+            )
+            .with_context(|| format!("listener {addr}"))?;
+        } else if !plan.listener.auth.client_cert_enabled() {
             warn!(%addr, "proxy authentication is disabled on this listener");
         }
     }
@@ -521,16 +522,16 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     // would say nothing about another's.
     for plan in &listeners {
         let client_certs = plan
-            .config
+            .listener
             .auth
             .client_cert_enabled()
             .then(|| Arc::new(SharedRoster::new(clients.clone())));
-        build_quic_config(&plan.config, client_certs)
-            .with_context(|| format!("listener {}", plan.config.server.listen_addr))?;
+        build_quic_config(config, client_certs)
+            .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
     }
     build_h3_config()?;
 
-    let total_shards = listeners.iter().map(|plan| plan.shards).sum();
+    let total_shards = listeners.iter().map(|plan| plan.listener.shards).sum();
     Ok(ValidatedServerConfig {
         clients,
         listeners,
@@ -549,6 +550,70 @@ fn roster_reload_settings(
         client_cert_enabled: any_client_cert_listener(config),
         ip_proxy_enabled: config.ip_proxy.enabled,
     })
+}
+
+/// Open the UDP socket for one shard with the listener's transport settings.
+async fn open_quic_socket(
+    config: &ServerConfig,
+    listen_addr: SocketAddr,
+    reuseport: bool,
+) -> anyhow::Result<QuicUdpSocket> {
+    QuicUdpSocket::bind_shared(
+        listen_addr,
+        config.quic.max_datagram_size,
+        config.quic.enable_udp_gso,
+        config.quic.enable_udp_gro,
+        reuseport,
+    )
+    .await
+    .with_context(|| format!("failed to bind listener {listen_addr}"))
+}
+
+/// Bind the first shard of a listener and resolve an ephemeral port, if any.
+///
+/// A multi-shard socket sets `SO_REUSEPORT` before binding. Linux may therefore
+/// choose an ephemeral port that is already held by another reuseport group,
+/// including a later fixed listener from this configuration. Detect that before
+/// the remaining shards join the group and ask the kernel for another port.
+async fn bind_first_listener_socket(
+    config: &ServerConfig,
+    requested: SocketAddr,
+    reuseport: bool,
+    unavailable: &[SocketAddr],
+) -> anyhow::Result<(QuicUdpSocket, SocketAddr)> {
+    for attempt in 1..=MAX_EPHEMERAL_BIND_ATTEMPTS {
+        let socket = open_quic_socket(config, requested, reuseport).await?;
+        let bound = socket.local_addr()?;
+
+        if requested.port() != 0 {
+            return Ok((socket, bound));
+        }
+
+        if let Some(existing) = unavailable
+            .iter()
+            .copied()
+            .find(|existing| listen_address_conflict(bound, *existing).is_some())
+        {
+            if attempt == MAX_EPHEMERAL_BIND_ATTEMPTS {
+                anyhow::bail!(
+                    "listener {requested} was repeatedly assigned an ephemeral address that \
+                     overlaps listener {existing}; tried {MAX_EPHEMERAL_BIND_ATTEMPTS} ports"
+                );
+            }
+            debug!(
+                %requested,
+                assigned = %bound,
+                conflicts_with = %existing,
+                attempt,
+                "ephemeral listener address overlaps another listener; retrying"
+            );
+            continue;
+        }
+
+        return Ok((socket, bound));
+    }
+
+    unreachable!("the bounded ephemeral-port loop either returns or reports its last conflict")
 }
 
 impl Server {
@@ -574,6 +639,7 @@ impl Server {
         } = validate_server_config(&config)?;
 
         let basic_shards = basic_shard_count(&listeners);
+        let config = Arc::new(config);
 
         let tun = build_tun(&config)?;
 
@@ -624,12 +690,49 @@ impl Server {
 
         let mut shards = Vec::with_capacity(total_shards);
         let mut inboxes = forward_rx.into_iter().zip(tun_rx);
-        for plan in listeners {
+        // Ephemeral listeners must avoid not only sockets that are already up,
+        // but fixed listeners that have not been reached yet. Otherwise an
+        // early `:0` listener can take a later port and, under SO_REUSEPORT,
+        // silently join the other authentication mode's group.
+        let mut unavailable_listener_addrs: Vec<SocketAddr> = listeners
+            .iter()
+            .map(|plan| plan.listener.listen_addr)
+            .filter(|addr| addr.port() != 0)
+            .collect();
+
+        for mut plan in listeners {
             // SO_REUSEPORT is what lets one listener's shards share an address.
             // A single-shard listener must not set it, or a later listener that
             // was misconfigured onto the same address could join its group.
-            let reuseport = plan.shards > 1;
-            for _ in 0..plan.shards {
+            let reuseport = plan.listener.shards > 1;
+
+            // Bind `:0` only once, then use the assigned address for every
+            // remaining shard. Asking the kernel for `:0` independently would
+            // split one logical listener across unrelated ports.
+            let (first_socket, bound_addr) = bind_first_listener_socket(
+                &config,
+                plan.listener.listen_addr,
+                reuseport,
+                &unavailable_listener_addrs,
+            )
+            .await?;
+            plan.listener.listen_addr = bound_addr;
+            unavailable_listener_addrs.push(bound_addr);
+
+            let (forward_rx, tun_rx) = inboxes
+                .next()
+                .expect("one inbox pair was created per planned shard");
+            shards.push(Shard::from_socket(
+                shards.len(),
+                Arc::clone(&shared),
+                Arc::clone(&config),
+                plan.listener.clone(),
+                first_socket,
+                forward_rx,
+                tun_rx,
+            )?);
+
+            for _ in 1..plan.listener.shards {
                 let (forward_rx, tun_rx) = inboxes
                     .next()
                     .expect("one inbox pair was created per planned shard");
@@ -637,7 +740,8 @@ impl Server {
                     Shard::bind(
                         shards.len(),
                         Arc::clone(&shared),
-                        plan.config.clone(),
+                        Arc::clone(&config),
+                        plan.listener.clone(),
                         reuseport,
                         forward_rx,
                         tun_rx,
@@ -654,17 +758,12 @@ impl Server {
     /// The address every shard actually bound, in shard order.
     ///
     /// A listener configured on port `0` takes whichever port the kernel had
-    /// free, so this is the only way to learn where it ended up. Shards of one
-    /// listener share an address and so repeat here.
+    /// free. This is the programmatic way to learn it; the live `listening` log
+    /// reports it too. Shards of one listener share an address and repeat here.
     pub fn listen_addrs(&self) -> Vec<SocketAddr> {
         self.shards
             .iter()
-            .map(|shard| {
-                shard
-                    .socket
-                    .local_addr()
-                    .unwrap_or(shard.config.server.listen_addr)
-            })
+            .map(|shard| shard.socket.local_addr().unwrap_or(shard.listen_addr))
             .collect()
     }
 
@@ -1251,7 +1350,9 @@ struct Shard {
     client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
+    /// Configured address after an ephemeral port, if any, has been resolved.
+    listen_addr: SocketAddr,
     /// Reverse index for routing TUN packets without scanning every connection.
     conn_by_index: FxHashMap<u64, quiche::ConnectionId<'static>>,
     udp_response_tx: mpsc::Sender<UdpResponse>,
@@ -1274,37 +1375,50 @@ impl Shard {
     async fn bind(
         index: usize,
         shared: Arc<Shared>,
-        config: ServerConfig,
+        config: Arc<ServerConfig>,
+        listener: ResolvedListener,
         reuseport: bool,
         forward_rx: mpsc::Receiver<ForwardedPacket>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
-        let auth = if config.auth.basic_enabled() {
+        let socket = open_quic_socket(&config, listener.listen_addr, reuseport).await?;
+        Self::from_socket(index, shared, config, listener, socket, forward_rx, tun_rx)
+    }
+
+    /// Build one shard around a socket that has already been bound.
+    ///
+    /// The first shard takes this path because an ephemeral listener has to
+    /// inspect the kernel-selected port before the rest of its reuseport group
+    /// is opened.
+    #[allow(clippy::too_many_arguments)]
+    fn from_socket(
+        index: usize,
+        shared: Arc<Shared>,
+        config: Arc<ServerConfig>,
+        listener: ResolvedListener,
+        socket: QuicUdpSocket,
+        forward_rx: mpsc::Receiver<ForwardedPacket>,
+        tun_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> anyhow::Result<Self> {
+        let auth = if listener.auth.basic_enabled() {
             Some(BasicAuthenticator::new(
-                &config.auth.username,
-                &config.auth.password_hash,
+                &listener.auth.username,
+                &listener.auth.password_hash,
             )?)
         } else {
             None
         };
 
-        let socket = QuicUdpSocket::bind_shared(
-            config.server.listen_addr,
-            config.quic.max_datagram_size,
-            config.quic.enable_udp_gso,
-            config.quic.enable_udp_gro,
-            reuseport,
-        )
-        .await?;
+        let bound_addr = socket.local_addr()?;
         info!(
             shard = index,
-            addr = %config.server.listen_addr,
+            addr = %bound_addr,
             udp_gso = socket.udp_gso_enabled(),
             udp_gro = socket.udp_gro_enabled(),
             "listening"
         );
 
-        let client_certs = if config.auth.client_cert_enabled() {
+        let client_certs = if listener.auth.client_cert_enabled() {
             Some(Arc::clone(&shared.clients))
         } else {
             None
@@ -1339,6 +1453,7 @@ impl Shard {
             tcp_policy,
             udp_policy,
             config,
+            listen_addr: listener.listen_addr,
             conn_by_index: FxHashMap::default(),
             udp_response_tx,
             udp_response_rx,
@@ -3228,21 +3343,20 @@ mod tests {
         ListenerSection {
             listen_addr: addr.parse().unwrap(),
             shards: 1,
-            auth: Some(AuthSection {
+            auth: AuthSection {
                 enabled: true,
                 mode,
                 // Enough to satisfy `BasicAuthenticator`; the hash is only
                 // parsed when a request actually arrives.
                 username: "alice".into(),
                 password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
-            }),
+            },
         }
     }
 
     #[test]
     fn roster_is_not_parsed_outside_client_certificate_mode() {
         let mut config = ServerConfig::default();
-        config.auth.mode = AuthMode::Basic;
         config.clients.push(invalid_roster_entry());
         assert!(
             super::active_client_registry(&config, false)
@@ -3250,8 +3364,8 @@ mod tests {
                 .is_empty()
         );
 
-        config.auth.enabled = false;
-        config.auth.mode = AuthMode::ClientCert;
+        config.listeners[0].auth.enabled = false;
+        config.listeners[0].auth.mode = AuthMode::ClientCert;
         assert!(!super::any_client_cert_listener(&config));
         assert!(
             super::active_client_registry(&config, false)
@@ -3263,7 +3377,7 @@ mod tests {
     #[test]
     fn active_client_certificate_roster_is_fail_closed() {
         let mut config = ServerConfig::default();
-        config.auth.mode = AuthMode::ClientCert;
+        config.listeners[0].auth.mode = AuthMode::ClientCert;
         assert!(super::active_client_registry(&config, true).is_err());
 
         config.clients.push(invalid_roster_entry());
@@ -3299,7 +3413,7 @@ mod tests {
         let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
         assert!(!reload.client_cert_enabled);
 
-        config.auth.mode = AuthMode::ClientCert;
+        config.listeners[0].auth.mode = AuthMode::ClientCert;
         config.ip_proxy.enabled = false;
         let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
         assert_eq!(reload.path, path);
@@ -3322,24 +3436,16 @@ mod tests {
     // ── Listener planning ────────────────────────────────────────────
 
     #[test]
-    fn a_configuration_without_listeners_plans_exactly_one() {
+    fn a_configuration_without_listeners_is_rejected() {
         let mut config = ServerConfig::default();
-        config.server.listen_addr = "127.0.0.1:8443".parse().unwrap();
-        config.server.shards = 1;
-
-        let plans = super::plan_listeners(&config).unwrap();
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].shards, 1);
-        assert_eq!(
-            plans[0].config.server.listen_addr,
-            "127.0.0.1:8443".parse::<std::net::SocketAddr>().unwrap()
-        );
+        config.listeners.clear();
+        assert!(super::plan_listeners(&config).is_err());
     }
 
-    /// Each shard reads one listener's configuration, so the substitution has
-    /// to be complete: a shard that could still see the list might act on it.
+    /// Planning keeps the listener-specific trust boundary separate from the
+    /// process-wide proxy, QUIC, TLS, and connection settings.
     #[test]
-    fn a_plan_describes_only_its_own_listener() {
+    fn a_plan_resolves_each_listener_independently() {
         let config = config_with(vec![
             listener("127.0.0.1:8443", AuthMode::Basic),
             listener("127.0.0.1:8444", AuthMode::ClientCert),
@@ -3348,13 +3454,12 @@ mod tests {
         let plans = super::plan_listeners(&config).unwrap();
         assert_eq!(plans.len(), 2);
         for plan in &plans {
-            assert!(plan.config.listeners.is_empty());
-            assert_eq!(plan.config.server.shards, plan.shards);
+            assert_eq!(plan.listener.shards, 1);
         }
-        assert!(plans[0].config.auth.basic_enabled());
-        assert!(plans[1].config.auth.client_cert_enabled());
+        assert!(plans[0].listener.auth.basic_enabled());
+        assert!(plans[1].listener.auth.client_cert_enabled());
         assert_eq!(
-            plans[1].config.server.listen_addr,
+            plans[1].listener.listen_addr,
             "127.0.0.1:8444".parse::<std::net::SocketAddr>().unwrap()
         );
     }
@@ -3441,9 +3546,33 @@ mod tests {
         assert!(super::plan_listeners(&config).is_ok());
     }
 
-    /// Port 0 asks the kernel for whichever port is free, so two listeners that
-    /// both do cannot land on the same one — and refusing the pair would make
-    /// the ephemeral form unusable.
+    /// A link-local IPv6 scope selects the interface. Dropping it during
+    /// canonicalisation would reject two valid listeners as one address.
+    #[test]
+    fn native_ipv6_scope_ids_remain_distinct() {
+        let config = config_with(vec![
+            listener("[fe80::1%2]:443", AuthMode::Basic),
+            listener("[fe80::1%3]:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&config).is_ok());
+
+        let same_scope = config_with(vec![
+            listener("[fe80::1%2]:443", AuthMode::Basic),
+            listener("[fe80::1%2]:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&same_scope).is_err());
+
+        // The kernel ignores a zone on a non-link-local address, so spelling a
+        // loopback address with two scopes must not bypass the conflict check.
+        let scoped_loopback = config_with(vec![
+            listener("[::1%2]:443", AuthMode::Basic),
+            listener("[::1%3]:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&scoped_loopback).is_err());
+    }
+
+    /// Port 0 has no fixed value until bind. Planning permits several such
+    /// listeners; startup resolves each one and prevents reuseport collisions.
     #[test]
     fn listeners_may_both_ask_for_an_ephemeral_port() {
         let config = config_with(vec![
@@ -3545,7 +3674,7 @@ mod tests {
     /// an upgrade must not silently switch a server over to it.
     #[test]
     fn sharding_is_off_by_default() {
-        assert_eq!(ServerConfig::default().server.shards, 1);
+        assert_eq!(ServerConfig::default().listeners[0].shards, 1);
         assert_eq!(super::resolve_shard_count(1), 1);
     }
 
@@ -3597,7 +3726,7 @@ mod tests {
         ]);
         let plans = super::plan_listeners(&config).unwrap();
 
-        let total_shards: usize = plans.iter().map(|plan| plan.shards).sum();
+        let total_shards: usize = plans.iter().map(|plan| plan.listener.shards).sum();
         assert_eq!(total_shards, 2);
         assert_eq!(super::basic_shard_count(&plans), 1);
 

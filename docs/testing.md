@@ -101,22 +101,23 @@ addresses — so use the generated blocks rather than transcribing.
 git clone https://github.com/Diniboy1123/usque && cd usque && go build .
 ```
 
-**2. Configure the server.** `auth.mode = "client_cert"`, and a certificate with
-an ECDSA key so the client can pin it:
+**2. Configure the server.** Use `auth.mode = "client_cert"` on its listener,
+and a certificate with an ECDSA key so the client can pin it:
 
 ```sh
 scripts/gen-certs.sh certs
 ```
 
 ```toml
-[server]
-listen_addr = "0.0.0.0:4433"
-
 [tls]
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 
-[auth]
+[[listeners]]
+listen_addr = "0.0.0.0:4433"
+shards = 1
+
+[listeners.auth]
 enabled = true
 mode = "client_cert"
 

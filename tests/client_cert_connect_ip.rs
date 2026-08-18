@@ -146,12 +146,12 @@ fn server_config(
     clients: Vec<ClientEntry>,
 ) -> ServerConfig {
     let mut config = ServerConfig::default();
-    config.server.listen_addr = listen_addr;
-    config.server.shards = 1;
     config.tls.cert_path = cert;
     config.tls.key_path = key;
-    config.auth.enabled = true;
-    config.auth.mode = AuthMode::ClientCert;
+    config.listeners[0].listen_addr = listen_addr;
+    config.listeners[0].shards = 1;
+    config.listeners[0].auth.enabled = true;
+    config.listeners[0].auth.mode = AuthMode::ClientCert;
     config.clients = clients;
     // The tunnels under test are CONNECT-IP only, and the TCP and UDP paths
     // would otherwise resolve and dial real targets.
@@ -555,29 +555,29 @@ fn dual_fixture(tag: &str) -> DualFixture {
     // targets.
     config.tcp_proxy.enabled = false;
     config.udp_proxy.enabled = false;
-    // Both on port 0: the kernel picks two free ports, and the server reports
-    // which. Two listeners asking for port 0 do not count as contending,
-    // because neither has a port yet.
+    // Both on port 0: the server asks the kernel for distinct free ports and
+    // reports which. They do not count as contending before bind, because
+    // neither has a port yet; startup detects and retries a reuseport collision.
     config.listeners = vec![
         ListenerSection {
             listen_addr: ephemeral_addr(),
             shards: 1,
-            auth: Some(AuthSection {
+            auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
                 username: BASIC_USERNAME.into(),
                 password_hash: masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap(),
-            }),
+            },
         },
         ListenerSection {
             listen_addr: ephemeral_addr(),
             shards: 1,
-            auth: Some(AuthSection {
+            auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,
                 username: String::new(),
                 password_hash: String::new(),
-            }),
+            },
         },
     ];
     config.clients = vec![ClientEntry {
@@ -613,12 +613,12 @@ fn dual_fixture(tag: &str) -> DualFixture {
 /// alone and the port stays valid across a reload.
 fn server_config_file(cert: &Path, key: &Path, clients: &[(&str, &str)]) -> String {
     let mut text = format!(
-        "[server]\nlisten_addr = \"127.0.0.1:0\"\nshards = 1\n\n\
-         [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
-         [auth]\nenabled = true\nmode = \"client_cert\"\n\n\
+        "[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
          [tcp_proxy]\nenabled = false\n\n[udp_proxy]\nenabled = false\n\n\
          [ip_proxy]\nenabled = true\nipv4_pool = \"10.89.0.0/24\"\n\
-         ipv6_pool = \"fd00:abcd::/64\"\n",
+         ipv6_pool = \"fd00:abcd::/64\"\n\n\
+         [[listeners]]\nlisten_addr = \"127.0.0.1:0\"\nshards = 1\n\n\
+         [listeners.auth]\nenabled = true\nmode = \"client_cert\"\n",
         cert.display(),
         key.display()
     );
@@ -670,6 +670,64 @@ fn raise_sighup() {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+/// Resolving `:0` once per shard would turn each shard into a different
+/// listener. The first socket must select the port and every later socket in
+/// that listener must join the exact same reuseport group. Separate listeners
+/// must still receive separate ports.
+#[cfg(target_os = "linux")]
+#[test]
+fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
+    let dir = TempDir::new("ephemeral-shards");
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert_path;
+    config.tls.key_path = key_path;
+    config.tcp_proxy.enabled = false;
+    config.udp_proxy.enabled = false;
+    config.ip_proxy.enabled = false;
+    config.listeners = vec![
+        ListenerSection {
+            listen_addr: ephemeral_addr(),
+            shards: 2,
+            auth: AuthSection {
+                enabled: false,
+                ..Default::default()
+            },
+        },
+        ListenerSection {
+            listen_addr: ephemeral_addr(),
+            shards: 2,
+            auth: AuthSection {
+                enabled: false,
+                ..Default::default()
+            },
+        },
+    ];
+
+    let bound = spawn_server(config);
+    assert_eq!(bound.len(), 4);
+    assert_ne!(bound[0].port(), 0);
+    assert_eq!(
+        bound[0], bound[1],
+        "one listener's shards must share a port"
+    );
+    assert_eq!(
+        bound[2], bound[3],
+        "one listener's shards must share a port"
+    );
+    assert_ne!(
+        bound[0], bound[2],
+        "separate listeners must not join one reuseport group"
+    );
+}
 
 /// Revoking a client must drop the tunnel it already holds, without restarting
 /// the server and without disturbing anyone else.

@@ -11,7 +11,7 @@ pre-1.0.
 
 ### Added
 
-- `[[listeners]]` runs several listening sockets from one process, each with
+- `[[listeners]]` runs one or more listening sockets from one process, each with
   its own `listen_addr`, `shards`, and authentication mode. This is what allows
   one server to accept both standards-compliant MASQUE clients, which send
   `Proxy-Authorization`, and Cloudflare-style clients, which authenticate with
@@ -28,8 +28,11 @@ pre-1.0.
   Addresses are compared in canonical form, so an IPv4-mapped spelling such as
   `[::ffff:127.0.0.1]` cannot present itself as a different address from the
   IPv4 one it resolves to, and the error names which conflict it found rather
-  than blaming a wildcard that may not be involved. Port `0` is exempt: it asks
-  the kernel for whichever port is free, so several listeners may use it.
+  than blaming a wildcard that may not be involved. Non-zero link-local IPv6
+  scope IDs remain part of the interface identity. Port `0` is exempt: it asks
+  the kernel for whichever port is free, so several listeners may use it; all
+  shards of one listener share the selected port, and startup prevents that port
+  from joining another listener's `SO_REUSEPORT` group.
 - `check-config` prints the resolved listeners, their shard counts, and the
   authentication each one demands, so the deployed modes can be read without
   re-deriving them from the TOML. Shard counts are the resolved ones, so
@@ -50,12 +53,11 @@ pre-1.0.
 - The concurrent password-verification budget is sized from the shards that
   verify passwords rather than from every shard, so a client-certificate
   listener cannot widen what unauthenticated callers may demand of a Basic one.
-- `--listen` is refused against a `[[listeners]]` configuration, which does not
-  use `[server].listen_addr`. Silently ignoring it would leave the configured
-  listeners bound when the flag was reached for to narrow exposure.
-- Configurations without `[[listeners]]` are unchanged: `[server]` and `[auth]`
-  still describe one listener, and `[server].listen_addr` and `[server].shards`
-  are ignored only when `[[listeners]]` names sockets itself.
+- **Breaking:** every configuration must define at least one `[[listeners]]`
+  entry with its own `[listeners.auth]`. Top-level `[auth]`,
+  `[server].listen_addr`, and `[server].shards` are rejected, and the `--listen`
+  override has been removed. The installer deliberately does not migrate 0.2
+  files; convert and validate them explicitly before upgrading.
 
 ## 0.2.0 - 2026-08-18
 

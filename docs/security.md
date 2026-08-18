@@ -32,7 +32,7 @@ Use a unique, high-entropy password. Basic credentials are protected by QUIC
 TLS in transit but are reusable bearer secrets at the HTTP layer. Rotate them
 after suspected client or log compromise.
 
-With `auth.mode = "client_cert"` the cost profile is different: identity is
+With a listener's `auth.mode = "client_cert"` the cost profile is different: identity is
 established once during the handshake, by public key, so there is no per-request
 verification to bound and no password to brute-force. An unenrolled key is
 refused with a TLS alert before it can open a stream, which keeps unauthorized
@@ -80,12 +80,12 @@ packet loss into seconds of latency and make memory exhaustion easier.
 The right server certificate depends on the authentication mode, because the
 two modes establish server identity in completely different ways.
 
-### With `auth.mode = "basic"`
+### With listener `auth.mode = "basic"`
 
 Clients validate the certificate normally. Use one trusted by them and covering
 the exact proxy hostname, and renew it before expiry as usual.
 
-### With `auth.mode = "client_cert"`
+### With listener `auth.mode = "client_cert"`
 
 Clients in this family skip chain validation entirely — the SNI they send names
 a vendor endpoint rather than this server — and instead pin the leaf public key

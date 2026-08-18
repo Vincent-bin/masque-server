@@ -1,22 +1,24 @@
 [server]
-listen_addr = "0.0.0.0:443"
 # Keep this above the client's keepalive period. VPN-style MASQUE clients
 # commonly default to 30s, and matching that exactly makes a quiet tunnel race
 # its own keepalive against the timeout.
 idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
-# Independent event loops, each with its own SO_REUSEPORT socket and its own
-# share of the connections. A connection is always handled by one loop, so this
-# is what lets a CPU-bound server use more than one core. 0 = one per core.
-# Linux only; measure before raising it.
-shards = 1
 
 [tls]
 cert_path = "/etc/masque/certs/server.crt"
 key_path = "/etc/masque/certs/server.key"
 
-[auth]
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+# Independent event loops, each with its own SO_REUSEPORT socket and its own
+# share of the connections. A connection is always handled by one loop, so this
+# is what lets a CPU-bound server use more than one core. 0 = one per core for a
+# single listener. Linux only; measure before raising it.
+shards = 1
+
+[listeners.auth]
 enabled = true
 # "basic"       — RFC 7617 Proxy-Authorization, checked per request.
 # "client_cert" — a TLS client certificate, matched against [[clients]] below.
@@ -25,8 +27,8 @@ enabled = true
 # (for example usque): they authenticate during the QUIC handshake and never
 # send Proxy-Authorization, so they cannot work against "basic".
 #
-# To serve both kinds of client, give each mode its own listener — see the
-# [[listeners]] block at the end of this file.
+# To serve both kinds of client, add the second listener shown at the end of
+# this file. Every listener has its own explicit authentication table.
 mode = "basic"
 username = "__MASQUE_AUTH_USERNAME__"
 password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
@@ -131,20 +133,13 @@ tun_offload = true
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
 
-# ── Multiple listeners ───────────────────────────────────────────────
+# ── Additional listener ─────────────────────────────────────────────
 #
 # One socket can serve only one authentication mode: auth.mode decides which
-# TLS context the socket is bound with, and that is settled before any client
-# connects. [[listeners]] gives each mode its own socket in the same process.
-#
-# This is the whole list of listeners, not an addition to the one above:
-# uncommenting it makes [server].listen_addr and [server].shards ignored, and
-# [auth] becomes the default that a listener without its own [listeners.auth]
-# inherits. Everything behind the sockets stays shared — one [[clients]]
-# roster, one TUN device, one CONNECT-IP address pool, one routing table.
-# That is the reason to do this in one process: two processes would need two
-# TUN devices and two pools, and overlapping pools hand the same tunnel address
-# to two clients.
+# TLS context is built before clients connect. Add another [[listeners]] entry
+# to serve another mode in the same process. Everything behind the sockets stays
+# shared — TLS files, proxy policies, one [[clients]] roster, one TUN device,
+# one CONNECT-IP address pool, and one routing table.
 #
 # Two listeners may not contend for the same address. That is refused at startup
 # rather than left to the kernel: a listener with shards > 1 binds with
@@ -152,22 +147,6 @@ ipv6_pool = "fd00:abcd::/64"
 # load-balancing group and be handed connections meant for the other mode.
 # Wildcards count — 0.0.0.0 claims every IPv4 address on its port, and :: is
 # assumed to claim IPv4 too, since IPV6_V6ONLY is the kernel's to decide.
-#
-# Also delete listen_addr and shards from [server] above: [[listeners]] names
-# the sockets, so those two settings no longer do anything.
-#
-# Move the username and password_hash from [auth] above into the Basic
-# listener, then run `masque-server --config <this file> check-config`.
-#
-# [[listeners]]
-# listen_addr = "0.0.0.0:443"
-# shards = 1
-#
-# [listeners.auth]
-# enabled = true
-# mode = "basic"
-# username = "proxy-user"
-# password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 #
 # [[listeners]]
 # listen_addr = "0.0.0.0:4443"

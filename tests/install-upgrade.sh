@@ -93,21 +93,21 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
 write_config() {
     cc_algorithm=$1
     cat >"$CONFIG_PATH" <<EOF
-[server]
-listen_addr = "127.0.0.1:8449"
-shards = 1
-
 [tls]
 cert_path = "/etc/masque/certs/server.crt"
 key_path = "/etc/masque/certs/server.key"
-
-[auth]
-enabled = false
 
 [quic]
 cc_algorithm = "$cc_algorithm"
 
 [ip_proxy]
+enabled = false
+
+[[listeners]]
+listen_addr = "127.0.0.1:8449"
+shards = 1
+
+[listeners.auth]
 enabled = false
 EOF
     chmod 0640 "$CONFIG_PATH"
@@ -152,11 +152,11 @@ grep -q '^listen_addr = "0.0.0.0:8449"$' "$CONFIG_PATH" ||
     die "the Basic listener did not take MASQUE_LISTEN_PORT"
 grep -q '^listen_addr = "0.0.0.0:8450"$' "$CONFIG_PATH" ||
     die "the certificate listener did not take MASQUE_CERT_LISTEN_PORT"
-# [[listeners]] names the sockets, so [server] must not still name one.
+# [server] contains only process-wide limits; listeners name every socket.
 grep -q '^\[server\]$' "$CONFIG_PATH" ||
     die "the [server] section disappeared from the dual configuration"
 ! grep -q '^listen_addr = "0.0.0.0:443"$' "$CONFIG_PATH" ||
-    die "the ignored [server].listen_addr was left in the dual configuration"
+    die "the template listener port was not replaced"
 grep -q '^\[\[clients\]\]$' "$CONFIG_PATH" ||
     die "dual mode did not enroll the first certificate client"
 [ -s "$DUAL_CLIENT_JSON" ] || die "dual mode did not write the client JSON"
@@ -168,10 +168,6 @@ grep -q '^listener 0.0.0.0:8449 auth=basic shards=1$' "$TEST_TMP/dual-check.log"
     die "the Basic listener was not reported by check-config"
 grep -q '^listener 0.0.0.0:8450 auth=client_cert shards=1$' "$TEST_TMP/dual-check.log" ||
     die "the certificate listener was not reported by check-config"
-# Nothing should warn about settings the rendered file no longer contains.
-! grep -q 'are ignored because' "$TEST_TMP/dual-check.log" ||
-    die "the dual configuration left ignored [server] settings behind"
-
 # A reinstall over it is an upgrade, and must report both modes rather than one.
 MASQUE_START_SERVICE=0 "$PACKAGE_DIR/install.sh" \
     >"$TEST_TMP/dual-upgrade.log" 2>&1 ||

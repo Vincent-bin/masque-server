@@ -63,7 +63,7 @@ Important settings:
 
 | Setting | Effect |
 | --- | --- |
-| `server.shards` | Aggregate multi-connection CPU parallelism |
+| `listeners[].shards` | Aggregate multi-connection CPU parallelism for that listener |
 | `quic.enable_udp_gso` | QUIC send syscall and per-packet overhead |
 | `quic.enable_udp_gro` | QUIC receive syscall overhead |
 | `quic.max_datagram_size` | Packet size and PMTU ceiling |

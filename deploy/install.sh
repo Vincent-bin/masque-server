@@ -200,11 +200,8 @@ choose_auth_mode() {
 
 # Report what the deployed configuration actually authenticates with.
 #
-# Taken from `check-config`, which resolves the listeners the same way the
-# server does, rather than read out of the TOML here. `[auth]` is only the
-# default a `[[listeners]]` entry may inherit, so reading that section alone
-# would describe one mode for a server that runs two — and re-deriving the
-# resolution in shell would be a second implementation to keep in step.
+# Taken from `check-config`, which validates and resolves the listeners the same
+# way the server does, rather than reimplement that logic in shell.
 # Every distinct mode is reported, `disabled` included. Summarising a
 # basic + disabled server as "basic" would tell an administrator that every port
 # demands credentials when one of them accepts anyone, which is the reading that
@@ -300,7 +297,7 @@ create_config_tmp() {
 render_new_config() {
     create_config_tmp
     case "$AUTH_MODE" in
-        basic)
+        basic|dual)
             generate_auth_credentials
             sed \
                 -e "s|__MASQUE_AUTH_USERNAME__|$AUTH_USERNAME|" \
@@ -314,41 +311,23 @@ render_new_config() {
                 -e '/^password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"$/d' \
                 "$PACKAGE_DIR/config/masque.toml" >"$CONFIG_TMP"
             ;;
-        dual)
-            # [auth] keeps the generated Basic credentials and becomes the
-            # default the Basic listener inherits; the certificate listener
-            # overrides it. [server].listen_addr and [server].shards are dropped
-            # because [[listeners]] names the sockets instead, and leaving them
-            # would have the server warn about ignored settings on every start.
-            generate_auth_credentials
-            sed \
-                -e "s|__MASQUE_AUTH_USERNAME__|$AUTH_USERNAME|" \
-                -e "s|__MASQUE_AUTH_PASSWORD_HASH__|$AUTH_PASSWORD_HASH|" \
-                -e '/^listen_addr = "0.0.0.0:443"$/d' \
-                -e '/^shards = 1$/d' \
-                "$PACKAGE_DIR/config/masque.toml" >"$CONFIG_TMP"
-            ;;
     esac
     if grep -q '__MASQUE_AUTH_' "$CONFIG_TMP"; then
         die "failed to render authentication configuration"
     fi
 }
 
-# Append the two listener blocks a dual configuration runs.
-append_dual_listeners() {
-    basic_port=$1
-    cert_port=$2
+# Append the certificate listener to the Basic listener already rendered from
+# the package template.
+append_certificate_listener() {
+    cert_port=$1
 
     cat >>"$CONFIG_TMP" <<EOF
 
-# Basic credentials on one socket, TLS client certificates on the other. The
+# TLS client certificates on this socket, Basic credentials on the first. The
 # authentication mode fixes what the TLS handshake demands, so the two cannot
 # share a socket; everything behind them — the client roster, the TUN device,
 # the CONNECT-IP address pool — is shared by the one process.
-[[listeners]]
-listen_addr = "0.0.0.0:$basic_port"
-shards = 1
-
 [[listeners]]
 listen_addr = "0.0.0.0:$cert_port"
 shards = 1
@@ -385,17 +364,6 @@ configure_fresh_listen_port() {
     listen_port=$(choose_listen_port "Public UDP listen port" 443 \
         "${MASQUE_LISTEN_PORT:-}")
 
-    if [ "$AUTH_MODE" = dual ]; then
-        cert_listen_port=$(choose_listen_port \
-            "Public UDP listen port for certificate clients" 4443 \
-            "${MASQUE_CERT_LISTEN_PORT:-}")
-        if [ "$cert_listen_port" = "$listen_port" ]; then
-            die "the two listeners need different ports; both asked for $listen_port"
-        fi
-        append_dual_listeners "$listen_port" "$cert_listen_port"
-        return
-    fi
-
     CONFIG_REWRITE_TMP=$(mktemp /etc/masque/.masque-listen.XXXXXX)
     chmod 0600 "$CONFIG_REWRITE_TMP"
     sed "s|^listen_addr = \"0.0.0.0:443\"$|listen_addr = \"0.0.0.0:$listen_port\"|" \
@@ -406,6 +374,16 @@ configure_fresh_listen_port() {
     fi
     mv -- "$CONFIG_REWRITE_TMP" "$CONFIG_TMP"
     CONFIG_REWRITE_TMP=
+
+    if [ "$AUTH_MODE" = dual ]; then
+        cert_listen_port=$(choose_listen_port \
+            "Public UDP listen port for certificate clients" 4443 \
+            "${MASQUE_CERT_LISTEN_PORT:-}")
+        if [ "$cert_listen_port" = "$listen_port" ]; then
+            die "the two listeners need different ports; both asked for $listen_port"
+        fi
+        append_certificate_listener "$cert_listen_port"
+    fi
 }
 
 normalize_optional_address() {

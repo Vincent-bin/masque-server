@@ -91,26 +91,39 @@ fn config_text(
     cc_algorithm: &str,
 ) -> String {
     format!(
-        r#"[server]
-listen_addr = "{listen_addr}"
-shards = 1
-
-[tls]
+        r#"[tls]
 cert_path = "{}"
 key_path = "{}"
-
-[auth]
-enabled = false
 
 [quic]
 cc_algorithm = "{cc_algorithm}"
 
 [ip_proxy]
 enabled = false
+
+[[listeners]]
+listen_addr = "{listen_addr}"
+shards = 1
+
+[listeners.auth]
+enabled = false
 "#,
         cert_path.display(),
         key_path.display()
     )
+}
+
+/// The packaged template is the source for fresh installs, so schema changes
+/// must fail locally instead of first appearing in a release archive.
+#[test]
+fn packaged_config_uses_the_current_listener_schema() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/config/masque.toml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let config = masque::config::parse_toml(&text).unwrap();
+
+    assert_eq!(config.listeners.len(), 1);
+    assert_eq!(config.listeners[0].listen_addr.to_string(), "0.0.0.0:443");
+    assert!(config.listeners[0].auth.basic_enabled());
 }
 
 #[test]
@@ -143,6 +156,44 @@ fn check_config_validates_without_binding_the_listen_port() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("configuration is compatible"));
+}
+
+/// A preflight deliberately has no network side effects, so an ephemeral port
+/// does not exist yet. Report the configured `:0`; the live `listening` log is
+/// what reports the address selected by the kernel.
+#[test]
+fn check_config_keeps_an_ephemeral_port_unresolved() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        config_text(
+            "127.0.0.1:0".parse().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "check-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("listener 127.0.0.1:0 auth=disabled shards=1"),
+        "check-config must not invent a runtime port: {stdout}"
+    );
 }
 
 /// A roster-ready public key, in the base64 SubjectPublicKeyInfo DER form
@@ -252,55 +303,30 @@ fn check_config_rejects_two_listeners_on_the_same_address() {
     );
 }
 
-/// `--listen` overrides `[server].listen_addr`, which a multi-listener
-/// configuration does not use. Silently accepting it would be the worst
-/// outcome: the flag is reached for to narrow a server's exposure, so appearing
-/// to work while the configured listeners stay bound is the failure it was
-/// meant to prevent.
+/// The 0.2 single-listener keys are deliberately not accepted by the 0.3
+/// configuration model. A stale deployment must fail preflight instead of
+/// appearing to run while silently selecting different defaults.
 #[test]
-fn listen_override_is_refused_against_a_multi_listener_configuration() {
+fn check_config_rejects_legacy_single_listener_configuration() {
     let dir = TempDir::new();
     let (cert_path, key_path) = write_server_identity(dir.path());
     let config_path = dir.path().join("masque.toml");
     std::fs::write(
         &config_path,
-        dual_listener_config_text("0.0.0.0:8449", "0.0.0.0:8450", &cert_path, &key_path),
-    )
-    .unwrap();
+        format!(
+            r#"[server]
+listen_addr = "127.0.0.1:8449"
+shards = 1
 
-    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
-        .arg("--config")
-        .arg(&config_path)
-        .arg("--listen")
-        .arg("127.0.0.1:8451")
-        .arg("check-config")
-        .output()
-        .unwrap();
+[tls]
+cert_path = "{}"
+key_path = "{}"
 
-    assert!(
-        !output.status.success(),
-        "--listen must not silently leave 0.0.0.0 bound"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--listen cannot choose among"),
-        "unexpected diagnostic: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// The override still works for the single-listener form it describes.
-#[test]
-fn listen_override_still_applies_without_listeners() {
-    let dir = TempDir::new();
-    let (cert_path, key_path) = write_server_identity(dir.path());
-    let config_path = dir.path().join("masque.toml");
-    std::fs::write(
-        &config_path,
-        config_text(
-            "127.0.0.1:8449".parse().unwrap(),
-            &cert_path,
-            &key_path,
-            "cubic",
+[auth]
+enabled = false
+"#,
+            cert_path.display(),
+            key_path.display()
         ),
     )
     .unwrap();
@@ -308,15 +334,14 @@ fn listen_override_still_applies_without_listeners() {
     let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
         .arg("--config")
         .arg(&config_path)
-        .arg("--listen")
-        .arg("127.0.0.1:8452")
         .arg("check-config")
         .output()
         .unwrap();
 
+    assert!(!output.status.success());
     assert!(
-        output.status.success(),
-        "check-config failed: {}",
+        String::from_utf8_lossy(&output.stderr).contains("unknown field"),
+        "unexpected diagnostic: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -332,18 +357,18 @@ fn check_config_reports_the_resolved_shard_count() {
     std::fs::write(
         &config_path,
         format!(
-            r#"[server]
-listen_addr = "127.0.0.1:8449"
-shards = 0
-
-[tls]
+            r#"[tls]
 cert_path = "{}"
 key_path = "{}"
 
-[auth]
+[ip_proxy]
 enabled = false
 
-[ip_proxy]
+[[listeners]]
+listen_addr = "127.0.0.1:8449"
+shards = 0
+
+[listeners.auth]
 enabled = false
 "#,
             cert_path.display(),

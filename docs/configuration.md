@@ -1,9 +1,10 @@
 # Configuration
 
-The server reads TOML from `--config` (default `masque.toml`). Missing sections
-use defaults, but authentication is deliberately fail-closed: the default
-configuration cannot start until credentials are set or authentication is
-explicitly disabled.
+The server reads TOML from `--config` (default `masque.toml`). Global sections
+may use defaults, but every file must explicitly define at least one
+`[[listeners]]` entry and its `[listeners.auth]` table. Authentication is
+deliberately fail-closed: a Basic listener cannot start until valid credentials
+are set. Unknown keys are rejected rather than silently ignored.
 
 Start from [`deploy/config/masque.toml`](../deploy/config/masque.toml). That
 file is the canonical deployable example and is tested by the release flow.
@@ -17,7 +18,6 @@ masque-server --config <PATH> check-config
 masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 
   -c, --config <PATH>       Config file [default: masque.toml]
-  -l, --listen <ADDR>       Override server.listen_addr
       --cert <PATH>         Override tls.cert_path
       --key <PATH>          Override tls.key_path
   -v, --verbose             Increase verbosity; repeat for trace logging
@@ -30,9 +30,9 @@ creating a TUN device. It is suitable for upgrade preflight, but cannot detect
 runtime conditions such as an occupied port or unavailable kernel device.
 
 `hash-password` reads a password on stdin and prints an Argon2id hash for
-`auth.password_hash`. `enroll-client` generates a client key pair for
-`auth.mode = "client_cert"`; it reads `tls.cert_path` from `--config`, so pass
-the same config the server uses. Both are described under
+`listeners.auth.password_hash`. `enroll-client` generates a client key pair for
+a listener using `auth.mode = "client_cert"`; it reads `tls.cert_path` from
+`--config`, so pass the same config the server uses. Both are described under
 [Authentication](#authentication).
 
 ```text
@@ -50,27 +50,19 @@ enroll-client options:
 
 ```toml
 [server]
-listen_addr = "0.0.0.0:443"
 idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
-shards = 1
 ```
 
 | Key | Meaning |
 | --- | --- |
-| `listen_addr` | UDP address used for QUIC and HTTP/3 |
 | `idle_timeout_secs` | Inactive tunnel lifetime |
 | `max_connections` | Per-shard connection cap |
 | `max_tunnels_per_connection` | CONNECT streams retained per connection |
-| `shards` | Linux event loops/listeners; `0` selects one per available core |
 
-Use one shard until a benchmark shows one event loop is CPU-bound. Memory and
-the effective connection capacity increase with the shard count.
-
-`listen_addr` and `shards` describe the single listener this section implies.
-A configuration that uses [`[[listeners]]`](#multiple-listeners) names its
-sockets there instead, and these two keys are then ignored.
+This section contains process-wide connection limits only. Socket addresses and
+shard counts belong to [`[[listeners]]`](#listeners).
 
 ## TLS
 
@@ -85,11 +77,10 @@ as group `masque`; install both files as `root:masque` with mode `0640`.
 
 ## Authentication
 
-`auth.mode` selects how clients prove who they are. The two modes are mutually
-exclusive *on one socket* — `client_cert` makes the TLS handshake demand a
-certificate, so a credential-based client cannot even connect, and vice versa.
-To serve both kinds of client, give each mode its own listener; see
-[Multiple listeners](#multiple-listeners).
+Each `[listeners.auth]` selects how clients prove who they are on that socket.
+The two modes are mutually exclusive *on one socket* — `client_cert` makes the
+TLS handshake demand a certificate, so a credential-based client cannot even
+connect, and vice versa. To serve both kinds of client, define two listeners.
 
 | Key | Meaning |
 | --- | --- |
@@ -110,7 +101,11 @@ Credentials are checked on every CONNECT request, so one authorized tunnel does
 not authorize later streams that omit the header.
 
 ```toml
-[auth]
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+shards = 1
+
+[listeners.auth]
 enabled = true
 mode = "basic"
 username = "proxy-user"
@@ -140,7 +135,11 @@ if their sections are enabled — the mode changes who may connect, not what the
 may ask for.
 
 ```toml
-[auth]
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+shards = 1
+
+[listeners.auth]
 enabled = true
 mode = "client_cert"
 
@@ -191,13 +190,11 @@ existing path is never overwritten. Without it the JSON goes to the terminal.
 Nothing is written to the server configuration automatically. Append the
 `[[clients]]` block yourself, then run `systemctl reload masque` or restart.
 
-## Multiple listeners
+## Listeners
 
-`[[listeners]]` gives each socket its own authentication mode, which is what
-lets one process serve both kinds of client. It is the whole list of listeners,
-not an addition to `[server].listen_addr`: naming any listener here stops the
-server deriving one from `[server]`, and `[server].listen_addr` and
-`[server].shards` are then ignored.
+`[[listeners]]` is the required, complete list of sockets. Each entry owns its
+address, shard count, and authentication mode. There is no top-level `[auth]`
+and `[server]` does not contain listener settings.
 
 ```toml
 [[listeners]]
@@ -223,17 +220,17 @@ mode = "client_cert"
 | --- | --- |
 | `listen_addr` | Required; there is no default, so a typo cannot silently land on someone else's port |
 | `shards` | Event loops for this listener; defaults to `1` |
-| `[listeners.auth]` | Optional; omitted means the top-level `[auth]` |
+| `[listeners.auth]` | Required; authentication is always explicit per socket |
 
-A `[listeners.auth]` table replaces `[auth]` outright rather than merging field
-by field, so the username from a Basic `[auth]` does not follow a listener that
-switched to `client_cert`.
-
-Everything else stays server-wide: one `[[clients]]` roster, one TUN device, one
-CONNECT-IP address pool, one routing table. That is the reason to run two
+Everything else stays server-wide: TLS and QUIC settings, TCP/UDP target
+policies, connection limits, one `[[clients]]` roster, one TUN device, one
+CONNECT-IP address pool, and one routing table. That is the reason to run two
 listeners in one process rather than two processes — two processes would need
 two TUN devices and two address pools, and overlapping pools hand the same
 tunnel address to two clients.
+
+Use one shard until a benchmark shows one event loop is CPU-bound. Memory and
+the effective connection capacity increase with the shard count.
 
 The server refuses to start when two listeners contend for the same address.
 This is not left to the kernel to report: a listener with more than one shard
@@ -256,8 +253,10 @@ the three it found: the same address twice, one address written two ways, or a
 wildcard covering another.
 
 Port `0` is exempt. It asks the kernel for whichever port is free, so several
-listeners may use it; `check-config` and the `listening` log lines report the
-ports they were given.
+listeners may use it. Every shard of one listener shares the same selected port,
+and the live `listening` log lines report that address. `check-config` is
+side-effect-free and therefore reports the configured `:0`; no port has been
+selected until the server binds.
 
 `shards = 0` (one per core) is rejected when more than one listener is
 configured; give each listener an explicit count. The 32-shard cap applies to
@@ -265,12 +264,9 @@ the server's total, not to any one listener. The budget for concurrent password
 verification is sized from the Basic listeners' shards alone, so adding a
 certificate listener does not widen what unauthenticated callers can demand.
 
-`--listen` overrides `[server].listen_addr`, which this form does not use, so
-it is refused rather than silently ignored when `[[listeners]]` is present.
-
-Run `masque-server --config masque.toml check-config` to validate a
-multi-listener file before restarting. It prints the resolved listeners, with
-the shard counts the server will actually run rather than the ones written down
+Run `masque-server --config masque.toml check-config` to validate a listener
+file before restarting. It prints the resolved listeners, with the shard counts
+the server will actually run rather than the ones written down
 — `shards = 0` expanded to one per core, and any excess capped:
 
 ```
@@ -335,8 +331,8 @@ client can be re-enrolled without a restart either.
 
 Only the roster is reloaded. Listen address, TLS material, pools, and tuning are
 fixed at bind time; changing those still needs a restart. A reload that does not
-validate — an unparseable key, a pinned address outside the pool, `auth.mode` no
-longer `client_cert` — is rejected as a whole and the running roster stays in
+validate — an unparseable key, a pinned address outside the pool, no listener
+using `auth.mode = "client_cert"` — is rejected as a whole and the running roster stays in
 force, so a typo cannot lock everyone out.
 
 Editing an existing entry counts as revocation: the client is disconnected and
@@ -363,7 +359,8 @@ and produce a startup warning.
 
 ### Disabling authentication
 
-`auth.enabled = false` turns off both modes and logs a warning. This is only
+`listeners.auth.enabled = false` turns off authentication on that listener and
+logs a warning. This is only
 appropriate in an isolated test environment or behind another trusted
 authentication boundary.
 
