@@ -46,7 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2", features = ["async_tokio"] }
 zeroize = "1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# Linux uses this for the packet path (recvmmsg, GSO/GRO, TUN offload); every
+# Unix uses it to turn terminal echo off while `add-listener` reads a password
+# and to keep an edited configuration file's owner.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bench]]

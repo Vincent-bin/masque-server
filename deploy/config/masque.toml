@@ -135,6 +135,11 @@ ipv6_pool = "fd00:abcd::/64"
 
 # ── Additional listener ─────────────────────────────────────────────
 #
+# `masque-server --config /etc/masque/masque.toml add-listener` appends one of
+# these for you: it asks for the address, the authentication mode, and any
+# credentials, validates the result the way check-config does, and leaves this
+# file untouched if the new listener would not start.
+#
 # One socket can serve only one authentication mode: auth.mode decides which
 # TLS context is built before clients connect. Add another [[listeners]] entry
 # to serve another mode in the same process. Everything behind the sockets stays

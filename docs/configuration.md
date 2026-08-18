@@ -15,6 +15,7 @@ file is the canonical deployable example and is tested by the release flow.
 masque-server [OPTIONS]
 masque-server hash-password
 masque-server --config <PATH> check-config
+masque-server --config <PATH> add-listener [OPTIONS]
 masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 
   -c, --config <PATH>       Config file [default: masque.toml]
@@ -28,6 +29,9 @@ masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 settings, client roster, and address pools without binding the UDP listener or
 creating a TUN device. It is suitable for upgrade preflight, but cannot detect
 runtime conditions such as an occupied port or unavailable kernel device.
+
+`add-listener` appends a `[[listeners]]` block to the configuration file, and is
+described under [Adding a listener](#adding-a-listener).
 
 `hash-password` reads a password on stdin and prints an Argon2id hash for
 `listeners.auth.password_hash`. `enroll-client` generates a client key pair for
@@ -363,6 +367,95 @@ and produce a startup warning.
 logs a warning. This is only
 appropriate in an isolated test environment or behind another trusted
 authentication boundary.
+
+### Adding a listener
+
+`add-listener` appends one `[[listeners]]` block to an existing configuration
+file. Run without flags it prompts for everything, defaulting to a free port and
+to whichever authentication mode the file does not serve yet:
+
+```sh
+masque-server --config /etc/masque/masque.toml add-listener
+```
+
+```
+Listen address (ip:port) [0.0.0.0:4443]:
+Authentication mode (basic | client_cert) [client_cert]:
+Event loops for this listener (shards) [1]:
+```
+
+A Basic listener also asks for a username and a password. The password is read
+without echo and confirmed; leaving it empty generates a strong one and prints
+it once. Only the Argon2id hash is written to the file.
+
+Every value can be given as a flag instead, which is also what a provisioning
+script must do — prompting requires a terminal, and without one a missing value
+is an error rather than a hang:
+
+```sh
+masque-server --config /etc/masque/masque.toml add-listener \
+    --listen-addr 0.0.0.0:4443 --mode client-cert --yes
+```
+
+```text
+add-listener options:
+      --listen-addr <ADDR:PORT>  Address for the new socket
+      --mode <MODE>         basic | client-cert
+      --shards <N>          Event loops for this listener [default: 1]
+      --username <NAME>     Basic username
+      --password-hash <PHC>  Argon2id hash, as printed by hash-password
+      --password-stdin      Read the password from stdin and hash it here
+      --disable-auth        Write enabled = false (trusted networks only)
+      --no-bind-check       Do not test-bind the new address
+      --dry-run             Print the block; leave the file unchanged
+  -y, --yes                 Skip the confirmation prompt
+```
+
+Combinations that would be ignored are refused rather than dropped:
+`--username`, `--password-hash`, and `--password-stdin` apply to `--mode basic`
+only, and `--disable-auth` cannot be combined with `--mode`, since a listener
+that demands nothing has no mode to record.
+
+#### What is checked, and what is not
+
+Before writing, the merged file is parsed and put through the same validation
+`check-config` runs — address overlap with an existing listener, credentials,
+shard counts, the client roster behind a certificate listener — and the new
+address is then bound once to see that nothing else holds it. If any of it
+fails, the error says so and the file is left byte for byte as it was.
+
+The bind test exists because `check-config` is side-effect-free and therefore
+says nothing about an occupied port, while the server binds every listener at
+startup and exits if one fails: a bad address would take down the listeners that
+work today at the next restart. It is a probe of the moment it runs, not a
+reservation, so **restart the server and confirm it came up**; nothing here can
+promise a start that happens minutes later. Use `--no-bind-check` when the
+address becomes available only later — a floating address, or a service running
+in another network namespace.
+
+The file is replaced atomically, keeping its mode and owner, so a password hash
+is never exposed and the service does not lose read access. Comments survive:
+the block is appended as text rather than the file being regenerated.
+
+Concurrent edits are refused, never merged silently. One run holds an advisory
+lock (`.masque.toml.lock` beside the configuration) so a second one stops
+immediately, and the file is compared against what was read before the
+replacement, so a change made by anything else — an editor, a script appending
+`[[clients]]` — aborts the edit and asks for a retry instead of being discarded.
+
+Two ordering rules follow from the validation being real:
+
+- A `client_cert` listener needs at least one `[[clients]]` entry, because the
+  server refuses to start without one. Run
+  [`enroll-client`](#enrolling-a-client) and append its `[[clients]]` block
+  first.
+- A file whose only listener uses `shards = 0` (one per core) has to be given an
+  explicit count first; that setting has no meaning once a second listener
+  exists.
+
+A new socket is bound at startup, so restart the server afterwards, and open the
+new UDP port in the firewall. `SIGHUP` reloads the `[[clients]]` roster only —
+it never adds, removes, or rebinds a listener.
 
 ## QUIC and UDP
 

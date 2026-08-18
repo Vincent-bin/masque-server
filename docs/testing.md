@@ -14,6 +14,7 @@
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
 | Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, and both authentication modes served from one process |
 | Config preflight | `cargo test --test check_config` | `check-config` accepts what a server accepts, including multi-listener files |
+| Config editing | `cargo test --test add_listener` | `add-listener` writes a listener that starts, or leaves the file untouched |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 
 ## Local tests

@@ -32,6 +32,7 @@ cleanup() {
     rm -f -- \
         "$BIN_PATH" \
         "$CONFIG_PATH" \
+        /etc/masque/.masque.toml.lock \
         "$UNIT_PATH" \
         /etc/masque/certs/server.crt \
         /etc/masque/certs/server.key
@@ -168,14 +169,45 @@ grep -q '^listener 0.0.0.0:8449 auth=basic shards=1$' "$TEST_TMP/dual-check.log"
     die "the Basic listener was not reported by check-config"
 grep -q '^listener 0.0.0.0:8450 auth=client_cert shards=1$' "$TEST_TMP/dual-check.log" ||
     die "the certificate listener was not reported by check-config"
+# The installed binary must be able to add a third listener to the file the
+# installer wrote, in place, without an operator editing TOML.
+config_owner_before=$(stat -c '%U:%G %a' "$CONFIG_PATH")
+"$BIN_PATH" --config "$CONFIG_PATH" add-listener \
+    --listen-addr 0.0.0.0:8451 --mode client_cert --yes \
+    >"$TEST_TMP/add-listener.log" 2>&1 ||
+    die "add-listener failed; see $TEST_TMP/add-listener.log"
+[ "$(grep -c '^\[\[listeners\]\]$' "$CONFIG_PATH")" -eq 3 ] ||
+    die "add-listener did not append a third listener"
+grep -q '^username = "proxy-user"$' "$CONFIG_PATH" ||
+    die "add-listener lost the Basic credentials already in the file"
+grep -q '^\[quic\]$' "$CONFIG_PATH" ||
+    die "add-listener lost the sections the installer wrote"
+# The file holds a password hash and is read by the service account, so an
+# in-place edit must not change who owns it or who may read it.
+[ "$(stat -c '%U:%G %a' "$CONFIG_PATH")" = "$config_owner_before" ] ||
+    die "add-listener changed the configuration file's owner or mode"
+"$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/added-check.log" 2>&1 ||
+    die "the configuration failed check-config after add-listener"
+grep -q '^listener 0.0.0.0:8451 auth=client_cert shards=1$' "$TEST_TMP/added-check.log" ||
+    die "the added listener was not reported by check-config"
+
+added_config_sha=$(sha256sum "$CONFIG_PATH" | awk '{print $1}')
+
 # A reinstall over it is an upgrade, and must report both modes rather than one.
 MASQUE_START_SERVICE=0 "$PACKAGE_DIR/install.sh" \
     >"$TEST_TMP/dual-upgrade.log" 2>&1 ||
     die "upgrading over the dual configuration failed"
 grep -q 'Authentication: basic + client_cert' "$TEST_TMP/dual-upgrade.log" ||
     die "the upgrade summary did not report both authentication modes"
+# An upgrade keeps what the operator added, including a listener this installer
+# never writes on its own.
+assert_sha_unchanged "$CONFIG_PATH" "$added_config_sha"
+grep -q '^listener 0.0.0.0:8451 auth=client_cert shards=1$' "$TEST_TMP/dual-upgrade.log" ||
+    die "the upgrade summary did not report the added listener"
+grep -q 'add-listener' "$TEST_TMP/dual-upgrade.log" ||
+    die "the upgrade summary did not name the command that adds a listener"
 
-rm -f -- "$CONFIG_PATH"
+rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
 
 # An incompatible existing configuration must fail before replacement.
 write_old_installation

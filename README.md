@@ -67,6 +67,20 @@ its own `[[listeners]]` entry in the same process; see
 [Authentication](docs/configuration.md#authentication) and
 [Listeners](docs/configuration.md#listeners).
 
+A second listener can be added to a deployed configuration without editing TOML
+by hand. This prompts for the address, the authentication mode, and any
+credentials, validates the merged file the way `check-config` does, test-binds
+the new address, and leaves the file untouched if anything is wrong:
+
+```sh
+masque-server --config /etc/masque/masque.toml add-listener
+```
+
+Every value is also available as a flag for provisioning scripts. See
+[Adding a listener](docs/configuration.md#adding-a-listener). A new socket is
+bound at startup, so open its UDP port, restart the service, and confirm it came
+up.
+
 ## One-command Linux install
 
 On Linux x86_64, download, verify, and install the latest stable release with:

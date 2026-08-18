@@ -17,14 +17,25 @@ pub(crate) struct BasicAuthenticator {
     password_hash: String,
 }
 
+/// Reject a username the Basic scheme cannot carry.
+///
+/// RFC 7617 joins the username and password with a colon before base64, so a
+/// colon inside the username makes the pair ambiguous. Shared with
+/// `add-listener`, which asks for a username interactively and has to reject a
+/// bad one while the operator is still there to retype it.
+pub(crate) fn check_username(username: &str) -> anyhow::Result<()> {
+    if username.is_empty() {
+        bail!("auth.username must not be empty when authentication is enabled");
+    }
+    if username.contains(':') || username.chars().any(char::is_control) {
+        bail!("auth.username must not contain ':' or control characters");
+    }
+    Ok(())
+}
+
 impl BasicAuthenticator {
     pub(crate) fn new(username: &str, password_hash: &str) -> anyhow::Result<Self> {
-        if username.is_empty() {
-            bail!("auth.username must not be empty when authentication is enabled");
-        }
-        if username.contains(':') || username.chars().any(char::is_control) {
-            bail!("auth.username must not contain ':' or control characters");
-        }
+        check_username(username)?;
 
         let parsed = PasswordHash::new(password_hash)
             .context("auth.password_hash is not a valid PHC password hash")?;

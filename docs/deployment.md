@@ -195,6 +195,42 @@ Check the effective sandbox:
 systemd-analyze security masque.service
 ```
 
+## Add a listener after installation
+
+The installer writes listeners only for a fresh installation; an upgrade keeps
+the existing file untouched. To add one to a deployed server — a second socket
+for the authentication mode the first does not serve, for example — use:
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml add-listener
+sudo systemctl restart masque
+```
+
+It prompts for the address, the authentication mode, and any credentials,
+validates the merged file the way the upgrade preflight does, and test-binds the
+new address; anything wrong leaves the file byte for byte unchanged. The file is
+replaced atomically with its mode and owner preserved, so the service account
+keeps its access. Flags cover every value for unattended use; see
+[Adding a listener](configuration.md#adding-a-listener).
+
+Open the new UDP port in the firewall as well — see
+[Network and firewall](#network-and-firewall). A new socket is bound at startup,
+so the restart is required; `systemctl reload` only re-reads the `[[clients]]`
+roster.
+
+The bind test describes the moment it ran, so confirm the service after the
+restart rather than assuming it:
+
+```sh
+sudo systemctl restart masque
+systemctl status masque --no-pager
+```
+
+If it failed to bind, the journal names the address, and the previous
+configuration is one `[[listeners]]` block away — remove the appended block and
+restart. Keep the usual configuration backups; this command edits in place and
+does not keep a copy.
+
 ## Upgrade
 
 For the latest stable release, rerun the bootstrap command:
