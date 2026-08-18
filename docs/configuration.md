@@ -251,7 +251,13 @@ binding on some hosts and failing on others.
 Addresses are compared in canonical form, so `[::ffff:127.0.0.1]:443` and
 `127.0.0.1:443` are recognised as the same interface rather than passing the
 check and then failing to bind — or, under `SO_REUSEPORT`, binding successfully
-and leaving one listener shadowing the other's traffic.
+and leaving one listener shadowing the other's traffic. The error names which of
+the three it found: the same address twice, one address written two ways, or a
+wildcard covering another.
+
+Port `0` is exempt. It asks the kernel for whichever port is free, so several
+listeners may use it; `check-config` and the `listening` log lines report the
+ports they were given.
 
 `shards = 0` (one per core) is rejected when more than one listener is
 configured; give each listener an explicit count. The 32-shard cap applies to

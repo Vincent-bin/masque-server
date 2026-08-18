@@ -27,7 +27,9 @@ pre-1.0.
   IPv4 as well, since whether it does is the kernel's `IPV6_V6ONLY` default.
   Addresses are compared in canonical form, so an IPv4-mapped spelling such as
   `[::ffff:127.0.0.1]` cannot present itself as a different address from the
-  IPv4 one it resolves to.
+  IPv4 one it resolves to, and the error names which conflict it found rather
+  than blaming a wildcard that may not be involved. Port `0` is exempt: it asks
+  the kernel for whichever port is free, so several listeners may use it.
 - `check-config` prints the resolved listeners, their shard counts, and the
   authentication each one demands, so the deployed modes can be read without
   re-deriving them from the TOML. Shard counts are the resolved ones, so

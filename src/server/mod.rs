@@ -226,15 +226,45 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Whether two listeners would contend for the same packets.
-fn listen_addresses_overlap(a: SocketAddr, b: SocketAddr) -> bool {
+/// How two listeners contend for the same packets, if they do.
+///
+/// Distinguished so the diagnostic can say which of them it is: told that a
+/// loopback pair "overlaps because a wildcard claims its family", an operator
+/// would go looking for a wildcard that is not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressConflict {
+    /// The same address, written the same way.
+    Identical,
+    /// The same address, written two ways — `127.0.0.1` and `::ffff:127.0.0.1`.
+    SameAddress,
+    /// One is a wildcard that claims the other.
+    WildcardCovers,
+}
+
+/// How two listeners would contend, or `None` if they would not.
+fn listen_address_conflict(a: SocketAddr, b: SocketAddr) -> Option<AddressConflict> {
     if a.port() != b.port() {
-        return false;
+        return None;
     }
-    // Canonical form first, so an IPv4-mapped spelling cannot present itself as
-    // a different address from the IPv4 one it resolves to.
-    let (a, b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
-    a == b || address_covers(a, b) || address_covers(b, a)
+    // Port 0 asks the kernel for whichever port is free, so two listeners that
+    // both do cannot land on the same one.
+    if a.port() == 0 {
+        return None;
+    }
+    if a == b {
+        return Some(AddressConflict::Identical);
+    }
+
+    // Canonical form, so an IPv4-mapped spelling cannot present itself as a
+    // different address from the IPv4 one it resolves to.
+    let (canonical_a, canonical_b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
+    if canonical_a == canonical_b {
+        return Some(AddressConflict::SameAddress);
+    }
+    if address_covers(canonical_a, canonical_b) || address_covers(canonical_b, canonical_a) {
+        return Some(AddressConflict::WildcardCovers);
+    }
+    None
 }
 
 /// Expand the configured listeners into one plan each, rejecting the
@@ -255,21 +285,27 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
         // `::` claims everything on its port. An overlapping pair is refused
         // rather than left to fail at bind time with an EADDRINUSE that says
         // nothing about which two listeners disagreed.
-        if let Some(existing) = plans.iter().find(|plan| {
-            listen_addresses_overlap(plan.config.server.listen_addr, listener.listen_addr)
-        }) {
-            let existing = existing.config.server.listen_addr;
-            if existing == listener.listen_addr {
-                anyhow::bail!(
+        let conflict = plans.iter().find_map(|plan| {
+            let existing = plan.config.server.listen_addr;
+            listen_address_conflict(existing, listener.listen_addr)
+                .map(|conflict| (existing, conflict))
+        });
+        if let Some((existing, conflict)) = conflict {
+            let new = listener.listen_addr;
+            match conflict {
+                AddressConflict::Identical => anyhow::bail!(
                     "two listeners are configured for {existing}; \
                      each listener needs its own address"
-                );
+                ),
+                AddressConflict::SameAddress => anyhow::bail!(
+                    "listeners {existing} and {new} are the same address written two ways; \
+                     each listener needs its own address"
+                ),
+                AddressConflict::WildcardCovers => anyhow::bail!(
+                    "listeners {existing} and {new} overlap; a wildcard address claims every \
+                     address of its family on that port, and :: may claim IPv4 as well"
+                ),
             }
-            anyhow::bail!(
-                "listeners {existing} and {} overlap; a wildcard address claims every \
-                 address of its family on that port, and :: may claim IPv4 as well",
-                listener.listen_addr
-            );
         }
 
         // "One per core" has no single answer once the cores are shared between
@@ -613,6 +649,23 @@ impl Server {
 
         info!(shards = total_shards, "server ready");
         Ok(Self { shards })
+    }
+
+    /// The address every shard actually bound, in shard order.
+    ///
+    /// A listener configured on port `0` takes whichever port the kernel had
+    /// free, so this is the only way to learn where it ended up. Shards of one
+    /// listener share an address and so repeat here.
+    pub fn listen_addrs(&self) -> Vec<SocketAddr> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .socket
+                    .local_addr()
+                    .unwrap_or(shard.config.server.listen_addr)
+            })
+            .collect()
     }
 
     /// Reload the roster whenever `SIGHUP` arrives.
@@ -3386,6 +3439,57 @@ mod tests {
             listener("[::1]:443", AuthMode::ClientCert),
         ]);
         assert!(super::plan_listeners(&config).is_ok());
+    }
+
+    /// Port 0 asks the kernel for whichever port is free, so two listeners that
+    /// both do cannot land on the same one — and refusing the pair would make
+    /// the ephemeral form unusable.
+    #[test]
+    fn listeners_may_both_ask_for_an_ephemeral_port() {
+        let config = config_with(vec![
+            listener("127.0.0.1:0", AuthMode::Basic),
+            listener("127.0.0.1:0", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&config).is_ok());
+    }
+
+    /// The diagnostic has to name the conflict it found. Told that a loopback
+    /// pair overlaps "because a wildcard claims its family", an operator would
+    /// go looking for a wildcard that is not there.
+    #[test]
+    fn an_address_conflict_is_described_by_its_kind() {
+        let cases = [
+            (
+                "0.0.0.0:443",
+                "0.0.0.0:443",
+                "two listeners are configured for",
+            ),
+            (
+                "127.0.0.1:443",
+                "[::ffff:127.0.0.1]:443",
+                "are the same address written two ways",
+            ),
+            (
+                "0.0.0.0:443",
+                "127.0.0.1:443",
+                "overlap; a wildcard address",
+            ),
+        ];
+
+        for (first, second, expected) in cases {
+            let config = config_with(vec![
+                listener(first, AuthMode::Basic),
+                listener(second, AuthMode::ClientCert),
+            ]);
+            let error = match super::plan_listeners(&config) {
+                Ok(_) => panic!("{first} and {second} contend and must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(expected),
+                "{first} vs {second}: expected {expected:?}, got {error:?}"
+            );
+        }
     }
 
     #[test]

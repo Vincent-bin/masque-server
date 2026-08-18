@@ -129,33 +129,24 @@ impl Drop for TempDir {
 
 // ── Server under test ────────────────────────────────────────────────
 
-/// Reserve a loopback UDP port and release it for the server to take.
+/// The loopback address that asks the kernel for whichever port is free.
 ///
-/// `Server::bind` does not report the port it landed on, so the port has to be
-/// chosen before it starts.
-fn free_port() -> u16 {
-    free_ports::<1>()[0]
-}
-
-/// Reserve several distinct loopback UDP ports at once.
-///
-/// Every socket is held until all of them are bound, because calling
-/// [`free_port`] twice in a row can return the same port: the first is released
-/// before the second is asked for, so nothing stops the kernel handing it out
-/// again.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let sockets: [UdpSocket; N] = std::array::from_fn(|_| UdpSocket::bind("127.0.0.1:0").unwrap());
-    std::array::from_fn(|index| sockets[index].local_addr().unwrap().port())
+/// Servers under test bind this and report back what they got, rather than
+/// picking a port in advance. Reserving one and releasing it leaves a window in
+/// which a parallel test can take it, and the whole point of a probe socket is
+/// that it must be closed before the server can have the port.
+fn ephemeral_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
 fn server_config(
     cert: PathBuf,
     key: PathBuf,
-    port: u16,
+    listen_addr: SocketAddr,
     clients: Vec<ClientEntry>,
 ) -> ServerConfig {
     let mut config = ServerConfig::default();
-    config.server.listen_addr = SocketAddr::from(([127, 0, 0, 1], port));
+    config.server.listen_addr = listen_addr;
     config.server.shards = 1;
     config.tls.cert_path = cert;
     config.tls.key_path = key;
@@ -169,11 +160,17 @@ fn server_config(
     config
 }
 
-/// Run a server on its own runtime thread for the duration of the test.
+/// Run a server on its own runtime thread and return the addresses it bound.
 ///
 /// The thread is detached: the runtime is dropped when the process exits, and
-/// the OS reclaims the port.
-fn spawn_server(config: ServerConfig) {
+/// the OS reclaims the ports.
+///
+/// Waiting for the real addresses rather than sleeping is what makes a
+/// `127.0.0.1:0` listener usable: the port is never held by anything but the
+/// server, so no parallel test can take it in between, and a caller cannot
+/// start talking to a socket that is not up yet.
+fn spawn_server(config: ServerConfig) -> Vec<SocketAddr> {
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -182,12 +179,19 @@ fn spawn_server(config: ServerConfig) {
         runtime.block_on(async move {
             match Server::bind(config).await {
                 Ok(mut server) => {
+                    // A failed send means the test gave up; run anyway and let
+                    // the detached thread die with the process.
+                    let _ = bound_tx.send(server.listen_addrs());
                     let _ = server.run().await;
                 }
                 Err(e) => panic!("server failed to bind: {e:#}"),
             }
         });
     });
+
+    bound_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not report its listen addresses")
 }
 
 // ── Client ───────────────────────────────────────────────────────────
@@ -482,22 +486,17 @@ fn fixture(tag: &str) -> Fixture {
         &self_signed(&stranger_key, None),
     );
 
-    let port = free_port();
-    spawn_server(server_config(
+    let peer = spawn_server(server_config(
         cert_path,
         key_path,
-        port,
+        ephemeral_addr(),
         vec![ClientEntry {
             name: "laptop".into(),
             public_key: public_key_b64(&client_key),
             ipv4: Some(CLIENT_IPV4.into()),
             ipv6: Some(CLIENT_IPV6.into()),
         }],
-    ));
-
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
-    // The server binds on another thread; give it a moment to take the port.
-    std::thread::sleep(Duration::from_millis(300));
+    ))[0];
 
     Fixture {
         _dir: dir,
@@ -549,10 +548,6 @@ fn dual_fixture(tag: &str) -> DualFixture {
         &self_signed(&client_key, None),
     );
 
-    // Both at once: two separate calls could hand back the same port, and the
-    // server would then refuse to start with an overlapping-listener error.
-    let [basic_port, cert_port] = free_ports::<2>();
-
     let mut config = ServerConfig::default();
     config.tls.cert_path = cert_path;
     config.tls.key_path = key_path;
@@ -560,9 +555,12 @@ fn dual_fixture(tag: &str) -> DualFixture {
     // targets.
     config.tcp_proxy.enabled = false;
     config.udp_proxy.enabled = false;
+    // Both on port 0: the kernel picks two free ports, and the server reports
+    // which. Two listeners asking for port 0 do not count as contending,
+    // because neither has a port yet.
     config.listeners = vec![
         ListenerSection {
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], basic_port)),
+            listen_addr: ephemeral_addr(),
             shards: 1,
             auth: Some(AuthSection {
                 enabled: true,
@@ -572,7 +570,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
             }),
         },
         ListenerSection {
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], cert_port)),
+            listen_addr: ephemeral_addr(),
             shards: 1,
             auth: Some(AuthSection {
                 enabled: true,
@@ -589,13 +587,14 @@ fn dual_fixture(tag: &str) -> DualFixture {
         ipv6: Some(CLIENT_IPV6.into()),
     }];
 
-    spawn_server(config);
-    std::thread::sleep(Duration::from_millis(300));
+    // One shard each, in configuration order.
+    let bound = spawn_server(config);
+    assert_eq!(bound.len(), 2, "one shard per listener");
 
     DualFixture {
         _dir: dir,
-        basic_peer: SocketAddr::from(([127, 0, 0, 1], basic_port)),
-        cert_peer: SocketAddr::from(([127, 0, 0, 1], cert_port)),
+        basic_peer: bound[0],
+        cert_peer: bound[1],
         client_cert,
         client_key: client_key_path,
         credentials: format!(
@@ -608,9 +607,13 @@ fn dual_fixture(tag: &str) -> DualFixture {
 // ── Roster reload fixture ────────────────────────────────────────────
 
 /// Render a server configuration file with the given roster entries.
-fn server_config_file(cert: &Path, key: &Path, port: u16, clients: &[(&str, &str)]) -> String {
+///
+/// The listen address is `127.0.0.1:0`; the server reports the port it took.
+/// Only the roster is reloaded, so rewriting this file leaves the bound socket
+/// alone and the port stays valid across a reload.
+fn server_config_file(cert: &Path, key: &Path, clients: &[(&str, &str)]) -> String {
     let mut text = format!(
-        "[server]\nlisten_addr = \"127.0.0.1:{port}\"\nshards = 1\n\n\
+        "[server]\nlisten_addr = \"127.0.0.1:0\"\nshards = 1\n\n\
          [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
          [auth]\nenabled = true\nmode = \"client_cert\"\n\n\
          [tcp_proxy]\nenabled = false\n\n[udp_proxy]\nenabled = false\n\n\
@@ -625,6 +628,36 @@ fn server_config_file(cert: &Path, key: &Path, port: u16, clients: &[(&str, &str
         ));
     }
     text
+}
+
+/// Start a reloadable server and return the addresses it bound.
+///
+/// Separate from [`spawn_server`] because these tests need the `SIGHUP` handler,
+/// which `run` installs after `bind` returns — so the caller still has to give
+/// it a moment before raising one.
+fn spawn_reloadable_server(config: ServerConfig, reload_path: PathBuf) -> Vec<SocketAddr> {
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut server = Server::bind_with_reload(config, Some(reload_path))
+                .await
+                .expect("server failed to bind");
+            let _ = bound_tx.send(server.listen_addrs());
+            let _ = server.run().await;
+        });
+    });
+
+    let bound = bound_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not report its listen addresses");
+    // Bound is not the same as ready to reload: `run` installs the SIGHUP
+    // handler, and a signal raised before that would be the default action.
+    std::thread::sleep(Duration::from_millis(600));
+    bound
 }
 
 /// Ask this process to reload, the way an operator would.
@@ -670,14 +703,12 @@ fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
         &self_signed(&keeper_key, None),
     );
 
-    let port = free_port();
     let config_path = dir.path().join("masque.toml");
     std::fs::write(
         &config_path,
         server_config_file(
             &cert_path,
             &key_path,
-            port,
             &[
                 ("doomed", &public_key_b64(&doomed_key)),
                 ("keeper", &public_key_b64(&keeper_key)),
@@ -688,23 +719,8 @@ fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
 
     let config =
         masque::config::parse_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    let reload_path = config_path.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            let mut server = Server::bind_with_reload(config, Some(reload_path))
-                .await
-                .expect("server failed to bind");
-            let _ = server.run().await;
-        });
-    });
-    // Let the server bind and install its signal handler before raising one.
-    std::thread::sleep(Duration::from_millis(600));
+    let peer = spawn_reloadable_server(config, config_path.clone())[0];
 
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
     let mut doomed = Client::connect(peer, &doomed_cert, &doomed_key_path).unwrap();
     doomed.handshake(Duration::from_secs(5)).unwrap();
     doomed.init_h3().unwrap();
@@ -733,7 +749,6 @@ fn revoked_client_is_disconnected_on_reload_while_others_keep_running() {
         server_config_file(
             &cert_path,
             &key_path,
-            port,
             &[("keeper", &public_key_b64(&keeper_key))],
         ),
     )
@@ -775,33 +790,17 @@ fn a_broken_reload_keeps_the_previous_roster() {
         &self_signed(&client_key, None),
     );
 
-    let port = free_port();
     let config_path = dir.path().join("masque.toml");
     let good = server_config_file(
         &cert_path,
         &key_path,
-        port,
         &[("laptop", &public_key_b64(&client_key))],
     );
     std::fs::write(&config_path, &good).unwrap();
 
     let config = masque::config::parse_toml(&good).unwrap();
-    let reload_path = config_path.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            let mut server = Server::bind_with_reload(config, Some(reload_path))
-                .await
-                .expect("server failed to bind");
-            let _ = server.run().await;
-        });
-    });
-    std::thread::sleep(Duration::from_millis(600));
+    let peer = spawn_reloadable_server(config, config_path.clone())[0];
 
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
     let mut client = Client::connect(peer, &client_cert, &client_key_path).unwrap();
     client.handshake(Duration::from_secs(5)).unwrap();
     client.init_h3().unwrap();
@@ -816,7 +815,7 @@ fn a_broken_reload_keeps_the_previous_roster() {
     // An unparseable public key: the roster must be rejected as a whole.
     std::fs::write(
         &config_path,
-        server_config_file(&cert_path, &key_path, port, &[("laptop", "!!not base64!!")]),
+        server_config_file(&cert_path, &key_path, &[("laptop", "!!not base64!!")]),
     )
     .unwrap();
     raise_sighup();
@@ -1166,11 +1165,10 @@ fn exhausted_address_pool_returns_503_instead_of_an_early_200() {
         &self_signed(&second_key, None),
     );
 
-    let port = free_port();
     let mut config = server_config(
         server_cert,
         server_key_path,
-        port,
+        ephemeral_addr(),
         vec![
             ClientEntry {
                 name: "first".into(),
@@ -1189,9 +1187,7 @@ fn exhausted_address_pool_returns_503_instead_of_an_early_200() {
     // network=.0, TUN gateway=.1, and the sole client address=.2.
     config.ip_proxy.ipv4_pool = "10.89.0.0/30".into();
     config.ip_proxy.ipv6_pool.clear();
-    spawn_server(config);
-    let peer = SocketAddr::from(([127, 0, 0, 1], port));
-    std::thread::sleep(Duration::from_millis(300));
+    let peer = spawn_server(config)[0];
 
     let mut first = Client::connect(peer, &first_cert, &first_key_path).unwrap();
     first.handshake(Duration::from_secs(5)).unwrap();
