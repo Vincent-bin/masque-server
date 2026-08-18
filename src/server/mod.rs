@@ -129,6 +129,18 @@ pub struct Server {
     shards: Vec<Shard>,
 }
 
+/// Configuration state prepared without opening sockets or creating a TUN
+/// device.
+///
+/// Keeping this as the single startup-validation path means `check-config`
+/// and a real server start reject the same authentication, TLS, QUIC, and
+/// address-pool mistakes.
+struct ValidatedServerConfig {
+    clients: ClientRegistry,
+    shard_count: usize,
+    address_pool: AddressPool,
+}
+
 /// Build only the roster selected by the active authentication mode.
 ///
 /// Keeping this decision separate from binding makes the "ignored outside
@@ -146,6 +158,121 @@ fn active_client_registry(config: &ServerConfig) -> anyhow::Result<ClientRegistr
         );
     }
     Ok(clients)
+}
+
+/// Validate everything in a server configuration that does not require a
+/// live listener or a TUN device.
+///
+/// This is intentionally side-effect-free so installers can qualify an
+/// existing configuration with a candidate binary before replacing the
+/// running version. Runtime-only failures such as an occupied UDP port or a
+/// missing kernel TUN device are still reported when the server starts.
+pub fn validate_config(config: &ServerConfig) -> anyhow::Result<()> {
+    validate_server_config(config).map(|_| ())
+}
+
+fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServerConfig> {
+    // Surface a bad credential or active roster configuration first. A roster
+    // outside client-cert mode is deliberately not parsed or allowed to
+    // reserve pool addresses: the configuration contract says it is ignored.
+    let clients = active_client_registry(config)?;
+    if config.auth.client_cert_enabled() {
+        info!(
+            clients = clients.len(),
+            "client certificate authentication enabled"
+        );
+    } else if !config.clients.is_empty() {
+        warn!(
+            "[[clients]] entries are ignored unless auth.mode = \"client_cert\" \
+             and auth.enabled = true"
+        );
+    }
+
+    if config.auth.basic_enabled() {
+        BasicAuthenticator::new(&config.auth.username, &config.auth.password_hash)?;
+    } else if !config.auth.client_cert_enabled() {
+        warn!("proxy authentication is disabled");
+    }
+
+    // Flow-control autotuning only ever grows a window toward its ceiling, so
+    // a ceiling below the advertised initial credit is a config mistake.
+    if config.quic.max_connection_window < config.quic.initial_max_data {
+        anyhow::bail!(
+            "quic.max_connection_window ({}) must be at least quic.initial_max_data ({})",
+            config.quic.max_connection_window,
+            config.quic.initial_max_data
+        );
+    }
+    if config.quic.max_stream_window < config.quic.initial_max_stream_data {
+        anyhow::bail!(
+            "quic.max_stream_window ({}) must be at least \
+             quic.initial_max_stream_data ({})",
+            config.quic.max_stream_window,
+            config.quic.initial_max_stream_data
+        );
+    }
+
+    if !(quiche::MIN_CLIENT_INITIAL_LEN..=MAX_DATAGRAM_SIZE)
+        .contains(&config.quic.max_datagram_size)
+    {
+        anyhow::bail!(
+            "quic.max_datagram_size ({}) must be between {} and {} bytes",
+            config.quic.max_datagram_size,
+            quiche::MIN_CLIENT_INITIAL_LEN,
+            MAX_DATAGRAM_SIZE
+        );
+    }
+
+    if config.ip_proxy.enabled && !(1..=u16::MAX as usize).contains(&config.ip_proxy.tun_mtu) {
+        anyhow::bail!(
+            "ip_proxy.tun_mtu ({}) must be between 1 and {}",
+            config.ip_proxy.tun_mtu,
+            u16::MAX
+        );
+    }
+
+    let shard_count = resolve_shard_count(config.server.shards);
+    // Sharing one address needs SO_REUSEPORT, which only Linux provides in the
+    // load-balancing form this depends on.
+    if shard_count > 1 && !cfg!(target_os = "linux") {
+        anyhow::bail!(
+            "server.shards = {shard_count} needs SO_REUSEPORT, which is only \
+             supported on Linux; set server.shards = 1"
+        );
+    }
+
+    let mut address_pool = AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
+        .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
+
+    // Withhold every pinned address from dynamic allocation up front, so a
+    // client that connects while a pinned peer is offline cannot take it.
+    if config.ip_proxy.enabled {
+        for (addr, owner) in clients.static_reservations() {
+            address_pool.reserve_static(addr, owner).map_err(|e| {
+                anyhow::anyhow!(
+                    "client address {addr} cannot be reserved ({e}); pinned addresses \
+                     must lie inside ip_proxy.ipv4_pool / ipv6_pool and must not be the \
+                     pool's gateway address"
+                )
+            })?;
+        }
+    }
+
+    // Build and discard the protocol configurations. This loads and matches
+    // the certificate/key pair and exercises the same quiche setters a shard
+    // will use, but has no network or device side effects.
+    let client_certs = config
+        .auth
+        .client_cert_enabled()
+        .then(|| Arc::new(SharedRoster::new(clients.clone())));
+    build_quic_config(config, client_certs)?;
+    build_h3_config()?;
+
+    Ok(ValidatedServerConfig {
+        clients,
+        shard_count,
+        address_pool,
+    })
 }
 
 /// Capture only the startup state that a roster reload is allowed to use.
@@ -175,78 +302,12 @@ impl Server {
         config: ServerConfig,
         config_path: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
-        // Surface a bad credential or active roster configuration once, before
-        // any shard binds the listen port. A roster outside client-cert mode is
-        // deliberately not parsed or allowed to reserve pool addresses: the
-        // configuration contract says it is ignored in that mode.
-        let clients = active_client_registry(&config)?;
-        if config.auth.client_cert_enabled() {
-            info!(
-                clients = clients.len(),
-                "client certificate authentication enabled"
-            );
-        } else if !config.clients.is_empty() {
-            warn!(
-                "[[clients]] entries are ignored unless auth.mode = \"client_cert\" \
-                 and auth.enabled = true"
-            );
-        }
-
-        if config.auth.basic_enabled() {
-            BasicAuthenticator::new(&config.auth.username, &config.auth.password_hash)?;
-        } else if !config.auth.client_cert_enabled() {
-            warn!("proxy authentication is disabled");
-        }
-
-        // Flow-control autotuning only ever grows a window toward its ceiling,
-        // so a ceiling below the advertised initial credit is a config mistake
-        // rather than something to silently honour. Check before binding, so a
-        // misconfigured server never briefly takes the listen port.
-        if config.quic.max_connection_window < config.quic.initial_max_data {
-            anyhow::bail!(
-                "quic.max_connection_window ({}) must be at least quic.initial_max_data ({})",
-                config.quic.max_connection_window,
-                config.quic.initial_max_data
-            );
-        }
-        if config.quic.max_stream_window < config.quic.initial_max_stream_data {
-            anyhow::bail!(
-                "quic.max_stream_window ({}) must be at least \
-                 quic.initial_max_stream_data ({})",
-                config.quic.max_stream_window,
-                config.quic.initial_max_stream_data
-            );
-        }
-
-        let shard_count = resolve_shard_count(config.server.shards);
-        // Sharing one address needs SO_REUSEPORT, which only Linux provides in
-        // the load-balancing form this depends on.
+        let ValidatedServerConfig {
+            clients,
+            shard_count,
+            address_pool,
+        } = validate_server_config(&config)?;
         let reuseport = shard_count > 1;
-        if reuseport && !cfg!(target_os = "linux") {
-            anyhow::bail!(
-                "server.shards = {shard_count} needs SO_REUSEPORT, which is only \
-                 supported on Linux; set server.shards = 1"
-            );
-        }
-
-        let mut address_pool =
-            AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
-                .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
-
-        // Withhold every pinned address from dynamic allocation up front, so a
-        // client that connects while a pinned peer is offline cannot take the
-        // address that peer needs.
-        if config.ip_proxy.enabled {
-            for (addr, owner) in clients.static_reservations() {
-                address_pool.reserve_static(addr, owner).map_err(|e| {
-                    anyhow::anyhow!(
-                        "client address {addr} cannot be reserved ({e}); pinned addresses \
-                         must lie inside ip_proxy.ipv4_pool / ipv6_pool and must not be the \
-                         pool's gateway address"
-                    )
-                })?;
-            }
-        }
 
         let tun = build_tun(&config)?;
 
@@ -534,6 +595,13 @@ fn build_client_cert_quic_config(
                 config.tls.key_path.display()
             )
         })?;
+    builder.check_private_key().map_err(|e| {
+        anyhow::anyhow!(
+            "tls.key_path {} does not match tls.cert_path {}: {e}",
+            config.tls.key_path.display(),
+            config.tls.cert_path.display()
+        )
+    })?;
 
     // PEER asks for the certificate; FAIL_IF_NO_PEER_CERT makes it mandatory.
     // Without the second flag a client that simply omits its certificate would
@@ -586,6 +654,139 @@ fn build_client_cert_quic_config(
 
     quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(|e| anyhow::anyhow!("failed to build QUIC config: {e}"))
+}
+
+/// Load the certificate and key together and verify that they match.
+///
+/// quiche's basic file loaders report malformed files, but checking the pair
+/// explicitly avoids deferring a mismatched key to the first handshake.
+fn validate_tls_pair(config: &ServerConfig) -> anyhow::Result<()> {
+    let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
+        .map_err(|e| anyhow::anyhow!("failed to create TLS context: {e}"))?;
+    builder
+        .set_certificate_chain_file(&config.tls.cert_path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load tls.cert_path {}: {e}",
+                config.tls.cert_path.display()
+            )
+        })?;
+    builder
+        .set_private_key_file(&config.tls.key_path, boring::ssl::SslFiletype::PEM)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load tls.key_path {}: {e}",
+                config.tls.key_path.display()
+            )
+        })?;
+    builder.check_private_key().map_err(|e| {
+        anyhow::anyhow!(
+            "tls.key_path {} does not match tls.cert_path {}: {e}",
+            config.tls.key_path.display(),
+            config.tls.cert_path.display()
+        )
+    })
+}
+
+/// Build the complete QUIC configuration used by both preflight validation and
+/// live shards.
+fn build_quic_config(
+    config: &ServerConfig,
+    client_certs: Option<Arc<SharedRoster>>,
+) -> anyhow::Result<quiche::Config> {
+    validate_tls_pair(config)?;
+
+    let mut quic_config = match client_certs {
+        Some(registry) => build_client_cert_quic_config(config, registry)?,
+        None => {
+            let cert_path = config.tls.cert_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tls.cert_path is not valid UTF-8: {}",
+                    config.tls.cert_path.display()
+                )
+            })?;
+            let key_path = config.tls.key_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tls.key_path is not valid UTF-8: {}",
+                    config.tls.key_path.display()
+                )
+            })?;
+            let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+            quic_config
+                .load_cert_chain_from_pem_file(cert_path)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to load tls.cert_path {} into quiche: {e}",
+                        config.tls.cert_path.display()
+                    )
+                })?;
+            quic_config
+                .load_priv_key_from_pem_file(key_path)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to load tls.key_path {} into quiche: {e}",
+                        config.tls.key_path.display()
+                    )
+                })?;
+            quic_config
+        }
+    };
+
+    quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+
+    let idle_timeout_ms = config
+        .server
+        .idle_timeout_secs
+        .checked_mul(1000)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "server.idle_timeout_secs ({}) is too large",
+                config.server.idle_timeout_secs
+            )
+        })?;
+
+    // Transport parameters.
+    quic_config.set_max_idle_timeout(idle_timeout_ms);
+    quic_config.set_max_recv_udp_payload_size(config.quic.max_datagram_size);
+    quic_config.set_max_send_udp_payload_size(config.quic.max_datagram_size);
+    quic_config.set_initial_max_data(config.quic.initial_max_data);
+    quic_config.set_initial_max_stream_data_bidi_local(config.quic.initial_max_stream_data);
+    quic_config.set_initial_max_stream_data_bidi_remote(config.quic.initial_max_stream_data);
+    quic_config.set_initial_max_stream_data_uni(config.quic.initial_max_stream_data);
+    quic_config.set_initial_max_streams_bidi(config.quic.initial_max_streams_bidi);
+    quic_config.set_initial_max_streams_uni(100);
+    quic_config.set_max_connection_window(config.quic.max_connection_window);
+    quic_config.set_max_stream_window(config.quic.max_stream_window);
+    quic_config.enable_pacing(true);
+    quic_config.discover_pmtu(config.quic.discover_pmtu);
+
+    quic_config
+        .set_cc_algorithm_name(&config.quic.cc_algorithm)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "unknown quic.cc_algorithm {:?} (expected cubic, reno, or bbr2)",
+                config.quic.cc_algorithm
+            )
+        })?;
+    quic_config
+        .set_initial_congestion_window_packets(config.quic.initial_congestion_window_packets);
+
+    if config.quic.enable_dgram {
+        quic_config.enable_dgram(
+            true,
+            config.quic.dgram_recv_queue_len,
+            config.quic.dgram_send_queue_len,
+        );
+    }
+
+    Ok(quic_config)
+}
+
+fn build_h3_config() -> anyhow::Result<quiche::h3::Config> {
+    let mut h3_config = quiche::h3::Config::new()?;
+    h3_config.set_max_field_section_size(8192);
+    h3_config.enable_extended_connect(true);
+    Ok(h3_config)
 }
 
 /// Create the TUN device if the IP proxy is enabled.
@@ -807,58 +1008,8 @@ impl Shard {
             None
         };
 
-        let mut quic_config = match &client_certs {
-            Some(registry) => build_client_cert_quic_config(&config, Arc::clone(registry))?,
-            None => {
-                let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-                quic_config
-                    .load_cert_chain_from_pem_file(config.tls.cert_path.to_str().unwrap_or(""))?;
-                quic_config
-                    .load_priv_key_from_pem_file(config.tls.key_path.to_str().unwrap_or(""))?;
-                quic_config
-            }
-        };
-
-        quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-
-        // Transport parameters
-        quic_config.set_max_idle_timeout(config.server.idle_timeout_secs * 1000);
-        quic_config.set_max_recv_udp_payload_size(config.quic.max_datagram_size);
-        quic_config.set_max_send_udp_payload_size(config.quic.max_datagram_size);
-        quic_config.set_initial_max_data(config.quic.initial_max_data);
-        quic_config.set_initial_max_stream_data_bidi_local(config.quic.initial_max_stream_data);
-        quic_config.set_initial_max_stream_data_bidi_remote(config.quic.initial_max_stream_data);
-        quic_config.set_initial_max_stream_data_uni(config.quic.initial_max_stream_data);
-        quic_config.set_initial_max_streams_bidi(config.quic.initial_max_streams_bidi);
-        quic_config.set_initial_max_streams_uni(100);
-        quic_config.set_max_connection_window(config.quic.max_connection_window);
-        quic_config.set_max_stream_window(config.quic.max_stream_window);
-        quic_config.enable_pacing(true);
-        quic_config.discover_pmtu(config.quic.discover_pmtu);
-
-        quic_config
-            .set_cc_algorithm_name(&config.quic.cc_algorithm)
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "unknown quic.cc_algorithm {:?} (expected cubic, reno, or bbr2)",
-                    config.quic.cc_algorithm
-                )
-            })?;
-        quic_config
-            .set_initial_congestion_window_packets(config.quic.initial_congestion_window_packets);
-
-        // DATAGRAM extension
-        if config.quic.enable_dgram {
-            quic_config.enable_dgram(
-                true,
-                config.quic.dgram_recv_queue_len,
-                config.quic.dgram_send_queue_len,
-            );
-        }
-
-        let mut h3_config = quiche::h3::Config::new()?;
-        h3_config.set_max_field_section_size(8192);
-        h3_config.enable_extended_connect(true);
+        let quic_config = build_quic_config(&config, client_certs.as_ref().map(Arc::clone))?;
+        let h3_config = build_h3_config()?;
 
         let tcp_policy = TargetPolicy::new(
             &config.tcp_proxy.allow_targets,

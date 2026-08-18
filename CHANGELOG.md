@@ -11,6 +11,14 @@ pre-1.0.
 
 ### Added
 
+- A one-command Linux x86_64 installer that resolves and verifies the latest
+  stable GitHub release, offers Basic or TLS client-certificate authentication,
+  enrolls the first certificate client, and prints a redacted configuration and
+  client setup result. Reusing it for an upgrade preserves the existing TOML
+  and TLS files, preflights them with the candidate binary, and rolls back the
+  binary, systemd unit, and service state if activation fails.
+- `masque-server check-config` validates startup configuration without binding
+  a socket or creating a TUN device, allowing safe preflight before replacement.
 - Compatibility with VPN-style MASQUE clients modelled on Cloudflare WARP, such
   as usque:
   - `ip_proxy.connect_protocols` accepts Cloudflare's `cf-connect-ip` alongside

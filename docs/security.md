@@ -118,6 +118,10 @@ Consequences worth planning for:
   `enroll-client` writes the JSON as `0600` and refuses to overwrite an existing
   path. Distribute it over a confidential channel and treat the command's
   terminal output, including the mihomo entry, as secret.
+- The one-command installer prints its effective configuration with password
+  hashes redacted, but it also prints a newly generated Basic password or the
+  mihomo client block. Run it only from a private terminal and keep provisioning
+  systems from copying that output into shared logs.
 - Skipping chain validation does not weaken proof of possession. TLS 1.3 makes
   the client sign the handshake transcript with the certificate's private key,
   and that signature is verified by the TLS stack; the roster check replaces

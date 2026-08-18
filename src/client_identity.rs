@@ -58,7 +58,7 @@ impl ClientIdentity {
 }
 
 /// The configured clients, indexed by public key.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ClientRegistry {
     /// Keyed by canonical SubjectPublicKeyInfo DER.
     ///

@@ -13,6 +13,7 @@ file is the canonical deployable example and is tested by the release flow.
 ```text
 masque-server [OPTIONS]
 masque-server hash-password
+masque-server --config <PATH> check-config
 masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 
   -c, --config <PATH>       Config file [default: masque.toml]
@@ -22,6 +23,11 @@ masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
   -v, --verbose             Increase verbosity; repeat for trace logging
   -V, --version             Print the server version
 ```
+
+`check-config` validates authentication, the TLS certificate/key pair, QUIC
+settings, client roster, and address pools without binding the UDP listener or
+creating a TUN device. It is suitable for upgrade preflight, but cannot detect
+runtime conditions such as an occupied port or unavailable kernel device.
 
 `hash-password` reads a password on stdin and prints an Argon2id hash for
 `auth.password_hash`. `enroll-client` generates a client key pair for

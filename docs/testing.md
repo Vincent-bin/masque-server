@@ -242,7 +242,8 @@ that, and all three were hit while qualifying this feature:
 - Build `x86_64-unknown-linux-musl` with the same command used by CI.
 - Extract the archive into a temporary directory and inspect permissions and
   paths.
-- Verify `masque-server --help` and `hash-password` from the packaged binary.
+- Verify `masque-server --help`, `hash-password`, and side-effect-free
+  `check-config` from the packaged binary.
 - Install on a disposable Linux host and run a client smoke test.
 - Tag only the commit that passed these checks.
 

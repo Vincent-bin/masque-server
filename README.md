@@ -61,7 +61,32 @@ private key and must be handled as a secret. Basic and client-certificate
 authentication are mutually exclusive within one server instance; see
 [Authentication](docs/configuration.md#authentication) for the complete setup.
 
-## Install a release on Linux
+## One-command Linux install
+
+On Linux x86_64, download, verify, and install the latest stable release with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
+```
+
+For a new configuration the installer prompts for `basic` or `client_cert`
+authentication and optional TLS file locations. Basic mode generates a random
+password when none is supplied. Client-certificate mode enrolls the first
+client, adds its `[[clients]]` entry, writes its secret JSON as mode `0600`, and
+prints the matching usque and mihomo configuration. At the end it prints the
+installed version, service state, and effective server configuration with the
+password hash redacted.
+
+The same command is also the upgrade command. When
+`/etc/masque/masque.toml` already exists, the candidate binary checks that
+configuration without binding a port or creating a TUN, then upgrades only the
+binary and systemd unit. It never rewrites the TOML or referenced TLS files. An
+incompatible configuration aborts before replacement; a failed service restart
+restores the prior binary, unit, and service state. See
+[Deployment](docs/deployment.md#one-command-install) for non-interactive
+variables, certificate requirements, and installing a specific release.
+
+## Install a downloaded release on Linux
 
 Release archives contain the binary, an example configuration, a hardened
 systemd unit, and an installer:
@@ -72,14 +97,10 @@ cd masque-vVERSION-linux-x86_64
 sudo ./install.sh
 ```
 
-The installer creates an unprivileged `masque` system user and enables the
-service. It preserves an existing `/etc/masque/masque.toml`. New installations
-receive a randomly generated proxy password unless `MASQUE_AUTH_USERNAME` and
-`MASQUE_AUTH_PASSWORD` are supplied to the installer.
-
-The installer initially configures Basic authentication. To use TLS client
-certificates instead, change `auth.mode` to `client_cert`, remove the Basic
-credentials, and enroll the allowed clients as described above.
+The package installer creates an unprivileged `masque` system user, lets new
+installations choose either authentication mode, and enables the service. Set
+`MASQUE_START_SERVICE=1` to start it immediately; the one-command installer
+does this automatically when TLS material is present.
 
 See [Deployment](docs/deployment.md) for certificates, systemd hardening,
 upgrades, and diagnostics.

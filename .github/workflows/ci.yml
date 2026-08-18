@@ -40,7 +40,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Check shell scripts
-        run: shellcheck deploy/install.sh scripts/*.sh tests/e2e/*.sh
+        run: |
+          sh -n install-latest.sh deploy/install.sh tests/install-upgrade.sh
+          shellcheck install-latest.sh deploy/install.sh scripts/*.sh \
+            tests/*.sh tests/e2e/*.sh
 
   msrv:
     name: Check MSRV (1.88.0)
@@ -82,10 +85,19 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake
+          sudo apt-get install --yes clang cmake openssl
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+      - name: Test installer upgrade safety
+        if: runner.os == 'Linux'
+        run: |
+          sudo env \
+            CI=true \
+            MASQUE_INSTALLER_TEST=1 \
+            MASQUE_TEST_PACKAGE_BIN="$PWD/target/debug/masque-server" \
+            "$PWD/tests/install-upgrade.sh"
 
   release-build:
     name: Linux musl release build

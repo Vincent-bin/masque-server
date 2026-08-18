@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use masque::auth;
 use masque::config::{self, ServerConfig};
 use masque::enroll;
-use masque::server::Server;
+use masque::server::{Server, validate_config};
 
 /// MASQUE proxy server (CONNECT / CONNECT-UDP / CONNECT-IP over HTTP/3).
 #[derive(Parser)]
@@ -44,6 +44,8 @@ struct Cli {
 enum Command {
     /// Read a password from standard input and print an Argon2id PHC hash.
     HashPassword,
+    /// Validate the configuration without binding sockets or creating a TUN.
+    CheckConfig,
     /// Generate a client key pair for `auth.mode = "client_cert"`.
     ///
     /// Prints the `[[clients]]` block to add to the server config, and the JSON
@@ -189,8 +191,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Load config
-    let mut cfg = if cli.config.exists() {
+    // Load config.
+    let config_exists = cli.config.exists();
+    if matches!(cli.command, Some(Command::CheckConfig)) && !config_exists {
+        anyhow::bail!("configuration file not found: {}", cli.config.display());
+    }
+    let mut cfg = if config_exists {
         let toml_str = std::fs::read_to_string(&cli.config)?;
         config::parse_toml(&toml_str)?
     } else {
@@ -230,6 +236,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if matches!(cli.command, Some(Command::CheckConfig)) {
+        validate_config(&cfg)?;
+        println!(
+            "configuration is compatible with masque-server {}: {}",
+            env!("CARGO_PKG_VERSION"),
+            cli.config.display()
+        );
+        return Ok(());
+    }
+
     info!(?cfg, "configuration loaded");
 
     // Pass the path so SIGHUP can re-read the [[clients]] roster. Only a
@@ -259,5 +275,10 @@ mod tests {
         let instruction = usque_port_instruction(8449);
         assert!(instruction.contains("--connect-port 8449"));
         assert!(instruction.contains("-P 8449"));
+    }
+
+    #[test]
+    fn check_config_subcommand_is_available() {
+        assert!(Cli::command().find_subcommand("check-config").is_some());
     }
 }
