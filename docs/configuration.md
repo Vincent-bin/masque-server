@@ -68,6 +68,10 @@ shards = 1
 Use one shard until a benchmark shows one event loop is CPU-bound. Memory and
 the effective connection capacity increase with the shard count.
 
+`listen_addr` and `shards` describe the single listener this section implies.
+A configuration that uses [`[[listeners]]`](#multiple-listeners) names its
+sockets there instead, and these two keys are then ignored.
+
 ## TLS
 
 ```toml
@@ -82,9 +86,10 @@ as group `masque`; install both files as `root:masque` with mode `0640`.
 ## Authentication
 
 `auth.mode` selects how clients prove who they are. The two modes are mutually
-exclusive — `client_cert` makes the TLS handshake demand a certificate, so a
-credential-based client cannot even connect, and vice versa. Serving both kinds
-of client requires two server instances.
+exclusive *on one socket* — `client_cert` makes the TLS handshake demand a
+certificate, so a credential-based client cannot even connect, and vice versa.
+To serve both kinds of client, give each mode its own listener; see
+[Multiple listeners](#multiple-listeners).
 
 | Key | Meaning |
 | --- | --- |
@@ -185,6 +190,63 @@ existing path is never overwritten. Without it the JSON goes to the terminal.
 
 Nothing is written to the server configuration automatically. Append the
 `[[clients]]` block yourself, then run `systemctl reload masque` or restart.
+
+## Multiple listeners
+
+`[[listeners]]` gives each socket its own authentication mode, which is what
+lets one process serve both kinds of client. It is the whole list of listeners,
+not an addition to `[server].listen_addr`: naming any listener here stops the
+server deriving one from `[server]`, and `[server].listen_addr` and
+`[server].shards` are then ignored.
+
+```toml
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "basic"
+username = "proxy-user"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+
+[[listeners]]
+listen_addr = "0.0.0.0:4443"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "client_cert"
+```
+
+| `[[listeners]]` key | Meaning |
+| --- | --- |
+| `listen_addr` | Required; there is no default, so a typo cannot silently land on someone else's port |
+| `shards` | Event loops for this listener; defaults to `1` |
+| `[listeners.auth]` | Optional; omitted means the top-level `[auth]` |
+
+A `[listeners.auth]` table replaces `[auth]` outright rather than merging field
+by field, so the username from a Basic `[auth]` does not follow a listener that
+switched to `client_cert`.
+
+Everything else stays server-wide: one `[[clients]]` roster, one TUN device, one
+CONNECT-IP address pool, one routing table. That is the reason to run two
+listeners in one process rather than two processes — two processes would need
+two TUN devices and two address pools, and overlapping pools hand the same
+tunnel address to two clients.
+
+The server refuses to start when two listeners name the same address. This is
+not left to the kernel to report: a listener with more than one shard opens its
+socket with `SO_REUSEPORT`, so a second listener on that address would join the
+load-balancing group and be handed connections meant for the other
+authentication mode.
+
+`shards = 0` (one per core) is rejected when more than one listener is
+configured; give each listener an explicit count. The `MAX_SHARDS` cap of 32
+applies to the server's total, not to any one listener.
+
+Run `masque-server --config masque.toml check-config` to validate a
+multi-listener file before restarting.
 
 The usque JSON schema stores the endpoint IP but not its port, so enrollment
 also prints the matching launch argument — `--connect-port 443` for the example

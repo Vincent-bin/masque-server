@@ -143,7 +143,10 @@ apply to these clients.
 **Authentication is a TLS client certificate.** No `Proxy-Authorization` is
 ever sent, so `auth.mode = "basic"` refuses these clients with `407`. Use
 `auth.mode = "client_cert"` and enroll each client's public key; see
-[Authentication](configuration.md#authentication).
+[Authentication](configuration.md#authentication). To keep serving
+standards-compliant clients at the same time, give each mode its own
+[listener](configuration.md#multiple-listeners) — the mode fixes the TLS
+context, so the two cannot share a socket, but they can share a process.
 
 **Extended CONNECT is not required of the server.** Cloudflare does not
 advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and these clients tolerate its

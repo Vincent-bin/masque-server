@@ -65,7 +65,9 @@ const MAX_QUIC_RECV_BATCH: usize = MAX_BATCH_PACKETS;
 const MAX_TUN_RECV_BATCH: usize = tun::TUN_BATCH_SIZE;
 
 /// Upper bound on shards, so a machine with a very high core count does not
-/// fan out into more event loops than the listen socket can usefully feed.
+/// fan out into more event loops than the listen sockets can usefully feed.
+///
+/// Applied to the server's total, not to one listener's share of it.
 const MAX_SHARDS: usize = 32;
 
 /// Queue depth for packets handed between shards.
@@ -119,12 +121,19 @@ struct UdpResponse {
 
 /// Top-level MASQUE server.
 ///
-/// Runs one event loop per shard. Each shard binds the listen address with
-/// `SO_REUSEPORT` and owns a disjoint set of connections, so QUIC's per-packet
-/// crypto — which is what saturates a core — spreads across them. The kernel
-/// hashes each 4-tuple to a shard, and the rare packet that lands on the wrong
-/// one (a client that changed address) is handed to its owner rather than
-/// dropped.
+/// Runs one event loop per shard. A listener's shards each bind its address
+/// with `SO_REUSEPORT` and own a disjoint set of connections, so QUIC's
+/// per-packet crypto — which is what saturates a core — spreads across them.
+/// The kernel hashes each 4-tuple to a shard, and the rare packet that lands on
+/// the wrong one (a client that changed address) is handed to its owner rather
+/// than dropped.
+///
+/// A server may have several listeners, which is what lets one process serve
+/// more than one authentication mode: `auth.mode` decides which TLS context a
+/// shard builds, and that is fixed once its socket is bound. Shards are
+/// numbered across the whole server, so everything shared between them — the
+/// address pool, the routing table, the TUN device, the cross-shard queues —
+/// stays single and needs no knowledge of which listener a shard serves.
 pub struct Server {
     shards: Vec<Shard>,
 }
@@ -137,16 +146,119 @@ pub struct Server {
 /// address-pool mistakes.
 struct ValidatedServerConfig {
     clients: ClientRegistry,
-    shard_count: usize,
+    listeners: Vec<ListenerPlan>,
+    total_shards: usize,
     address_pool: AddressPool,
+}
+
+/// One listener's fully materialised configuration and shard count.
+struct ListenerPlan {
+    /// The whole configuration with this listener's address, shard count, and
+    /// authentication substituted in.
+    ///
+    /// A shard reads exactly one of these and never has to know it is one
+    /// listener among several, which is what keeps the multi-listener change
+    /// out of the request and packet paths entirely.
+    config: ServerConfig,
+    shards: usize,
+}
+
+/// Whether any listener authenticates with a client certificate.
+///
+/// The roster, and the reload that replaces it, belong to the server rather
+/// than to a listener, so both are governed by this rather than by one
+/// listener's mode.
+fn any_client_cert_listener(config: &ServerConfig) -> bool {
+    config
+        .resolved_listeners()
+        .iter()
+        .any(|listener| listener.auth.client_cert_enabled())
+}
+
+/// Expand the configured listeners into one plan each, rejecting the
+/// combinations that cannot be served.
+fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
+    let listeners = config.resolved_listeners();
+    let mut plans: Vec<ListenerPlan> = Vec::with_capacity(listeners.len());
+    let mut total_shards = 0usize;
+
+    for listener in &listeners {
+        // Two listeners on one address is not merely a bind failure to let the
+        // kernel report. A listener with more than one shard opens its socket
+        // with SO_REUSEPORT, so a second listener on the same address would
+        // join that load-balancing group and the kernel would hand it
+        // connections meant for a different authentication mode.
+        if plans
+            .iter()
+            .any(|plan| plan.config.server.listen_addr == listener.listen_addr)
+        {
+            anyhow::bail!(
+                "two listeners are configured for {}; each listener needs its own address",
+                listener.listen_addr
+            );
+        }
+
+        // "One per core" has no single answer once the cores are shared between
+        // listeners, and quietly giving every listener a full set would
+        // oversubscribe the machine by the number of listeners.
+        if listener.shards == 0 && listeners.len() > 1 {
+            anyhow::bail!(
+                "listener {} uses shards = 0 (one per core), which has no meaning \
+                 alongside other listeners; give each listener an explicit count",
+                listener.listen_addr
+            );
+        }
+
+        let shards = resolve_shard_count(listener.shards);
+        // Sharing one address needs SO_REUSEPORT, which only Linux provides in
+        // the load-balancing form this depends on.
+        if shards > 1 && !cfg!(target_os = "linux") {
+            anyhow::bail!(
+                "listener {} asks for {shards} shards, which needs SO_REUSEPORT; \
+                 that is Linux only, so set shards = 1",
+                listener.listen_addr
+            );
+        }
+
+        total_shards += shards;
+
+        let mut listener_config = config.clone();
+        listener_config.server.listen_addr = listener.listen_addr;
+        listener_config.server.shards = shards;
+        listener_config.auth = listener.auth.clone();
+        // A shard's configuration describes only its own listener, so the list
+        // cannot be misread as something it should act on.
+        listener_config.listeners.clear();
+
+        plans.push(ListenerPlan {
+            config: listener_config,
+            shards,
+        });
+    }
+
+    // Every shard costs two cross-shard queues in each direction and a slice of
+    // the shared verification budget, so the cap is on the total rather than on
+    // any one listener's share of it.
+    if total_shards > MAX_SHARDS {
+        anyhow::bail!(
+            "{} listeners ask for {total_shards} shards in total, more than the \
+             {MAX_SHARDS} this server runs",
+            plans.len()
+        );
+    }
+
+    Ok(plans)
 }
 
 /// Build only the roster selected by the active authentication mode.
 ///
 /// Keeping this decision separate from binding makes the "ignored outside
 /// client_cert" contract testable without opening sockets or loading TLS keys.
-fn active_client_registry(config: &ServerConfig) -> anyhow::Result<ClientRegistry> {
-    if !config.auth.client_cert_enabled() {
+fn active_client_registry(
+    config: &ServerConfig,
+    any_client_cert: bool,
+) -> anyhow::Result<ClientRegistry> {
+    if !any_client_cert {
         return Ok(ClientRegistry::default());
     }
 
@@ -172,11 +284,24 @@ pub fn validate_config(config: &ServerConfig) -> anyhow::Result<()> {
 }
 
 fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServerConfig> {
+    let listeners = plan_listeners(config)?;
+    let any_client_cert = any_client_cert_listener(config);
+
+    if !config.listeners.is_empty() {
+        // [[listeners]] is the whole list, so these are dead settings. Only
+        // worth a warning: which sockets actually came up is spelled out by the
+        // "listening" line each listener logs, and by `check-config`.
+        warn!(
+            "[[listeners]] replaces [server].listen_addr and [server].shards, \
+             which are ignored"
+        );
+    }
+
     // Surface a bad credential or active roster configuration first. A roster
     // outside client-cert mode is deliberately not parsed or allowed to
     // reserve pool addresses: the configuration contract says it is ignored.
-    let clients = active_client_registry(config)?;
-    if config.auth.client_cert_enabled() {
+    let clients = active_client_registry(config, any_client_cert)?;
+    if any_client_cert {
         info!(
             clients = clients.len(),
             "client certificate authentication enabled"
@@ -188,10 +313,16 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
         );
     }
 
-    if config.auth.basic_enabled() {
-        BasicAuthenticator::new(&config.auth.username, &config.auth.password_hash)?;
-    } else if !config.auth.client_cert_enabled() {
-        warn!("proxy authentication is disabled");
+    // Credentials are per listener, so a mistake in the second one has to name
+    // the listener it came from or it cannot be found in a multi-listener file.
+    for plan in &listeners {
+        let addr = plan.config.server.listen_addr;
+        if plan.config.auth.basic_enabled() {
+            BasicAuthenticator::new(&plan.config.auth.username, &plan.config.auth.password_hash)
+                .with_context(|| format!("listener {addr}"))?;
+        } else if !plan.config.auth.client_cert_enabled() {
+            warn!(%addr, "proxy authentication is disabled on this listener");
+        }
     }
 
     // Flow-control autotuning only ever grows a window toward its ceiling, so
@@ -231,16 +362,6 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
         );
     }
 
-    let shard_count = resolve_shard_count(config.server.shards);
-    // Sharing one address needs SO_REUSEPORT, which only Linux provides in the
-    // load-balancing form this depends on.
-    if shard_count > 1 && !cfg!(target_os = "linux") {
-        anyhow::bail!(
-            "server.shards = {shard_count} needs SO_REUSEPORT, which is only \
-             supported on Linux; set server.shards = 1"
-        );
-    }
-
     let mut address_pool = AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
         .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
 
@@ -261,16 +382,26 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     // Build and discard the protocol configurations. This loads and matches
     // the certificate/key pair and exercises the same quiche setters a shard
     // will use, but has no network or device side effects.
-    let client_certs = config
-        .auth
-        .client_cert_enabled()
-        .then(|| Arc::new(SharedRoster::new(clients.clone())));
-    build_quic_config(config, client_certs)?;
+    //
+    // Once per listener rather than once per server: the authentication mode
+    // decides which of two TLS contexts is built, so validating one listener's
+    // would say nothing about another's.
+    for plan in &listeners {
+        let client_certs = plan
+            .config
+            .auth
+            .client_cert_enabled()
+            .then(|| Arc::new(SharedRoster::new(clients.clone())));
+        build_quic_config(&plan.config, client_certs)
+            .with_context(|| format!("listener {}", plan.config.server.listen_addr))?;
+    }
     build_h3_config()?;
 
+    let total_shards = listeners.iter().map(|plan| plan.shards).sum();
     Ok(ValidatedServerConfig {
         clients,
-        shard_count,
+        listeners,
+        total_shards,
         address_pool,
     })
 }
@@ -282,7 +413,7 @@ fn roster_reload_settings(
 ) -> Option<RosterReload> {
     config_path.map(|path| RosterReload {
         path,
-        client_cert_enabled: config.auth.client_cert_enabled(),
+        client_cert_enabled: any_client_cert_listener(config),
         ip_proxy_enabled: config.ip_proxy.enabled,
     })
 }
@@ -304,10 +435,10 @@ impl Server {
     ) -> anyhow::Result<Self> {
         let ValidatedServerConfig {
             clients,
-            shard_count,
+            listeners,
+            total_shards,
             address_pool,
         } = validate_server_config(&config)?;
-        let reuseport = shard_count > 1;
 
         let tun = build_tun(&config)?;
 
@@ -316,12 +447,15 @@ impl Server {
             .map_err(|_| anyhow::anyhow!("failed to seed connection ID key"))?;
 
         // Every shard needs a handle to every other shard's inboxes, so the
-        // channels are made before the shards that read them.
-        let mut forward_tx = Vec::with_capacity(shard_count);
-        let mut forward_rx = Vec::with_capacity(shard_count);
-        let mut tun_tx = Vec::with_capacity(shard_count);
-        let mut tun_rx = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
+        // channels are made before the shards that read them. Shards are
+        // numbered across the whole server rather than within a listener, so a
+        // packet or a TUN packet reaches its owner without anyone having to
+        // know which listener that owner belongs to.
+        let mut forward_tx = Vec::with_capacity(total_shards);
+        let mut forward_rx = Vec::with_capacity(total_shards);
+        let mut tun_tx = Vec::with_capacity(total_shards);
+        let mut tun_rx = Vec::with_capacity(total_shards);
+        for _ in 0..total_shards {
             let (tx, rx) = mpsc::channel(SHARD_FORWARD_QUEUE_CAPACITY);
             forward_tx.push(tx);
             forward_rx.push(rx);
@@ -332,7 +466,9 @@ impl Server {
 
         // A live switch from Basic to client-certificate authentication is not
         // possible: the TLS context is fixed when each shard binds. Capture the
-        // startup mode so SIGHUP can be consumed safely but cannot fake a switch.
+        // startup mode so SIGHUP can be consumed safely but cannot fake a
+        // switch — including the switch from no client-certificate listener to
+        // one, which no reload can conjure a TLS context for.
         let roster_reload = roster_reload_settings(&config, config_path);
 
         let shared = Arc::new(Shared {
@@ -345,28 +481,38 @@ impl Server {
             tun,
             forward_tx,
             tun_tx,
-            auth_permits: Arc::new(Semaphore::new(auth_concurrency(shard_count))),
+            auth_permits: Arc::new(Semaphore::new(auth_concurrency(total_shards))),
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
             clients: Arc::new(SharedRoster::new(clients)),
             roster_reload,
         });
 
-        let mut shards = Vec::with_capacity(shard_count);
-        for (index, (forward_rx, tun_rx)) in forward_rx.into_iter().zip(tun_rx).enumerate() {
-            shards.push(
-                Shard::bind(
-                    index,
-                    Arc::clone(&shared),
-                    config.clone(),
-                    reuseport,
-                    forward_rx,
-                    tun_rx,
-                )
-                .await?,
-            );
+        let mut shards = Vec::with_capacity(total_shards);
+        let mut inboxes = forward_rx.into_iter().zip(tun_rx);
+        for plan in listeners {
+            // SO_REUSEPORT is what lets one listener's shards share an address.
+            // A single-shard listener must not set it, or a later listener that
+            // was misconfigured onto the same address could join its group.
+            let reuseport = plan.shards > 1;
+            for _ in 0..plan.shards {
+                let (forward_rx, tun_rx) = inboxes
+                    .next()
+                    .expect("one inbox pair was created per planned shard");
+                shards.push(
+                    Shard::bind(
+                        shards.len(),
+                        Arc::clone(&shared),
+                        plan.config.clone(),
+                        reuseport,
+                        forward_rx,
+                        tun_rx,
+                    )
+                    .await?,
+                );
+            }
         }
 
-        info!(shards = shard_count, "server ready");
+        info!(shards = total_shards, "server ready");
         Ok(Self { shards })
     }
 
@@ -489,14 +635,15 @@ fn reload_roster(shared: &Shared) -> anyhow::Result<(u64, usize)> {
     let config = crate::config::parse_toml(&text)
         .with_context(|| format!("failed to parse {}", reload.path.display()))?;
 
-    if !config.auth.client_cert_enabled() {
+    let any_client_cert = any_client_cert_listener(&config);
+    if !any_client_cert {
         anyhow::bail!(
-            "refusing to reload: auth.mode is no longer \"client_cert\", which cannot be \
-             changed without a restart"
+            "refusing to reload: no listener uses auth.mode = \"client_cert\" any more, \
+             which cannot be changed without a restart"
         );
     }
 
-    let registry = active_client_registry(&config)?;
+    let registry = active_client_registry(&config, any_client_cert)?;
 
     // Reservations are recomputed before the swap: if a pinned address became
     // invalid, the roster is rejected rather than half-applied.
@@ -1059,6 +1206,9 @@ impl Shard {
         let mut tun_send = TunSendBatch::new();
         let mut recv_batch = RecvPacketBatch::new(MAX_QUIC_RECV_BATCH);
         let mut send_batch = SendPacketBatch::new();
+        // One shard reads the shared TUN device and hands each packet to the
+        // connection that owns its address. Shard 0 is an arbitrary but stable
+        // choice; nothing here depends on which listener that shard serves.
         let tun_device = if self.index == 0 {
             self.shared.tun.as_ref().map(TunManager::device)
         } else {
@@ -2899,7 +3049,7 @@ impl Shard {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{AuthMode, ClientEntry, ServerConfig};
+    use crate::config::{AuthMode, AuthSection, ClientEntry, ListenerSection, ServerConfig};
 
     fn invalid_roster_entry() -> ClientEntry {
         ClientEntry {
@@ -2910,26 +3060,77 @@ mod tests {
         }
     }
 
+    /// A default configuration that listens on the given listeners.
+    fn config_with(listeners: Vec<ListenerSection>) -> ServerConfig {
+        ServerConfig {
+            listeners,
+            ..Default::default()
+        }
+    }
+
+    /// A listener with the given address and authentication mode.
+    fn listener(addr: &str, mode: AuthMode) -> ListenerSection {
+        ListenerSection {
+            listen_addr: addr.parse().unwrap(),
+            shards: 1,
+            auth: Some(AuthSection {
+                enabled: true,
+                mode,
+                // Enough to satisfy `BasicAuthenticator`; the hash is only
+                // parsed when a request actually arrives.
+                username: "alice".into(),
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            }),
+        }
+    }
+
     #[test]
     fn roster_is_not_parsed_outside_client_certificate_mode() {
         let mut config = ServerConfig::default();
         config.auth.mode = AuthMode::Basic;
         config.clients.push(invalid_roster_entry());
-        assert!(super::active_client_registry(&config).unwrap().is_empty());
+        assert!(
+            super::active_client_registry(&config, false)
+                .unwrap()
+                .is_empty()
+        );
 
         config.auth.enabled = false;
         config.auth.mode = AuthMode::ClientCert;
-        assert!(super::active_client_registry(&config).unwrap().is_empty());
+        assert!(!super::any_client_cert_listener(&config));
+        assert!(
+            super::active_client_registry(&config, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn active_client_certificate_roster_is_fail_closed() {
         let mut config = ServerConfig::default();
         config.auth.mode = AuthMode::ClientCert;
-        assert!(super::active_client_registry(&config).is_err());
+        assert!(super::active_client_registry(&config, true).is_err());
 
         config.clients.push(invalid_roster_entry());
-        assert!(super::active_client_registry(&config).is_err());
+        assert!(super::active_client_registry(&config, true).is_err());
+    }
+
+    /// The roster belongs to the server, so one certificate listener among
+    /// several is enough to make it load — and to keep reload available.
+    #[test]
+    fn one_certificate_listener_is_enough_to_activate_the_roster() {
+        let mut config = config_with(vec![
+            listener("0.0.0.0:443", AuthMode::Basic),
+            listener("0.0.0.0:4443", AuthMode::ClientCert),
+        ]);
+        assert!(super::any_client_cert_listener(&config));
+
+        // Fail closed for the whole server: the certificate listener has no
+        // roster to admit anyone from.
+        assert!(super::active_client_registry(&config, true).is_err());
+
+        config.listeners = vec![listener("0.0.0.0:443", AuthMode::Basic)];
+        assert!(!super::any_client_cert_listener(&config));
     }
 
     #[test]
@@ -2950,8 +3151,98 @@ mod tests {
         assert!(reload.client_cert_enabled);
         assert!(!reload.ip_proxy_enabled);
 
+        // A certificate listener reached only through [[listeners]] must enable
+        // reload too, or revoking a client would cost a restart.
+        let config = config_with(vec![
+            listener("0.0.0.0:443", AuthMode::Basic),
+            listener("0.0.0.0:4443", AuthMode::ClientCert),
+        ]);
+        let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
+        assert!(reload.client_cert_enabled);
+
         // Programmatic servers have no source file to re-read.
         assert!(super::roster_reload_settings(&config, None).is_none());
+    }
+
+    // ── Listener planning ────────────────────────────────────────────
+
+    #[test]
+    fn a_configuration_without_listeners_plans_exactly_one() {
+        let mut config = ServerConfig::default();
+        config.server.listen_addr = "127.0.0.1:8443".parse().unwrap();
+        config.server.shards = 1;
+
+        let plans = super::plan_listeners(&config).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].shards, 1);
+        assert_eq!(
+            plans[0].config.server.listen_addr,
+            "127.0.0.1:8443".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    /// Each shard reads one listener's configuration, so the substitution has
+    /// to be complete: a shard that could still see the list might act on it.
+    #[test]
+    fn a_plan_describes_only_its_own_listener() {
+        let config = config_with(vec![
+            listener("127.0.0.1:8443", AuthMode::Basic),
+            listener("127.0.0.1:8444", AuthMode::ClientCert),
+        ]);
+
+        let plans = super::plan_listeners(&config).unwrap();
+        assert_eq!(plans.len(), 2);
+        for plan in &plans {
+            assert!(plan.config.listeners.is_empty());
+            assert_eq!(plan.config.server.shards, plan.shards);
+        }
+        assert!(plans[0].config.auth.basic_enabled());
+        assert!(plans[1].config.auth.client_cert_enabled());
+        assert_eq!(
+            plans[1].config.server.listen_addr,
+            "127.0.0.1:8444".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    /// Not just a bind failure: a multi-shard listener uses SO_REUSEPORT, so a
+    /// second listener on its address would join that load-balancing group and
+    /// be handed connections meant for a different authentication mode.
+    #[test]
+    fn two_listeners_cannot_share_an_address() {
+        let config = config_with(vec![
+            listener("0.0.0.0:443", AuthMode::Basic),
+            listener("0.0.0.0:443", AuthMode::ClientCert),
+        ]);
+        assert!(super::plan_listeners(&config).is_err());
+    }
+
+    #[test]
+    fn automatic_sharding_is_rejected_for_multiple_listeners() {
+        let mut config = ServerConfig::default();
+        let mut listeners = vec![
+            listener("0.0.0.0:443", AuthMode::Basic),
+            listener("0.0.0.0:4443", AuthMode::ClientCert),
+        ];
+        listeners[0].shards = 0;
+        config.listeners = listeners;
+        assert!(super::plan_listeners(&config).is_err());
+
+        // A lone listener still gets to ask for one per core.
+        config.listeners.truncate(1);
+        assert!(super::plan_listeners(&config).is_ok());
+    }
+
+    #[test]
+    fn the_shard_cap_applies_to_the_server_total() {
+        let mut config = ServerConfig::default();
+        let mut first = listener("0.0.0.0:443", AuthMode::Basic);
+        let mut second = listener("0.0.0.0:4443", AuthMode::Basic);
+        first.shards = super::MAX_SHARDS;
+        second.shards = 1;
+        config.listeners = vec![first, second];
+
+        // Each listener is under the cap on its own; together they are not.
+        assert!(super::plan_listeners(&config).is_err());
     }
 
     /// The default algorithm name is only validated when a server starts, and

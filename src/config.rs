@@ -20,6 +20,18 @@ pub struct ServerConfig {
     /// Only consulted when `auth.mode = "client_cert"`. Written as repeated
     /// `[[clients]]` tables.
     pub clients: Vec<ClientEntry>,
+    /// Every socket this server listens on, written as repeated `[[listeners]]`
+    /// tables.
+    ///
+    /// This is the whole list, not an addition to `[server].listen_addr`: a
+    /// configuration that names any listener here stops deriving one from
+    /// `[server]`. Leaving it empty keeps the single-listener form, which is
+    /// what every configuration written before this existed uses.
+    ///
+    /// Separate listeners are what allow one process to serve two
+    /// authentication modes at once — `auth.mode` fixes the TLS context, so a
+    /// Basic listener and a client-certificate listener cannot share a socket.
+    pub listeners: Vec<ListenerSection>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -97,6 +109,68 @@ impl AuthSection {
     /// Whether a client certificate is required to complete the handshake.
     pub fn client_cert_enabled(&self) -> bool {
         self.enabled && self.mode == AuthMode::ClientCert
+    }
+}
+
+/// One listening socket.
+///
+/// `listen_addr` has no default on purpose: an omitted address would otherwise
+/// silently become `0.0.0.0:443` and collide with whichever listener meant to
+/// take that port.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ListenerSection {
+    pub listen_addr: SocketAddr,
+    /// Independent event loops for this listener. See [`ServerSection::shards`].
+    #[serde(default = "default_listener_shards")]
+    pub shards: usize,
+    /// Authentication for this listener. Omitted means the top-level `[auth]`.
+    ///
+    /// An override replaces `[auth]` outright rather than merging field by
+    /// field: half-inherited credentials would be an authentication decision
+    /// assembled from two places, which is not something to leave implicit.
+    #[serde(default)]
+    pub auth: Option<AuthSection>,
+}
+
+fn default_listener_shards() -> usize {
+    1
+}
+
+/// A listener whose authentication has been resolved against the top-level
+/// `[auth]` default.
+///
+/// Distinct from [`ListenerSection`] so the inheritance happens exactly once,
+/// where it can be tested, rather than at each place that reads a listener.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedListener {
+    pub listen_addr: SocketAddr,
+    pub shards: usize,
+    pub auth: AuthSection,
+}
+
+impl ServerConfig {
+    /// Every listener this configuration asks for, in the order it named them.
+    ///
+    /// An empty `[[listeners]]` desugars to the single listener described by
+    /// `[server]` and `[auth]`, so the two configuration forms produce the same
+    /// shape and the rest of the server only ever handles a list.
+    pub fn resolved_listeners(&self) -> Vec<ResolvedListener> {
+        if self.listeners.is_empty() {
+            return vec![ResolvedListener {
+                listen_addr: self.server.listen_addr,
+                shards: self.server.shards,
+                auth: self.auth.clone(),
+            }];
+        }
+
+        self.listeners
+            .iter()
+            .map(|listener| ResolvedListener {
+                listen_addr: listener.listen_addr,
+                shards: listener.shards,
+                auth: listener.auth.clone().unwrap_or_else(|| self.auth.clone()),
+            })
+            .collect()
     }
 }
 
@@ -352,6 +426,7 @@ mod tests {
         assert!(cfg.auth.username.is_empty());
         assert!(cfg.auth.password_hash.is_empty());
         assert!(cfg.clients.is_empty());
+        assert!(cfg.listeners.is_empty());
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
@@ -467,6 +542,137 @@ public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb3RoZXI="
         // A typo here would otherwise silently fall back to Basic and lock out
         // every client certificate.
         assert!(parse_toml("[auth]\nmode = \"mtls\"\n").is_err());
+    }
+
+    #[test]
+    fn a_configuration_without_listeners_desugars_to_one() {
+        let cfg = parse_toml(
+            r#"
+[server]
+listen_addr = "127.0.0.1:8443"
+shards = 3
+
+[auth]
+mode = "client_cert"
+"#,
+        )
+        .unwrap();
+
+        let listeners = cfg.resolved_listeners();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].listen_addr, "127.0.0.1:8443".parse().unwrap());
+        assert_eq!(listeners[0].shards, 3);
+        assert_eq!(listeners[0].auth, cfg.auth);
+    }
+
+    #[test]
+    fn listeners_replace_the_single_listener_form() {
+        let cfg = parse_toml(
+            r#"
+[server]
+listen_addr = "0.0.0.0:443"
+
+[auth]
+enabled = true
+mode = "basic"
+username = "alice"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+
+[[listeners]]
+listen_addr = "0.0.0.0:8443"
+
+[[listeners]]
+listen_addr = "0.0.0.0:4443"
+shards = 2
+
+[listeners.auth]
+mode = "client_cert"
+"#,
+        )
+        .unwrap();
+
+        let listeners = cfg.resolved_listeners();
+        assert_eq!(listeners.len(), 2, "[server].listen_addr must not add one");
+
+        // No override: the top-level [auth] is inherited whole.
+        assert_eq!(listeners[0].listen_addr, "0.0.0.0:8443".parse().unwrap());
+        assert_eq!(listeners[0].shards, 1, "shards default to one per listener");
+        assert!(listeners[0].auth.basic_enabled());
+        assert_eq!(listeners[0].auth.username, "alice");
+
+        // An override replaces [auth] rather than merging into it, so the
+        // inherited username does not follow the mode across.
+        assert_eq!(listeners[1].listen_addr, "0.0.0.0:4443".parse().unwrap());
+        assert_eq!(listeners[1].shards, 2);
+        assert!(listeners[1].auth.client_cert_enabled());
+        assert!(listeners[1].auth.username.is_empty());
+    }
+
+    /// The whole point of the list: one process, two authentication modes.
+    #[test]
+    fn listeners_can_disagree_about_the_authentication_mode() {
+        let cfg = parse_toml(
+            r#"
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+
+[listeners.auth]
+mode = "basic"
+username = "alice"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+
+[[listeners]]
+listen_addr = "0.0.0.0:4443"
+
+[listeners.auth]
+mode = "client_cert"
+"#,
+        )
+        .unwrap();
+
+        let listeners = cfg.resolved_listeners();
+        assert!(listeners[0].auth.basic_enabled());
+        assert!(!listeners[0].auth.client_cert_enabled());
+        assert!(listeners[1].auth.client_cert_enabled());
+        assert!(!listeners[1].auth.basic_enabled());
+    }
+
+    #[test]
+    fn a_listener_without_an_address_is_rejected() {
+        // Defaulting this would silently put the listener on 0.0.0.0:443,
+        // where it would fight whichever listener meant to take that port.
+        assert!(parse_toml("[[listeners]]\nshards = 2\n").is_err());
+    }
+
+    #[test]
+    fn parse_unknown_listener_auth_mode_is_rejected() {
+        let toml = r#"
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+
+[listeners.auth]
+mode = "mtls"
+"#;
+        assert!(parse_toml(toml).is_err());
+    }
+
+    #[test]
+    fn listener_password_hashes_are_redacted_in_debug_output() {
+        let cfg = parse_toml(
+            r#"
+[[listeners]]
+listen_addr = "0.0.0.0:443"
+
+[listeners.auth]
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+"#,
+        )
+        .unwrap();
+
+        // `info!(?cfg, ...)` logs the whole configuration at startup.
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("$argon2id$"));
     }
 
     #[test]

@@ -28,7 +28,7 @@ use quiche::h3::NameValue as _;
 
 use masque::capsule::decoder::{CapsuleDecoder, DecodeError};
 use masque::capsule::{CapsuleFrame, IpAddress};
-use masque::config::{AuthMode, ClientEntry, ServerConfig};
+use masque::config::{AuthMode, AuthSection, ClientEntry, ListenerSection, ServerConfig};
 use masque::datagram::DatagramHeader;
 use masque::server::Server;
 
@@ -198,6 +198,16 @@ impl Client {
     /// the endpoint, so they skip chain validation and pin the server's public
     /// key instead.
     fn connect(peer: SocketAddr, cert: &Path, key: &Path) -> anyhow::Result<Self> {
+        Self::connect_with(peer, Some((cert, key)))
+    }
+
+    /// Connect without a client certificate, the way a standards-compliant
+    /// MASQUE client that authenticates with `Proxy-Authorization` does.
+    fn connect_anonymous(peer: SocketAddr) -> anyhow::Result<Self> {
+        Self::connect_with(peer, None)
+    }
+
+    fn connect_with(peer: SocketAddr, identity: Option<(&Path, &Path)>) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -205,8 +215,10 @@ impl Client {
 
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.verify_peer(false);
-        config.load_cert_chain_from_pem_file(cert.to_str().unwrap())?;
-        config.load_priv_key_from_pem_file(key.to_str().unwrap())?;
+        if let Some((cert, key)) = identity {
+            config.load_cert_chain_from_pem_file(cert.to_str().unwrap())?;
+            config.load_priv_key_from_pem_file(key.to_str().unwrap())?;
+        }
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
         config.set_max_idle_timeout(10_000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -329,7 +341,16 @@ impl Client {
 
     /// Send the CONNECT-IP request exactly as Cloudflare's clients send it.
     fn send_connect_ip(&mut self, protocol: &str) -> anyhow::Result<u64> {
-        let headers = [
+        self.send_connect_ip_with_credentials(protocol, None)
+    }
+
+    /// The same request, optionally carrying `Proxy-Authorization`.
+    fn send_connect_ip_with_credentials(
+        &mut self,
+        protocol: &str,
+        credentials: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        let mut headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", protocol.as_bytes()),
             quiche::h3::Header::new(b":scheme", b"https"),
@@ -340,6 +361,12 @@ impl Client {
             // QPACK and the server's header scan.
             quiche::h3::Header::new(b"user-agent", b""),
         ];
+        if let Some(credentials) = credentials {
+            headers.push(quiche::h3::Header::new(
+                b"proxy-authorization",
+                credentials.as_bytes(),
+            ));
+        }
 
         let h3 = self.h3.as_mut().unwrap();
         let stream_id = h3.send_request(&mut self.quic, &headers, false)?;
@@ -472,6 +499,101 @@ fn fixture(tag: &str) -> Fixture {
         client_key: client_key_path,
         stranger_cert,
         stranger_key: stranger_key_path,
+    }
+}
+
+// ── Multi-listener fixture ───────────────────────────────────────────
+
+const BASIC_USERNAME: &str = "alice";
+const BASIC_PASSWORD: &str = "correct horse battery staple";
+
+/// A server running both authentication modes at once, on two ports.
+struct DualFixture {
+    _dir: TempDir,
+    basic_peer: SocketAddr,
+    cert_peer: SocketAddr,
+    client_cert: PathBuf,
+    client_key: PathBuf,
+    /// A ready-made `Proxy-Authorization` value for the Basic listener.
+    credentials: String,
+}
+
+/// Start one process listening on two ports: Basic on the first,
+/// client-certificate on the second.
+///
+/// `auth.mode` fixes the TLS context when a socket is bound, so this is the
+/// only shape in which one process can serve both.
+fn dual_fixture(tag: &str) -> DualFixture {
+    let dir = TempDir::new(tag);
+
+    let server_key = p256_key();
+    let (cert_path, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+
+    let basic_port = free_port();
+    let cert_port = free_port();
+
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert_path;
+    config.tls.key_path = key_path;
+    // Only CONNECT-IP is under test here; the other forms would dial real
+    // targets.
+    config.tcp_proxy.enabled = false;
+    config.udp_proxy.enabled = false;
+    config.listeners = vec![
+        ListenerSection {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], basic_port)),
+            shards: 1,
+            auth: Some(AuthSection {
+                enabled: true,
+                mode: AuthMode::Basic,
+                username: BASIC_USERNAME.into(),
+                password_hash: masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap(),
+            }),
+        },
+        ListenerSection {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], cert_port)),
+            shards: 1,
+            auth: Some(AuthSection {
+                enabled: true,
+                mode: AuthMode::ClientCert,
+                username: String::new(),
+                password_hash: String::new(),
+            }),
+        },
+    ];
+    config.clients = vec![ClientEntry {
+        name: "laptop".into(),
+        public_key: public_key_b64(&client_key),
+        ipv4: Some(CLIENT_IPV4.into()),
+        ipv6: Some(CLIENT_IPV6.into()),
+    }];
+
+    spawn_server(config);
+    std::thread::sleep(Duration::from_millis(300));
+
+    DualFixture {
+        _dir: dir,
+        basic_peer: SocketAddr::from(([127, 0, 0, 1], basic_port)),
+        cert_peer: SocketAddr::from(([127, 0, 0, 1], cert_port)),
+        client_cert,
+        client_key: client_key_path,
+        credentials: format!(
+            "Basic {}",
+            STANDARD.encode(format!("{BASIC_USERNAME}:{BASIC_PASSWORD}"))
+        ),
     }
 }
 
@@ -756,6 +878,123 @@ fn registered_client_gets_its_pinned_addresses_over_cf_connect_ip() {
             .any(|frame| matches!(frame, CapsuleFrame::RouteAdvertisement(_))),
         "expected ROUTE_ADVERTISEMENT, got {capsules:?}"
     );
+}
+
+/// One process, two listeners, two authentication modes.
+///
+/// `auth.mode` decides which TLS context a shard builds, and that is settled
+/// when its socket is bound — so a Cloudflare-style client and a
+/// standards-compliant one cannot share a listener. They can share a process,
+/// and this is the test that says so.
+///
+/// It also pins the reason for sharing one: the address pool is per server, not
+/// per listener, so the two clients cannot be handed the same tunnel address.
+#[test]
+fn two_listeners_serve_both_authentication_modes_from_one_process() {
+    let fixture = dual_fixture("dual");
+
+    // The certificate listener: authenticated during the handshake, pinned
+    // addresses from the roster.
+    let mut cert_client =
+        Client::connect(fixture.cert_peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    cert_client.handshake(Duration::from_secs(5)).unwrap();
+    cert_client.init_h3().unwrap();
+
+    let stream_id = cert_client.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        cert_client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200,
+        "the certificate listener must accept the enrolled client"
+    );
+    let cert_addresses = assigned_addresses(&mut cert_client, stream_id);
+    assert!(
+        cert_addresses.contains(&IpAddress::V4(CLIENT_IPV4.parse::<Ipv4Addr>().unwrap())),
+        "expected the pinned IPv4, got {cert_addresses:?}"
+    );
+
+    // The Basic listener, at the same time, in the same process: no client
+    // certificate at all, credentials on the request instead.
+    let mut basic_client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    basic_client.handshake(Duration::from_secs(5)).unwrap();
+    basic_client.init_h3().unwrap();
+
+    let stream_id = basic_client
+        .send_connect_ip_with_credentials("connect-ip", Some(&fixture.credentials))
+        .unwrap();
+    assert_eq!(
+        basic_client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200,
+        "the Basic listener must accept correct credentials"
+    );
+    let basic_addresses = assigned_addresses(&mut basic_client, stream_id);
+    assert!(
+        !basic_addresses.is_empty(),
+        "the Basic listener must assign an address from the pool"
+    );
+
+    // One pool behind both listeners. Two processes could not do this: each
+    // would allocate from its own copy and hand out the same addresses.
+    for address in &basic_addresses {
+        assert!(
+            !cert_addresses.contains(address),
+            "listeners handed out the same address {address:?}; the pool is not shared"
+        );
+    }
+}
+
+/// Each listener enforces its own mode and only its own.
+#[test]
+fn a_listener_enforces_only_its_own_authentication_mode() {
+    let fixture = dual_fixture("dual-refuse");
+
+    // Basic listener, no credentials: refused at the request, not the
+    // handshake, because this listener never asks for a certificate.
+    let mut client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let stream_id = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        407,
+        "the Basic listener must still demand credentials"
+    );
+
+    // Certificate listener, same anonymous client: refused during the
+    // handshake, before it can open a stream.
+    let mut client = Client::connect_anonymous(fixture.cert_peer).unwrap();
+    let _ = client.handshake(Duration::from_secs(5));
+    assert!(
+        client.wait_for_close(Duration::from_secs(5)),
+        "the certificate listener must not serve a client without a certificate"
+    );
+
+    // And credentials are no substitute for a certificate on that listener.
+    let mut client = Client::connect_anonymous(fixture.cert_peer).unwrap();
+    let _ = client.handshake(Duration::from_secs(5));
+    assert!(
+        client.wait_for_close(Duration::from_secs(5)),
+        "Basic credentials must not open the certificate listener"
+    );
+}
+
+/// Collect the addresses the server assigned on `stream_id`.
+fn assigned_addresses(client: &mut Client, stream_id: u64) -> Vec<IpAddress> {
+    client
+        .capsules(stream_id, 2, Duration::from_secs(5))
+        .iter()
+        .find_map(|frame| match frame {
+            CapsuleFrame::AddressAssign(addrs) => {
+                Some(addrs.iter().map(|a| a.ip.clone()).collect())
+            }
+            _ => None,
+        })
+        .expect("server must send ADDRESS_ASSIGN")
 }
 
 /// The registered `connect-ip` spelling has to keep working: accepting

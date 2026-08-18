@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use boring::asn1::Asn1Time;
 use boring::bn::BigNum;
 use boring::ec::{EcGroup, EcKey};
@@ -135,6 +137,113 @@ fn check_config_validates_without_binding_the_listen_port() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("configuration is compatible"));
+}
+
+/// A roster-ready public key, in the base64 SubjectPublicKeyInfo DER form
+/// `enroll-client` prints.
+fn public_key_b64(key: &PKey<Private>) -> String {
+    STANDARD.encode(key.public_key_to_der().unwrap())
+}
+
+/// A two-listener file, with the credentials each mode needs.
+fn dual_listener_config_text(
+    basic_addr: &str,
+    cert_addr: &str,
+    cert_path: &Path,
+    key_path: &Path,
+) -> String {
+    let client_public_key = public_key_b64(&p256_key());
+    // `check-config` parses the PHC string, so a placeholder will not do.
+    let password_hash = masque::auth::hash_password(b"correct horse battery staple").unwrap();
+    format!(
+        r#"[tls]
+cert_path = "{}"
+key_path = "{}"
+
+[ip_proxy]
+enabled = false
+
+[[listeners]]
+listen_addr = "{basic_addr}"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "basic"
+username = "alice"
+password_hash = "{password_hash}"
+
+[[listeners]]
+listen_addr = "{cert_addr}"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "client_cert"
+
+[[clients]]
+name = "laptop"
+public_key = "{client_public_key}"
+"#,
+        cert_path.display(),
+        key_path.display()
+    )
+}
+
+/// The installer's preflight has to understand the multi-listener form, or an
+/// operator who splits their authentication modes cannot qualify an upgrade.
+#[test]
+fn check_config_accepts_two_listeners_with_different_authentication_modes() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        dual_listener_config_text("127.0.0.1:8449", "127.0.0.1:8450", &cert_path, &key_path),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "check-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Two listeners on one address is not a bind failure to discover at startup:
+/// a multi-shard listener uses SO_REUSEPORT, so the kernel would hand the
+/// second one connections meant for a different authentication mode.
+#[test]
+fn check_config_rejects_two_listeners_on_the_same_address() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        dual_listener_config_text("127.0.0.1:8449", "127.0.0.1:8449", &cert_path, &key_path),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("two listeners are configured for"),
+        "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

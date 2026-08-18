@@ -12,7 +12,8 @@
 | Microbenchmark | `cargo bench --bench core` | Codec, routing, and allocation regressions |
 | Network benchmark | `scripts/network-bench.sh` | Local direct-vs-MASQUE throughput and RTT |
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
-| Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth and CONNECT-IP setup |
+| Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, and both authentication modes served from one process |
+| Config preflight | `cargo test --test check_config` | `check-config` accepts what a server accepts, including multi-listener files |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 
 ## Local tests

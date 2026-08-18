@@ -7,6 +7,34 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-18
+
+### Added
+
+- `[[listeners]]` runs several listening sockets from one process, each with
+  its own `listen_addr`, `shards`, and authentication mode. This is what allows
+  one server to accept both standards-compliant MASQUE clients, which send
+  `Proxy-Authorization`, and Cloudflare-style clients, which authenticate with
+  a TLS client certificate: `auth.mode` decides which TLS context a socket is
+  bound with, so the two modes cannot share a socket. They do share everything
+  behind them — one `[[clients]]` roster, one TUN device, one CONNECT-IP
+  address pool, one routing table — which two processes could not.
+- Startup and `check-config` reject two listeners on one address. A listener
+  with more than one shard binds with `SO_REUSEPORT`, so a second listener on
+  that address would join the load-balancing group and be handed connections
+  meant for the other authentication mode.
+
+### Changed
+
+- Shards are numbered across the whole server rather than within a listener,
+  and the 32-shard cap now applies to that total. `shards = 0` (one per core)
+  is rejected when more than one listener is configured.
+- The `[[clients]]` roster and its `SIGHUP` reload follow "any listener uses
+  `client_cert`" rather than the single `auth.mode`.
+- Configurations without `[[listeners]]` are unchanged: `[server]` and `[auth]`
+  still describe one listener, and `[server].listen_addr` and `[server].shards`
+  are ignored only when `[[listeners]]` names sockets itself.
+
 ## 0.2.0 - 2026-08-18
 
 ### Added
