@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -38,6 +41,19 @@ jobs:
           python3 -m pip install --user cargo-zigbuild==0.23.0
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/cargo-zigbuild" --version
+
+      # Tag builds can restore the trusted cache populated by main's packaging
+      # job, but the release archive is always rebuilt from the tagged source.
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.97.1-musl-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.97.1-musl-
 
       - name: Test
         run: cargo test --workspace --release --locked

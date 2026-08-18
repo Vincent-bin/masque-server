@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -17,6 +20,10 @@ concurrency:
 jobs:
   quality:
     name: Format, Clippy, and scripts
+    # Pull requests get the complete source-level validation. A protected main
+    # branch has already passed these checks on its tested merge commit, so its
+    # push run only needs to exercise the release packaging path below.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -33,6 +40,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes clang cmake shellcheck
 
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.97.1-native-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.97.1-native-
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -47,6 +65,7 @@ jobs:
 
   msrv:
     name: Check MSRV (1.88.0)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -60,11 +79,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes clang cmake
 
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.88.0-native-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.88.0-native-
+
       - name: Check workspace
         run: cargo +1.88.0 check --workspace --locked
 
   test:
     name: Test (${{ matrix.os }})
+    if: github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -87,6 +118,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes clang cmake openssl
 
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.97.1-native-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.97.1-native-
+
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
@@ -101,6 +143,10 @@ jobs:
 
   release-build:
     name: Linux musl release build
+    # Packaging is deliberately omitted from ordinary PR commits. It runs once
+    # after merge and can still be exercised together with every other job via
+    # workflow_dispatch.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     steps:
       - name: Check out source
@@ -121,6 +167,17 @@ jobs:
         run: |
           python3 -m pip install --user cargo-zigbuild==0.23.0
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.97.1-musl-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.97.1-musl-
 
       - name: Build archive
         env:
