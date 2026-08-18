@@ -130,7 +130,11 @@ parse_start_requested() {
 }
 
 can_prompt() {
-    [ -r /dev/tty ] && [ -w /dev/tty ]
+    # Device-node permissions alone are not enough: CI containers often expose
+    # /dev/tty without giving the process a controlling terminal. Actually open
+    # it so a non-interactive install falls back to defaults instead of failing
+    # on the first prompt.
+    (: </dev/tty >/dev/tty) 2>/dev/null
 }
 
 prompt_value() {
