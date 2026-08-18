@@ -660,3 +660,11 @@ elif [ "$START_REQUESTED" -eq 0 ]; then
     echo "Start the service with: systemctl start masque"
 fi
 echo "Review $CONFIG_PATH, especially the proxy allow/deny policy."
+
+# Listeners are written only for a fresh installation; an upgrade keeps the
+# existing file. Adding one later is a separate, deliberate command, so name it
+# here rather than leaving hand-edited TOML as the discoverable option.
+echo
+echo "To serve another authentication mode, or another port, add a listener:"
+echo "  masque-server --config $CONFIG_PATH add-listener"
+echo "Then open its UDP port in the firewall and run: systemctl restart masque"

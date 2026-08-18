@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 use masque::auth;
 use masque::config::{self, ServerConfig};
+use masque::config_edit;
 use masque::enroll;
 use masque::server::{Server, validate_config};
 
@@ -72,6 +73,98 @@ enum Command {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// Append a `[[listeners]]` block to the configuration file.
+    ///
+    /// Anything not given as a flag is prompted for when standard input is a
+    /// terminal, and required otherwise, so the same command serves an operator
+    /// and a provisioning script.
+    ///
+    /// Before writing, the merged file is validated the way `check-config`
+    /// validates one, and the new address is bound once to see that it is free.
+    /// Whatever fails, the file is left exactly as it was. The bind test
+    /// describes the moment it ran, so it narrows the risk of the restart
+    /// rather than removing it: check that the server came up afterwards.
+    ///
+    /// A new socket is bound at startup, so a restart is required — SIGHUP
+    /// reloads only the `[[clients]]` roster.
+    AddListener {
+        /// Address and port for the new socket, for example `0.0.0.0:4443`.
+        #[arg(long)]
+        listen_addr: Option<SocketAddr>,
+
+        /// Authentication this socket demands. One mode per listener: the mode
+        /// decides which TLS context is built before clients connect.
+        #[arg(long, value_enum)]
+        mode: Option<AuthModeArg>,
+
+        /// Event loops for this listener. Defaults to 1.
+        #[arg(long)]
+        shards: Option<usize>,
+
+        /// Basic username.
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Argon2id PHC hash, as printed by `hash-password`.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password_hash: Option<String>,
+
+        /// Read the password from standard input and hash it here.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Write `enabled = false`. Anyone who reaches the socket may use the
+        /// proxy, so this is for a listener on a trusted network only.
+        ///
+        /// Conflicts with `--mode`: a listener that demands nothing has no
+        /// authentication mode to pick, and writing one down would describe a
+        /// requirement that is not enforced.
+        #[arg(long, conflicts_with_all = ["mode", "username", "password_hash", "password_stdin"])]
+        disable_auth: bool,
+
+        /// Do not try to bind the new address before writing it.
+        ///
+        /// The bind test is what catches an address something else already
+        /// holds. Skip it when the address only becomes available later, for
+        /// example a floating address, or when the service runs in another
+        /// network namespace.
+        #[arg(long)]
+        no_bind_check: bool,
+
+        /// Print the block that would be appended and leave the file alone.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// `--mode` on the command line.
+///
+/// Separate from [`config::AuthMode`] so the configuration model stays free of
+/// command-line parsing; the two are mapped in one place below.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AuthModeArg {
+    /// RFC 7617 `Proxy-Authorization`, checked per request.
+    Basic,
+    /// A TLS client certificate, matched against the `[[clients]]` roster.
+    ///
+    /// Accepts the configuration file's own spelling as well: an operator who
+    /// has read `mode = "client_cert"` should not have to discover that the
+    /// flag wants a hyphen.
+    #[value(alias = "client_cert")]
+    ClientCert,
+}
+
+impl From<AuthModeArg> for config::AuthMode {
+    fn from(mode: AuthModeArg) -> Self {
+        match mode {
+            AuthModeArg::Basic => config::AuthMode::Basic,
+            AuthModeArg::ClientCert => config::AuthMode::ClientCert,
+        }
+    }
 }
 
 /// How a listener's authentication reads in `check-config` output.
@@ -205,8 +298,45 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config.
     let config_exists = cli.config.exists();
-    if matches!(cli.command, Some(Command::CheckConfig)) && !config_exists {
+    if matches!(
+        cli.command,
+        Some(Command::CheckConfig | Command::AddListener { .. })
+    ) && !config_exists
+    {
         anyhow::bail!("configuration file not found: {}", cli.config.display());
+    }
+
+    // Editing runs before the load below on purpose: it re-reads the file
+    // itself, and validates it exactly as the service will read it rather than
+    // with this invocation's --cert/--key overrides applied.
+    if let Some(Command::AddListener {
+        listen_addr,
+        mode,
+        shards,
+        username,
+        password_hash,
+        password_stdin,
+        disable_auth,
+        no_bind_check,
+        dry_run,
+        yes,
+    }) = cli.command
+    {
+        return config_edit::add_listener(
+            &cli.config,
+            config_edit::AddListener {
+                listen_addr,
+                mode: mode.map(Into::into),
+                shards,
+                username,
+                password_hash,
+                password_stdin,
+                disable_auth,
+                no_bind_check,
+                dry_run,
+                assume_yes: yes,
+            },
+        );
     }
     let mut cfg = if config_exists {
         let toml_str = std::fs::read_to_string(&cli.config)?;

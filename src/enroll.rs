@@ -232,7 +232,7 @@ pub fn client_config_json(
 }
 
 /// Quote a value as a TOML basic string.
-fn toml_string(value: &str) -> String {
+pub(crate) fn toml_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for c in value.chars() {

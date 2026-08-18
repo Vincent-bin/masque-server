@@ -3,6 +3,7 @@ pub mod auth;
 pub mod capsule;
 pub mod client_identity;
 pub mod config;
+pub mod config_edit;
 pub mod connection;
 pub mod datagram;
 pub mod enroll;
