@@ -12,7 +12,8 @@ a staging environment.
 - Standard CONNECT for TCP streams
 - CONNECT-UDP ([RFC 9298]) using HTTP Datagrams
 - CONNECT-IP ([RFC 9484]) with Linux TUN integration
-- HTTP Basic proxy authentication with Argon2id password verification
+- HTTP Basic authentication with Argon2id password verification, or TLS client
+  certificate authentication against a public-key roster
 - CIDR allow and deny policies for TCP and UDP targets
 - Bounded queues and backpressure across authentication and tunnel I/O
 - Linux `recvmmsg`/`sendmmsg`, UDP GRO, optional UDP GSO, and TUN offload
@@ -27,22 +28,38 @@ Build the server:
 cargo build --release --bin masque-server
 ```
 
-Generate an Argon2id password hash:
+Authentication is enabled by default. For the default `basic` mode, generate an
+Argon2id password hash:
 
 ```sh
 printf '%s' 'replace-this-password' | \
   target/release/masque-server hash-password
 ```
 
-Copy [`deploy/config/masque.toml`](deploy/config/masque.toml), set the TLS
+Copy [`deploy/config/masque.toml`](deploy/config/masque.toml), set the server TLS
 certificate, private key, username, and password hash, then start the server:
 
 ```sh
 target/release/masque-server --config ./masque.toml
 ```
 
-Authentication is fail-closed. The server refuses to start with authentication
-enabled until a valid username and Argon2id hash are configured.
+Authentication is fail-closed. In `basic` mode the server refuses to start until
+a valid username and Argon2id hash are configured.
+
+Alternatively, set `auth.mode = "client_cert"` to authenticate clients during
+the TLS handshake. Generate each client's P-256 key and configuration with:
+
+```sh
+target/release/masque-server --config ./masque.toml enroll-client \
+  --name laptop --endpoint 203.0.113.9:443 \
+  --ipv4 10.89.0.2 --ipv6 fd00:abcd::2 --out laptop.json
+```
+
+Append the generated `[[clients]]` block to the server configuration, then
+reload or restart the service. The generated client configuration contains a
+private key and must be handled as a secret. Basic and client-certificate
+authentication are mutually exclusive within one server instance; see
+[Authentication](docs/configuration.md#authentication) for the complete setup.
 
 ## Install a release on Linux
 
@@ -59,6 +76,10 @@ The installer creates an unprivileged `masque` system user and enables the
 service. It preserves an existing `/etc/masque/masque.toml`. New installations
 receive a randomly generated proxy password unless `MASQUE_AUTH_USERNAME` and
 `MASQUE_AUTH_PASSWORD` are supplied to the installer.
+
+The installer initially configures Basic authentication. To use TLS client
+certificates instead, change `auth.mode` to `client_cert`, remove the Basic
+credentials, and enroll the allowed clients as described above.
 
 See [Deployment](docs/deployment.md) for certificates, systemd hardening,
 upgrades, and diagnostics.
