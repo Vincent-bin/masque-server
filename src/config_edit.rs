@@ -23,9 +23,10 @@
 //!
 //! Concurrency is handled twice over, because losing another operator's edit is
 //! silent and unrecoverable: an advisory lock keeps two of these commands off
-//! one file, and the file is compared against what was read before it is
-//! replaced, so an edit made by anything else — an editor, a script appending
-//! `[[clients]]` — is detected rather than overwritten.
+//! one file, and the file is compared against what was read immediately before
+//! it is replaced. The comparison catches ordinary editors and scripts that do
+//! not honour the lock; like every portable compare-then-rename sequence, it
+//! cannot control an uncooperative writer racing the final system call.
 
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write as _};
@@ -223,6 +224,13 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         }
     }
 
+    // Deliver the only copy before committing the hash. In particular, a
+    // broken pipe or full redirected output must leave the configuration
+    // untouched instead of installing a credential the operator never saw.
+    if let Some(password) = generated_password.as_ref() {
+        print_generated_password(&listener.auth.username, password)?;
+    }
+
     write_in_place(config_path, &text, &merged)?;
 
     println!(
@@ -230,14 +238,6 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         auth_label(&listener.auth),
         config_path.display()
     );
-    if let Some(password) = generated_password {
-        println!(
-            "generated password for {}: {}",
-            listener.auth.username,
-            password.as_str()
-        );
-        println!("this password is not stored anywhere; copy it now");
-    }
     // A new socket is bound at startup, so unlike a roster change this cannot
     // be picked up by the running process. The unit the installer writes is
     // `masque`, not the program name.
@@ -252,6 +252,24 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         );
     }
 
+    Ok(())
+}
+
+/// Deliver a generated credential and make output failure observable before
+/// its hash is committed to the configuration.
+fn print_generated_password(username: &str, password: &str) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "generated password for {username}: {password}")
+        .context("failed to print the generated password; configuration is unchanged")?;
+    writeln!(
+        output,
+        "copy this password now; the configuration has not been written yet"
+    )
+    .context("failed to print the generated password notice; configuration is unchanged")?;
+    output
+        .flush()
+        .context("failed to flush the generated password; configuration is unchanged")?;
     Ok(())
 }
 
@@ -400,10 +418,20 @@ fn resolve_password(
     }
 
     if interactive {
-        let password = prompt_password()?;
+        let password = prompt_password(!request.dry_run)?;
         if let Some(password) = password {
             return Ok((auth::hash_password(password.as_bytes())?, None));
         }
+    }
+
+    // A dry run returns before generated credentials are delivered, so
+    // inventing one here would emit a hash without the only password copy.
+    if request.dry_run {
+        bail!(
+            "--dry-run cannot generate a Basic password because its output would contain a \
+             hash without the only copy of the password; provide --password-hash or \
+             --password-stdin"
+        );
     }
 
     // Nothing was supplied. A generated password is the safe default — the
@@ -532,10 +560,23 @@ fn prompt_username() -> anyhow::Result<String> {
     })
 }
 
-/// Read a password twice without echoing it, or `None` to generate one.
-fn prompt_password() -> anyhow::Result<Option<Zeroizing<String>>> {
-    let password = read_hidden_line("Password (empty to generate a strong one): ")?;
+/// Read a password twice without echoing it, or `None` when generation is
+/// allowed and the operator leaves it empty.
+fn prompt_password(allow_generate: bool) -> anyhow::Result<Option<Zeroizing<String>>> {
+    let prompt = if allow_generate {
+        "Password (empty to generate a strong one): "
+    } else {
+        "Password (--dry-run requires an explicit password): "
+    };
+    let password = read_hidden_line(prompt)?;
     if password.is_empty() {
+        if !allow_generate {
+            bail!(
+                "--dry-run cannot generate a Basic password because its output would contain a \
+                 hash without the only copy of the password; provide --password-hash or \
+                 --password-stdin"
+            );
+        }
         return Ok(None);
     }
     check_password(&password)?;
@@ -595,12 +636,26 @@ fn read_hidden_line(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     struct EchoOff {
         fd: i32,
         saved: libc::termios,
+        active: bool,
+    }
+
+    impl EchoOff {
+        fn restore(&mut self) -> std::io::Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+            // SAFETY: `saved` was filled by tcgetattr on this descriptor.
+            if unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.active = false;
+            Ok(())
+        }
     }
 
     impl Drop for EchoOff {
         fn drop(&mut self) {
-            // SAFETY: `saved` was filled by tcgetattr on this same descriptor.
-            unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) };
+            let _ = self.restore();
         }
     }
 
@@ -610,22 +665,33 @@ fn read_hidden_line(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     let fd = std::io::stdin().as_raw_fd();
     let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: writes a termios into our own uninitialised storage.
-    let _guard = if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } == 0 {
-        // SAFETY: tcgetattr returned success, so the value is initialised.
-        let saved = unsafe { saved.assume_init() };
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        // SAFETY: `quiet` is a complete termios for this descriptor.
-        unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) };
-        Some(EchoOff { fd, saved })
-    } else {
-        None
+    if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context(
+            "failed to inspect terminal settings; refusing to read a password that might echo",
+        );
+    }
+    // SAFETY: tcgetattr returned success, so the value is initialised.
+    let saved = unsafe { saved.assume_init() };
+    let mut quiet = saved;
+    quiet.c_lflag &= !libc::ECHO;
+    // SAFETY: `quiet` is a complete termios for this descriptor.
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to disable terminal echo; no password was read");
+    }
+    let mut guard = EchoOff {
+        fd,
+        saved,
+        active: true,
     };
 
     let mut line = Zeroizing::new(String::new());
     if std::io::stdin().read_line(&mut line)? == 0 {
         bail!("standard input ended before the password was entered; nothing was written");
     }
+    guard
+        .restore()
+        .context("failed to restore terminal echo; configuration is unchanged")?;
     // The newline the operator typed was not echoed, so the next output would
     // otherwise continue on the prompt's line.
     eprintln!();
@@ -633,14 +699,11 @@ fn read_hidden_line(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
 }
 
 #[cfg(not(unix))]
-fn read_hidden_line(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
-    eprint!("{prompt}");
-    std::io::stderr().flush()?;
-    let mut line = Zeroizing::new(String::new());
-    if std::io::stdin().read_line(&mut line)? == 0 {
-        bail!("standard input ended before the password was entered; nothing was written");
-    }
-    Ok(Zeroizing::new(trim_newline(&line).to_owned()))
+fn read_hidden_line(_prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+    bail!(
+        "hidden password input is unavailable on this platform; use --password-stdin or \
+         --password-hash so the password is not echoed"
+    )
 }
 
 // ── Writing ───────────────────────────────────────────────────────────
@@ -672,16 +735,6 @@ fn write_in_place(path: &Path, expected: &str, contents: &str) -> anyhow::Result
     let metadata = std::fs::metadata(&path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    let current = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to re-read {}", path.display()))?;
-    if current != expected {
-        bail!(
-            "{} changed while this edit was being prepared, and applying it would discard \
-             that change; nothing was written, so run the command again",
-            path.display()
-        );
-    }
-
     let temp = TempPath(dir.join(format!(".{name}.new.{}", std::process::id())));
 
     let mut options = OpenOptions::new();
@@ -706,6 +759,20 @@ fn write_in_place(path: &Path, expected: &str, contents: &str) -> anyhow::Result
     file.sync_all()
         .with_context(|| format!("failed to sync {}", temp.0.display()))?;
     drop(file);
+
+    // Keep this comparison after the new file is completely prepared and as
+    // close to rename as portable APIs allow. Checking before the potentially
+    // slow write and fsync would leave a much wider window in which an editor
+    // could make a change that the rename then silently discards.
+    let current = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to re-read {}", path.display()))?;
+    if current != expected {
+        bail!(
+            "{} changed while this edit was being prepared, and applying it would discard \
+             that change; nothing was written, so run the command again",
+            path.display()
+        );
+    }
 
     std::fs::rename(&temp.0, &path)
         .with_context(|| format!("failed to replace {}", path.display()))?;

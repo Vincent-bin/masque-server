@@ -281,11 +281,40 @@ fn generates_a_password_when_a_script_supplies_none() {
         "the generated password is the only copy, so it has to be printed: {stdout}"
     );
     assert!(
+        stdout.find("generated password for carol:") < stdout.find("added listener"),
+        "the only password copy must be delivered before its hash is committed: {stdout}"
+    );
+    assert!(
         fixture.config().listeners[1]
             .auth
             .password_hash
             .starts_with("$argon2id$")
     );
+}
+
+/// A dry-run block is often redirected for review or provisioning. Generating
+/// a password but returning before printing its only copy would make that block
+/// impossible to authenticate to.
+#[test]
+fn dry_run_refuses_to_generate_an_unrecoverable_password() {
+    let fixture = Fixture::new(false);
+    let output = fixture.add_listener(&[
+        "--listen-addr",
+        "127.0.0.1:8461",
+        "--mode",
+        "basic",
+        "--username",
+        "dave",
+        "--dry-run",
+    ]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--dry-run cannot generate a Basic password"),
+        "unexpected diagnostic: {stderr}"
+    );
+    fixture.assert_unchanged();
 }
 
 #[test]

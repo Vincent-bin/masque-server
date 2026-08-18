@@ -7,6 +7,28 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.3.1 - 2026-08-19
+
+### Added
+
+- `masque-server add-listener` safely appends another Basic,
+  client-certificate, or trusted-network listener to a deployed configuration.
+  It supports interactive and unattended use, validates the complete result,
+  probes the new UDP address, preserves comments and file ownership, and
+  refuses conflicting authentication arguments.
+- The Linux installer now points existing installations to `add-listener`, and
+  its integration test verifies that a listener added after installation
+  survives a later upgrade unchanged.
+
+### Fixed
+
+- Configuration edits use a stable advisory lock and a final content check so
+  concurrent edits are refused instead of silently overwritten.
+- Generated Basic credentials are delivered and flushed before their hash is
+  committed, while `--dry-run` refuses to create an unrecoverable password.
+- Interactive password entry fails closed if terminal echo cannot be disabled,
+  and the post-edit instruction names the installed `masque.service` unit.
+
 ## 0.3.0 - 2026-08-18
 
 ### Added

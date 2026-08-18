@@ -274,7 +274,7 @@ the server will actually run rather than the ones written down
 — `shards = 0` expanded to one per core, and any excess capped:
 
 ```
-configuration is compatible with masque-server 0.3.0: /etc/masque/masque.toml
+configuration is compatible with masque-server 0.3.1: /etc/masque/masque.toml
 listener 0.0.0.0:443 auth=basic shards=1
 listener 0.0.0.0:4443 auth=client_cert shards=1
 ```
@@ -416,6 +416,10 @@ Combinations that would be ignored are refused rather than dropped:
 only, and `--disable-auth` cannot be combined with `--mode`, since a listener
 that demands nothing has no mode to record.
 
+A Basic `--dry-run` must be given a password through `--password-stdin` or an
+existing hash through `--password-hash`. It never generates a password whose
+only recoverable copy would be omitted from the dry-run output.
+
 #### What is checked, and what is not
 
 Before writing, the merged file is parsed and put through the same validation
@@ -437,11 +441,13 @@ The file is replaced atomically, keeping its mode and owner, so a password hash
 is never exposed and the service does not lose read access. Comments survive:
 the block is appended as text rather than the file being regenerated.
 
-Concurrent edits are refused, never merged silently. One run holds an advisory
-lock (`.masque.toml.lock` beside the configuration) so a second one stops
-immediately, and the file is compared against what was read before the
-replacement, so a change made by anything else — an editor, a script appending
-`[[clients]]` — aborts the edit and asks for a retry instead of being discarded.
+Concurrent `add-listener` edits are refused. One run holds an advisory lock
+(`.masque.toml.lock` beside the configuration) so a second one stops
+immediately. A final content comparison immediately before replacement also
+catches normal editor and script changes that do not honour the lock. No
+portable file API can exclude an uncooperative writer racing the final rename,
+so configuration-management tools should take the same lock or avoid writing
+the file while this command runs.
 
 Two ordering rules follow from the validation being real:
 
