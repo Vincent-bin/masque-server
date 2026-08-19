@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.3.1` selects `v0.3.1`. This is also how to install a
+`MASQUE_VERSION=0.3.2` selects `v0.3.2`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
@@ -230,6 +230,17 @@ If it failed to bind, the journal names the address, and the previous
 configuration is one `[[listeners]]` block away — remove the appended block and
 restart. Keep the usual configuration backups; this command edits in place and
 does not keep a copy.
+
+## Service lifecycle
+
+`systemctl stop` and `systemctl restart` send SIGTERM. The server receives that
+signal once and broadcasts the shutdown request to every shard, sends HTTP/3
+GOAWAY and QUIC CONNECTION_CLOSE, and drains existing connections for at most
+five seconds. The packaged unit sets `TimeoutStopSec=10s`, leaving a second
+five-second margin before systemd may escalate to SIGKILL.
+
+SIGINT follows the same path for foreground runs. SIGHUP remains distinct: it
+reloads only the `[[clients]]` roster and does not stop the service.
 
 ## Upgrade
 

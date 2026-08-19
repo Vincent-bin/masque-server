@@ -14,6 +14,11 @@ ExecStart=/usr/local/bin/masque-server --config /etc/masque/masque.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
+# The server handles SIGTERM by sending GOAWAY/CONNECTION_CLOSE to every shard
+# and draining for at most five seconds. Leave time for that bounded shutdown
+# before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=10s
 LimitNOFILE=1048576
 
 # Port 443 and CONNECT-IP TUN setup without running the process as root.
