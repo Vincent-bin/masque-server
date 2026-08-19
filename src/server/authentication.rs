@@ -51,6 +51,7 @@ impl Shard {
             let queue_slot = match Arc::clone(&self.shared.auth_queue_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
+                    self.metrics.record_auth_overloaded();
                     warn!(stream_id, "credential verification queue is full");
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
@@ -61,10 +62,12 @@ impl Shard {
                     continue;
                 }
             };
+            let pending_gauge = self.metrics.auth_pending_guard();
 
             let auth = Arc::clone(&auth);
             let auth_tx = self.auth_tx.clone();
             let permits = Arc::clone(&self.shared.auth_permits);
+            let metrics = Arc::clone(&self.metrics);
             let PendingAuth {
                 stream_id,
                 password,
@@ -72,13 +75,16 @@ impl Shard {
             } = request;
 
             let task = tokio::spawn(async move {
+                let _pending_gauge = pending_gauge;
                 // Admission above bounds waiting tasks; this second permit
                 // bounds the Argon2 CPU and memory actually running at once.
                 let Ok(permit) = permits.acquire_owned().await else {
                     return;
                 };
+                let running_gauge = metrics.auth_running_guard();
 
                 let verified = tokio::task::spawn_blocking(move || {
+                    let _running_gauge = running_gauge;
                     // Aborting an async task cannot stop spawn_blocking after
                     // it begins. This check prevents queued blocking work from
                     // starting Argon2 after its stream has disappeared.
@@ -97,6 +103,15 @@ impl Shard {
                     Ok(None) => return,
                     Err(_) => false,
                 };
+                // Count completed verification even when the stream or
+                // connection disappeared while Argon2 was running. Otherwise
+                // disconnecting after each bad password would hide abusive
+                // work from the authentication metrics.
+                if authorized {
+                    metrics.record_auth_success();
+                } else {
+                    metrics.record_auth_failure();
+                }
                 let _ = auth_tx
                     .send(AuthOutcome {
                         connection_index: conn_idx,

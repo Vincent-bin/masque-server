@@ -27,6 +27,7 @@ fi
 install -d \
     "$STAGING_ROOT/$ARCHIVE_NAME/bin" \
     "$STAGING_ROOT/$ARCHIVE_NAME/config" \
+    "$STAGING_ROOT/$ARCHIVE_NAME/monitoring" \
     "$STAGING_ROOT/$ARCHIVE_NAME/systemd"
 install -m 0755 "target/$TARGET/release/masque-server" \
     "$STAGING_ROOT/$ARCHIVE_NAME/bin/masque-server"
@@ -34,6 +35,10 @@ install -m 0755 deploy/install.sh "$STAGING_ROOT/$ARCHIVE_NAME/install.sh"
 install -m 0644 deploy/config/masque.toml "$STAGING_ROOT/$ARCHIVE_NAME/config/masque.toml"
 install -m 0644 deploy/systemd/masque.service \
     "$STAGING_ROOT/$ARCHIVE_NAME/systemd/masque.service"
+install -m 0644 deploy/monitoring/prometheus-rules.yml \
+    "$STAGING_ROOT/$ARCHIVE_NAME/monitoring/prometheus-rules.yml"
+install -m 0644 deploy/monitoring/grafana-dashboard.json \
+    "$STAGING_ROOT/$ARCHIVE_NAME/monitoring/grafana-dashboard.json"
 install -m 0644 README.md "$STAGING_ROOT/$ARCHIVE_NAME/README.md"
 install -m 0644 CHANGELOG.md "$STAGING_ROOT/$ARCHIVE_NAME/CHANGELOG.md"
 install -m 0644 LICENSE "$STAGING_ROOT/$ARCHIVE_NAME/LICENSE"

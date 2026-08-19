@@ -61,6 +61,21 @@ deny_targets = []
 enabled = false
 EOF
 
+case "${MASQUE_BENCH_OBSERVABILITY:-0}" in
+    0) ;;
+    1)
+        cat >>"$BENCH_DIR/masque.toml" <<'EOF'
+
+[observability]
+listen_addr = "127.0.0.1:0"
+EOF
+        ;;
+    *)
+        echo "MASQUE_BENCH_OBSERVABILITY must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 cargo build --workspace --release
 
 truncate -s 67108864 "$BENCH_DIR/masque-bench.bin"

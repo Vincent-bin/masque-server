@@ -6,6 +6,8 @@
 - [Deployment](deployment.md): Linux installation and systemd operation.
 - [Protocols](protocols.md): supported MASQUE and HTTP/3 behavior.
 - [Performance](performance.md): fast paths, tuning, and benchmark rules.
+- [Observability](observability.md): health, readiness, Prometheus, Grafana,
+  structured logs, and systemd notification.
 - [Testing](testing.md): local, E2E, Linux, and release validation.
 - [Security](security.md): threat model and operator hardening.
 

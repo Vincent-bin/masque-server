@@ -35,6 +35,18 @@ struct Cli {
     /// Increase log verbosity (repeatable: -v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Log encoding for stderr/journald.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    /// Human-readable logs for terminals and `journalctl`.
+    Text,
+    /// Newline-delimited JSON for log collectors.
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -286,15 +298,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Logging
     let default_filter = match cli.verbose {
-        0 => "masque=info",
-        1 => "masque=debug",
-        _ => "masque=trace",
+        0 => "masque=info,masque_server=info",
+        1 => "masque=debug,masque_server=debug",
+        _ => "masque=trace,masque_server=trace",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
-        )
-        .init();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    match cli.log_format {
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .init(),
+    }
 
     // Load config.
     let config_exists = cli.config.exists();
@@ -377,6 +397,11 @@ async fn main() -> anyhow::Result<()> {
 
     if matches!(cli.command, Some(Command::CheckConfig)) {
         let listeners = validate_config(&cfg)?;
+        info!(
+            path = %cli.config.display(),
+            listeners = listeners.len(),
+            "configuration validated"
+        );
         println!(
             "configuration is compatible with masque-server {}: {}",
             env!("CARGO_PKG_VERSION"),
@@ -396,6 +421,9 @@ async fn main() -> anyhow::Result<()> {
                 auth_label(&listener.auth),
                 listener.shards
             );
+        }
+        if let Some(addr) = cfg.observability.listen_addr {
+            println!("observability {addr} health=/healthz ready=/readyz metrics=/metrics");
         }
         return Ok(());
     }

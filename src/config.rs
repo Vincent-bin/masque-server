@@ -20,6 +20,9 @@ pub struct ServerConfig {
     pub udp_proxy: UdpProxySection,
     #[serde(default)]
     pub ip_proxy: IpProxySection,
+    /// Optional loopback-only HTTP endpoint for health checks and Prometheus.
+    #[serde(default)]
+    pub observability: ObservabilitySection,
     /// Pre-registered clients, identified by their TLS client certificate key.
     ///
     /// Only consulted when a listener uses `auth.mode = "client_cert"`.
@@ -247,6 +250,18 @@ pub struct IpProxySection {
     pub ipv6_pool: String,
 }
 
+/// Operational HTTP endpoint, disabled when `listen_addr` is absent.
+///
+/// Metrics contain deployment and traffic information and have no
+/// authentication layer of their own, so validation permits only a loopback
+/// address. Operators can use a local Prometheus agent or an SSH tunnel when a
+/// collector does not run on the same host.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilitySection {
+    pub listen_addr: Option<SocketAddr>,
+}
+
 // ── Defaults ──────────────────────────────────────────────────────────
 
 impl Default for ServerConfig {
@@ -258,6 +273,7 @@ impl Default for ServerConfig {
             tcp_proxy: TcpProxySection::default(),
             udp_proxy: UdpProxySection::default(),
             ip_proxy: IpProxySection::default(),
+            observability: ObservabilitySection::default(),
             clients: Vec::new(),
             listeners: vec![ListenerSection {
                 listen_addr: "0.0.0.0:443".parse().unwrap(),
@@ -428,6 +444,7 @@ enabled = false
         assert!(cfg.udp_proxy.enabled);
         assert!(cfg.ip_proxy.enabled);
         assert_eq!(cfg.ip_proxy.tun_mtu, 1280);
+        assert_eq!(cfg.observability.listen_addr, None);
         // Cloudflare's non-standard identifier is accepted out of the box; an
         // RFC 9484 client never sends it, so this costs nothing.
         assert_eq!(
@@ -466,6 +483,20 @@ key_path = "/etc/masque/key.pem"
         );
         assert_eq!(cfg.tls.cert_path, PathBuf::from("/etc/masque/cert.pem"));
         assert_eq!(cfg.tls.key_path, PathBuf::from("/etc/masque/key.pem"));
+    }
+
+    #[test]
+    fn parse_observability_section() {
+        let cfg = parse_with_listener(
+            r#"
+[observability]
+listen_addr = "127.0.0.1:9090"
+"#,
+        );
+        assert_eq!(
+            cfg.observability.listen_addr,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
     }
 
     #[test]

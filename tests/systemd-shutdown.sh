@@ -24,6 +24,10 @@ grep -q '^KillSignal=SIGTERM$' deploy/systemd/masque.service ||
     die "the systemd unit does not send SIGTERM"
 grep -q '^TimeoutStopSec=10s$' deploy/systemd/masque.service ||
     die "the systemd unit does not leave time for the bounded drain"
+grep -q '^Type=notify$' deploy/systemd/masque.service ||
+    die "the systemd unit does not wait for application readiness"
+grep -q '^NotifyAccess=main$' deploy/systemd/masque.service ||
+    die "the systemd unit accepts readiness from more than the main process"
 
 TEST_TMP=$(mktemp -d /tmp/masque-systemd-shutdown.XXXXXX)
 SERVER_PID=

@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "masque-server"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "High-performance MASQUE proxy for CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/3"
@@ -42,9 +42,12 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tun-rs = { version = "2", features = ["async_tokio"] }
 zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1"
 
 # Linux uses this for the packet path (recvmmsg, GSO/GRO, TUN offload); every
 # Unix uses it to turn terminal echo off while `add-listener` reads a password

@@ -67,6 +67,12 @@ replace host controls. Apply reasonable systemd limits, provider firewall rate
 limits, and monitoring for memory, CPU, file descriptors, authentication
 failures, connections, and datagram drops.
 
+The optional operational endpoint has no authentication and therefore accepts
+only loopback addresses. It must stay host-local: use a local collector or a
+secure tunnel instead of forwarding `/metrics` to a public interface. Metric
+labels exclude usernames, client identities, targets, stream IDs, and
+connection IDs.
+
 Do not respond to overload by making queues arbitrarily deep; this can turn
 packet loss into seconds of latency and make memory exhaustion easier.
 

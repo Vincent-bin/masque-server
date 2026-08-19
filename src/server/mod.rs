@@ -29,15 +29,18 @@ use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
 use crate::fxhash::FxHashMap;
 use crate::ip_packet;
+use crate::metrics::{Metrics, ShardMetrics};
 use crate::net::quic::{
     MAX_BATCH_PACKETS, MAX_DATAGRAM_SIZE, QuicUdpSocket, RecvPacketBatch, SendPacketBatch,
 };
 #[cfg(target_os = "linux")]
 use crate::net::target_udp;
 use crate::net::target_udp::TargetRecvBatch;
+use crate::observability::ObservabilityServer;
 use crate::policy::TargetPolicy;
 use crate::routing::{RoutingTable, TunnelOwner};
 use crate::scheduler::{DirtySet, TimerQueue};
+use crate::systemd;
 use crate::tun::{self, TunManager, TunRecvBatch, TunSendBatch};
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpRelayEvent, TcpTunnel, spawn_tcp_connect};
@@ -154,6 +157,8 @@ struct UdpResponse {
 /// stays single and needs no knowledge of which listener a shard serves.
 pub struct Server {
     shards: Vec<Shard>,
+    metrics: Arc<Metrics>,
+    observability: Option<ObservabilityServer>,
 }
 
 /// Configuration state prepared without opening sockets or creating a TUN
@@ -184,6 +189,25 @@ fn any_client_cert_listener(config: &ServerConfig) -> bool {
         .listeners
         .iter()
         .any(|listener| listener.auth.client_cert_enabled())
+}
+
+fn listener_auth_label(listener: &ResolvedListener) -> &'static str {
+    if listener.auth.client_cert_enabled() {
+        "client_cert"
+    } else if listener.auth.basic_enabled() {
+        "basic"
+    } else {
+        "disabled"
+    }
+}
+
+fn is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| ip.is_loopback(), |ip| ip.is_loopback()),
+    }
 }
 
 /// Shards that verify passwords, which is what the verification budget rations.
@@ -428,6 +452,15 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
 
+    if let Some(addr) = config.observability.listen_addr
+        && !is_loopback(addr.ip())
+    {
+        anyhow::bail!(
+            "observability.listen_addr ({addr}) must use a loopback address; \
+             run Prometheus locally or forward the endpoint securely"
+        );
+    }
+
     // Surface a bad credential or active roster configuration first. A roster
     // outside client-cert mode is deliberately not parsed or allowed to
     // reserve pool addresses: the configuration contract says it is ignored.
@@ -640,6 +673,7 @@ impl Server {
 
         let basic_shards = basic_shard_count(&listeners);
         let config = Arc::new(config);
+        let metrics = Arc::new(Metrics::new(config.observability.listen_addr.is_some()));
 
         let tun = build_tun(&config)?;
 
@@ -686,6 +720,8 @@ impl Server {
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
             clients: Arc::new(SharedRoster::new(clients)),
             roster_reload,
+            metrics: Arc::clone(&metrics),
+            shard_metrics: RwLock::new(Vec::with_capacity(total_shards)),
         });
 
         let mut shards = Vec::with_capacity(total_shards);
@@ -718,6 +754,16 @@ impl Server {
             .await?;
             plan.listener.listen_addr = bound_addr;
             unavailable_listener_addrs.push(bound_addr);
+            let listener_metrics = metrics.register_listener(
+                bound_addr,
+                listener_auth_label(&plan.listener),
+                plan.listener.shards,
+            );
+            shared
+                .shard_metrics
+                .write()
+                .expect("shard metrics list poisoned")
+                .extend(listener_metrics.iter().cloned());
 
             let (forward_rx, tun_rx) = inboxes
                 .next()
@@ -728,11 +774,12 @@ impl Server {
                 Arc::clone(&config),
                 plan.listener.clone(),
                 first_socket,
+                Arc::clone(&listener_metrics[0]),
                 forward_rx,
                 tun_rx,
             )?);
 
-            for _ in 1..plan.listener.shards {
+            for shard_metrics in listener_metrics.iter().skip(1) {
                 let (forward_rx, tun_rx) = inboxes
                     .next()
                     .expect("one inbox pair was created per planned shard");
@@ -743,6 +790,7 @@ impl Server {
                         Arc::clone(&config),
                         plan.listener.clone(),
                         reuseport,
+                        Arc::clone(shard_metrics),
                         forward_rx,
                         tun_rx,
                     )
@@ -751,8 +799,17 @@ impl Server {
             }
         }
 
+        let observability = match config.observability.listen_addr {
+            Some(addr) => Some(ObservabilityServer::bind(addr, Arc::clone(&metrics)).await?),
+            None => None,
+        };
+
         info!(shards = total_shards, "server ready");
-        Ok(Self { shards })
+        Ok(Self {
+            shards,
+            metrics,
+            observability,
+        })
     }
 
     /// The address every shard actually bound, in shard order.
@@ -765,6 +822,13 @@ impl Server {
             .iter()
             .map(|shard| shard.socket.local_addr().unwrap_or(shard.listen_addr))
             .collect()
+    }
+
+    /// Bound observability address, including a kernel-selected test port.
+    pub fn observability_addr(&self) -> Option<SocketAddr> {
+        self.observability
+            .as_ref()
+            .and_then(|server| server.local_addr().ok())
     }
 
     /// Reload the roster whenever `SIGHUP` arrives.
@@ -793,9 +857,11 @@ impl Server {
                 // server keeps serving the clients it already admitted.
                 match reload_roster(&shared) {
                     Ok((generation, clients)) => {
+                        shared.metrics.record_roster_reload(true);
                         info!(generation, clients, "roster reloaded")
                     }
                     Err(e) => {
+                        shared.metrics.record_roster_reload(false);
                         warn!(error = %format!("{e:#}"), "roster reload failed, keeping the previous one")
                     }
                 }
@@ -817,15 +883,52 @@ impl Server {
         // SIGTERM starts every drain even if a shard was not polling its event
         // loop at the instant the signal arrived.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let shutdown_listener = spawn_shutdown_notifier(shutdown_tx)
+        let shutdown_listener = spawn_shutdown_notifier(shutdown_tx.clone())
             .context("failed to install shutdown signal handlers")?;
         debug!("shutdown signal handlers installed");
+
+        let observability_task = self.observability.take().map(ObservabilityServer::spawn);
+        self.metrics.set_ready(true);
+        if let Err(error) = systemd::notify("READY=1\nSTATUS=Ready to serve MASQUE traffic") {
+            self.metrics.begin_shutdown();
+            shutdown_listener.abort();
+            if let Some(task) = observability_task {
+                task.abort();
+            }
+            return Err(error).context("failed to notify systemd that the server is ready");
+        }
+
+        // Readiness becomes false as soon as draining starts, while /healthz
+        // and /metrics remain available until every shard has stopped.
+        let mut readiness_shutdown = shutdown_rx.clone();
+        let readiness_metrics = Arc::clone(&self.metrics);
+        let readiness_task = tokio::spawn(async move {
+            if readiness_shutdown
+                .wait_for(|requested| *requested)
+                .await
+                .is_ok()
+                && readiness_metrics.begin_shutdown()
+                && let Err(error) = systemd::notify("STOPPING=1\nSTATUS=Draining connections")
+            {
+                warn!(%error, "failed to notify systemd that the server is stopping");
+            }
+        });
 
         // A single shard keeps the current behaviour of running on the caller's
         // task, which keeps the common case free of a spawn and a join.
         if self.shards.len() == 1 {
             let outcome = self.shards[0].run(shutdown_rx).await;
+            if self.metrics.begin_shutdown()
+                && let Err(error) = systemd::notify("STOPPING=1\nSTATUS=Stopping")
+            {
+                warn!(%error, "failed to notify systemd that the server is stopping");
+            }
+            let _ = shutdown_tx.send(true);
             shutdown_listener.abort();
+            readiness_task.abort();
+            if let Some(task) = observability_task {
+                task.abort();
+            }
             return outcome;
         }
 
@@ -847,6 +950,13 @@ impl Server {
                     if outcome.is_ok() {
                         outcome = Err(error);
                     }
+                    if !*shutdown_tx.borrow() {
+                        warn!(
+                            shard = index,
+                            "draining remaining shards after an unexpected exit"
+                        );
+                        let _ = shutdown_tx.send(true);
+                    }
                 }
                 Ok((_, Ok(()))) => {}
                 Err(error) => {
@@ -854,10 +964,24 @@ impl Server {
                     if outcome.is_ok() {
                         outcome = Err(anyhow::anyhow!("shard task panicked: {error}"));
                     }
+                    if !*shutdown_tx.borrow() {
+                        warn!("draining remaining shards after an unexpected exit");
+                        let _ = shutdown_tx.send(true);
+                    }
                 }
             }
         }
+        if self.metrics.begin_shutdown()
+            && let Err(error) = systemd::notify("STOPPING=1\nSTATUS=Stopping")
+        {
+            warn!(%error, "failed to notify systemd that the server is stopping");
+        }
+        let _ = shutdown_tx.send(true);
         shutdown_listener.abort();
+        readiness_task.abort();
+        if let Some(task) = observability_task {
+            task.abort();
+        }
         outcome
     }
 }
@@ -1415,12 +1539,43 @@ struct Shared {
     /// Present when the server started from a config file. The captured startup
     /// mode prevents SIGHUP from pretending to change the bound TLS context.
     roster_reload: Option<RosterReload>,
+    /// Process-wide counters and readiness state.
+    metrics: Arc<Metrics>,
+    /// Metric owner for each global shard index. Read only on a queue-drop
+    /// path so a cross-listener handoff is attributed to its destination.
+    shard_metrics: RwLock<Vec<Arc<ShardMetrics>>>,
+}
+
+impl Shared {
+    fn record_shard_queue_drop(&self, shard: usize) {
+        if let Some(metrics) = self
+            .shard_metrics
+            .read()
+            .expect("shard metrics list poisoned")
+            .get(shard)
+        {
+            metrics.record_shard_queue_drop();
+        }
+    }
+
+    fn record_tun_queue_drop(&self, shard: usize) {
+        if let Some(metrics) = self
+            .shard_metrics
+            .read()
+            .expect("shard metrics list poisoned")
+            .get(shard)
+        {
+            metrics.record_tun_queue_drop();
+        }
+    }
 }
 
 /// One shard: an independent event loop over its own share of connections.
 struct Shard {
     index: usize,
     shared: Arc<Shared>,
+    /// Counters owned by this shard and aggregated per listener while scraping.
+    metrics: Arc<ShardMetrics>,
     socket: QuicUdpSocket,
     quic_config: quiche::Config,
     h3_config: quiche::h3::Config,
@@ -1462,11 +1617,14 @@ impl Shard {
         config: Arc<ServerConfig>,
         listener: ResolvedListener,
         reuseport: bool,
+        metrics: Arc<ShardMetrics>,
         forward_rx: mpsc::Receiver<ForwardedPacket>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         let socket = open_quic_socket(&config, listener.listen_addr, reuseport).await?;
-        Self::from_socket(index, shared, config, listener, socket, forward_rx, tun_rx)
+        Self::from_socket(
+            index, shared, config, listener, socket, metrics, forward_rx, tun_rx,
+        )
     }
 
     /// Build one shard around a socket that has already been bound.
@@ -1481,6 +1639,7 @@ impl Shard {
         config: Arc<ServerConfig>,
         listener: ResolvedListener,
         socket: QuicUdpSocket,
+        metrics: Arc<ShardMetrics>,
         forward_rx: mpsc::Receiver<ForwardedPacket>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
@@ -1528,6 +1687,7 @@ impl Shard {
         Ok(Self {
             index,
             shared,
+            metrics,
             socket,
             quic_config,
             h3_config,
@@ -1676,7 +1836,11 @@ impl Shard {
                     }
                 }
                 Event::PacketBatch(Ok(received)) => {
+                    let mut packet_count = 0usize;
+                    let mut byte_count = 0usize;
                     recv_batch.for_each_packet_mut(received, |packet, from| {
+                        packet_count += 1;
+                        byte_count += packet.len();
                         if !shutting_down {
                             self.handle_packet(packet, from, local_addr);
                             return;
@@ -1696,6 +1860,7 @@ impl Shard {
                             self.dirty.mark(index);
                         }
                     });
+                    self.metrics.record_receive_batch(packet_count, byte_count);
                 }
                 Event::PacketBatch(Err(e)) => {
                     error!(%e, "socket recv error");
@@ -1847,6 +2012,7 @@ impl Shard {
                         remaining = self.connections.len(),
                         "drain timeout reached, forcing exit"
                     );
+                    self.shared.metrics.record_forced_shutdown();
                     // Release all remaining IP tunnel resources.
                     for client in self.connections.values() {
                         for tunnel in client.ip_tunnels.values() {
@@ -1946,6 +2112,7 @@ impl Shard {
                             // Dropping under pressure is what the network
                             // would have done; QUIC will retransmit.
                             if self.shared.forward_tx[shard].try_send(forwarded).is_err() {
+                                self.shared.record_shard_queue_drop(shard);
                                 debug!(shard, "shard forward queue full, dropping packet");
                             }
                         }
@@ -1956,6 +2123,7 @@ impl Shard {
 
                 // Enforce max_connections limit.
                 if self.connections.len() >= self.config.server.max_connections {
+                    self.metrics.connection_rejected_limit();
                     warn!("max connections reached, rejecting new connection");
                     return;
                 }
@@ -1988,7 +2156,7 @@ impl Shard {
                     .expect("index ownership poisoned")
                     .insert(conn_idx, self.index);
 
-                let client = ClientConnection::new(quic, conn_idx);
+                let client = ClientConnection::new(quic, conn_idx, Arc::clone(&self.metrics));
                 self.connections.insert(scid, client);
             }
 
@@ -2025,10 +2193,12 @@ impl Shard {
                 .map(|der| registry.load().identify(der))
             {
                 Some(Ok(identity)) => {
+                    self.metrics.record_auth_success();
                     info!(client = %identity.name, %from, "client authenticated by certificate");
                     client.identity = Some(identity);
                 }
                 other => {
+                    self.metrics.record_auth_failure();
                     match other {
                         Some(Err(e)) => warn!(%e, "closing connection with unusable certificate"),
                         // Unreachable while the context sets
@@ -3010,17 +3180,18 @@ impl Shard {
                 tunnel.last_activity = Instant::now();
                 self.dirty.mark(batch.connection_index);
 
-                for datagram in batch.datagrams {
-                    if queue_full {
-                        // The rest of the batch would only be dropped by
-                        // quiche anyway.
-                        break;
-                    }
+                let datagram_count = batch.datagrams.len();
+                for (index, datagram) in batch.datagrams.into_iter().enumerate() {
                     match client.quic.dgram_send_buf(datagram) {
                         Ok(()) => {}
                         // The send queue is full: stop draining and let the
                         // flush at the end of the loop make room.
-                        Err(quiche::Error::Done) => queue_full = true,
+                        Err(quiche::Error::Done) => {
+                            queue_full = true;
+                            self.metrics
+                                .record_datagram_queue_drop(datagram_count - index);
+                            break;
+                        }
                         // Oversized, or datagrams disabled. Dropping this one
                         // says nothing about the next, so keep draining.
                         Err(e) => {
@@ -3078,6 +3249,7 @@ impl Shard {
             && shard != self.index
         {
             if self.shared.tun_tx[shard].try_send(pkt.to_vec()).is_err() {
+                self.shared.record_tun_queue_drop(shard);
                 debug!(shard, "shard TUN queue full, dropping packet");
             }
             return true;
@@ -3101,6 +3273,7 @@ impl Shard {
             // Check for backpressure before framing, so a full queue costs no
             // allocation.
             if client.quic.is_dgram_send_queue_full() {
+                self.metrics.record_datagram_queue_drop(1);
                 return false;
             }
 
@@ -3109,7 +3282,10 @@ impl Shard {
 
             match client.quic.dgram_send_buf(tunnel.header.encode(pkt)) {
                 Ok(()) => {}
-                Err(quiche::Error::Done) => return false,
+                Err(quiche::Error::Done) => {
+                    self.metrics.record_datagram_queue_drop(1);
+                    return false;
+                }
                 // Oversized, or datagrams disabled — dropping this packet says
                 // nothing about the next one, so keep draining the device.
                 Err(e) => {
@@ -3176,10 +3352,7 @@ impl Shard {
                 udp_tunnels,
                 ip_tunnels,
                 index,
-                awaiting_auth: _,
-                deferred_send: _,
-                scheduled_deadline: _,
-                identity: _,
+                ..
             } = client;
 
             // Closing a tunnel writes a response or a FIN to the connection,
@@ -3388,8 +3561,11 @@ impl Shard {
                     break;
                 }
 
-                if let Err(e) = socket.send_batch(batch).await {
-                    warn!(%e, "socket send error");
+                match socket.send_batch(batch).await {
+                    Ok(()) => self
+                        .metrics
+                        .record_send_batch(batch.packet_count(), batch.byte_count()),
+                    Err(e) => warn!(%e, "socket send error"),
                 }
 
                 if quiche_done || pacing_blocked {
@@ -3401,6 +3577,7 @@ impl Shard {
             // connection's next wakeup is only knowable once it is fully
             // driven.
             Self::reschedule(client, timers, Instant::now());
+            client.sync_metrics();
         }
     }
 }
@@ -3528,6 +3705,28 @@ mod tests {
         let mut config = ServerConfig::default();
         config.listeners.clear();
         assert!(super::plan_listeners(&config).is_err());
+    }
+
+    #[test]
+    fn observability_is_restricted_to_loopback() {
+        for allowed in ["127.0.0.1:9090", "[::1]:9090", "[::ffff:127.0.0.1]:9090"] {
+            assert!(super::is_loopback(
+                allowed.parse::<std::net::SocketAddr>().unwrap().ip()
+            ));
+        }
+        for denied in ["0.0.0.0:9090", "192.0.2.1:9090", "[::]:9090"] {
+            assert!(!super::is_loopback(
+                denied.parse::<std::net::SocketAddr>().unwrap().ip()
+            ));
+        }
+
+        let mut config = ServerConfig::default();
+        config.observability.listen_addr = Some("0.0.0.0:9090".parse().unwrap());
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("a public observability address must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("must use a loopback address"), "{error}");
     }
 
     /// Planning keeps the listener-specific trust boundary separate from the

@@ -19,7 +19,11 @@ CANDIDATE=${MASQUE_TEST_PACKAGE_BIN:-}
 BIN_PATH=/usr/local/bin/masque-server
 CONFIG_PATH=/etc/masque/masque.toml
 UNIT_PATH=/etc/systemd/system/masque.service
-for protected_path in "$BIN_PATH" "$CONFIG_PATH" "$UNIT_PATH"; do
+MONITORING_DIR=/usr/local/share/masque-server/monitoring
+PROMETHEUS_RULES_PATH=$MONITORING_DIR/prometheus-rules.yml
+GRAFANA_DASHBOARD_PATH=$MONITORING_DIR/grafana-dashboard.json
+for protected_path in "$BIN_PATH" "$CONFIG_PATH" "$UNIT_PATH" \
+    "$PROMETHEUS_RULES_PATH" "$GRAFANA_DASHBOARD_PATH"; do
     [ ! -e "$protected_path" ] || die "runner is not clean: $protected_path already exists"
 done
 
@@ -34,9 +38,12 @@ cleanup() {
         "$CONFIG_PATH" \
         /etc/masque/.masque.toml.lock \
         "$UNIT_PATH" \
+        "$PROMETHEUS_RULES_PATH" \
+        "$GRAFANA_DASHBOARD_PATH" \
         /etc/masque/certs/server.crt \
         /etc/masque/certs/server.key
     rmdir /etc/masque/certs /etc/masque >/dev/null 2>&1
+    rmdir "$MONITORING_DIR" /usr/local/share/masque-server >/dev/null 2>&1
     rm -rf -- "$TEST_TMP"
     exit "$cleanup_status"
 }
@@ -46,11 +53,16 @@ trap 'exit 1' HUP INT TERM
 PACKAGE_DIR=$TEST_TMP/package
 MOCK_BIN=$TEST_TMP/mock-bin
 MOCK_STATE=$TEST_TMP/restart-count
-install -d "$PACKAGE_DIR/bin" "$PACKAGE_DIR/config" "$PACKAGE_DIR/systemd" "$MOCK_BIN"
+install -d "$PACKAGE_DIR/bin" "$PACKAGE_DIR/config" "$PACKAGE_DIR/monitoring" \
+    "$PACKAGE_DIR/systemd" "$MOCK_BIN"
 install -m 0755 "$CANDIDATE" "$PACKAGE_DIR/bin/masque-server"
 install -m 0755 deploy/install.sh "$PACKAGE_DIR/install.sh"
 install -m 0644 deploy/config/masque.toml "$PACKAGE_DIR/config/masque.toml"
 install -m 0644 deploy/systemd/masque.service "$PACKAGE_DIR/systemd/masque.service"
+install -m 0644 deploy/monitoring/prometheus-rules.yml \
+    "$PACKAGE_DIR/monitoring/prometheus-rules.yml"
+install -m 0644 deploy/monitoring/grafana-dashboard.json \
+    "$PACKAGE_DIR/monitoring/grafana-dashboard.json"
 
 cat >"$MOCK_BIN/systemctl" <<'EOF'
 #!/usr/bin/env sh
@@ -122,6 +134,10 @@ EOF
     chmod 0755 "$BIN_PATH"
     printf '%s\n' 'old systemd unit' >"$UNIT_PATH"
     chmod 0644 "$UNIT_PATH"
+    install -d "$MONITORING_DIR"
+    printf '%s\n' 'old prometheus rules' >"$PROMETHEUS_RULES_PATH"
+    printf '%s\n' 'old grafana dashboard' >"$GRAFANA_DASHBOARD_PATH"
+    chmod 0644 "$PROMETHEUS_RULES_PATH" "$GRAFANA_DASHBOARD_PATH"
 }
 
 assert_sha_unchanged() {
@@ -214,12 +230,16 @@ write_old_installation
 write_config not-a-controller
 old_binary_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
 old_unit_sha=$(sha256sum "$UNIT_PATH" | awk '{print $1}')
+old_rules_sha=$(sha256sum "$PROMETHEUS_RULES_PATH" | awk '{print $1}')
+old_dashboard_sha=$(sha256sum "$GRAFANA_DASHBOARD_PATH" | awk '{print $1}')
 bad_config_sha=$(sha256sum "$CONFIG_PATH" | awk '{print $1}')
 if MASQUE_START_SERVICE=0 "$PACKAGE_DIR/install.sh" >"$TEST_TMP/preflight.log" 2>&1; then
     die "incompatible configuration unexpectedly passed"
 fi
 assert_sha_unchanged "$BIN_PATH" "$old_binary_sha"
 assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
+assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
+assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$bad_config_sha"
 
 # A staged upgrade replaces the program and unit, never the configuration.
@@ -231,10 +251,12 @@ assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
 candidate_sha=$(sha256sum "$CANDIDATE" | awk '{print $1}')
 assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
 
-# A failed activation restores both files and the prior service state.
+# A failed activation restores every release-managed file and the prior service state.
 write_old_installation
 old_binary_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
 old_unit_sha=$(sha256sum "$UNIT_PATH" | awk '{print $1}')
+old_rules_sha=$(sha256sum "$PROMETHEUS_RULES_PATH" | awk '{print $1}')
+old_dashboard_sha=$(sha256sum "$GRAFANA_DASHBOARD_PATH" | awk '{print $1}')
 : >"$MOCK_STATE"
 if MOCK_ACTIVE=1 MOCK_ENABLED=1 MOCK_FAIL_FIRST_RESTART=1 \
     MASQUE_START_SERVICE=1 "$PACKAGE_DIR/install.sh" \
@@ -243,8 +265,10 @@ if MOCK_ACTIVE=1 MOCK_ENABLED=1 MOCK_FAIL_FIRST_RESTART=1 \
 fi
 assert_sha_unchanged "$BIN_PATH" "$old_binary_sha"
 assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
+assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
+assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
-grep -q 'Previous binary, systemd unit, and service state restored' \
+grep -q 'Previous binary, systemd unit, monitoring assets, and service state restored' \
     "$TEST_TMP/rollback.log" || die "rollback confirmation was not printed"
 
 echo "installer upgrade preflight, preservation, and rollback passed"
