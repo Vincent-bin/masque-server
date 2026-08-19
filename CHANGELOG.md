@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.3.2 - 2026-08-20
+
+### Fixed
+
+- SIGINT and SIGTERM are now received once at the server level and broadcast
+  to every shard, so `systemctl stop` and `systemctl restart` run the bounded
+  QUIC drain instead of terminating the process before it can send GOAWAY and
+  CONNECTION_CLOSE.
+- The systemd unit explicitly uses SIGTERM and leaves ten seconds for the
+  server's five-second drain before escalating. Linux CI starts a real
+  two-shard server and verifies that both SIGTERM and SIGINT drain every shard
+  and exit successfully.
+
 ## 0.3.1 - 2026-08-19
 
 ### Added

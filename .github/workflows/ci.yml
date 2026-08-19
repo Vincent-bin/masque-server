@@ -59,7 +59,8 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          sh -n install-latest.sh deploy/install.sh tests/install-upgrade.sh
+          sh -n install-latest.sh deploy/install.sh \
+            tests/install-upgrade.sh tests/systemd-shutdown.sh
           shellcheck install-latest.sh deploy/install.sh scripts/*.sh \
             tests/*.sh tests/e2e/*.sh
 
@@ -131,6 +132,10 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+      - name: Test systemd shutdown signals
+        if: runner.os == 'Linux'
+        run: MASQUE_TEST_BIN="$PWD/target/debug/masque-server" tests/systemd-shutdown.sh
 
       - name: Test installer upgrade safety
         if: runner.os == 'Linux'

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use std::sync::{Mutex, RwLock};
 
 use anyhow::Context as _;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -812,17 +812,29 @@ impl Server {
             Self::spawn_roster_reloader(Arc::clone(&shard.shared));
         }
 
+        // Install one process-wide signal listener before any shard starts.
+        // Every shard receives the same latched watch value, so one SIGINT or
+        // SIGTERM starts every drain even if a shard was not polling its event
+        // loop at the instant the signal arrived.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_listener = spawn_shutdown_notifier(shutdown_tx)
+            .context("failed to install shutdown signal handlers")?;
+        debug!("shutdown signal handlers installed");
+
         // A single shard keeps the current behaviour of running on the caller's
         // task, which keeps the common case free of a spawn and a join.
         if self.shards.len() == 1 {
-            return self.shards[0].run().await;
+            let outcome = self.shards[0].run(shutdown_rx).await;
+            shutdown_listener.abort();
+            return outcome;
         }
 
         let mut tasks = tokio::task::JoinSet::new();
         for mut shard in self.shards.drain(..) {
+            let shutdown_rx = shutdown_rx.clone();
             tasks.spawn(async move {
                 let index = shard.index;
-                let result = shard.run().await;
+                let result = shard.run(shutdown_rx).await;
                 (index, result)
             });
         }
@@ -845,8 +857,80 @@ impl Server {
                 }
             }
         }
+        shutdown_listener.abort();
         outcome
     }
+}
+
+/// Register one listener for the process shutdown signals and latch the result
+/// into a watch channel shared by every shard.
+///
+/// Keeping the task alive after the first signal means a second signal is not
+/// silently swallowed while the bounded drain is still in progress. systemd
+/// will still enforce `TimeoutStopSec` and send SIGKILL if that bound is ever
+/// exceeded.
+#[cfg(unix)]
+fn spawn_shutdown_notifier(
+    shutdown_tx: watch::Sender<bool>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    Ok(tokio::spawn(async move {
+        let mut requested = false;
+        loop {
+            let signal = tokio::select! {
+                _ = sigint.recv() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            };
+
+            if requested {
+                warn!(
+                    signal,
+                    "additional shutdown signal received; drain already in progress"
+                );
+                continue;
+            }
+
+            requested = true;
+            info!(signal, "shutdown signal received, draining shards");
+            if shutdown_tx.send(true).is_err() {
+                return;
+            }
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn spawn_shutdown_notifier(
+    shutdown_tx: watch::Sender<bool>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    Ok(tokio::spawn(async move {
+        let mut requested = false;
+        loop {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                error!(%error, "cannot listen for Ctrl-C; shutting down safely");
+                let _ = shutdown_tx.send(true);
+                return;
+            }
+
+            if requested {
+                warn!("additional Ctrl-C received; drain already in progress");
+                continue;
+            }
+
+            requested = true;
+            info!(
+                signal = "Ctrl-C",
+                "shutdown signal received, draining shards"
+            );
+            if shutdown_tx.send(true).is_err() {
+                return;
+            }
+        }
+    }))
 }
 
 /// Resolve the configured shard count, where 0 means "one per core".
@@ -1469,7 +1553,7 @@ impl Shard {
     }
 
     /// Run the server event loop.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut dgram_buf = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut tun_recv = TunRecvBatch::new(self.config.ip_proxy.tun_mtu);
@@ -1533,7 +1617,7 @@ impl Shard {
 
             let event = if let Some(timeout) = timeout {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c(), if !shutting_down => {
+                    _ = shutdown.wait_for(|requested| *requested), if !shutting_down => {
                         Event::Shutdown
                     }
                     response = self.udp_response_rx.recv(), if !shutting_down => {
@@ -1572,7 +1656,11 @@ impl Shard {
 
             match event {
                 Event::Shutdown => {
-                    info!("shutdown signal received, draining connections...");
+                    info!(
+                        shard = self.index,
+                        connections = self.connections.len(),
+                        "shard draining connections"
+                    );
                     shutting_down = true;
                     drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
 
@@ -1749,7 +1837,7 @@ impl Shard {
             // the drain deadline is reached.
             if shutting_down {
                 if self.connections.is_empty() {
-                    info!("all connections drained, exiting");
+                    info!(shard = self.index, "all connections drained, exiting");
                     return Ok(());
                 }
                 if let Some(deadline) = drain_deadline
