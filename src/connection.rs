@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::client_identity::ClientIdentity;
 use crate::fxhash::FxHashMap;
+use crate::metrics::ShardMetrics;
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
 use crate::tunnel::udp::UdpTunnel;
@@ -115,10 +116,13 @@ pub struct ClientConnection {
     /// The deadline this connection currently holds in the server's timer
     /// queue, used to tell a live wakeup from one a later deadline superseded.
     pub(crate) scheduled_deadline: Option<std::time::Instant>,
+    metrics: Arc<ShardMetrics>,
+    published_tunnels: [usize; 3],
 }
 
 impl ClientConnection {
-    pub fn new(quic: quiche::Connection, index: u64) -> Self {
+    pub(crate) fn new(quic: quiche::Connection, index: u64, metrics: Arc<ShardMetrics>) -> Self {
+        metrics.connection_opened();
         Self {
             quic,
             h3: None,
@@ -131,6 +135,8 @@ impl ClientConnection {
             identity: None,
             deferred_send: DeferredSend::default(),
             scheduled_deadline: None,
+            metrics,
+            published_tunnels: [0; 3],
         }
     }
 
@@ -150,6 +156,30 @@ impl ClientConnection {
             + self.tcp_tunnels.len()
             + self.udp_tunnels.len()
             + self.ip_tunnels.len()
+    }
+
+    /// Publish tunnel gauges once after this connection's event-loop work.
+    ///
+    /// Several datagrams can be handled between calls; gauges describe the
+    /// resulting live state without adding atomics to the per-datagram path.
+    pub(crate) fn sync_metrics(&mut self) {
+        if !self.metrics.enabled() {
+            return;
+        }
+        let current = [
+            self.tcp_tunnels.len(),
+            self.udp_tunnels.len(),
+            self.ip_tunnels.len(),
+        ];
+        self.metrics.update_tunnels(self.published_tunnels, current);
+        self.published_tunnels = current;
+    }
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        self.metrics.update_tunnels(self.published_tunnels, [0; 3]);
+        self.metrics.connection_closed();
     }
 }
 

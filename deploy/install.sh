@@ -13,6 +13,9 @@ CONFIG_PATH=/etc/masque/masque.toml
 TLS_CERT_PATH=/etc/masque/certs/server.crt
 TLS_KEY_PATH=/etc/masque/certs/server.key
 UNIT_PATH=/etc/systemd/system/masque.service
+MONITORING_DIR=/usr/local/share/masque-server/monitoring
+PROMETHEUS_RULES_PATH=$MONITORING_DIR/prometheus-rules.yml
+GRAFANA_DASHBOARD_PATH=$MONITORING_DIR/grafana-dashboard.json
 
 AUTH_MODE=
 AUTH_USERNAME=
@@ -28,10 +31,14 @@ CLIENT_BLOCK_TMP=
 CLIENT_CONFIG_OUT=
 BINARY_INSTALL_TMP=
 UNIT_INSTALL_TMP=
+PROMETHEUS_RULES_INSTALL_TMP=
+GRAFANA_DASHBOARD_INSTALL_TMP=
 UPGRADE_BACKUP_DIR=
 ROLLBACK_PENDING=0
 HAD_BINARY=0
 HAD_UNIT=0
+HAD_PROMETHEUS_RULES=0
+HAD_GRAFANA_DASHBOARD=0
 WAS_SERVICE_ACTIVE=0
 WAS_SERVICE_ENABLED=0
 SERVICE_RESULT="enabled, not started"
@@ -50,6 +57,8 @@ cleanup() {
     [ -z "$CLIENT_BLOCK_TMP" ] || rm -f -- "$CLIENT_BLOCK_TMP"
     [ -z "$BINARY_INSTALL_TMP" ] || rm -f -- "$BINARY_INSTALL_TMP"
     [ -z "$UNIT_INSTALL_TMP" ] || rm -f -- "$UNIT_INSTALL_TMP"
+    [ -z "$PROMETHEUS_RULES_INSTALL_TMP" ] || rm -f -- "$PROMETHEUS_RULES_INSTALL_TMP"
+    [ -z "$GRAFANA_DASHBOARD_INSTALL_TMP" ] || rm -f -- "$GRAFANA_DASHBOARD_INSTALL_TMP"
     [ -z "$UPGRADE_BACKUP_DIR" ] || rm -rf -- "$UPGRADE_BACKUP_DIR"
     exit "$cleanup_status"
 }
@@ -84,6 +93,28 @@ rollback_installation() {
         rollback_ok=0
     fi
 
+    if [ "$HAD_PROMETHEUS_RULES" -eq 1 ]; then
+        if ! cp -p -- "$UPGRADE_BACKUP_DIR/prometheus-rules.yml" \
+            "$PROMETHEUS_RULES_PATH"; then
+            echo "error: could not restore $PROMETHEUS_RULES_PATH" >&2
+            rollback_ok=0
+        fi
+    elif ! rm -f -- "$PROMETHEUS_RULES_PATH"; then
+        echo "error: could not remove the newly installed $PROMETHEUS_RULES_PATH" >&2
+        rollback_ok=0
+    fi
+
+    if [ "$HAD_GRAFANA_DASHBOARD" -eq 1 ]; then
+        if ! cp -p -- "$UPGRADE_BACKUP_DIR/grafana-dashboard.json" \
+            "$GRAFANA_DASHBOARD_PATH"; then
+            echo "error: could not restore $GRAFANA_DASHBOARD_PATH" >&2
+            rollback_ok=0
+        fi
+    elif ! rm -f -- "$GRAFANA_DASHBOARD_PATH"; then
+        echo "error: could not remove the newly installed $GRAFANA_DASHBOARD_PATH" >&2
+        rollback_ok=0
+    fi
+
     if ! systemctl daemon-reload; then
         echo "error: systemd did not reload the restored unit" >&2
         rollback_ok=0
@@ -109,7 +140,7 @@ rollback_installation() {
 
     ROLLBACK_PENDING=0
     if [ "$rollback_ok" -eq 1 ]; then
-        echo "Previous binary, systemd unit, and service state restored." >&2
+        echo "Previous binary, systemd unit, monitoring assets, and service state restored." >&2
     else
         echo "error: rollback was incomplete; inspect the paths and service above" >&2
     fi
@@ -520,6 +551,14 @@ snapshot_installed_files() {
         cp -p -- "$UNIT_PATH" "$UPGRADE_BACKUP_DIR/masque.service"
         HAD_UNIT=1
     fi
+    if [ -e "$PROMETHEUS_RULES_PATH" ]; then
+        cp -p -- "$PROMETHEUS_RULES_PATH" "$UPGRADE_BACKUP_DIR/prometheus-rules.yml"
+        HAD_PROMETHEUS_RULES=1
+    fi
+    if [ -e "$GRAFANA_DASHBOARD_PATH" ]; then
+        cp -p -- "$GRAFANA_DASHBOARD_PATH" "$UPGRADE_BACKUP_DIR/grafana-dashboard.json"
+        HAD_GRAFANA_DASHBOARD=1
+    fi
     if systemctl is-active --quiet masque.service; then
         WAS_SERVICE_ACTIVE=1
     fi
@@ -531,8 +570,14 @@ snapshot_installed_files() {
 install_program_and_unit() {
     BINARY_INSTALL_TMP=$(mktemp /usr/local/bin/.masque-server.install.XXXXXX)
     UNIT_INSTALL_TMP=$(mktemp /etc/systemd/system/.masque.service.install.XXXXXX)
+    PROMETHEUS_RULES_INSTALL_TMP=$(mktemp "$MONITORING_DIR/.prometheus-rules.install.XXXXXX")
+    GRAFANA_DASHBOARD_INSTALL_TMP=$(mktemp "$MONITORING_DIR/.grafana-dashboard.install.XXXXXX")
     install -m 0755 "$CANDIDATE_BIN" "$BINARY_INSTALL_TMP"
     install -m 0644 "$PACKAGE_DIR/systemd/masque.service" "$UNIT_INSTALL_TMP"
+    install -m 0644 "$PACKAGE_DIR/monitoring/prometheus-rules.yml" \
+        "$PROMETHEUS_RULES_INSTALL_TMP"
+    install -m 0644 "$PACKAGE_DIR/monitoring/grafana-dashboard.json" \
+        "$GRAFANA_DASHBOARD_INSTALL_TMP"
 
     snapshot_installed_files
     ROLLBACK_PENDING=1
@@ -541,6 +586,10 @@ install_program_and_unit() {
     BINARY_INSTALL_TMP=
     mv -f -- "$UNIT_INSTALL_TMP" "$UNIT_PATH"
     UNIT_INSTALL_TMP=
+    mv -f -- "$PROMETHEUS_RULES_INSTALL_TMP" "$PROMETHEUS_RULES_PATH"
+    PROMETHEUS_RULES_INSTALL_TMP=
+    mv -f -- "$GRAFANA_DASHBOARD_INSTALL_TMP" "$GRAFANA_DASHBOARD_PATH"
+    GRAFANA_DASHBOARD_INSTALL_TMP=
 
     systemctl daemon-reload
     systemctl enable masque.service
@@ -580,7 +629,8 @@ if ! id masque >/dev/null 2>&1; then
         --create-home --shell /usr/sbin/nologin masque
 fi
 
-install -d -m 0755 /usr/local/bin /etc/masque /etc/systemd/system
+install -d -m 0755 /usr/local/bin /etc/masque /etc/systemd/system \
+    /usr/local/share/masque-server "$MONITORING_DIR"
 install -d -o root -g masque -m 0750 /etc/masque/certs
 
 if [ "$FRESH_CONFIG" -eq 1 ]; then
@@ -613,6 +663,8 @@ echo "  Configuration:  $CONFIG_PATH"
 echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
 echo "  Logs:           journalctl -u masque -f"
+echo "  Prometheus:     $PROMETHEUS_RULES_PATH"
+echo "  Grafana:        $GRAFANA_DASHBOARD_PATH"
 
 # The per-socket truth behind the summary line above, so a server that
 # authenticates on one port and not another cannot read as if it did both.

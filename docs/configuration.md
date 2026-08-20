@@ -21,6 +21,7 @@ masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
   -c, --config <PATH>       Config file [default: masque.toml]
       --cert <PATH>         Override tls.cert_path
       --key <PATH>          Override tls.key_path
+      --log-format <FORMAT> Log encoding: text or json [default: text]
   -v, --verbose             Increase verbosity; repeat for trace logging
   -V, --version             Print the server version
 ```
@@ -48,7 +49,8 @@ enroll-client options:
   -o, --out <PATH>          Write the client JSON here instead of stdout
 ```
 
-`RUST_LOG` overrides the default tracing filter.
+`RUST_LOG` overrides the default tracing filter. Logs are human-readable by
+default; `--log-format json` emits newline-delimited structured JSON.
 
 ## Server
 
@@ -67,6 +69,22 @@ max_tunnels_per_connection = 100
 
 This section contains process-wide connection limits only. Socket addresses and
 shard counts belong to [`[[listeners]]`](#listeners).
+
+## Observability
+
+The operational HTTP endpoint is disabled by default. Enable it for a
+same-host collector with:
+
+```toml
+[observability]
+listen_addr = "127.0.0.1:9090"
+```
+
+Only IPv4/IPv6 loopback addresses are accepted; wildcard and public addresses
+fail validation because the endpoint intentionally has no authentication. It
+serves `/healthz`, `/readyz`, and Prometheus `/metrics`. `check-config` prints
+the resolved address and paths when enabled. See
+[Observability](observability.md) for metrics, alerts, and Grafana setup.
 
 ## TLS
 
@@ -274,7 +292,7 @@ the server will actually run rather than the ones written down
 — `shards = 0` expanded to one per core, and any excess capped:
 
 ```
-configuration is compatible with masque-server 0.3.2: /etc/masque/masque.toml
+configuration is compatible with masque-server 0.4.0: /etc/masque/masque.toml
 listener 0.0.0.0:443 auth=basic shards=1
 listener 0.0.0.0:4443 auth=client_cert shards=1
 ```

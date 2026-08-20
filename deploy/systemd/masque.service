@@ -5,7 +5,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=masque
 Group=masque
 ExecStart=/usr/local/bin/masque-server --config /etc/masque/masque.toml

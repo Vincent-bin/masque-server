@@ -92,6 +92,10 @@ MASQUE_BENCH_RTT_SAMPLES=100 \
 scripts/network-bench.sh
 ```
 
+Set `MASQUE_BENCH_OBSERVABILITY=1` to enable the loopback endpoint and metric
+updates during an A/B run; the default `0` measures the uninstrumented packet
+path.
+
 The expiry interval must exceed network RTT plus expected queueing. Otherwise
 the load generator spends its window on requests it has already classified as
 expired and the result measures the benchmark harness rather than the server.

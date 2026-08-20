@@ -1,0 +1,74 @@
+groups:
+  - name: masque-server
+    rules:
+      - alert: MasqueServerNotReady
+        expr: masque_server_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: MASQUE server is not ready
+          description: >-
+            The process is alive but has reported not-ready for more than two
+            minutes. Check systemd state and the service journal.
+
+      - alert: MasqueConnectionLimitReached
+        expr: increase(masque_connections_rejected_total{reason="limit"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: MASQUE listener rejected connections at its configured limit
+          description: >-
+            Listener {{ $labels.listener }} rejected at least one new QUIC
+            connection during the last five minutes.
+
+      - alert: MasqueAuthenticationOverloaded
+        expr: increase(masque_auth_attempts_total{result="overloaded"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: MASQUE authentication queue is shedding work
+          description: >-
+            Listener {{ $labels.listener }} exhausted its bounded password
+            verification queue. Check for abusive login traffic or CPU pressure.
+
+      - alert: MasqueHighAuthenticationFailureRatio
+        expr: |
+          sum by (instance, listener) (rate(masque_auth_attempts_total{result="failure"}[5m]))
+          /
+          clamp_min(sum by (instance, listener) (rate(masque_auth_attempts_total[5m])), 1)
+          > 0.20
+          and
+          sum by (instance, listener) (rate(masque_auth_attempts_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: MASQUE listener has a high authentication failure ratio
+          description: >-
+            More than 20% of authentication attempts on listener
+            {{ $labels.listener }} failed while the attempt rate exceeded one
+            per second for ten minutes.
+
+      - alert: MasqueInternalPacketDrops
+        expr: sum by (instance, listener, reason) (rate(masque_packets_dropped_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: MASQUE internal queues are dropping packets
+          description: >-
+            Listener {{ $labels.listener }} is dropping more than ten packets
+            per second in the {{ $labels.reason }} path.
+
+      - alert: MasqueForcedShutdown
+        expr: increase(masque_forced_shutdowns_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: MASQUE shutdown exceeded its connection drain deadline
+          description: >-
+            At least one shard still had live connections after the bounded
+            five-second drain. Inspect clients and shutdown logs.

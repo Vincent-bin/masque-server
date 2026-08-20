@@ -6,6 +6,12 @@ idle_timeout_secs = 60
 max_connections = 10000
 max_tunnels_per_connection = 100
 
+# Optional loopback-only operational endpoint. Uncomment to expose health,
+# readiness, and Prometheus metrics to a collector on this host. Public and
+# wildcard addresses are rejected because this endpoint has no authentication.
+# [observability]
+# listen_addr = "127.0.0.1:9090"
+
 [tls]
 cert_path = "/etc/masque/certs/server.crt"
 key_path = "/etc/masque/certs/server.key"

@@ -20,6 +20,9 @@ a staging environment.
 - Bounded queues and backpressure across authentication and tunnel I/O
 - Linux `recvmmsg`/`sendmmsg`, UDP GRO, optional UDP GSO, and TUN offload
 - Multi-core sharding with `SO_REUSEPORT`
+- Loopback health/readiness endpoints, low-overhead Prometheus metrics,
+  packaged alert rules and a Grafana dashboard
+- Optional JSON logs and native systemd readiness notification
 - Static Linux x86_64 release archives with a systemd installer
 
 ## Quick start
@@ -101,10 +104,11 @@ password hash redacted.
 
 The same command is also the upgrade command. When
 `/etc/masque/masque.toml` already exists, the candidate binary checks that
-configuration without binding a port or creating a TUN, then upgrades only the
-binary and systemd unit. It never rewrites the TOML or referenced TLS files. An
+configuration without binding a port or creating a TUN, then upgrades the
+binary, systemd unit, and versioned monitoring assets. It never rewrites the
+TOML or referenced TLS files. An
 incompatible configuration aborts before replacement; a failed service restart
-restores the prior binary, unit, and service state. See
+restores the prior binary, unit, monitoring assets, and service state. See
 [Deployment](docs/deployment.md#one-command-install) for non-interactive
 variables, certificate requirements, and installing a specific release.
 
@@ -116,7 +120,7 @@ them automatically.
 ## Install a downloaded release on Linux
 
 Release archives contain the binary, an example configuration, a hardened
-systemd unit, and an installer:
+systemd unit, Prometheus rules, a Grafana dashboard, and an installer:
 
 ```sh
 tar xzf masque-vVERSION-linux-x86_64.tar.gz
@@ -141,6 +145,7 @@ upgrades, and diagnostics.
 | [Deployment](docs/deployment.md) | Linux installation, systemd, certificates, and upgrades |
 | [Protocols](docs/protocols.md) | Supported RFCs and CONNECT request behavior |
 | [Performance](docs/performance.md) | Benchmark methodology and Linux fast paths |
+| [Observability](docs/observability.md) | Health/readiness, metrics, alerts, dashboard, and structured logs |
 | [Testing](docs/testing.md) | Unit, E2E, benchmark, and release validation |
 | [Security](docs/security.md) | Threat model, safe defaults, and operational guidance |
 
@@ -154,7 +159,7 @@ src/                    Server library and CLI
 tools/masque-e2e/       E2E client and load generator
 tests/e2e/              Docker E2E environment and fixtures
 benches/                In-process microbenchmarks
-deploy/                 Example config, installer, and systemd unit
+deploy/                 Example config, installer, systemd unit, and monitoring assets
 docs/                   Operator and contributor documentation
 scripts/                Test, benchmark, certificate, and packaging helpers
 .github/workflows/      CI and release automation

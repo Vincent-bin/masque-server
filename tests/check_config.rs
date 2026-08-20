@@ -158,6 +158,48 @@ fn check_config_validates_without_binding_the_listen_port() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("configuration is compatible"));
 }
 
+#[test]
+fn json_log_format_emits_machine_parseable_events() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        config_text(
+            "127.0.0.1:0".parse().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--log-format")
+        .arg("json")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !events.is_empty(),
+        "validation should emit at least one event"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["fields"]["message"].is_string())
+    );
+}
+
 /// A preflight deliberately has no network side effects, so an ephemeral port
 /// does not exist yet. Report the configured `:0`; the live `listening` log is
 /// what reports the address selected by the kernel.
@@ -194,6 +236,63 @@ fn check_config_keeps_an_ephemeral_port_unresolved() {
         stdout.contains("listener 127.0.0.1:0 auth=disabled shards=1"),
         "check-config must not invent a runtime port: {stdout}"
     );
+}
+
+#[test]
+fn check_config_reports_a_loopback_observability_endpoint() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    let mut config = config_text(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert_path,
+        &key_path,
+        "cubic",
+    );
+    config.push_str("\n[observability]\nlisten_addr = \"127.0.0.1:9090\"\n");
+    std::fs::write(&config_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "check-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "observability 127.0.0.1:9090 health=/healthz ready=/readyz metrics=/metrics"
+        )
+    );
+}
+
+#[test]
+fn check_config_rejects_a_public_observability_endpoint() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    let mut config = config_text(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert_path,
+        &key_path,
+        "cubic",
+    );
+    config.push_str("\n[observability]\nlisten_addr = \"0.0.0.0:9090\"\n");
+    std::fs::write(&config_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must use a loopback address"));
 }
 
 /// A roster-ready public key, in the base64 SubjectPublicKeyInfo DER form

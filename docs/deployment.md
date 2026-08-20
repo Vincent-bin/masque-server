@@ -7,6 +7,8 @@ GitHub Actions builds a static `x86_64-unknown-linux-musl` binary and packages:
 ```text
 bin/masque-server
 config/masque.toml
+monitoring/prometheus-rules.yml
+monitoring/grafana-dashboard.json
 systemd/masque.service
 install.sh
 README.md
@@ -90,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.3.2` selects `v0.3.2`. This is also how to install a
+`MASQUE_VERSION=0.4.0` selects `v0.4.0`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
@@ -99,11 +101,12 @@ exist.
 The same one-command installer is safe to reuse for later releases. If the
 configuration already exists, the downloaded candidate runs `check-config`
 against it before any installed file is replaced. A failed check leaves the
-binary, systemd unit, configuration, TLS files, and running service untouched.
-On success, only the binary and packaged systemd unit are upgraded; the TOML
-and every TLS path it references remain unchanged. If the requested service
-restart then fails, the installer restores the previous binary, unit, enabled
-state, and active state.
+binary, systemd unit, monitoring assets, configuration, TLS files, and running
+service untouched. On success, the binary, packaged systemd unit, Prometheus
+rules, and Grafana dashboard are upgraded; the TOML and every TLS path it
+references remain unchanged. If the requested service restart then fails, the
+installer restores the previous release-managed files, enabled state, and
+active state.
 
 Version 0.3 does not migrate the 0.2 single-listener format. Before upgrading,
 move every socket into `[[listeners]]` with an explicit `[listeners.auth]` and
@@ -139,7 +142,9 @@ The installer creates:
 - `/usr/local/bin/masque-server`;
 - `/etc/masque/masque.toml`;
 - `/etc/masque/certs/`;
-- `/etc/systemd/system/masque.service`; and
+- `/etc/systemd/system/masque.service`;
+- `/usr/local/share/masque-server/monitoring/prometheus-rules.yml`;
+- `/usr/local/share/masque-server/monitoring/grafana-dashboard.json`; and
 - the unprivileged `masque` user and group.
 
 It preserves every existing configuration and referenced TLS file byte for
@@ -184,7 +189,7 @@ sudo systemctl status masque --no-pager
 sudo journalctl -u masque -f
 ```
 
-The supplied unit uses an unprivileged account, a read-only filesystem view,
+The supplied unit uses `Type=notify`, an unprivileged account, a read-only filesystem view,
 restricted kernel access, and only `CAP_NET_BIND_SERVICE` plus
 `CAP_NET_ADMIN`. If CONNECT-IP is disabled and the listen port is above 1023,
 both capabilities can be removed from a local override.
@@ -239,6 +244,10 @@ GOAWAY and QUIC CONNECTION_CLOSE, and drains existing connections for at most
 five seconds. The packaged unit sets `TimeoutStopSec=10s`, leaving a second
 five-second margin before systemd may escalate to SIGKILL.
 
+systemd considers startup complete only after the process has bound every
+proxy listener and the optional observability endpoint and sent `READY=1`.
+Graceful shutdown sends `STOPPING=1` as readiness changes to false.
+
 SIGINT follows the same path for foreground runs. SIGHUP remains distinct: it
 reloads only the `[[clients]]` roster and does not stop the service.
 
@@ -266,7 +275,10 @@ configuration deliberately; the installer never migrates it automatically.
 After a successful upgrade, inspect service status and run a client
 connectivity and throughput smoke test. Keep independent backups as part of
 normal operations even though the installer performs a temporary transactional
-rollback around the binary and unit replacement.
+rollback around the binary, unit, and packaged monitoring-asset replacement.
+
+For health checks, Prometheus scraping, alert rules, and the installed Grafana
+dashboard, see [Observability](observability.md).
 
 ## Diagnostics
 

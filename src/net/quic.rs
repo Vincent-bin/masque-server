@@ -158,6 +158,7 @@ pub(crate) struct SendPacketBatch {
     messages: Vec<SendMessage>,
     used: usize,
     packet_count: usize,
+    byte_count: usize,
 }
 
 struct SendMessage {
@@ -210,12 +211,14 @@ impl SendPacketBatch {
             messages: Vec::new(),
             used: 0,
             packet_count: 0,
+            byte_count: 0,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.used = 0;
         self.packet_count = 0;
+        self.byte_count = 0;
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -224,6 +227,10 @@ impl SendPacketBatch {
 
     pub(crate) fn packet_count(&self) -> usize {
         self.packet_count
+    }
+
+    pub(crate) fn byte_count(&self) -> usize {
+        self.byte_count
     }
 
     pub(crate) fn push(
@@ -241,6 +248,7 @@ impl SendPacketBatch {
                 last.data.extend_from_slice(packet);
                 last.segments += 1;
                 self.packet_count += 1;
+                self.byte_count += packet.len();
                 return;
             }
         }
@@ -251,6 +259,7 @@ impl SendPacketBatch {
         self.messages[self.used].reset(packet, info);
         self.used += 1;
         self.packet_count += 1;
+        self.byte_count += packet.len();
     }
 
     fn active(&self) -> &[SendMessage] {

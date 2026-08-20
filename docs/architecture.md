@@ -46,6 +46,12 @@ starts one or more `Shard` instances. A shard owns:
 
 No connection is concurrently mutated by two shards.
 
+When configured, a separate loopback TCP task serves health, readiness, and
+Prometheus requests. Shards update fixed atomic counters in batches and never
+format metrics or acquire the scrape-side listener-list lock. systemd readiness
+uses the same lifecycle state: ready after every socket is bound, not ready as
+soon as the bounded drain begins.
+
 ## Source layout
 
 | Path | Responsibility |
@@ -54,6 +60,9 @@ No connection is concurrently mutated by two shards.
 | `src/server/request.rs` | CONNECT classification, auth precheck, and authorized dispatch |
 | `src/server/authentication.rs` | Bounded Argon2 scheduling, cancellation, and request resumption |
 | `src/connection.rs` | Per-client QUIC/H3 state and deferred sends |
+| `src/metrics.rs` | Low-cardinality atomic counters and Prometheus rendering |
+| `src/observability.rs` | Bounded loopback health/readiness/metrics HTTP endpoint |
+| `src/systemd.rs` | Dependency-free systemd readiness notification |
 | `src/net/quic.rs` | QUIC UDP receive/send batching, GSO/GRO, and portable fallbacks |
 | `src/net/target_udp.rs` | Batched target UDP I/O and truncation detection |
 | `src/tunnel/tcp.rs` | TCP connection setup and bounded bidirectional relay |

@@ -7,6 +7,36 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-20
+
+### Added
+
+- An optional loopback-only operational HTTP endpoint serves `/healthz`,
+  `/readyz`, and Prometheus `/metrics`. Configuration and startup reject
+  wildcard or public observability addresses because the endpoint has no
+  authentication.
+- Low-cardinality metrics cover readiness, uptime, listener shards,
+  connections, active TCP/UDP/IP tunnels, QUIC network batches/packets/bytes,
+  authentication pressure and outcomes, internal queue drops, roster reloads,
+  and forced shutdowns. Prometheus alert rules and an importable Grafana
+  dashboard ship in release archives and are installed transactionally.
+- `--log-format json` emits newline-delimited structured logs for collectors.
+- The server implements systemd's notification protocol directly. The packaged
+  unit now uses `Type=notify`, reports ready only after every socket is bound,
+  and reports stopping as the graceful drain begins.
+
+### Changed
+
+- Each shard owns its metric counters and Prometheus aggregates only while
+  scraping, avoiding cache-line contention between event-loop cores. When the
+  observability endpoint is disabled, traffic collection performs no atomic
+  counter updates.
+- Operational logs now explicitly use stderr, keeping command output on stdout
+  separate from both human-readable and JSON log streams.
+- Release installation and rollback now include the versioned Prometheus and
+  Grafana assets while continuing to preserve the operator's TOML and TLS
+  files unchanged.
+
 ## 0.3.2 - 2026-08-20
 
 ### Fixed
