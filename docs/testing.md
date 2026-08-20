@@ -55,6 +55,20 @@ Run several repetitions and preserve the direct UDP baseline. When changing
 batching, readiness, pacing, flow control, or buffers, test both 64-byte and
 1200-byte payloads. Use multiple connections for shard tests.
 
+CONNECT-TCP runs include an alternating direct-origin sample by default and
+print `TCP_DOWNLOAD_SUMMARY` with both medians. Useful controls are:
+
+```sh
+MASQUE_TCP_DOWNLOAD_BYTES=536870912 \
+MASQUE_TCP_DOWNLOAD_REPEATS=3 \
+MASQUE_TCP_DIRECT_BASELINE=1 \
+scripts/network-bench.sh
+```
+
+Set `MASQUE_BENCH_QUIC_GSO=0|1` and
+`MASQUE_BENCH_TARGET_GSO=0|1` independently. The former changes the outer QUIC
+socket; the latter changes only CONNECT-UDP target egress.
+
 See [Performance](performance.md) for methodology and reporting requirements.
 
 ## Linux-specific checks

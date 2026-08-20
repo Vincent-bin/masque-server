@@ -104,6 +104,11 @@ All metric names start with `masque_`.
 | `masque_quic_send_batches_total` | counter | `listener`, `auth` | Successful network send batches |
 | `masque_quic_send_packets_total` | counter | `listener`, `auth` | Sent QUIC UDP datagrams |
 | `masque_quic_send_bytes_total` | counter | `listener`, `auth` | Sent QUIC UDP bytes |
+| `masque_quic_udp_gso_enabled` | gauge | `listener`, `auth` | Bound QUIC socket is using UDP GSO |
+| `masque_quic_udp_gro_enabled` | gauge | `listener`, `auth` | Bound QUIC socket is using UDP GRO |
+| `masque_tcp_relay_batches_total` | counter | `listener`, `auth` | Event-loop rounds consuming target TCP events |
+| `masque_tcp_relay_events_total` | counter | `listener`, `auth` | Target TCP events consumed by shards |
+| `masque_tcp_relay_bytes_total` | counter | `listener`, `auth` | Target TCP response bytes handed to shards |
 | `masque_tunnels_active` | gauge | `listener`, `auth`, `protocol` | Live `tcp`, `udp`, or `ip` tunnels |
 | `masque_auth_attempts_total` | counter | `listener`, `auth`, `result` | Successful, failed, or load-shed verification |
 | `masque_auth_pending` | gauge | `listener`, `auth` | Admitted Basic checks not yet completed |
@@ -117,14 +122,16 @@ protocols, and fixed result classes. Usernames, client identities, target
 addresses, stream IDs, and connection IDs are never labels, which avoids both
 sensitive-data exposure and unbounded Prometheus cardinality.
 
-Receive and send counters are updated once per kernel batch rather than once
-per datagram. Connection counts use object lifetime, while tunnel gauges are
-published once after a connection's event-loop work. Scraping is the only path
-that formats text or takes the listener-list read lock. Each shard owns its
-counter allocation, so event-loop cores never contend on a shared metric cache
-line. When `[observability]` is absent, traffic collection performs no counter
-atomics; each shard still performs one heartbeat store per second for readiness
-and systemd watchdog supervision.
+Receive, send, and TCP relay counters are updated once per batch rather than
+once per packet or relay event. Dividing relay events by relay batches shows
+the effective event-loop coalescing factor. Connection counts use object
+lifetime, while tunnel gauges are published once after a connection's
+event-loop work. Scraping is the only path that formats text or takes the
+listener-list read lock. Each shard owns its counter allocation, so event-loop
+cores never contend on a shared metric cache line. When `[observability]` is
+absent, traffic collection performs no counter atomics; each shard still
+performs one heartbeat store per second for readiness and systemd watchdog
+supervision.
 
 ## Logs and systemd readiness
 

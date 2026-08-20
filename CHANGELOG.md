@@ -7,6 +7,30 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- Prometheus now exposes target-to-HTTP/3 TCP relay batches, events, and bytes,
+  plus the effective QUIC UDP GSO/GRO state of every listener. The offload
+  gauges report what the bound socket actually accepted rather than merely
+  echoing the requested configuration.
+- The network benchmark can alternate a direct TCP origin download with each
+  CONNECT-TCP sample and prints a median direct/proxy summary. It also exposes
+  independent controls for QUIC-socket and target-socket GSO, and raises the
+  Linux benchmark client's UDP receive buffer to avoid measuring client kernel
+  drops as server throughput.
+
+### Changed
+
+- A shard drains a bounded group of already-ready target TCP events before it
+  drives HTTP/3. The existing 256 KiB per-tunnel response credit remains the
+  memory bound, while four typical 64 KiB reads share one event-loop round.
+  Alternating Linux loopback runs improved median CONNECT-TCP throughput from
+  1.818 to 1.973 Gbit/s (8.6%) and reduced server CPU time for the same transfer
+  by 9.5%.
+- GSO remains opt-in. QUIC-socket GSO substantially reduces server CPU on
+  Linux, but its throughput improvement did not reproduce on a variable
+  network path, while target-side GSO likewise showed no measurable gain.
+
 ## 0.4.1 - 2026-08-20
 
 ### Added
