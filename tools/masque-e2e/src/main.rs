@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
-#[cfg(target_os = "macos")]
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -21,15 +21,16 @@ use tracing::{error, info, warn};
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const BUF_SIZE: usize = 65535;
 const MAX_HTTP_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const CLIENT_UDP_RECEIVE_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tune_udp_receive_buffer(socket: &UdpSocket) {
-    // The macOS UDP default is roughly 768 KiB. A high-BDP download can fill
-    // that between scheduler wakeups, making the benchmark report kernel
-    // socket drops as QUIC/path performance. Keep the requested size below the
-    // default 8 MiB kern.ipc.maxsockbuf ceiling.
+    // Default UDP receive buffers are small on both macOS and Linux. A bulk
+    // download can fill one between scheduler wakeups, making the benchmark
+    // report client-side kernel drops as QUIC/server performance. The kernel
+    // may clamp this request to its configured maximum; that is still better
+    // than silently retaining the much smaller default.
     // SAFETY: the file descriptor and option pointer remain valid throughout
     // the call, and SO_RCVBUF expects a `c_int` value.
     let result = unsafe {
@@ -259,9 +260,10 @@ impl Client {
         let peer: SocketAddr = server_addr.parse().context("parse server addr")?;
 
         let socket = UdpSocket::bind("0.0.0.0:0")?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        tune_udp_receive_buffer(&socket);
         #[cfg(target_os = "macos")]
         {
-            tune_udp_receive_buffer(&socket);
             bind_udp_socket_to_requested_interface(&socket)?;
         }
         socket.connect(peer)?;
@@ -1234,6 +1236,98 @@ fn test_standard_connect_early_body(server_addr: &str, echo_addr: &str) -> Resul
     Ok(())
 }
 
+fn benchmark_direct_tcp_download(
+    target: &str,
+    path: &str,
+    configured_body_bytes: Option<u64>,
+    timeout: Duration,
+) -> Result<(TcpDownloadResult, Instant, Instant, Instant)> {
+    let sample_started = Instant::now();
+    let mut stream = TcpStream::connect(target)
+        .with_context(|| format!("connect directly to TCP origin {target}"))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let connected_at = Instant::now();
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {target}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+    );
+    let request_started = Instant::now();
+    stream.write_all(request.as_bytes())?;
+
+    let mut response = HttpDownloadResponse::new();
+    let mut buffer = [0_u8; BUF_SIZE];
+    let mut stream_finished = false;
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                stream_finished = true;
+                break;
+            }
+            Ok(len) => response.ingest(&buffer[..len], Instant::now())?,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!(
+                    "direct TCP download timed out after receiving {} body bytes",
+                    response.body_bytes
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        if let Some(expected) = response.expected_body_bytes(configured_body_bytes) {
+            if response.body_bytes > expected {
+                bail!(
+                    "direct TCP download received {} body bytes, expected {expected}",
+                    response.body_bytes
+                );
+            }
+            if response.body_bytes == expected {
+                break;
+            }
+        }
+    }
+
+    if !response.header_complete {
+        bail!("direct TCP origin closed before a complete HTTP response header arrived");
+    }
+    if response.status != Some(200) {
+        bail!("direct TCP origin returned status {:?}", response.status);
+    }
+    if let (Some(configured), Some(advertised)) = (configured_body_bytes, response.content_length)
+        && configured != advertised
+    {
+        bail!(
+            "configured body size {configured} differs from direct origin Content-Length {advertised}"
+        );
+    }
+    if let Some(expected) = response.expected_body_bytes(configured_body_bytes)
+        && response.body_bytes != expected
+    {
+        bail!(
+            "direct TCP download finished after {} of {expected} body bytes",
+            response.body_bytes
+        );
+    }
+
+    let finished_at = Instant::now();
+    Ok((
+        TcpDownloadResult {
+            response,
+            finished_at,
+            stream_finished,
+        },
+        sample_started,
+        connected_at,
+        request_started,
+    ))
+}
+
 fn benchmark_standard_connect_download(server_addr: &str) -> Result<()> {
     let target = std::env::var("MASQUE_TCP_TARGET")
         .context("MASQUE_TCP_TARGET must be set to origin-host:port")?;
@@ -1254,6 +1348,7 @@ fn benchmark_standard_connect_download(server_addr: &str) -> Result<()> {
         .unwrap_or_else(|_| "1".into())
         .parse::<u32>()
         .context("MASQUE_TCP_DOWNLOAD_REPEATS must be an integer")?;
+    let direct_baseline = std::env::var_os("MASQUE_TCP_DIRECT_BASELINE").is_some();
 
     if target.is_empty()
         || target
@@ -1277,8 +1372,56 @@ fn benchmark_standard_connect_download(server_addr: &str) -> Result<()> {
     client.handshake()?;
     client.init_h3()?;
     let quic_setup = Instant::now().saturating_duration_since(connection_started);
+    let mut direct_transfer_rates = Vec::with_capacity(repeats as usize);
+    let mut masque_transfer_rates = Vec::with_capacity(repeats as usize);
 
     for sample in 1..=repeats {
+        if direct_baseline {
+            let (direct, direct_started, connected_at, request_started) =
+                benchmark_direct_tcp_download(
+                    &target,
+                    &path,
+                    configured_body_bytes,
+                    Duration::from_secs(timeout_secs),
+                )?;
+            let first_body_at = direct
+                .response
+                .first_body_at
+                .context("direct HTTP response contained no body")?;
+            let body_bytes = direct.response.body_bytes;
+            let connect_elapsed = connected_at.saturating_duration_since(direct_started);
+            let ttfb = first_body_at.saturating_duration_since(request_started);
+            let request_elapsed = direct
+                .finished_at
+                .saturating_duration_since(request_started);
+            let transfer_elapsed = direct.finished_at.saturating_duration_since(first_body_at);
+            let sample_elapsed = direct.finished_at.saturating_duration_since(direct_started);
+            let mbps = |elapsed: Duration| -> f64 {
+                if elapsed.is_zero() {
+                    return 0.0;
+                }
+                body_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0
+            };
+            let request_mbps = mbps(request_elapsed);
+            let transfer_mbps = mbps(transfer_elapsed);
+            let sample_mbps = mbps(sample_elapsed);
+            direct_transfer_rates.push(transfer_mbps);
+            println!(
+                "DIRECT_TCP_DOWNLOAD_RESULT sample={sample} body_bytes={body_bytes} \
+connect_ms={:.3} ttfb_ms={:.3} request_ms={:.3} transfer_ms={:.3} sample_ms={:.3} \
+request_mbps={:.3} transfer_mbps={:.3} sample_mbps={:.3} stream_finished={}",
+                connect_elapsed.as_secs_f64() * 1000.0,
+                ttfb.as_secs_f64() * 1000.0,
+                request_elapsed.as_secs_f64() * 1000.0,
+                transfer_elapsed.as_secs_f64() * 1000.0,
+                sample_elapsed.as_secs_f64() * 1000.0,
+                request_mbps,
+                transfer_mbps,
+                sample_mbps,
+                direct.stream_finished,
+            );
+        }
+
         let sample_started = Instant::now();
         let stats_before = client.quic.stats();
         let counters_before = (
@@ -1339,6 +1482,10 @@ fn benchmark_standard_connect_download(server_addr: &str) -> Result<()> {
             }
             body_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0
         };
+        let request_mbps = mbps(request_elapsed);
+        let transfer_mbps = mbps(transfer_elapsed);
+        let sample_mbps = mbps(sample_elapsed);
+        masque_transfer_rates.push(transfer_mbps);
 
         let stats = client.quic.stats();
         let path_stats = client.quic.path_stats().find(|path| path.active);
@@ -1367,9 +1514,9 @@ data_blocked_received={} stream_blocked_received={} stream_finished={}",
             request_elapsed.as_secs_f64() * 1000.0,
             transfer_elapsed.as_secs_f64() * 1000.0,
             sample_elapsed.as_secs_f64() * 1000.0,
-            mbps(request_elapsed),
-            mbps(transfer_elapsed),
-            mbps(sample_elapsed),
+            request_mbps,
+            transfer_mbps,
+            sample_mbps,
             stats.recv.saturating_sub(counters_before.0),
             stats.recv_bytes.saturating_sub(counters_before.1),
             stats.lost.saturating_sub(counters_before.2),
@@ -1381,6 +1528,20 @@ data_blocked_received={} stream_blocked_received={} stream_finished={}",
                 .stream_data_blocked_recv_count
                 .saturating_sub(counters_before.5),
             result.stream_finished,
+        );
+    }
+
+    let masque_median = median(&mut masque_transfer_rates)
+        .expect("at least one MASQUE TCP download sample was required");
+    if let Some(direct_median) = median(&mut direct_transfer_rates) {
+        println!(
+            "TCP_DOWNLOAD_SUMMARY samples={repeats} direct_transfer_mbps_median={direct_median:.3} \
+masque_transfer_mbps_median={masque_median:.3} direct_ratio_pct={:.2}",
+            masque_median * 100.0 / direct_median,
+        );
+    } else {
+        println!(
+            "TCP_DOWNLOAD_SUMMARY samples={repeats} masque_transfer_mbps_median={masque_median:.3}"
         );
     }
 
@@ -1629,6 +1790,19 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() & 1 == 0 {
+        Some((values[middle - 1] + values[middle]) / 2.0)
+    } else {
+        Some(values[middle])
+    }
 }
 
 fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
@@ -2136,5 +2310,48 @@ fn main() {
     info!("{passed} passed, {failed} failed");
     if failed > 0 {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_tcp_download_counts_body_without_http_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).unwrap();
+            assert!(request[..read].starts_with(b"GET /blob HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\npayload")
+                .unwrap();
+        });
+
+        let (result, started, connected, request_started) = benchmark_direct_tcp_download(
+            &addr.to_string(),
+            "/blob",
+            Some(7),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        origin.join().unwrap();
+        assert_eq!(result.response.status, Some(200));
+        assert_eq!(result.response.content_length, Some(7));
+        assert_eq!(result.response.body_bytes, 7);
+        assert!(connected >= started);
+        assert!(request_started >= connected);
+        assert!(result.finished_at >= request_started);
+    }
+
+    #[test]
+    fn median_handles_odd_even_and_empty_samples() {
+        assert_eq!(median(&mut []), None);
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), Some(2.5));
     }
 }

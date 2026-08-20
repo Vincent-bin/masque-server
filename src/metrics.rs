@@ -55,9 +55,18 @@ impl Metrics {
         addr: SocketAddr,
         auth: &'static str,
         shards: usize,
+        udp_gso: bool,
+        udp_gro: bool,
     ) -> Vec<Arc<ShardMetrics>> {
-        let listener =
-            ListenerMetrics::new(addr, auth, shards, self.enabled, self.elapsed_millis());
+        let listener = ListenerMetrics::new(
+            addr,
+            auth,
+            shards,
+            udp_gso,
+            udp_gro,
+            self.enabled,
+            self.elapsed_millis(),
+        );
         let shard_metrics = listener.shards.clone();
         self.listeners
             .write()
@@ -223,6 +232,8 @@ impl ListenerMetrics {
         addr: SocketAddr,
         auth: &'static str,
         shards: usize,
+        udp_gso: bool,
+        udp_gro: bool,
         enabled: bool,
         now_millis: u64,
     ) -> Self {
@@ -233,7 +244,7 @@ impl ListenerMetrics {
                 escape_label(auth)
             ),
             shards: (0..shards)
-                .map(|_| Arc::new(ShardMetrics::new(enabled, now_millis)))
+                .map(|_| Arc::new(ShardMetrics::new(enabled, now_millis, udp_gso, udp_gro)))
                 .collect(),
         }
     }
@@ -251,6 +262,26 @@ impl ListenerMetrics {
             out,
             "masque_listener_shards{{{label}}} {}",
             self.shards.len()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "masque_quic_udp_gso_enabled{{{label}}} {}",
+            u8::from(
+                self.shards
+                    .iter()
+                    .all(|shard| shard.quic_udp_gso_enabled.load(RELAXED))
+            )
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "masque_quic_udp_gro_enabled{{{label}}} {}",
+            u8::from(
+                self.shards
+                    .iter()
+                    .all(|shard| shard.quic_udp_gro_enabled.load(RELAXED))
+            )
         )
         .unwrap();
         for (index, shard) in self.shards.iter().enumerate() {
@@ -313,6 +344,15 @@ impl ListenerMetrics {
             }),
             ("masque_quic_send_bytes_total", |shard| {
                 &shard.quic_send_bytes
+            }),
+            ("masque_tcp_relay_batches_total", |shard| {
+                &shard.tcp_relay_batches
+            }),
+            ("masque_tcp_relay_events_total", |shard| {
+                &shard.tcp_relay_events
+            }),
+            ("masque_tcp_relay_bytes_total", |shard| {
+                &shard.tcp_relay_bytes
             }),
         ] {
             render_value(out, name, label, self.sum(field));
@@ -388,6 +428,8 @@ pub(crate) struct ShardMetrics {
     last_heartbeat_millis: AtomicU64,
     event_loop_lag_micros: AtomicU64,
     event_loop_lag_max_micros: AtomicU64,
+    quic_udp_gso_enabled: AtomicBool,
+    quic_udp_gro_enabled: AtomicBool,
     connections_active: AtomicU64,
     connections_accepted: AtomicU64,
     connections_rejected_limit: AtomicU64,
@@ -397,6 +439,9 @@ pub(crate) struct ShardMetrics {
     quic_send_batches: AtomicU64,
     quic_send_packets: AtomicU64,
     quic_send_bytes: AtomicU64,
+    tcp_relay_batches: AtomicU64,
+    tcp_relay_events: AtomicU64,
+    tcp_relay_bytes: AtomicU64,
     tunnels_active: [AtomicU64; 3],
     auth_success: AtomicU64,
     auth_failure: AtomicU64,
@@ -409,12 +454,14 @@ pub(crate) struct ShardMetrics {
 }
 
 impl ShardMetrics {
-    fn new(enabled: bool, now_millis: u64) -> Self {
+    fn new(enabled: bool, now_millis: u64, udp_gso: bool, udp_gro: bool) -> Self {
         Self {
             enabled,
             last_heartbeat_millis: AtomicU64::new(now_millis),
             event_loop_lag_micros: AtomicU64::new(0),
             event_loop_lag_max_micros: AtomicU64::new(0),
+            quic_udp_gso_enabled: AtomicBool::new(udp_gso),
+            quic_udp_gro_enabled: AtomicBool::new(udp_gro),
             connections_active: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected_limit: AtomicU64::new(0),
@@ -424,6 +471,9 @@ impl ShardMetrics {
             quic_send_batches: AtomicU64::new(0),
             quic_send_packets: AtomicU64::new(0),
             quic_send_bytes: AtomicU64::new(0),
+            tcp_relay_batches: AtomicU64::new(0),
+            tcp_relay_events: AtomicU64::new(0),
+            tcp_relay_bytes: AtomicU64::new(0),
             tunnels_active: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_success: AtomicU64::new(0),
             auth_failure: AtomicU64::new(0),
@@ -438,6 +488,17 @@ impl ShardMetrics {
 
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Publish the state accepted by this shard's bound QUIC socket.
+    pub(crate) fn set_udp_offload_state(&self, udp_gso: bool, udp_gro: bool) {
+        self.quic_udp_gso_enabled.store(udp_gso, RELAXED);
+        self.quic_udp_gro_enabled.store(udp_gro, RELAXED);
+    }
+
+    /// Reflect the runtime fallback after an external path rejects GSO.
+    pub(crate) fn disable_udp_gso(&self) {
+        self.quic_udp_gso_enabled.store(false, RELAXED);
     }
 
     /// Publish liveness once per maintenance interval rather than on every
@@ -494,6 +555,16 @@ impl ShardMetrics {
         self.quic_send_batches.fetch_add(1, RELAXED);
         self.quic_send_packets.fetch_add(packets as u64, RELAXED);
         self.quic_send_bytes.fetch_add(bytes as u64, RELAXED);
+    }
+
+    #[inline]
+    pub(crate) fn record_tcp_relay_batch(&self, events: usize, bytes: usize) {
+        if !self.enabled || events == 0 {
+            return;
+        }
+        self.tcp_relay_batches.fetch_add(1, RELAXED);
+        self.tcp_relay_events.fetch_add(events as u64, RELAXED);
+        self.tcp_relay_bytes.fetch_add(bytes as u64, RELAXED);
     }
 
     pub(crate) fn update_tunnels(&self, previous: [usize; 3], current: [usize; 3]) {
@@ -636,6 +707,16 @@ fn render_listener_headers(out: &mut String) {
             "gauge",
         ),
         (
+            "masque_quic_udp_gso_enabled",
+            "Whether the listener's Linux QUIC send socket is using UDP GSO.",
+            "gauge",
+        ),
+        (
+            "masque_quic_udp_gro_enabled",
+            "Whether the listener's Linux QUIC receive socket is using UDP GRO.",
+            "gauge",
+        ),
+        (
             "masque_event_loop_lag_seconds",
             "Delay of the latest scheduled proxy-shard heartbeat.",
             "gauge",
@@ -691,6 +772,21 @@ fn render_listener_headers(out: &mut String) {
             "counter",
         ),
         (
+            "masque_tcp_relay_batches_total",
+            "Event-loop rounds that consumed target TCP relay events.",
+            "counter",
+        ),
+        (
+            "masque_tcp_relay_events_total",
+            "Target TCP relay events consumed by proxy shards.",
+            "counter",
+        ),
+        (
+            "masque_tcp_relay_bytes_total",
+            "Target TCP response bytes handed to proxy shards.",
+            "counter",
+        ),
+        (
             "masque_tunnels_active",
             "Currently active CONNECT tunnels by protocol.",
             "gauge",
@@ -740,12 +836,14 @@ mod tests {
     #[test]
     fn renders_prometheus_metrics_with_stable_low_cardinality_labels() {
         let metrics = Metrics::new(true);
-        let shards = metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 2);
+        let shards =
+            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 2, true, true);
         let listener = &shards[0];
         metrics.set_ready(true);
         listener.connection_opened();
         listener.record_receive_batch(4, 4800);
         listener.record_send_batch(3, 3600);
+        listener.record_tcp_relay_batch(4, 256 * 1024);
         listener.update_tunnels([0, 0, 0], [1, 2, 1]);
         listener.record_auth_success();
         listener.record_heartbeat(metrics.elapsed_millis(), Duration::from_millis(25));
@@ -761,6 +859,17 @@ mod tests {
         assert!(rendered.contains(
             "masque_quic_receive_bytes_total{listener=\"127.0.0.1:8449\",auth=\"basic\"} 4800"
         ));
+        assert!(
+            rendered.contains(
+                "masque_quic_udp_gso_enabled{listener=\"127.0.0.1:8449\",auth=\"basic\"} 1"
+            )
+        );
+        assert!(rendered.contains(
+            "masque_tcp_relay_events_total{listener=\"127.0.0.1:8449\",auth=\"basic\"} 4"
+        ));
+        assert!(rendered.contains(
+            "masque_tcp_relay_bytes_total{listener=\"127.0.0.1:8449\",auth=\"basic\"} 262144"
+        ));
         assert!(rendered.contains(
             "masque_tunnels_active{listener=\"127.0.0.1:8449\",auth=\"basic\",protocol=\"udp\"} 2"
         ));
@@ -769,12 +878,21 @@ mod tests {
         ));
         assert!(!rendered.contains("username="));
         assert!(!rendered.contains("target="));
+
+        shards[1].disable_udp_gso();
+        let after_fallback = metrics.render();
+        assert!(
+            after_fallback.contains(
+                "masque_quic_udp_gso_enabled{listener=\"127.0.0.1:8449\",auth=\"basic\"} 0"
+            )
+        );
     }
 
     #[test]
     fn gauge_guards_are_balanced_when_dropped() {
         let metrics = Metrics::new(true);
-        let shards = metrics.register_listener("[::1]:9090".parse().unwrap(), "basic", 1);
+        let shards =
+            metrics.register_listener("[::1]:9090".parse().unwrap(), "basic", 1, false, true);
         let listener = &shards[0];
         {
             let _pending = listener.auth_pending_guard();
@@ -789,11 +907,13 @@ mod tests {
     #[test]
     fn disabled_collection_does_not_touch_counters() {
         let metrics = Metrics::new(false);
-        let shards = metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1);
+        let shards =
+            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1, false, false);
         let shard = &shards[0];
         shard.connection_opened();
         shard.record_receive_batch(8, 9600);
         shard.record_send_batch(8, 9600);
+        shard.record_tcp_relay_batch(4, 256 * 1024);
         shard.update_tunnels([0; 3], [1; 3]);
         shard.record_heartbeat(123, Duration::from_millis(25));
         let _pending = shard.auth_pending_guard();
@@ -801,6 +921,7 @@ mod tests {
         assert_eq!(shard.connections_active.load(RELAXED), 0);
         assert_eq!(shard.quic_receive_packets.load(RELAXED), 0);
         assert_eq!(shard.quic_send_packets.load(RELAXED), 0);
+        assert_eq!(shard.tcp_relay_events.load(RELAXED), 0);
         assert_eq!(shard.auth_pending.load(RELAXED), 0);
         assert_eq!(shard.last_heartbeat_millis.load(RELAXED), 123);
         assert_eq!(shard.event_loop_lag_micros.load(RELAXED), 0);
@@ -809,7 +930,8 @@ mod tests {
     #[test]
     fn readiness_fails_closed_when_any_shard_heartbeat_is_stale() {
         let metrics = Metrics::new(false);
-        let shards = metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1);
+        let shards =
+            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1, false, false);
         let registered_at = shards[0].last_heartbeat_millis.load(RELAXED);
         let stale_after = SHARD_STALE_AFTER.as_millis() as u64;
         metrics.set_ready(true);

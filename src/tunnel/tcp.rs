@@ -57,6 +57,19 @@ pub enum TcpRelayEvent {
     },
 }
 
+impl TcpRelayEvent {
+    /// Target payload carried by this event.
+    ///
+    /// Setup, EOF, and error notifications still count as relay events, but
+    /// only data contributes to the per-round byte budget and metrics.
+    pub(crate) fn payload_len(&self) -> usize {
+        match self {
+            Self::Data { data, .. } => data.len(),
+            Self::ConnectResult { .. } | Self::Eof { .. } | Self::Error { .. } => 0,
+        }
+    }
+}
+
 enum TcpCommand {
     Data(Vec<u8>),
     Finish,
@@ -453,6 +466,22 @@ async fn resolve_and_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_event_payload_length_counts_only_data() {
+        let data = TcpRelayEvent::Data {
+            connection_index: 1,
+            stream_id: 4,
+            data: Bytes::from_static(b"payload"),
+        };
+        let eof = TcpRelayEvent::Eof {
+            connection_index: 1,
+            stream_id: 4,
+        };
+
+        assert_eq!(data.payload_len(), 7);
+        assert_eq!(eof.payload_len(), 0);
+    }
 
     #[tokio::test]
     async fn pending_tunnel_bounds_early_data() {

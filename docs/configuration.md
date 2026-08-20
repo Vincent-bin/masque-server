@@ -292,7 +292,7 @@ the server will actually run rather than the ones written down
 — `shards = 0` expanded to one per core, and any excess capped:
 
 ```
-configuration is compatible with masque-server 0.4.1: /etc/masque/masque.toml
+configuration is compatible with masque-server 0.5.0: /etc/masque/masque.toml
 listener 0.0.0.0:443 auth=basic shards=1
 listener 0.0.0.0:4443 auth=client_cert shards=1
 ```

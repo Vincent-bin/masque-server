@@ -7,6 +7,9 @@ BENCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/masque-network-bench.XXXXXX")"
 SERVER_PID=""
 ECHO_PID=""
 HTTP_PID=""
+TCP_DOWNLOAD_BYTES="${MASQUE_TCP_DOWNLOAD_BYTES:-67108864}"
+TCP_DOWNLOAD_REPEATS="${MASQUE_TCP_DOWNLOAD_REPEATS:-2}"
+TCP_DIRECT_BASELINE="${MASQUE_TCP_DIRECT_BASELINE:-1}"
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
@@ -34,6 +37,24 @@ case "${MASQUE_BENCH_TARGET_GSO:-0}" in
         ;;
 esac
 
+case "${MASQUE_BENCH_QUIC_GSO:-0}" in
+    0) QUIC_GSO_TOML=false ;;
+    1) QUIC_GSO_TOML=true ;;
+    *)
+        echo "MASQUE_BENCH_QUIC_GSO must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
+case "$TCP_DIRECT_BASELINE" in
+    0) unset MASQUE_TCP_DIRECT_BASELINE ;;
+    1) export MASQUE_TCP_DIRECT_BASELINE=1 ;;
+    *)
+        echo "MASQUE_TCP_DIRECT_BASELINE must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 bash scripts/gen-certs.sh "$BENCH_DIR/certs"
 
 cat >"$BENCH_DIR/masque.toml" <<EOF
@@ -55,6 +76,7 @@ password_hash = "\$argon2id\$v=19\$m=19456,t=2,p=1\$1xNVXhqKU7jJ6cqTBJKphQ\$GXXA
 [quic]
 max_datagram_size = 1350
 enable_dgram = true
+enable_udp_gso = $QUIC_GSO_TOML
 
 [tcp_proxy]
 enabled = true
@@ -88,7 +110,7 @@ esac
 
 cargo build --workspace --release
 
-truncate -s 67108864 "$BENCH_DIR/masque-bench.bin"
+truncate -s "$TCP_DOWNLOAD_BYTES" "$BENCH_DIR/masque-bench.bin"
 python3 -m http.server 9998 --bind 127.0.0.1 --directory "$BENCH_DIR" \
     >"$BENCH_DIR/http.log" 2>&1 &
 HTTP_PID=$!
@@ -119,8 +141,8 @@ target/release/masque-e2e
 MASQUE_TCP_DOWNLOAD=1 \
 MASQUE_SERVER_ADDR=127.0.0.1:4433 \
 MASQUE_TCP_TARGET=127.0.0.1:9998 \
-MASQUE_TCP_DOWNLOAD_BYTES=67108864 \
-MASQUE_TCP_DOWNLOAD_REPEATS=2 \
+MASQUE_TCP_DOWNLOAD_BYTES="$TCP_DOWNLOAD_BYTES" \
+MASQUE_TCP_DOWNLOAD_REPEATS="$TCP_DOWNLOAD_REPEATS" \
 MASQUE_USERNAME=test \
 MASQUE_PASSWORD=test-password \
 RUST_LOG=warn \
