@@ -378,7 +378,20 @@ pub unsafe fn send_mmsg(
         let header = &mut headers[index].msg_hdr;
         // Connected socket, so the destination is implicit.
         header.msg_iov = &mut iovecs[group.first];
-        header.msg_iovlen = group.segments;
+        // glibc exposes msg_iovlen as size_t while musl uses the kernel ABI's
+        // int. Keep the assignments separate so each target sees its native
+        // type and glibc Clippy does not flag an identity conversion.
+        #[cfg(target_env = "musl")]
+        {
+            header.msg_iovlen = group
+                .segments
+                .try_into()
+                .expect("target UDP send batch fits msg_iovlen");
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            header.msg_iovlen = group.segments;
+        }
         if group.segments > 1 {
             let control_len = controls[index].set_udp_segment(group.segment_size as u16);
             header.msg_control = controls[index].words.as_mut_ptr().cast::<c_void>();
