@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "masque-server"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 description = "High-performance MASQUE proxy for CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/3"

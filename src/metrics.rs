@@ -9,9 +9,13 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RELAXED: Ordering = Ordering::Relaxed;
+/// A shard that has not completed an event-loop round within this interval is
+/// not ready. The normal heartbeat is once per second, leaving enough margin
+/// for scheduler jitter without hiding a genuinely stuck shard.
+const SHARD_STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// Process-wide metrics and readiness state.
 pub(crate) struct Metrics {
@@ -52,7 +56,8 @@ impl Metrics {
         auth: &'static str,
         shards: usize,
     ) -> Vec<Arc<ShardMetrics>> {
-        let listener = ListenerMetrics::new(addr, auth, shards, self.enabled);
+        let listener =
+            ListenerMetrics::new(addr, auth, shards, self.enabled, self.elapsed_millis());
         let shard_metrics = listener.shards.clone();
         self.listeners
             .write()
@@ -71,7 +76,27 @@ impl Metrics {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.is_ready_at(self.elapsed_millis())
+    }
+
+    fn is_ready_at(&self, now_millis: u64) -> bool {
+        if !self.ready.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let stale_after = SHARD_STALE_AFTER.as_millis() as u64;
+        self.listeners
+            .read()
+            .expect("metrics listener list poisoned")
+            .iter()
+            .flat_map(|listener| &listener.shards)
+            .all(|shard| {
+                now_millis.saturating_sub(shard.last_heartbeat_millis.load(RELAXED)) <= stale_after
+            })
+    }
+
+    pub(crate) fn elapsed_millis(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 
     pub(crate) fn record_roster_reload(&self, success: bool) {
@@ -113,7 +138,7 @@ impl Metrics {
         metric_header(
             &mut out,
             "masque_server_ready",
-            "Whether all proxy listeners are ready to accept traffic.",
+            "Whether proxy startup is complete and every shard heartbeat is current.",
             "gauge",
         );
         writeln!(out, "masque_server_ready {}", u8::from(self.is_ready())).unwrap();
@@ -174,13 +199,14 @@ impl Metrics {
         )
         .unwrap();
 
+        let now_millis = self.elapsed_millis();
         let listeners = self
             .listeners
             .read()
             .expect("metrics listener list poisoned");
         render_listener_headers(&mut out);
         for listener in listeners.iter() {
-            listener.render(&mut out);
+            listener.render(&mut out, now_millis);
         }
         out
     }
@@ -193,7 +219,13 @@ struct ListenerMetrics {
 }
 
 impl ListenerMetrics {
-    fn new(addr: SocketAddr, auth: &'static str, shards: usize, enabled: bool) -> Self {
+    fn new(
+        addr: SocketAddr,
+        auth: &'static str,
+        shards: usize,
+        enabled: bool,
+        now_millis: u64,
+    ) -> Self {
         Self {
             label: format!(
                 "listener=\"{}\",auth=\"{}\"",
@@ -201,7 +233,7 @@ impl ListenerMetrics {
                 escape_label(auth)
             ),
             shards: (0..shards)
-                .map(|_| Arc::new(ShardMetrics::new(enabled)))
+                .map(|_| Arc::new(ShardMetrics::new(enabled, now_millis)))
                 .collect(),
         }
     }
@@ -213,7 +245,7 @@ impl ListenerMetrics {
             .sum()
     }
 
-    fn render(&self, out: &mut String) {
+    fn render(&self, out: &mut String, now_millis: u64) {
         let label = &self.label;
         writeln!(
             out,
@@ -221,6 +253,28 @@ impl ListenerMetrics {
             self.shards.len()
         )
         .unwrap();
+        for (index, shard) in self.shards.iter().enumerate() {
+            let heartbeat_age = now_millis.saturating_sub(shard.last_heartbeat_millis.load(RELAXED))
+                as f64
+                / 1_000.0;
+            let lag = shard.event_loop_lag_micros.load(RELAXED) as f64 / 1_000_000.0;
+            let lag_max = shard.event_loop_lag_max_micros.load(RELAXED) as f64 / 1_000_000.0;
+            writeln!(
+                out,
+                "masque_shard_heartbeat_age_seconds{{{label},shard=\"{index}\"}} {heartbeat_age:.6}"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "masque_event_loop_lag_seconds{{{label},shard=\"{index}\"}} {lag:.6}"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "masque_event_loop_lag_max_seconds{{{label},shard=\"{index}\"}} {lag_max:.6}"
+            )
+            .unwrap();
+        }
         render_value(
             out,
             "masque_connections_active",
@@ -328,6 +382,12 @@ impl ListenerMetrics {
 /// scrape reads across these allocations.
 pub(crate) struct ShardMetrics {
     enabled: bool,
+    /// Monotonic process-relative timestamp. Updated once per second even when
+    /// Prometheus metrics are disabled because readiness and systemd watchdog
+    /// supervision depend on it.
+    last_heartbeat_millis: AtomicU64,
+    event_loop_lag_micros: AtomicU64,
+    event_loop_lag_max_micros: AtomicU64,
     connections_active: AtomicU64,
     connections_accepted: AtomicU64,
     connections_rejected_limit: AtomicU64,
@@ -349,9 +409,12 @@ pub(crate) struct ShardMetrics {
 }
 
 impl ShardMetrics {
-    fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, now_millis: u64) -> Self {
         Self {
             enabled,
+            last_heartbeat_millis: AtomicU64::new(now_millis),
+            event_loop_lag_micros: AtomicU64::new(0),
+            event_loop_lag_max_micros: AtomicU64::new(0),
             connections_active: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected_limit: AtomicU64::new(0),
@@ -375,6 +438,20 @@ impl ShardMetrics {
 
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Publish liveness once per maintenance interval rather than on every
+    /// packet batch, keeping this out of the high-throughput hot path.
+    pub(crate) fn record_heartbeat(&self, now_millis: u64, lag: Duration) {
+        self.last_heartbeat_millis.store(now_millis, RELAXED);
+        if !self.enabled {
+            return;
+        }
+
+        let lag_micros = lag.as_micros().min(u64::MAX as u128) as u64;
+        self.event_loop_lag_micros.store(lag_micros, RELAXED);
+        self.event_loop_lag_max_micros
+            .fetch_max(lag_micros, RELAXED);
     }
 
     pub(crate) fn connection_opened(&self) {
@@ -554,6 +631,21 @@ fn render_listener_headers(out: &mut String) {
             "gauge",
         ),
         (
+            "masque_shard_heartbeat_age_seconds",
+            "Seconds since a proxy shard last completed its event-loop heartbeat.",
+            "gauge",
+        ),
+        (
+            "masque_event_loop_lag_seconds",
+            "Delay of the latest scheduled proxy-shard heartbeat.",
+            "gauge",
+        ),
+        (
+            "masque_event_loop_lag_max_seconds",
+            "Largest scheduled proxy-shard heartbeat delay since process start.",
+            "gauge",
+        ),
+        (
             "masque_connections_active",
             "Currently active QUIC connections.",
             "gauge",
@@ -656,6 +748,7 @@ mod tests {
         listener.record_send_batch(3, 3600);
         listener.update_tunnels([0, 0, 0], [1, 2, 1]);
         listener.record_auth_success();
+        listener.record_heartbeat(metrics.elapsed_millis(), Duration::from_millis(25));
         shards[1].connection_opened();
 
         let rendered = metrics.render();
@@ -670,6 +763,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "masque_tunnels_active{listener=\"127.0.0.1:8449\",auth=\"basic\",protocol=\"udp\"} 2"
+        ));
+        assert!(rendered.contains(
+            "masque_event_loop_lag_seconds{listener=\"127.0.0.1:8449\",auth=\"basic\",shard=\"0\"} 0.025000"
         ));
         assert!(!rendered.contains("username="));
         assert!(!rendered.contains("target="));
@@ -699,12 +795,30 @@ mod tests {
         shard.record_receive_batch(8, 9600);
         shard.record_send_batch(8, 9600);
         shard.update_tunnels([0; 3], [1; 3]);
+        shard.record_heartbeat(123, Duration::from_millis(25));
         let _pending = shard.auth_pending_guard();
 
         assert_eq!(shard.connections_active.load(RELAXED), 0);
         assert_eq!(shard.quic_receive_packets.load(RELAXED), 0);
         assert_eq!(shard.quic_send_packets.load(RELAXED), 0);
         assert_eq!(shard.auth_pending.load(RELAXED), 0);
+        assert_eq!(shard.last_heartbeat_millis.load(RELAXED), 123);
+        assert_eq!(shard.event_loop_lag_micros.load(RELAXED), 0);
+    }
+
+    #[test]
+    fn readiness_fails_closed_when_any_shard_heartbeat_is_stale() {
+        let metrics = Metrics::new(false);
+        let shards = metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1);
+        let registered_at = shards[0].last_heartbeat_millis.load(RELAXED);
+        let stale_after = SHARD_STALE_AFTER.as_millis() as u64;
+        metrics.set_ready(true);
+
+        assert!(metrics.is_ready_at(registered_at + stale_after));
+        assert!(!metrics.is_ready_at(registered_at + stale_after + 1));
+
+        shards[0].record_heartbeat(registered_at + stale_after + 1, Duration::ZERO);
+        assert!(metrics.is_ready_at(registered_at + stale_after + 1));
     }
 
     #[test]

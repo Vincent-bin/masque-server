@@ -7,6 +7,10 @@ After=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
+# The process pings only while every proxy shard completes its heartbeat. A
+# wedged event loop therefore becomes a supervised failure, not a live-looking
+# process that accepts no useful traffic.
+WatchdogSec=30s
 User=masque
 Group=masque
 ExecStart=/usr/local/bin/masque-server --config /etc/masque/masque.toml

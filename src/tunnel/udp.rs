@@ -10,6 +10,8 @@ use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 #[cfg(target_os = "linux")]
 use crate::net::target_udp;
@@ -40,6 +42,9 @@ pub struct UdpTunnel {
     /// staging them turns what was a syscall per datagram into one per burst.
     send_stage: Vec<Vec<u8>>,
     staged: usize,
+    /// Whether target-side UDP segmentation offload is active on Linux.
+    #[cfg(target_os = "linux")]
+    udp_gso: bool,
 }
 
 impl UdpTunnel {
@@ -76,6 +81,8 @@ impl UdpTunnel {
             recv_task: None,
             send_stage: Vec::new(),
             staged: 0,
+            #[cfg(target_os = "linux")]
+            udp_gso: false,
         })
     }
 
@@ -85,7 +92,11 @@ impl UdpTunnel {
         send_socket: std::net::UdpSocket,
         socket: Arc<UdpSocket>,
         recv_task: JoinHandle<()>,
+        udp_gso: bool,
     ) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = udp_gso;
+
         Self {
             stream_id,
             socket,
@@ -95,6 +106,8 @@ impl UdpTunnel {
             recv_task: Some(recv_task),
             send_stage: Vec::new(),
             staged: 0,
+            #[cfg(target_os = "linux")]
+            udp_gso,
         }
     }
 
@@ -154,9 +167,33 @@ impl UdpTunnel {
         {
             use std::os::fd::AsRawFd;
             // SAFETY: The socket is live, connected, and nonblocking.
-            let sent = unsafe {
-                target_udp::send_mmsg(self.send_socket.as_raw_fd(), &self.send_stage[..staged])
-            }?;
+            let sent = match unsafe {
+                target_udp::send_mmsg(
+                    self.send_socket.as_raw_fd(),
+                    &self.send_stage[..staged],
+                    self.udp_gso,
+                )
+            } {
+                Ok(sent) => sent,
+                Err(error) if self.udp_gso && target_udp::is_udp_gso_error(&error) => {
+                    self.udp_gso = false;
+                    warn!(
+                        stream_id = self.stream_id,
+                        %error,
+                        "target UDP GSO unavailable, falling back to sendmmsg"
+                    );
+                    // SAFETY: The socket is still live, connected, and
+                    // nonblocking; no message was accepted on the failed call.
+                    unsafe {
+                        target_udp::send_mmsg(
+                            self.send_socket.as_raw_fd(),
+                            &self.send_stage[..staged],
+                            false,
+                        )
+                    }?
+                }
+                Err(error) => return Err(error),
+            };
             if sent < staged {
                 debug!(
                     stream_id = self.stream_id,

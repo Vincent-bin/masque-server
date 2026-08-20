@@ -663,8 +663,8 @@ echo "  Configuration:  $CONFIG_PATH"
 echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
 echo "  Logs:           journalctl -u masque -f"
-echo "  Prometheus:     $PROMETHEUS_RULES_PATH"
-echo "  Grafana:        $GRAFANA_DASHBOARD_PATH"
+echo "  Prometheus rules (optional): $PROMETHEUS_RULES_PATH"
+echo "  Grafana JSON (optional):     $GRAFANA_DASHBOARD_PATH"
 
 # The per-socket truth behind the summary line above, so a server that
 # authenticates on one port and not another cannot read as if it did both.

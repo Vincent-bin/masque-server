@@ -9,6 +9,60 @@ pub(crate) fn notify(message: &str) -> std::io::Result<bool> {
     imp::notify(message)
 }
 
+/// Return systemd's service watchdog timeout when this process is the service
+/// main PID. An absent or zero `WATCHDOG_USEC` means watchdog supervision is
+/// disabled, including for manual launches.
+pub(crate) fn watchdog_timeout() -> std::io::Result<Option<std::time::Duration>> {
+    parse_watchdog(
+        std::env::var_os("WATCHDOG_USEC").as_deref(),
+        std::env::var_os("WATCHDOG_PID").as_deref(),
+        std::process::id(),
+    )
+}
+
+/// Ping well before the deadline. Very small synthetic values are clamped to
+/// one nanosecond so a positive interval cannot create a zero-duration Tokio
+/// timer.
+pub(crate) fn watchdog_ping_interval(timeout: std::time::Duration) -> std::time::Duration {
+    timeout
+        .checked_div(3)
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(std::time::Duration::from_nanos(1))
+}
+
+fn parse_watchdog(
+    usec: Option<&std::ffi::OsStr>,
+    pid: Option<&std::ffi::OsStr>,
+    current_pid: u32,
+) -> std::io::Result<Option<std::time::Duration>> {
+    use std::io::{Error, ErrorKind};
+
+    if let Some(pid) = pid {
+        let pid = pid
+            .to_str()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "WATCHDOG_PID is not UTF-8"))?
+            .parse::<u32>()
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "WATCHDOG_PID is not an integer"))?;
+        if pid != current_pid {
+            return Ok(None);
+        }
+    }
+
+    let Some(usec) = usec else {
+        return Ok(None);
+    };
+    let usec = usec
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "WATCHDOG_USEC is not UTF-8"))?
+        .parse::<u64>()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "WATCHDOG_USEC is not an integer"))?;
+    if usec == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(std::time::Duration::from_micros(usec)))
+}
+
 #[cfg(unix)]
 mod imp {
     use std::ffi::OsStr;
@@ -99,6 +153,54 @@ mod imp {
             let read = receiver.recv(&mut buf).unwrap();
             assert_eq!(&buf[..read], b"READY=1");
         }
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::time::Duration;
+
+    #[test]
+    fn absent_or_zero_watchdog_is_disabled() {
+        assert_eq!(parse_watchdog(None, None, 42).unwrap(), None);
+        assert_eq!(
+            parse_watchdog(Some(OsStr::new("0")), None, 42).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn watchdog_is_scoped_to_the_service_main_pid() {
+        assert_eq!(
+            parse_watchdog(Some(OsStr::new("30000000")), Some(OsStr::new("41")), 42).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_watchdog(Some(OsStr::new("30000000")), Some(OsStr::new("42")), 42).unwrap(),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn malformed_watchdog_environment_is_rejected() {
+        assert!(parse_watchdog(Some(OsStr::new("later")), None, 42).is_err());
+        assert!(
+            parse_watchdog(Some(OsStr::new("30000000")), Some(OsStr::new("main")), 42).is_err()
+        );
+    }
+
+    #[test]
+    fn watchdog_ping_is_safely_ahead_of_the_deadline() {
+        assert_eq!(
+            watchdog_ping_interval(Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            watchdog_ping_interval(Duration::from_micros(1)),
+            Duration::from_nanos(333)
+        );
     }
 }
 

@@ -7,6 +7,35 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.4.1 - 2026-08-20
+
+### Added
+
+- CONNECT-UDP can opt into target-side Linux UDP segmentation offload with
+  `udp_proxy.enable_udp_gso`. Large equal-sized datagrams are submitted as one
+  scatter/gather super-packet without a userspace concatenation copy; small
+  datagrams retain the existing `sendmmsg` path, and explicit offload errors
+  disable GSO for that tunnel before retrying normally.
+- Each proxy shard publishes a once-per-second heartbeat and event-loop lag.
+  `/readyz` now fails when any shard is stale, and the packaged systemd unit
+  uses a 30-second watchdog that is pinged only while every shard is making
+  progress.
+- Prometheus exposition includes current shard heartbeat age plus current and
+  process-maximum event-loop lag. Collection remains optional and loopback
+  only.
+
+### Changed
+
+- The network benchmark accepts `MASQUE_BENCH_TARGET_GSO=0|1` for repeatable
+  target-egress A/B tests. In three alternating 5-second runs on the qualifying
+  Ubuntu loopback host, 1200-byte CONNECT-UDP application goodput improved from
+  an average 1.063 to 1.427 Gbit/s (34%) while 64-byte throughput remained
+  effectively unchanged. This validates the local Linux packet path; it is not
+  an estimate of external-network throughput.
+- Installation output and documentation identify Prometheus rules and Grafana
+  JSON as optional static assets. The installer does not install or start a
+  Prometheus or Grafana service on the VPS.
+
 ## 0.4.0 - 2026-08-20
 
 ### Added

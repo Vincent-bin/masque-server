@@ -33,7 +33,11 @@ Batching never sends a packet before the time supplied by quiche.
 Client bursts are staged per tunnel during one shard iteration and submitted
 with a direct `SYS_sendmmsg`. Target responses are drained with
 `SYS_recvmmsg`. On non-Linux systems, Tokio sends and receives individual
-datagrams.
+datagrams. When `udp_proxy.enable_udp_gso = true`, equal-sized large client
+payloads are submitted as scatter/gather segments of one UDP super-packet,
+avoiding a userspace concatenation copy. Small payloads remain on `sendmmsg`;
+an explicit kernel error disables GSO on that tunnel and retries through
+`sendmmsg`.
 
 Static releases use musl. Its public 64-bit `sendmmsg` wrapper loops through
 `sendmsg` to handle ABI differences, so both Linux send adapters deliberately
@@ -66,6 +70,7 @@ Important settings:
 | `listeners[].shards` | Aggregate multi-connection CPU parallelism for that listener |
 | `quic.enable_udp_gso` | QUIC send syscall and per-packet overhead |
 | `quic.enable_udp_gro` | QUIC receive syscall overhead |
+| `udp_proxy.enable_udp_gso` | Client-to-target UDP kernel overhead |
 | `quic.max_datagram_size` | Packet size and PMTU ceiling |
 | `quic.initial_max_*` | Initial bandwidth-delay window |
 | `quic.max_*_window` | Autotuning ceiling and memory bound |
@@ -89,10 +94,13 @@ MASQUE_BENCH_DURATION_SECS=10 \
 MASQUE_BENCH_WINDOW=256 \
 MASQUE_BENCH_EXPIRY_MS=1000 \
 MASQUE_BENCH_RTT_SAMPLES=100 \
+MASQUE_BENCH_TARGET_GSO=1 \
 scripts/network-bench.sh
 ```
 
-Set `MASQUE_BENCH_OBSERVABILITY=1` to enable the loopback endpoint and metric
+Use `MASQUE_BENCH_TARGET_GSO=0` and `1` in alternating runs to compare the
+target-side path; it defaults to `0`. Set
+`MASQUE_BENCH_OBSERVABILITY=1` to enable the loopback endpoint and metric
 updates during an A/B run; the default `0` measures the uninstrumented packet
 path.
 

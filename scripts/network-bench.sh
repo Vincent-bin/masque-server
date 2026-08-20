@@ -25,6 +25,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+case "${MASQUE_BENCH_TARGET_GSO:-0}" in
+    0) TARGET_GSO_TOML=false ;;
+    1) TARGET_GSO_TOML=true ;;
+    *)
+        echo "MASQUE_BENCH_TARGET_GSO must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 bash scripts/gen-certs.sh "$BENCH_DIR/certs"
 
 cat >"$BENCH_DIR/masque.toml" <<EOF
@@ -54,6 +63,7 @@ deny_targets = []
 
 [udp_proxy]
 enabled = true
+enable_udp_gso = $TARGET_GSO_TOML
 allow_targets = ["127.0.0.0/8"]
 deny_targets = []
 
