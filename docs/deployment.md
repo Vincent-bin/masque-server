@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.4.0` selects `v0.4.0`. This is also how to install a
+`MASQUE_VERSION=0.4.1` selects `v0.4.1`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
@@ -246,6 +246,8 @@ five-second margin before systemd may escalate to SIGKILL.
 
 systemd considers startup complete only after the process has bound every
 proxy listener and the optional observability endpoint and sent `READY=1`.
+The packaged unit also sets `WatchdogSec=30s`; pings stop if any shard misses
+its five-second liveness window, allowing systemd to restart a wedged process.
 Graceful shutdown sends `STOPPING=1` as readiness changes to false.
 
 SIGINT follows the same path for foreground runs. SIGHUP remains distinct: it
@@ -277,8 +279,9 @@ connectivity and throughput smoke test. Keep independent backups as part of
 normal operations even though the installer performs a temporary transactional
 rollback around the binary, unit, and packaged monitoring-asset replacement.
 
-For health checks, Prometheus scraping, alert rules, and the installed Grafana
-dashboard, see [Observability](observability.md).
+For optional health checks, Prometheus scraping, alert rules, and the dashboard
+JSON, see [Observability](observability.md). The installer copies those static
+assets but never installs or starts Prometheus or Grafana on the server.
 
 ## Diagnostics
 

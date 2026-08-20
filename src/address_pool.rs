@@ -186,10 +186,10 @@ impl AddressPool {
         if self.is_gateway(&addr) {
             return Err(PoolError::AlreadyAllocated(addr));
         }
-        if !self
+        if self
             .reserved
             .get(&addr)
-            .is_some_and(|reserved_owner| reserved_owner == owner)
+            .is_none_or(|reserved_owner| reserved_owner != owner)
         {
             return Err(PoolError::NotReserved(addr));
         }

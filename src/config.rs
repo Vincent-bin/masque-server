@@ -216,6 +216,10 @@ pub struct UdpProxySection {
     pub uri_template: String,
     pub allow_targets: Vec<String>,
     pub deny_targets: Vec<String>,
+    /// Use UDP segmentation offload when relaying large client datagrams to
+    /// targets on Linux. Kept separate from the outer QUIC socket because the
+    /// two egress paths can have different offload support.
+    pub enable_udp_gso: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -360,6 +364,7 @@ impl Default for UdpProxySection {
             uri_template: "/.well-known/masque/udp/{target_host}/{target_port}/".into(),
             allow_targets: vec!["0.0.0.0/0".into()],
             deny_targets: vec!["127.0.0.0/8".into(), "10.0.0.0/8".into(), "::1/128".into()],
+            enable_udp_gso: false,
         }
     }
 }
@@ -702,11 +707,13 @@ discover_pmtu = true
 enabled = false
 allow_targets = ["192.168.0.0/16"]
 deny_targets = []
+enable_udp_gso = true
 "#,
         );
         assert!(!cfg.udp_proxy.enabled);
         assert_eq!(cfg.udp_proxy.allow_targets, vec!["192.168.0.0/16"]);
         assert!(cfg.udp_proxy.deny_targets.is_empty());
+        assert!(cfg.udp_proxy.enable_udp_gso);
     }
 
     #[test]

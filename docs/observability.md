@@ -19,11 +19,12 @@ through a firewall rule or unauthenticated reverse proxy.
 | Path | Success | Meaning |
 | --- | --- | --- |
 | `/healthz` | `200 ok` | The process and operational HTTP task are alive |
-| `/readyz` | `200 ready` | All proxy sockets are bound and the server is accepting traffic |
+| `/readyz` | `200 ready` | All proxy sockets are bound and every shard heartbeat is current |
 | `/metrics` | `200` | Prometheus text exposition |
 
-`/readyz` returns `503` before readiness and as soon as graceful shutdown
-starts. `/healthz` and `/metrics` remain available during the bounded drain.
+`/readyz` returns `503` before readiness, when any proxy shard has made no
+event-loop progress for five seconds, and as soon as graceful shutdown starts.
+`/healthz` and `/metrics` remain available during the bounded drain.
 Only `GET` and `HEAD` are accepted, requests time out after two seconds, request
 headers are capped at 8 KiB, and concurrency is bounded.
 
@@ -36,6 +37,11 @@ curl --fail http://127.0.0.1:9090/metrics
 ```
 
 ## Prometheus
+
+The installer does not install or start Prometheus or Grafana. It only writes
+optional rule and dashboard files; a lightweight VPS can run masque-server by
+itself and leave `[observability]` disabled. If collection is desired, run the
+collector elsewhere and reach loopback through an authenticated tunnel.
 
 Add the endpoint as a static target in the Prometheus instance running on the
 host:
@@ -86,6 +92,9 @@ All metric names start with `masque_`.
 | `masque_process_start_time_seconds` | gauge | — | Process start as a Unix timestamp |
 | `masque_process_uptime_seconds` | gauge | — | Current process uptime |
 | `masque_listener_shards` | gauge | `listener`, `auth` | Event loops assigned to the listener |
+| `masque_shard_heartbeat_age_seconds` | gauge | `listener`, `auth`, `shard` | Time since the shard last made event-loop progress |
+| `masque_event_loop_lag_seconds` | gauge | `listener`, `auth`, `shard` | Latest one-second heartbeat scheduling delay |
+| `masque_event_loop_lag_max_seconds` | gauge | `listener`, `auth`, `shard` | Largest heartbeat delay since startup |
 | `masque_connections_active` | gauge | `listener`, `auth` | Live QUIC connections |
 | `masque_connections_accepted_total` | counter | `listener`, `auth` | Accepted connection objects |
 | `masque_connections_rejected_total` | counter | `listener`, `auth`, `reason` | Connections rejected at a resource limit |
@@ -113,7 +122,9 @@ per datagram. Connection counts use object lifetime, while tunnel gauges are
 published once after a connection's event-loop work. Scraping is the only path
 that formats text or takes the listener-list read lock. Each shard owns its
 counter allocation, so event-loop cores never contend on a shared metric cache
-line; when `[observability]` is absent, collection performs no counter atomics.
+line. When `[observability]` is absent, traffic collection performs no counter
+atomics; each shard still performs one heartbeat store per second for readiness
+and systemd watchdog supervision.
 
 ## Logs and systemd readiness
 
@@ -127,7 +138,8 @@ masque-server --log-format json --config /etc/masque/masque.toml
 `RUST_LOG` and `-v` keep their existing filtering behavior. For the packaged
 service, add `--log-format json` to an `ExecStart` override when desired.
 
-The supplied unit uses `Type=notify`. The process sends `READY=1` only after all
-proxy sockets and the optional operational socket are bound, and sends
-`STOPPING=1` when graceful draining begins. Manual foreground runs need no
-special environment; notification is a no-op when `NOTIFY_SOCKET` is absent.
+The supplied unit uses `Type=notify` and `WatchdogSec=30s`. The process sends
+`READY=1` only after all proxy sockets and the optional operational socket are
+bound, sends watchdog pings only while every shard heartbeat is current, and
+sends `STOPPING=1` when graceful draining begins. Manual foreground runs need
+no special environment; notification is a no-op when `NOTIFY_SOCKET` is absent.

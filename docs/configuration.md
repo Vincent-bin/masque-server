@@ -292,7 +292,7 @@ the server will actually run rather than the ones written down
 — `shards = 0` expanded to one per core, and any excess capped:
 
 ```
-configuration is compatible with masque-server 0.4.0: /etc/masque/masque.toml
+configuration is compatible with masque-server 0.4.1: /etc/masque/masque.toml
 listener 0.0.0.0:443 auth=basic shards=1
 listener 0.0.0.0:4443 auth=client_cert shards=1
 ```
@@ -545,13 +545,19 @@ management networks denied unless access is intentional.
 [udp_proxy]
 enabled = true
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
+enable_udp_gso = false
 allow_targets = ["0.0.0.0/0", "::/0"]
 deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
 ```
 
 The template must retain `{target_host}` and `{target_port}`. Apply the same
 internal-network restrictions used for TCP unless UDP access is intentionally
-different.
+different. `enable_udp_gso` batches equal-sized large client payloads into
+Linux UDP super-packets without first copying them into one contiguous
+userspace buffer. Small payloads continue through `sendmmsg`, where segmentation
+overhead would outweigh the saved kernel work. It is independent of
+`quic.enable_udp_gso`; keep it disabled until the target egress path has passed
+a loss and throughput A/B test.
 
 ## CONNECT-IP
 

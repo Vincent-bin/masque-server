@@ -110,6 +110,11 @@ deny_targets = [
 [udp_proxy]
 enabled = true
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
+# This controls the UDP socket from the proxy to each target. It is separate
+# from quic.enable_udp_gso because the target and client egress paths can differ.
+# Leave it off until an external-path A/B test confirms no throughput or loss
+# regression on the target egress path.
+enable_udp_gso = false
 allow_targets = ["0.0.0.0/0", "::/0"]
 deny_targets = [
     "127.0.0.0/8",

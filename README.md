@@ -20,9 +20,9 @@ a staging environment.
 - Bounded queues and backpressure across authentication and tunnel I/O
 - Linux `recvmmsg`/`sendmmsg`, UDP GRO, optional UDP GSO, and TUN offload
 - Multi-core sharding with `SO_REUSEPORT`
-- Loopback health/readiness endpoints, low-overhead Prometheus metrics,
-  packaged alert rules and a Grafana dashboard
-- Optional JSON logs and native systemd readiness notification
+- Optional loopback health/readiness endpoints and low-overhead Prometheus
+  metrics, with packaged static alert rules and a Grafana dashboard JSON
+- Optional JSON logs plus native systemd readiness and shard-liveness watchdog
 - Static Linux x86_64 release archives with a systemd installer
 
 ## Quick start
@@ -127,6 +127,9 @@ tar xzf masque-vVERSION-linux-x86_64.tar.gz
 cd masque-vVERSION-linux-x86_64
 sudo ./install.sh
 ```
+
+The monitoring files are optional static assets. Installation does not install
+or start Prometheus or Grafana on the server.
 
 The package installer creates an unprivileged `masque` system user, lets new
 installations choose either authentication mode, and enables the service. Set

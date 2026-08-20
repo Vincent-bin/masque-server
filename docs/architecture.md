@@ -49,8 +49,9 @@ No connection is concurrently mutated by two shards.
 When configured, a separate loopback TCP task serves health, readiness, and
 Prometheus requests. Shards update fixed atomic counters in batches and never
 format metrics or acquire the scrape-side listener-list lock. systemd readiness
-uses the same lifecycle state: ready after every socket is bound, not ready as
-soon as the bounded drain begins.
+uses the lifecycle state plus one heartbeat store per shard per second: ready
+after every socket is bound, not ready when a shard is stale or as soon as the
+bounded drain begins. The packaged watchdog uses the same liveness decision.
 
 ## Source layout
 
@@ -62,9 +63,9 @@ soon as the bounded drain begins.
 | `src/connection.rs` | Per-client QUIC/H3 state and deferred sends |
 | `src/metrics.rs` | Low-cardinality atomic counters and Prometheus rendering |
 | `src/observability.rs` | Bounded loopback health/readiness/metrics HTTP endpoint |
-| `src/systemd.rs` | Dependency-free systemd readiness notification |
+| `src/systemd.rs` | Dependency-free systemd readiness and watchdog notification |
 | `src/net/quic.rs` | QUIC UDP receive/send batching, GSO/GRO, and portable fallbacks |
-| `src/net/target_udp.rs` | Batched target UDP I/O and truncation detection |
+| `src/net/target_udp.rs` | Batched target UDP I/O, GSO, and truncation detection |
 | `src/tunnel/tcp.rs` | TCP connection setup and bounded bidirectional relay |
 | `src/tunnel/udp.rs` | Per-target CONNECT-UDP state and send staging |
 | `src/tunnel/ip.rs` | CONNECT-IP assignment and activity state |

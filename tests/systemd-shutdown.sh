@@ -28,6 +28,8 @@ grep -q '^Type=notify$' deploy/systemd/masque.service ||
     die "the systemd unit does not wait for application readiness"
 grep -q '^NotifyAccess=main$' deploy/systemd/masque.service ||
     die "the systemd unit accepts readiness from more than the main process"
+grep -q '^WatchdogSec=30s$' deploy/systemd/masque.service ||
+    die "the systemd unit does not supervise proxy-shard liveness"
 
 TEST_TMP=$(mktemp -d /tmp/masque-systemd-shutdown.XXXXXX)
 SERVER_PID=

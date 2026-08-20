@@ -874,6 +874,8 @@ impl Server {
 
     /// Run every shard until they all stop.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let watchdog_timeout =
+            systemd::watchdog_timeout().context("invalid systemd watchdog environment")?;
         if let Some(shard) = self.shards.first() {
             Self::spawn_roster_reloader(Arc::clone(&shard.shared));
         }
@@ -889,10 +891,16 @@ impl Server {
 
         let observability_task = self.observability.take().map(ObservabilityServer::spawn);
         self.metrics.set_ready(true);
+        let watchdog_task = watchdog_timeout.map(|timeout| {
+            spawn_systemd_watchdog(timeout, Arc::clone(&self.metrics), shutdown_rx.clone())
+        });
         if let Err(error) = systemd::notify("READY=1\nSTATUS=Ready to serve MASQUE traffic") {
             self.metrics.begin_shutdown();
             shutdown_listener.abort();
             if let Some(task) = observability_task {
+                task.abort();
+            }
+            if let Some(task) = watchdog_task {
                 task.abort();
             }
             return Err(error).context("failed to notify systemd that the server is ready");
@@ -927,6 +935,9 @@ impl Server {
             shutdown_listener.abort();
             readiness_task.abort();
             if let Some(task) = observability_task {
+                task.abort();
+            }
+            if let Some(task) = watchdog_task {
                 task.abort();
             }
             return outcome;
@@ -982,8 +993,59 @@ impl Server {
         if let Some(task) = observability_task {
             task.abort();
         }
+        if let Some(task) = watchdog_task {
+            task.abort();
+        }
         outcome
     }
+}
+
+/// Ping systemd only while every proxy shard is making progress. If one shard
+/// stops completing its once-per-second heartbeat, readiness fails and pings
+/// are withheld so `WatchdogSec` can restart the process.
+fn spawn_systemd_watchdog(
+    timeout: Duration,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let interval = systemd::watchdog_ping_interval(timeout);
+    info!(
+        timeout_secs = timeout.as_secs_f64(),
+        ping_interval_secs = interval.as_secs_f64(),
+        "systemd watchdog enabled"
+    );
+
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut withheld = false;
+
+        loop {
+            tokio::select! {
+                result = shutdown.wait_for(|requested| *requested) => {
+                    let _ = result;
+                    return;
+                }
+                _ = ticker.tick() => {
+                    if !metrics.is_ready() {
+                        if !withheld {
+                            warn!("withholding systemd watchdog ping because a shard is stale");
+                            withheld = true;
+                        }
+                        continue;
+                    }
+
+                    withheld = false;
+                    match systemd::notify("WATCHDOG=1") {
+                        Ok(true) => {}
+                        Ok(false) => warn!("WATCHDOG_USEC is set but NOTIFY_SOCKET is absent"),
+                        Err(error) => warn!(%error, "failed to ping systemd watchdog"),
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Register one listener for the process shutdown signals and latch the result
@@ -1736,6 +1798,8 @@ impl Shard {
         let mut drain_deadline: Option<Instant> = None;
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
         let mut next_idle_sweep = Instant::now() + IDLE_SWEEP_INTERVAL;
+        self.metrics
+            .record_heartbeat(self.shared.metrics.elapsed_millis(), Duration::ZERO);
         // The roster generation this shard has already enforced.
         let mut applied_roster_generation = self.shared.clients.generation();
         // The connections serviced in the current round. Held across
@@ -1929,6 +1993,9 @@ impl Shard {
             // stays in the past and pins the wakeup above to zero.
             let now = Instant::now();
             if now >= next_idle_sweep {
+                let event_loop_lag = now.saturating_duration_since(next_idle_sweep);
+                self.metrics
+                    .record_heartbeat(self.shared.metrics.elapsed_millis(), event_loop_lag);
                 next_idle_sweep = now + IDLE_SWEEP_INTERVAL;
                 if !shutting_down {
                     // Cheap in the common case: one atomic read, and a scan
@@ -2416,6 +2483,7 @@ impl Shard {
             .quic
             .max_datagram_size
             .clamp(1, MAX_DATAGRAM_SIZE);
+        let enable_target_udp_gso = self.config.udp_proxy.enable_udp_gso;
         for (stream_id, target) in pending_udp_setups {
             if client.tunnel_count() >= max_tunnels {
                 warn!(
@@ -2468,6 +2536,21 @@ impl Shard {
                                 }
                                 continue;
                             }
+                            #[cfg(target_os = "linux")]
+                            let target_udp_gso = if enable_target_udp_gso {
+                                use std::os::fd::AsRawFd as _;
+                                target_udp::detect_udp_gso(
+                                    std_sock.as_raw_fd(),
+                                    target_datagram_size,
+                                )
+                            } else {
+                                false
+                            };
+                            #[cfg(not(target_os = "linux"))]
+                            let target_udp_gso = {
+                                let _ = enable_target_udp_gso;
+                                false
+                            };
                             let recv_std = match std_sock.try_clone() {
                                 Ok(socket) => socket,
                                 Err(e) => {
@@ -2529,11 +2612,17 @@ impl Shard {
                                         }
                                     });
                                     let tunnel = UdpTunnel::from_socket(
-                                        stream_id, addr, std_sock, socket, recv_task,
+                                        stream_id,
+                                        addr,
+                                        std_sock,
+                                        socket,
+                                        recv_task,
+                                        target_udp_gso,
                                     );
                                     info!(
                                         stream_id,
                                         target = %addr,
+                                        udp_gso = target_udp_gso,
                                         "UDP tunnel established"
                                     );
                                     client.udp_tunnels.insert(stream_id, tunnel);
