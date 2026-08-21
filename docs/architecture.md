@@ -70,7 +70,14 @@ bounded drain begins. The packaged watchdog uses the same liveness decision.
 | Path | Responsibility |
 | --- | --- |
 | `src/server/mod.rs` | Server startup, shard event loop, and tunnel coordination |
-| `src/server/http2.rs` | TCP/TLS accept loop, H2 connections, CONNECT relays, DATAGRAM capsules, and IP/TUN task integration |
+| `src/server/http2.rs` | HTTP/2 TCP/TLS listener lifecycle and shared connection context |
+| `src/server/http2/connection.rs` | H2 connection lifecycle, graceful drain, roster enforcement, and request dispatch |
+| `src/server/http2/request.rs` | HTTP/2 CONNECT recognition and post-authentication target validation |
+| `src/server/http2/auth.rs` | HTTP/2 certificate identity and bounded per-request Basic authentication |
+| `src/server/http2/tcp.rs` | HTTP/2 standard CONNECT byte relay |
+| `src/server/http2/udp.rs` | HTTP/2 CONNECT-UDP capsule relay |
+| `src/server/http2/ip.rs` | HTTP/2 CONNECT-IP capsule and TUN integration |
+| `src/server/http2/support.rs` | Shared H2 flow-control, activity, and metrics lifecycle helpers |
 | `src/server/request.rs` | CONNECT classification, auth precheck, and authorized dispatch |
 | `src/server/authentication.rs` | Bounded Argon2 scheduling, cancellation, and request resumption |
 | `src/connection.rs` | Per-client QUIC/H3 state and deferred sends |
