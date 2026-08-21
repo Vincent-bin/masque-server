@@ -60,7 +60,9 @@ jobs:
       - name: Check shell scripts
         run: |
           sh -n install-latest.sh deploy/install.sh \
-            tests/install-upgrade.sh tests/systemd-shutdown.sh
+            scripts/validate-release.sh tests/install-upgrade.sh \
+            tests/release-metadata.sh tests/systemd-shutdown.sh
+          sh tests/release-metadata.sh
           shellcheck install-latest.sh deploy/install.sh scripts/*.sh \
             tests/*.sh tests/e2e/*.sh
 

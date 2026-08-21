@@ -102,6 +102,8 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -days 1 -subj /CN=localhost \
     -keyout /etc/masque/certs/server.key \
     -out /etc/masque/certs/server.crt >/dev/null 2>&1
+tls_cert_sha=$(sha256sum /etc/masque/certs/server.crt | awk '{print $1}')
+tls_key_sha=$(sha256sum /etc/masque/certs/server.key | awk '{print $1}')
 
 write_config() {
     cc_algorithm=$1
@@ -147,6 +149,18 @@ assert_sha_unchanged() {
     [ "$actual" = "$expected" ] || die "$path changed unexpectedly"
 }
 
+assert_upgrade_output_is_summary_only() {
+    log_path=$1
+    grep -q 'Existing configuration was preserved and is not printed during upgrades' \
+        "$log_path" || die "the upgrade did not explain that it suppressed the configuration"
+    ! grep -q 'Effective server configuration' "$log_path" ||
+        die "the upgrade printed the existing configuration"
+    ! grep -q 'private-upgrade-log-marker' "$log_path" ||
+        die "the upgrade copied an existing configuration marker into its output"
+    ! grep -q 'password_hash' "$log_path" ||
+        die "the upgrade printed an existing password hash field"
+}
+
 # A fresh dual installation writes a two-listener configuration and provisions
 # both authentication modes. This runs first, while the runner still has no
 # configuration; the upgrade cases below overwrite everything it leaves behind.
@@ -162,6 +176,10 @@ MASQUE_AUTH_MODE=dual \
     MASQUE_START_SERVICE=0 \
     "$PACKAGE_DIR/install.sh" >"$TEST_TMP/dual.log" 2>&1 ||
     die "fresh dual installation failed; see $TEST_TMP/dual.log"
+grep -q 'Effective server configuration (password hash redacted)' "$TEST_TMP/dual.log" ||
+    die "fresh installation did not print its generated configuration"
+grep -Eq 'password_hash[[:space:]]*=[[:space:]]*"<redacted>"' "$TEST_TMP/dual.log" ||
+    die "fresh installation did not redact its generated password hash"
 
 [ "$(grep -c '^\[\[listeners\]\]$' "$CONFIG_PATH")" -eq 2 ] ||
     die "dual mode did not write two listeners"
@@ -207,6 +225,7 @@ grep -q '^\[quic\]$' "$CONFIG_PATH" ||
 grep -q '^listener 0.0.0.0:8451 auth=client_cert shards=1$' "$TEST_TMP/added-check.log" ||
     die "the added listener was not reported by check-config"
 
+printf '\n# private-upgrade-log-marker\n' >>"$CONFIG_PATH"
 added_config_sha=$(sha256sum "$CONFIG_PATH" | awk '{print $1}')
 
 # A reinstall over it is an upgrade, and must report both modes rather than one.
@@ -218,6 +237,9 @@ grep -q 'Authentication: basic + client_cert' "$TEST_TMP/dual-upgrade.log" ||
 # An upgrade keeps what the operator added, including a listener this installer
 # never writes on its own.
 assert_sha_unchanged "$CONFIG_PATH" "$added_config_sha"
+assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
+assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
+assert_upgrade_output_is_summary_only "$TEST_TMP/dual-upgrade.log"
 grep -q '^listener 0.0.0.0:8451 auth=client_cert shards=1$' "$TEST_TMP/dual-upgrade.log" ||
     die "the upgrade summary did not report the added listener"
 grep -q 'add-listener' "$TEST_TMP/dual-upgrade.log" ||
@@ -248,8 +270,26 @@ valid_config_sha=$(sha256sum "$CONFIG_PATH" | awk '{print $1}')
 MOCK_ACTIVE=0 MOCK_ENABLED=0 MASQUE_START_SERVICE=0 \
     "$PACKAGE_DIR/install.sh" >"$TEST_TMP/staged.log" 2>&1
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
+assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
+assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
+assert_upgrade_output_is_summary_only "$TEST_TMP/staged.log"
 candidate_sha=$(sha256sum "$CANDIDATE" | awk '{print $1}')
 assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
+
+# A successful activation restarts once and preserves operator-managed files.
+write_old_installation
+: >"$MOCK_STATE"
+MOCK_ACTIVE=1 MOCK_ENABLED=1 MASQUE_START_SERVICE=1 \
+    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/activated.log" 2>&1
+[ "$(sed -n '1p' "$MOCK_STATE")" -eq 1 ] ||
+    die "successful activation did not restart the service exactly once"
+assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
+assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
+assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
+assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
+assert_upgrade_output_is_summary_only "$TEST_TMP/activated.log"
+grep -q 'Service:        started or restarted' "$TEST_TMP/activated.log" ||
+    die "successful activation did not report the service result"
 
 # A failed activation restores every release-managed file and the prior service state.
 write_old_installation
@@ -268,6 +308,8 @@ assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
 assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
 assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
+assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
+assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
 grep -q 'Previous binary, systemd unit, monitoring assets, and service state restored' \
     "$TEST_TMP/rollback.log" || die "rollback confirmation was not printed"
 

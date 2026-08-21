@@ -98,15 +98,16 @@ random password when none is supplied. Client-certificate mode enrolls the first
 client, adds its `[[clients]]` entry, writes its secret JSON as mode `0600`, and
 prints the matching usque and mihomo configuration. Dual mode does both, writing
 a two-listener configuration that serves credentials on one port and
-certificates on another. At the end it prints the
-installed version, service state, and effective server configuration with the
-password hash redacted.
+certificates on another. At the end a fresh installation prints the installed
+version, service state, and effective server configuration with the password
+hash redacted.
 
 The same command is also the upgrade command. When
 `/etc/masque/masque.toml` already exists, the candidate binary checks that
 configuration without binding a port or creating a TUN, then upgrades the
 binary, systemd unit, and versioned monitoring assets. It never rewrites the
-TOML or referenced TLS files. An
+TOML or referenced TLS files, and it does not copy the existing configuration
+into unattended upgrade logs. An
 incompatible configuration aborts before replacement; a failed service restart
 restores the prior binary, unit, monitoring assets, and service state. See
 [Deployment](docs/deployment.md#one-command-install) for non-interactive
