@@ -99,6 +99,7 @@ scripts/network-bench.sh
 Useful controls include:
 
 ```sh
+MASQUE_BENCH_MODE=udp \
 MASQUE_BENCH_DURATION_SECS=10 \
 MASQUE_BENCH_WINDOW=256 \
 MASQUE_BENCH_EXPIRY_MS=1000 \
@@ -109,6 +110,31 @@ MASQUE_TCP_DOWNLOAD_BYTES=536870912 \
 MASQUE_TCP_DOWNLOAD_REPEATS=3 \
 scripts/network-bench.sh
 ```
+
+`MASQUE_BENCH_MODE` accepts `all` (the default), `smoke`, `tcp`, `udp`, or
+`load`. Focused modes still build the release workspace and start only the
+supporting processes needed by that measurement. `MASQUE_BENCH_SHARDS`
+selects the listener shard count; `0` retains the server's documented
+one-shard-per-core behavior.
+
+For a repeatable multi-connection run:
+
+```sh
+MASQUE_BENCH_MODE=load \
+MASQUE_BENCH_SHARDS=1 \
+MASQUE_LOAD_CONNS=2 \
+MASQUE_LOAD_DURATION_SECS=30 \
+MASQUE_LOAD_PAYLOAD=1200 \
+MASQUE_LOAD_WINDOW=256 \
+MASQUE_LOAD_EXPIRY_MS=1000 \
+scripts/network-bench.sh
+```
+
+The final `LOAD_RESULT` line is intended for scripts. It includes requested
+and established connections, packet counts and rates, application goodput,
+bidirectional relay rate, response shortfall, expired packets, and setup and
+runtime failure counts. A non-zero worker failure makes the command fail after
+printing the record.
 
 Use `MASQUE_BENCH_QUIC_GSO=0|1` for the outer QUIC socket and
 `MASQUE_BENCH_TARGET_GSO=0|1` for CONNECT-UDP target egress; both default to
@@ -137,6 +163,14 @@ For connection load tests, each worker records its own setup duration. Report
 batch wall-clock throughput as connections per second, and report individual
 average/p50/p95/p99 latency separately. Dividing concurrent batch duration by
 connection count is not connection latency.
+
+The load generator uses one native thread per connection. When the objective
+is a single-shard server ceiling, give the client enough independent CPU cores
+that it cannot become the first saturated endpoint, and keep the target echo
+process on another core. Pinning a single client and the server to one core
+each can produce a client ceiling that looks like a server result. Always
+record `response_shortfall_pct`; higher offered load is not an improvement if
+fewer responses complete.
 
 ## Linux verification
 

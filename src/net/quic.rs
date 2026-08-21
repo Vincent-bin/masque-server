@@ -704,41 +704,53 @@ fn send_mmsg(
     messages: &[SendMessage],
     enable_gso: bool,
 ) -> io::Result<usize> {
+    use std::mem::MaybeUninit;
     use std::os::raw::c_void;
 
     let count = messages.len().min(MAX_BATCH_PACKETS);
-    // SAFETY: Zero is a valid initial representation for these C I/O structs;
-    // all fields submitted to the kernel are populated below.
-    let mut addresses: [libc::sockaddr_storage; MAX_BATCH_PACKETS] = unsafe { std::mem::zeroed() };
-    // SAFETY: See above.
-    let mut iovecs: [libc::iovec; MAX_BATCH_PACKETS] = unsafe { std::mem::zeroed() };
-    // SAFETY: See above.
-    let mut headers: [libc::mmsghdr; MAX_BATCH_PACKETS] = unsafe { std::mem::zeroed() };
-    let mut controls = [ControlBuffer::default(); MAX_BATCH_PACKETS];
+    // The common non-GSO batch contains about a dozen messages, well below
+    // the hard ceiling. Leaving the backing arrays uninitialized avoids
+    // clearing every unused sockaddr/header/control slot on every sendmmsg.
+    // Each element exposed to the kernel is fully initialized in the loop.
+    let mut addresses: [MaybeUninit<libc::sockaddr_storage>; MAX_BATCH_PACKETS] =
+        [const { MaybeUninit::uninit() }; MAX_BATCH_PACKETS];
+    let mut iovecs: [MaybeUninit<libc::iovec>; MAX_BATCH_PACKETS] =
+        [const { MaybeUninit::uninit() }; MAX_BATCH_PACKETS];
+    let mut headers: [MaybeUninit<libc::mmsghdr>; MAX_BATCH_PACKETS] =
+        [const { MaybeUninit::uninit() }; MAX_BATCH_PACKETS];
+    let mut controls: [MaybeUninit<ControlBuffer>; MAX_BATCH_PACKETS] =
+        [const { MaybeUninit::uninit() }; MAX_BATCH_PACKETS];
 
     for (index, message) in messages.iter().take(count).enumerate() {
         let (address, address_len) = socket_addr_to_raw(message.to);
-        addresses[index] = address;
-        iovecs[index] = libc::iovec {
+        let address = addresses[index].write(address);
+        let iovec = iovecs[index].write(libc::iovec {
             iov_base: message.data.as_ptr().cast_mut().cast::<c_void>(),
             iov_len: message.data.len(),
-        };
+        });
 
         let (control, control_len) = if enable_gso && message.segments > 1 {
-            let len = controls[index].set_udp_segment(message.segment_size as u16);
-            (controls[index].as_mut_ptr().cast::<c_void>(), len)
+            let mut value = ControlBuffer::default();
+            let len = value.set_udp_segment(message.segment_size as u16);
+            let value = controls[index].write(value);
+            (value.as_mut_ptr().cast::<c_void>(), len)
         } else {
             (std::ptr::null_mut(), 0)
         };
 
-        let header = &mut headers[index].msg_hdr;
-        header.msg_name = (&mut addresses[index] as *mut libc::sockaddr_storage).cast::<c_void>();
+        // Zero one live header rather than the entire maximum-sized array.
+        // All fields read by sendmmsg are then assigned explicitly.
+        // SAFETY: Zero is a valid initial representation for mmsghdr.
+        let mut message_header: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        let header = &mut message_header.msg_hdr;
+        header.msg_name = (address as *mut libc::sockaddr_storage).cast::<c_void>();
         header.msg_namelen = address_len;
-        header.msg_iov = &mut iovecs[index];
+        header.msg_iov = iovec;
         header.msg_iovlen = 1;
         header.msg_control = control;
         header.msg_controllen = control_len as _;
         header.msg_flags = 0;
+        headers[index].write(message_header);
     }
 
     // SAFETY: All pointers in the first `count` headers refer to live storage
@@ -746,7 +758,7 @@ fn send_mmsg(
     let result = unsafe {
         raw_sendmmsg(
             fd,
-            headers.as_mut_ptr(),
+            headers.as_mut_ptr().cast::<libc::mmsghdr>(),
             count as libc::c_uint,
             libc::MSG_DONTWAIT as _,
         )
@@ -918,6 +930,45 @@ mod tests {
             assert_eq!(received, len);
             assert!(buffer[..received].iter().all(|value| *value == byte));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sendmmsg_initializes_every_live_slot() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = receiver.local_addr().unwrap();
+        let mut sender =
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, false)
+                .await
+                .unwrap();
+
+        let mut batch = SendPacketBatch::new();
+        for sequence in 0..MAX_BATCH_PACKETS {
+            batch.push(
+                &(sequence as u64).to_be_bytes(),
+                send_info(target),
+                false,
+                65_535,
+            );
+        }
+        sender.send_batch(&batch).await.unwrap();
+
+        let mut seen = vec![false; MAX_BATCH_PACKETS];
+        let mut buffer = [0_u8; 8];
+        for _ in 0..MAX_BATCH_PACKETS {
+            let (received, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                receiver.recv_from(&mut buffer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(received, buffer.len());
+            let sequence = u64::from_be_bytes(buffer) as usize;
+            assert!(sequence < MAX_BATCH_PACKETS);
+            assert!(!std::mem::replace(&mut seen[sequence], true));
+        }
+        assert!(seen.into_iter().all(|received| received));
     }
 
     /// Connection sharding is only worth anything if the kernel actually

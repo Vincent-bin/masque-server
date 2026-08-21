@@ -10,6 +10,9 @@ HTTP_PID=""
 TCP_DOWNLOAD_BYTES="${MASQUE_TCP_DOWNLOAD_BYTES:-67108864}"
 TCP_DOWNLOAD_REPEATS="${MASQUE_TCP_DOWNLOAD_REPEATS:-2}"
 TCP_DIRECT_BASELINE="${MASQUE_TCP_DIRECT_BASELINE:-1}"
+BENCH_MODE="${MASQUE_BENCH_MODE:-all}"
+BENCH_SHARDS="${MASQUE_BENCH_SHARDS:-1}"
+LOAD_CONNS="${MASQUE_LOAD_CONNS:-}"
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
@@ -27,6 +30,29 @@ cleanup() {
     rm -rf -- "$BENCH_DIR"
 }
 trap cleanup EXIT INT TERM
+
+case "$BENCH_MODE" in
+    all|smoke|tcp|udp|load) ;;
+    *)
+        echo "MASQUE_BENCH_MODE must be all, smoke, tcp, udp, or load" >&2
+        exit 2
+        ;;
+esac
+
+case "$BENCH_SHARDS" in
+    ''|*[!0-9]*)
+        echo "MASQUE_BENCH_SHARDS must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+
+case "$LOAD_CONNS" in
+    ''|0) ;;
+    *[!0-9]*)
+        echo "MASQUE_LOAD_CONNS must be a positive integer" >&2
+        exit 2
+        ;;
+esac
 
 case "${MASQUE_BENCH_TARGET_GSO:-0}" in
     0) TARGET_GSO_TOML=false ;;
@@ -67,6 +93,7 @@ key_path = "$BENCH_DIR/certs/server.key"
 
 [[listeners]]
 listen_addr = "127.0.0.1:4433"
+shards = $BENCH_SHARDS
 
 [listeners.auth]
 enabled = true
@@ -110,48 +137,81 @@ esac
 
 cargo build --workspace --release
 
-truncate -s "$TCP_DOWNLOAD_BYTES" "$BENCH_DIR/masque-bench.bin"
-python3 -m http.server 9998 --bind 127.0.0.1 --directory "$BENCH_DIR" \
-    >"$BENCH_DIR/http.log" 2>&1 &
-HTTP_PID=$!
+case "$BENCH_MODE" in
+    all|tcp)
+        truncate -s "$TCP_DOWNLOAD_BYTES" "$BENCH_DIR/masque-bench.bin"
+        python3 -m http.server 9998 --bind 127.0.0.1 --directory "$BENCH_DIR" \
+            >"$BENCH_DIR/http.log" 2>&1 &
+        HTTP_PID=$!
+        ;;
+esac
 
-MASQUE_ECHO_SERVER_ADDR=127.0.0.1:9999 \
-RUST_LOG=warn \
-target/release/masque-e2e >"$BENCH_DIR/echo.log" 2>&1 &
-ECHO_PID=$!
+case "$BENCH_MODE" in
+    all|smoke|udp|load)
+        MASQUE_ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        RUST_LOG=warn \
+        target/release/masque-e2e >"$BENCH_DIR/echo.log" 2>&1 &
+        ECHO_PID=$!
+        ;;
+esac
 
 RUST_LOG=warn target/release/masque-server --config "$BENCH_DIR/masque.toml" \
     >"$BENCH_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
-MASQUE_AUTH_CHECK=1 \
-MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-ECHO_SERVER_ADDR=127.0.0.1:9999 \
-RUST_LOG=warn \
-target/release/masque-e2e
+case "$BENCH_MODE" in
+    all|smoke)
+        MASQUE_AUTH_CHECK=1 \
+        MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+        ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        RUST_LOG=warn \
+        target/release/masque-e2e
 
-MASQUE_TCP_CHECK=1 \
-MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-ECHO_SERVER_ADDR=127.0.0.1:9999 \
-MASQUE_USERNAME=test \
-MASQUE_PASSWORD=test-password \
-RUST_LOG=warn \
-target/release/masque-e2e
+        MASQUE_TCP_CHECK=1 \
+        MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+        ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        MASQUE_USERNAME=test \
+        MASQUE_PASSWORD=test-password \
+        RUST_LOG=warn \
+        target/release/masque-e2e
+        ;;
+esac
 
-MASQUE_TCP_DOWNLOAD=1 \
-MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-MASQUE_TCP_TARGET=127.0.0.1:9998 \
-MASQUE_TCP_DOWNLOAD_BYTES="$TCP_DOWNLOAD_BYTES" \
-MASQUE_TCP_DOWNLOAD_REPEATS="$TCP_DOWNLOAD_REPEATS" \
-MASQUE_USERNAME=test \
-MASQUE_PASSWORD=test-password \
-RUST_LOG=warn \
-target/release/masque-e2e
+case "$BENCH_MODE" in
+    all|tcp)
+        MASQUE_TCP_DOWNLOAD=1 \
+        MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+        MASQUE_TCP_TARGET=127.0.0.1:9998 \
+        MASQUE_TCP_DOWNLOAD_BYTES="$TCP_DOWNLOAD_BYTES" \
+        MASQUE_TCP_DOWNLOAD_REPEATS="$TCP_DOWNLOAD_REPEATS" \
+        MASQUE_USERNAME=test \
+        MASQUE_PASSWORD=test-password \
+        RUST_LOG=warn \
+        target/release/masque-e2e
+        ;;
+esac
 
-MASQUE_BENCH=1 \
-MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-ECHO_SERVER_ADDR=127.0.0.1:9999 \
-MASQUE_USERNAME=test \
-MASQUE_PASSWORD=test-password \
-RUST_LOG=warn \
-cargo run --release -p masque-e2e
+case "$BENCH_MODE" in
+    all|udp)
+        MASQUE_BENCH=1 \
+        MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+        ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        MASQUE_USERNAME=test \
+        MASQUE_PASSWORD=test-password \
+        RUST_LOG=warn \
+        target/release/masque-e2e
+        ;;
+esac
+
+if [ "$BENCH_MODE" = load ] || {
+    [ "$BENCH_MODE" = all ] && [ -n "$LOAD_CONNS" ] && [ "$LOAD_CONNS" != 0 ]
+}; then
+    MASQUE_LOAD=1 \
+    MASQUE_LOAD_CONNS="${LOAD_CONNS:-32}" \
+    MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+    ECHO_SERVER_ADDR=127.0.0.1:9999 \
+    MASQUE_USERNAME=test \
+    MASQUE_PASSWORD=test-password \
+    RUST_LOG=warn \
+    target/release/masque-e2e
+fi

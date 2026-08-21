@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.5.1` selects `v0.5.1`. This is also how to install a
+`MASQUE_VERSION=0.6.0` selects `v0.6.0`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
