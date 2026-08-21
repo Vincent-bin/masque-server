@@ -21,7 +21,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use boring::nid::Nid;
 use boring::pkey::{PKey, Public};
+use boring::ssl::{SslAlert, SslContextBuilder, SslVerifyError, SslVerifyMode};
 use boring::x509::X509;
+use tracing::{debug, warn};
 
 use crate::config::ClientEntry;
 
@@ -242,6 +244,50 @@ impl SharedRoster {
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
+}
+
+/// Configure a TLS server context to require a client certificate and admit
+/// only public keys present in `roster`.
+///
+/// MASQUE clients in this family present short-lived self-signed certificates,
+/// so normal CA-chain verification is intentionally replaced by a canonical
+/// public-key lookup. Keeping the callback here lets QUIC and TCP/TLS listeners
+/// enforce exactly the same identity rule.
+pub(crate) fn configure_client_cert_verification(
+    builder: &mut SslContextBuilder,
+    roster: Arc<SharedRoster>,
+) {
+    let mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+    builder.set_custom_verify_callback(mode, move |ssl| {
+        let denied = Err(SslVerifyError::Invalid(SslAlert::ACCESS_DENIED));
+
+        let Some(cert) = ssl.peer_certificate() else {
+            warn!("rejecting client that presented no certificate");
+            return denied;
+        };
+        let Ok(der) = cert.to_der() else {
+            warn!("rejecting client certificate that could not be re-encoded");
+            return denied;
+        };
+
+        match roster.load().identify(&der) {
+            Ok(identity) => {
+                debug!(client = %identity.name, "client certificate accepted");
+                Ok(())
+            }
+            Err(IdentityError::UnknownKey(key)) => {
+                warn!(
+                    public_key = %key,
+                    "rejecting client: public key is not in the [[clients]] roster"
+                );
+                denied
+            }
+            Err(e) => {
+                warn!(%e, "rejecting client certificate");
+                denied
+            }
+        }
+    });
 }
 
 /// Why a presented client certificate was not accepted.

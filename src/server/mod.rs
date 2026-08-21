@@ -1,6 +1,7 @@
 // QUIC listener and connection accept loop.
 
 mod authentication;
+mod http2;
 mod request;
 
 use std::net::{IpAddr, SocketAddr};
@@ -23,8 +24,10 @@ use crate::address_pool::{AddressPool, PoolError};
 use crate::auth::BasicAuthenticator;
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
-use crate::client_identity::{ClientIdentity, ClientRegistry, IdentityError, SharedRoster};
-use crate::config::{ResolvedListener, ServerConfig};
+use crate::client_identity::{
+    ClientIdentity, ClientRegistry, SharedRoster, configure_client_cert_verification,
+};
+use crate::config::{ListenerTransport, ResolvedListener, ServerConfig};
 use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
 use crate::fxhash::FxHashMap;
@@ -150,6 +153,17 @@ struct UdpResponse {
     datagrams: Vec<Vec<u8>>,
 }
 
+/// Return path for one CONNECT-IP stream carried by HTTP/2.
+///
+/// HTTP/3 connections live inside shards and can be addressed through
+/// `index_shard`. HTTP/2 streams are independent Tokio tasks, so the shared
+/// TUN reader hands their packets to a bounded channel instead.
+#[derive(Clone)]
+struct Http2TunRoute {
+    sender: mpsc::Sender<Vec<u8>>,
+    metrics: Arc<ShardMetrics>,
+}
+
 /// Top-level MASQUE server.
 ///
 /// Runs one event loop per shard. A listener's shards each bind its address
@@ -167,6 +181,11 @@ struct UdpResponse {
 /// stays single and needs no knowledge of which listener a shard serves.
 pub struct Server {
     shards: Vec<Shard>,
+    http2_listeners: Vec<http2::Http2Listener>,
+    /// Bound worker addresses in configuration order. HTTP/3 repeats an
+    /// address once per shard, preserving the public method's original shape.
+    listen_addrs: Vec<SocketAddr>,
+    shared: Arc<Shared>,
     metrics: Arc<Metrics>,
     observability: Option<ObservabilityServer>,
 }
@@ -349,6 +368,9 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
         // rather than left to fail at bind time with an EADDRINUSE that says
         // nothing about which two listeners disagreed.
         let conflict = plans.iter().find_map(|plan| {
+            if plan.listener.transport != listener.transport {
+                return None;
+            }
             let existing = plan.listener.listen_addr;
             listen_address_conflict(existing, listener.listen_addr)
                 .map(|conflict| (existing, conflict))
@@ -374,7 +396,18 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
         // "One per core" has no single answer once the cores are shared between
         // listeners, and quietly giving every listener a full set would
         // oversubscribe the machine by the number of listeners.
-        if listener.shards == 0 && config.listeners.len() > 1 {
+        if listener.transport == ListenerTransport::Http2 && listener.shards != 1 {
+            anyhow::bail!(
+                "HTTP/2 listener {} must use shards = 1; one Tokio accept loop already \
+                 dispatches its TCP connections across the runtime",
+                listener.listen_addr
+            );
+        }
+
+        if listener.transport == ListenerTransport::Http3
+            && listener.shards == 0
+            && config.listeners.len() > 1
+        {
             anyhow::bail!(
                 "listener {} uses shards = 0 (one per core), which has no meaning \
                  alongside other listeners; give each listener an explicit count",
@@ -382,10 +415,17 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
             );
         }
 
-        let shards = resolve_shard_count(listener.shards);
+        let shards = if listener.transport == ListenerTransport::Http3 {
+            resolve_shard_count(listener.shards)
+        } else {
+            1
+        };
         // Sharing one address needs SO_REUSEPORT, which only Linux provides in
         // the load-balancing form this depends on.
-        if shards > 1 && !cfg!(target_os = "linux") {
+        if listener.transport == ListenerTransport::Http3
+            && shards > 1
+            && !cfg!(target_os = "linux")
+        {
             anyhow::bail!(
                 "listener {} asks for {shards} shards, which needs SO_REUSEPORT; \
                  that is Linux only, so set shards = 1",
@@ -393,10 +433,13 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
             );
         }
 
-        total_shards += shards;
+        if listener.transport == ListenerTransport::Http3 {
+            total_shards += shards;
+        }
         plans.push(ListenerPlan {
             listener: ResolvedListener {
                 listen_addr: listener.listen_addr,
+                transport: listener.transport,
                 shards,
                 auth: listener.auth.clone(),
             },
@@ -531,6 +574,49 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
         );
     }
 
+    const MAX_HTTP2_WINDOW: u32 = (1_u32 << 31) - 1;
+    if !(1..=MAX_HTTP2_WINDOW).contains(&config.http2.initial_stream_window) {
+        anyhow::bail!(
+            "http2.initial_stream_window ({}) must be between 1 and {MAX_HTTP2_WINDOW}",
+            config.http2.initial_stream_window
+        );
+    }
+    if !(1..=MAX_HTTP2_WINDOW).contains(&config.http2.initial_connection_window) {
+        anyhow::bail!(
+            "http2.initial_connection_window ({}) must be between 1 and {MAX_HTTP2_WINDOW}",
+            config.http2.initial_connection_window
+        );
+    }
+    if config.http2.max_concurrent_streams == 0 {
+        anyhow::bail!("http2.max_concurrent_streams must be at least 1");
+    }
+    if config.http2.max_header_list_size == 0 {
+        anyhow::bail!("http2.max_header_list_size must be at least 1");
+    }
+    if config.http2.max_send_buffer_size == 0
+        || config.http2.max_send_buffer_size > u32::MAX as usize
+    {
+        anyhow::bail!(
+            "http2.max_send_buffer_size ({}) must be between 1 and {}",
+            config.http2.max_send_buffer_size,
+            u32::MAX
+        );
+    }
+    const MAX_HTTP2_DATA_FRAME_BUDGET: usize = 16 * 1024 * 1024;
+    if !(1..=MAX_HTTP2_DATA_FRAME_BUDGET).contains(&config.http2.data_frame_budget) {
+        anyhow::bail!(
+            "http2.data_frame_budget ({}) must be between 1 and \
+             {MAX_HTTP2_DATA_FRAME_BUDGET}",
+            config.http2.data_frame_budget
+        );
+    }
+    if !(1..=65_527).contains(&config.http2.max_datagram_size) {
+        anyhow::bail!(
+            "http2.max_datagram_size ({}) must be between 1 and 65527 bytes",
+            config.http2.max_datagram_size
+        );
+    }
+
     if config.ip_proxy.enabled && !(1..=u16::MAX as usize).contains(&config.ip_proxy.tun_mtu) {
         anyhow::bail!(
             "ip_proxy.tun_mtu ({}) must be between 1 and {}",
@@ -569,12 +655,29 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
             .auth
             .client_cert_enabled()
             .then(|| Arc::new(SharedRoster::new(clients.clone())));
-        build_quic_config(config, client_certs)
-            .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
+        match plan.listener.transport {
+            ListenerTransport::Http3 => {
+                build_quic_config(config, client_certs)
+                    .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
+            }
+            ListenerTransport::Http2 => {
+                http2::build_acceptor(config, client_certs)
+                    .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
+            }
+        }
     }
-    build_h3_config()?;
+    if listeners
+        .iter()
+        .any(|plan| plan.listener.transport == ListenerTransport::Http3)
+    {
+        build_h3_config()?;
+    }
 
-    let total_shards = listeners.iter().map(|plan| plan.listener.shards).sum();
+    let total_shards = listeners
+        .iter()
+        .filter(|plan| plan.listener.transport == ListenerTransport::Http3)
+        .map(|plan| plan.listener.shards)
+        .sum();
     Ok(ValidatedServerConfig {
         clients,
         listeners,
@@ -721,6 +824,7 @@ impl Server {
             routing_table: RwLock::new(RoutingTable::new()),
             cid_shard: RwLock::new(FxHashMap::default()),
             index_shard: RwLock::new(FxHashMap::default()),
+            http2_tun_routes: RwLock::new(FxHashMap::default()),
             next_conn_index: AtomicU64::new(0),
             conn_id_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes),
             tun,
@@ -735,18 +839,43 @@ impl Server {
         });
 
         let mut shards = Vec::with_capacity(total_shards);
+        let mut http2_listeners = Vec::new();
+        let mut listen_addrs = Vec::with_capacity(total_shards + listeners.len());
         let mut inboxes = forward_rx.into_iter().zip(tun_rx);
         // Ephemeral listeners must avoid not only sockets that are already up,
         // but fixed listeners that have not been reached yet. Otherwise an
         // early `:0` listener can take a later port and, under SO_REUSEPORT,
         // silently join the other authentication mode's group.
-        let mut unavailable_listener_addrs: Vec<SocketAddr> = listeners
+        let mut unavailable_http3_addrs: Vec<SocketAddr> = listeners
             .iter()
+            .filter(|plan| plan.listener.transport == ListenerTransport::Http3)
+            .map(|plan| plan.listener.listen_addr)
+            .filter(|addr| addr.port() != 0)
+            .collect();
+        let mut unavailable_http2_addrs: Vec<SocketAddr> = listeners
+            .iter()
+            .filter(|plan| plan.listener.transport == ListenerTransport::Http2)
             .map(|plan| plan.listener.listen_addr)
             .filter(|addr| addr.port() != 0)
             .collect();
 
         for mut plan in listeners {
+            if plan.listener.transport == ListenerTransport::Http2 {
+                let listener = http2::Http2Listener::bind(
+                    Arc::clone(&config),
+                    Arc::clone(&shared),
+                    plan.listener.clone(),
+                    Arc::clone(&metrics),
+                    listener_auth_label(&plan.listener),
+                    &unavailable_http2_addrs,
+                )
+                .await?;
+                unavailable_http2_addrs.push(listener.local_addr());
+                listen_addrs.push(listener.local_addr());
+                http2_listeners.push(listener);
+                continue;
+            }
+
             // SO_REUSEPORT is what lets one listener's shards share an address.
             // A single-shard listener must not set it, or a later listener that
             // was misconfigured onto the same address could join its group.
@@ -759,13 +888,15 @@ impl Server {
                 &config,
                 plan.listener.listen_addr,
                 reuseport,
-                &unavailable_listener_addrs,
+                &unavailable_http3_addrs,
             )
             .await?;
             plan.listener.listen_addr = bound_addr;
-            unavailable_listener_addrs.push(bound_addr);
+            unavailable_http3_addrs.push(bound_addr);
+            listen_addrs.extend(std::iter::repeat_n(bound_addr, plan.listener.shards));
             let listener_metrics = metrics.register_listener(
                 bound_addr,
+                plan.listener.transport.as_str(),
                 listener_auth_label(&plan.listener),
                 plan.listener.shards,
                 first_socket.udp_gso_enabled(),
@@ -816,9 +947,16 @@ impl Server {
             None => None,
         };
 
-        info!(shards = total_shards, "server ready");
+        info!(
+            http3_shards = total_shards,
+            http2_listeners = http2_listeners.len(),
+            "server ready"
+        );
         Ok(Self {
             shards,
+            http2_listeners,
+            listen_addrs,
+            shared,
             metrics,
             observability,
         })
@@ -830,10 +968,7 @@ impl Server {
     /// free. This is the programmatic way to learn it; the live `listening` log
     /// reports it too. Shards of one listener share an address and repeat here.
     pub fn listen_addrs(&self) -> Vec<SocketAddr> {
-        self.shards
-            .iter()
-            .map(|shard| shard.socket.local_addr().unwrap_or(shard.listen_addr))
-            .collect()
+        self.listen_addrs.clone()
     }
 
     /// Bound observability address, including a kernel-selected test port.
@@ -888,9 +1023,7 @@ impl Server {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let watchdog_timeout =
             systemd::watchdog_timeout().context("invalid systemd watchdog environment")?;
-        if let Some(shard) = self.shards.first() {
-            Self::spawn_roster_reloader(Arc::clone(&shard.shared));
-        }
+        Self::spawn_roster_reloader(Arc::clone(&self.shared));
 
         // Install one process-wide signal listener before any shard starts.
         // Every shard receives the same latched watch value, so one SIGINT or
@@ -934,9 +1067,11 @@ impl Server {
             }
         });
 
-        // A single shard keeps the current behaviour of running on the caller's
-        // task, which keeps the common case free of a spawn and a join.
-        if self.shards.len() == 1 {
+        // Preserve the hot-path shape used by the common one-listener,
+        // one-shard HTTP/3 deployment. Running that shard on the caller avoids
+        // an otherwise unnecessary Tokio task boundary and keeps HTTP/2 support
+        // from perturbing existing throughput.
+        if self.http2_listeners.is_empty() && self.shards.len() == 1 {
             let outcome = self.shards[0].run(shutdown_rx).await;
             if self.metrics.begin_shutdown()
                 && let Err(error) = systemd::notify("STOPPING=1\nSTATUS=Stopping")
@@ -956,39 +1091,52 @@ impl Server {
         }
 
         let mut tasks = tokio::task::JoinSet::new();
+        if self.shards.is_empty() && self.shared.tun.is_some() {
+            let shared = Arc::clone(&self.shared);
+            let shutdown_rx = shutdown_rx.clone();
+            tasks.spawn(async move {
+                let result = run_http2_tun_dispatcher(shared, shutdown_rx).await;
+                ("HTTP/2 TUN dispatcher".to_string(), result)
+            });
+        }
         for mut shard in self.shards.drain(..) {
             let shutdown_rx = shutdown_rx.clone();
             tasks.spawn(async move {
                 let index = shard.index;
                 let result = shard.run(shutdown_rx).await;
-                (index, result)
+                (format!("HTTP/3 shard {index}"), result)
+            });
+        }
+        for listener in self.http2_listeners.drain(..) {
+            let shutdown_rx = shutdown_rx.clone();
+            let addr = listener.local_addr();
+            tasks.spawn(async move {
+                let result = listener.run(shutdown_rx).await;
+                (format!("HTTP/2 listener {addr}"), result)
             });
         }
 
         let mut outcome = Ok(());
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok((index, Err(error))) => {
-                    error!(shard = index, %error, "shard exited with an error");
+                Ok((worker, Err(error))) => {
+                    error!(%worker, %error, "proxy worker exited with an error");
                     if outcome.is_ok() {
                         outcome = Err(error);
                     }
                     if !*shutdown_tx.borrow() {
-                        warn!(
-                            shard = index,
-                            "draining remaining shards after an unexpected exit"
-                        );
+                        warn!(%worker, "draining remaining workers after an unexpected exit");
                         let _ = shutdown_tx.send(true);
                     }
                 }
                 Ok((_, Ok(()))) => {}
                 Err(error) => {
-                    error!(%error, "shard task panicked");
+                    error!(%error, "proxy worker task panicked");
                     if outcome.is_ok() {
-                        outcome = Err(anyhow::anyhow!("shard task panicked: {error}"));
+                        outcome = Err(anyhow::anyhow!("proxy worker task panicked: {error}"));
                     }
                     if !*shutdown_tx.borrow() {
-                        warn!("draining remaining shards after an unexpected exit");
+                        warn!("draining remaining workers after an unexpected exit");
                         let _ = shutdown_tx.send(true);
                     }
                 }
@@ -1012,7 +1160,7 @@ impl Server {
     }
 }
 
-/// Ping systemd only while every proxy shard is making progress. If one shard
+/// Ping systemd only while every proxy worker is making progress. If one worker
 /// stops completing its once-per-second heartbeat, readiness fails and pings
 /// are withheld so `WatchdogSec` can restart the process.
 fn spawn_systemd_watchdog(
@@ -1238,6 +1386,47 @@ fn allocate_pool_addresses(shared: &Shared) -> Vec<IpAddr> {
     addresses
 }
 
+/// Encode the address and default-route capsules shared by HTTP/2 and HTTP/3
+/// CONNECT-IP setup.
+fn encode_ip_setup_capsules(addresses: &[IpAddr]) -> Vec<u8> {
+    let assigned = addresses
+        .iter()
+        .map(|ip| match *ip {
+            IpAddr::V4(ip) => AssignedAddress {
+                request_id: 0,
+                ip: IpAddress::V4(ip),
+                prefix_len: 32,
+            },
+            IpAddr::V6(ip) => AssignedAddress {
+                request_id: 0,
+                ip: IpAddress::V6(ip),
+                prefix_len: 128,
+            },
+        })
+        .collect();
+
+    let mut capsules = Vec::new();
+    capsule::encoder::encode(&CapsuleFrame::AddressAssign(assigned), &mut capsules);
+    capsule::encoder::encode(
+        &CapsuleFrame::RouteAdvertisement(vec![
+            IpAddressRange {
+                start: IpAddress::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                end: IpAddress::V4(std::net::Ipv4Addr::BROADCAST),
+                ip_protocol: 0,
+            },
+            IpAddressRange {
+                start: IpAddress::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                end: IpAddress::V6(std::net::Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                )),
+                ip_protocol: 0,
+            },
+        ]),
+        &mut capsules,
+    );
+    capsules
+}
+
 /// Build a QUIC config that demands a client certificate and admits only keys
 /// on the roster.
 ///
@@ -1283,54 +1472,7 @@ fn build_client_cert_quic_config(
         )
     })?;
 
-    // PEER asks for the certificate; FAIL_IF_NO_PEER_CERT makes it mandatory.
-    // Without the second flag a client that simply omits its certificate would
-    // complete the handshake and reach the request path with no identity.
-    //
-    // This is the *custom* verify hook, not the legacy `SSL_CTX_set_verify`
-    // callback: the legacy one runs as a step inside BoringSSL's X.509 chain
-    // verification, which never happens here because no CA store is configured,
-    // so it is simply never consulted. `SSL_CTX_set_custom_verify` replaces
-    // chain verification outright and is always called.
-    let mode = boring::ssl::SslVerifyMode::PEER | boring::ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT;
-    builder.set_custom_verify_callback(mode, move |ssl| {
-        // ACCESS_DENIED rather than a certificate-specific alert: the
-        // certificate is structurally fine, it is the identity behind it that
-        // is not authorized. Clients in this family surface that alert as a
-        // login failure, which is the right thing to tell the operator.
-        let denied = Err(boring::ssl::SslVerifyError::Invalid(
-            boring::ssl::SslAlert::ACCESS_DENIED,
-        ));
-
-        let Some(cert) = ssl.peer_certificate() else {
-            warn!("rejecting client that presented no certificate");
-            return denied;
-        };
-        let Ok(der) = cert.to_der() else {
-            warn!("rejecting client certificate that could not be re-encoded");
-            return denied;
-        };
-
-        match roster.load().identify(&der) {
-            Ok(identity) => {
-                debug!(client = %identity.name, "client certificate accepted");
-                Ok(())
-            }
-            Err(IdentityError::UnknownKey(key)) => {
-                // Logged in full so an operator can enroll the client by
-                // pasting this straight into a `[[clients]]` entry.
-                warn!(
-                    public_key = %key,
-                    "rejecting client: public key is not in the [[clients]] roster"
-                );
-                denied
-            }
-            Err(e) => {
-                warn!(%e, "rejecting client certificate");
-                denied
-            }
-        }
-    });
+    configure_client_cert_verification(&mut builder, roster);
 
     quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(|e| anyhow::anyhow!("failed to build QUIC config: {e}"))
@@ -1518,6 +1660,60 @@ fn build_tun(config: &ServerConfig) -> anyhow::Result<Option<TunManager>> {
     }
 }
 
+/// Own the shared TUN read side when a process has HTTP/2 listeners but no
+/// HTTP/3 shard. In a mixed deployment HTTP/3 shard zero already performs this
+/// job and dispatches HTTP/2-owned packets through `relay_http2_tun_packet`.
+async fn run_http2_tun_dispatcher(
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let tun = shared
+        .tun
+        .as_ref()
+        .expect("HTTP/2 TUN dispatcher requires a configured device");
+    let device = tun.device();
+    let mut batch = TunRecvBatch::new(tun.mtu());
+
+    loop {
+        let received = tokio::select! {
+            result = shutdown.wait_for(|requested| *requested) => {
+                let _ = result;
+                return Ok(());
+            }
+            result = tun::recv_batch(&device, &mut batch) => result,
+        };
+
+        let segments = match received {
+            Ok(segments) => segments,
+            Err(error) => {
+                error!(%error, "HTTP/2 TUN receive failed");
+                continue;
+            }
+        };
+        for index in 0..segments.min(MAX_TUN_RECV_BATCH) {
+            let Some(packet) = batch.packet(index) else {
+                break;
+            };
+            let destination = match ip_packet::dst_addr(packet) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    debug!(%error, "invalid IP header from TUN");
+                    continue;
+                }
+            };
+            let owner = shared
+                .routing_table
+                .read()
+                .expect("routing table poisoned")
+                .lookup(&destination)
+                .copied();
+            if let Some(owner) = owner {
+                shared.relay_http2_tun_packet(owner, packet);
+            }
+        }
+    }
+}
+
 /// Wait for the target socket to be readable, then drain a batch of datagrams.
 async fn recv_target_batch(
     socket: &UdpSocket,
@@ -1575,6 +1771,12 @@ struct Shared {
     cid_shard: RwLock<FxHashMap<quiche::ConnectionId<'static>, usize>>,
     /// Which shard owns each connection index, for routing TUN packets.
     index_shard: RwLock<FxHashMap<u64, usize>>,
+    /// Bounded return path for CONNECT-IP streams owned by HTTP/2 tasks.
+    ///
+    /// An owner is present in exactly one of `index_shard` or this map. That
+    /// keeps the common HTTP/3 lookup unchanged while allowing the one shared
+    /// TUN reader to dispatch packets across transports.
+    http2_tun_routes: RwLock<FxHashMap<TunnelOwner, Http2TunRoute>>,
     /// Monotonically increasing connection index used as the conn_id in
     /// TunnelOwner (since quiche ConnectionId is not easily hashable).
     ///
@@ -1642,6 +1844,34 @@ impl Shared {
             metrics.record_tun_queue_drop();
         }
     }
+
+    /// Hand one TUN packet to an HTTP/2 CONNECT-IP task without waiting for
+    /// stream flow control. Returns false when `owner` belongs to HTTP/3 (or
+    /// has already disappeared), so the shard can continue its normal path.
+    fn relay_http2_tun_packet(&self, owner: TunnelOwner, packet: &[u8]) -> bool {
+        let route = self
+            .http2_tun_routes
+            .read()
+            .expect("HTTP/2 TUN routes poisoned")
+            .get(&owner)
+            .cloned();
+        let Some(route) = route else {
+            return false;
+        };
+
+        match route.sender.try_reserve() {
+            Ok(permit) => permit.send(packet.to_vec()),
+            Err(_) => {
+                route.metrics.record_tun_queue_drop();
+                debug!(
+                    conn_id = owner.conn_id,
+                    stream_id = owner.stream_id,
+                    "HTTP/2 TUN queue full, dropping packet"
+                );
+            }
+        }
+        true
+    }
 }
 
 /// One shard: an independent event loop over its own share of connections.
@@ -1664,8 +1894,6 @@ struct Shard {
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
     config: Arc<ServerConfig>,
-    /// Configured address after an ephemeral port, if any, has been resolved.
-    listen_addr: SocketAddr,
     /// Reverse index for routing TUN packets without scanning every connection.
     conn_by_index: FxHashMap<u64, quiche::ConnectionId<'static>>,
     udp_response_tx: mpsc::Sender<UdpResponse>,
@@ -1772,7 +2000,6 @@ impl Shard {
             tcp_policy,
             udp_policy,
             config,
-            listen_addr: listener.listen_addr,
             conn_by_index: FxHashMap::default(),
             udp_response_tx,
             udp_response_rx,
@@ -2733,21 +2960,8 @@ impl Shard {
             return;
         }
 
-        let mut assigned = Vec::with_capacity(addresses.len());
         for ip in &addresses {
             tunnel.assigned_addrs.push(*ip);
-            assigned.push(match *ip {
-                IpAddr::V4(v4) => AssignedAddress {
-                    request_id: 0,
-                    ip: IpAddress::V4(v4),
-                    prefix_len: 32,
-                },
-                IpAddr::V6(v6) => AssignedAddress {
-                    request_id: 0,
-                    ip: IpAddress::V6(v6),
-                    prefix_len: 128,
-                },
-            });
         }
 
         // Do not acknowledge the CONNECT until every address has been leased.
@@ -2801,25 +3015,7 @@ impl Shard {
         // Send ADDRESS_ASSIGN and ROUTE_ADVERTISEMENT back to back: one buffer,
         // one send_body call. The route advertisement is a default route, so
         // the client knows it can send all traffic through this tunnel.
-        let mut capsules = Vec::new();
-        capsule::encoder::encode(&CapsuleFrame::AddressAssign(assigned), &mut capsules);
-        capsule::encoder::encode(
-            &CapsuleFrame::RouteAdvertisement(vec![
-                IpAddressRange {
-                    start: IpAddress::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-                    end: IpAddress::V4(std::net::Ipv4Addr::new(255, 255, 255, 255)),
-                    ip_protocol: 0, // all protocols
-                },
-                IpAddressRange {
-                    start: IpAddress::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                    end: IpAddress::V6(std::net::Ipv6Addr::new(
-                        0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-                    )),
-                    ip_protocol: 0,
-                },
-            ]),
-            &mut capsules,
-        );
+        let capsules = encode_ip_setup_capsules(&addresses);
 
         if let Err(e) = h3.send_body(&mut client.quic, stream_id, &capsules, false) {
             warn!(stream_id, %e, "failed to send CONNECT-IP capsules");
@@ -3367,6 +3563,9 @@ impl Shard {
             .expect("index ownership poisoned")
             .get(&owner.conn_id)
             .copied();
+        if owner_shard.is_none() && self.shared.relay_http2_tun_packet(owner, pkt) {
+            return true;
+        }
         if let Some(shard) = owner_shard
             && shard != self.index
         {
@@ -3710,7 +3909,9 @@ impl Shard {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{AuthMode, AuthSection, ClientEntry, ListenerSection, ServerConfig};
+    use crate::config::{
+        AuthMode, AuthSection, ClientEntry, ListenerSection, ListenerTransport, ServerConfig,
+    };
 
     fn invalid_roster_entry() -> ClientEntry {
         ClientEntry {
@@ -3733,6 +3934,7 @@ mod tests {
     fn listener(addr: &str, mode: AuthMode) -> ListenerSection {
         ListenerSection {
             listen_addr: addr.parse().unwrap(),
+            transport: ListenerTransport::Http3,
             shards: 1,
             auth: AuthSection {
                 enabled: true,
@@ -3887,6 +4089,31 @@ mod tests {
             listener("0.0.0.0:443", AuthMode::ClientCert),
         ]);
         assert!(super::plan_listeners(&config).is_err());
+    }
+
+    #[test]
+    fn http2_and_http3_may_share_a_numeric_address() {
+        let mut http3 = listener("127.0.0.1:8443", AuthMode::Basic);
+        http3.transport = ListenerTransport::Http3;
+        let mut http2 = listener("127.0.0.1:8443", AuthMode::Basic);
+        http2.transport = ListenerTransport::Http2;
+        let config = config_with(vec![http3, http2]);
+
+        assert!(super::plan_listeners(&config).is_ok());
+    }
+
+    #[test]
+    fn http2_listener_rejects_quic_sharding() {
+        let mut http2 = listener("127.0.0.1:8443", AuthMode::Basic);
+        http2.transport = ListenerTransport::Http2;
+        http2.shards = 2;
+        let config = config_with(vec![http2]);
+
+        let error = match super::plan_listeners(&config) {
+            Ok(_) => panic!("HTTP/2 sharding should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("HTTP/2 listener"));
     }
 
     /// A wildcard claims every address of its family on its port, so an

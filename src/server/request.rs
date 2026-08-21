@@ -57,6 +57,38 @@ fn accepts_connect_ip(configured: &[String], protocol: &[u8]) -> bool {
             .any(|accepted| accepted.as_bytes() == protocol)
 }
 
+/// Classify the transport-neutral semantics of one header block.
+///
+/// HTTP/2 and HTTP/3 encode their pseudo-headers differently in memory, but
+/// the supported CONNECT methods and feature gates must stay identical.
+pub(super) fn classify_connect_request(
+    method: &[u8],
+    protocol: &[u8],
+    authority: &[u8],
+    path: &[u8],
+    config: &ServerConfig,
+) -> Option<ConnectRequest> {
+    if method != b"CONNECT" {
+        return None;
+    }
+
+    if protocol.is_empty() && config.tcp_proxy.enabled {
+        Some(ConnectRequest::Tcp {
+            authority: String::from_utf8_lossy(authority).into_owned(),
+        })
+    } else if protocol == b"connect-udp" && config.udp_proxy.enabled {
+        Some(ConnectRequest::Udp {
+            path: String::from_utf8_lossy(path).into_owned(),
+        })
+    } else if config.ip_proxy.enabled
+        && accepts_connect_ip(&config.ip_proxy.connect_protocols, protocol)
+    {
+        Some(ConnectRequest::Ip)
+    } else {
+        None
+    }
+}
+
 /// Shared request dependencies passed together to keep dispatch APIs focused.
 pub(super) struct RequestContext<'a> {
     pub(super) config: &'a ServerConfig,
@@ -109,50 +141,34 @@ impl Shard {
         // Authenticate supported proxy requests before parsing their target
         // or allocating any tunnel resources. Duplicate credentials are
         // rejected rather than choosing one ambiguously.
-        if method == b"CONNECT" {
-            let request = if protocol.is_empty() && context.config.tcp_proxy.enabled {
-                Some(ConnectRequest::Tcp {
-                    authority: String::from_utf8_lossy(authority).into_owned(),
-                })
-            } else if protocol == b"connect-udp" && context.config.udp_proxy.enabled {
-                Some(ConnectRequest::Udp {
-                    path: String::from_utf8_lossy(path).into_owned(),
-                })
-            } else if context.config.ip_proxy.enabled
-                && accepts_connect_ip(&context.config.ip_proxy.connect_protocols, protocol)
-            {
-                Some(ConnectRequest::Ip)
-            } else {
-                None
+        if let Some(request) =
+            classify_connect_request(method, protocol, authority, path, context.config)
+        {
+            let Some(auth) = context.auth else {
+                Self::dispatch_connect(h3, quic, stream_id, &request, context, pending);
+                return None;
             };
 
-            if let Some(request) = request {
-                let Some(auth) = context.auth else {
-                    Self::dispatch_connect(h3, quic, stream_id, &request, context, pending);
-                    return None;
-                };
-
-                // The cheap half runs here; only a well-formed request for the
-                // configured user reaches the password hash, and that is
-                // deliberately slow enough that it must not run on this thread.
-                if duplicate_proxy_authorization {
-                    warn!(stream_id, "duplicate proxy credentials");
+            // The cheap half runs here; only a well-formed request for the
+            // configured user reaches the password hash, and that is
+            // deliberately slow enough that it must not run on this thread.
+            if duplicate_proxy_authorization {
+                warn!(stream_id, "duplicate proxy credentials");
+                Self::send_proxy_auth_required(h3, quic, stream_id);
+                return None;
+            }
+            match auth.precheck(proxy_authorization) {
+                AuthPrecheck::Rejected => {
+                    warn!(stream_id, "proxy authentication failed");
                     Self::send_proxy_auth_required(h3, quic, stream_id);
                     return None;
                 }
-                match auth.precheck(proxy_authorization) {
-                    AuthPrecheck::Rejected => {
-                        warn!(stream_id, "proxy authentication failed");
-                        Self::send_proxy_auth_required(h3, quic, stream_id);
-                        return None;
-                    }
-                    AuthPrecheck::NeedsVerify(password) => {
-                        return Some(PendingAuth {
-                            stream_id,
-                            password,
-                            request,
-                        });
-                    }
+                AuthPrecheck::NeedsVerify(password) => {
+                    return Some(PendingAuth {
+                        stream_id,
+                        password,
+                        request,
+                    });
                 }
             }
         }

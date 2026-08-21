@@ -10,15 +10,15 @@ use crate::fxhash::FxHashMap;
 /// Identifies a specific tunnel within a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TunnelOwner {
-    /// Opaque identifier for the QUIC connection (index into a connection table).
+    /// Process-unique identifier for the HTTP connection.
     pub conn_id: u64,
-    /// The HTTP/3 stream ID that owns this tunnel.
+    /// The HTTP/2 or HTTP/3 stream ID that owns this tunnel.
     pub stream_id: u64,
 }
 
 /// Maps client-assigned IP addresses to tunnel owners.
 ///
-/// Used by the TUN reader to route inbound packets to the correct QUIC
+/// Used by the TUN reader to route inbound packets to the correct HTTP
 /// connection and stream.
 pub struct RoutingTable {
     entries: FxHashMap<IpAddr, TunnelOwner>,

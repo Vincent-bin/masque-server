@@ -37,7 +37,9 @@ use anyhow::{Context, bail, ensure};
 use zeroize::Zeroizing;
 
 use crate::auth;
-use crate::config::{self, AuthMode, AuthSection, ListenerSection, ServerConfig};
+use crate::config::{
+    self, AuthMode, AuthSection, ListenerSection, ListenerTransport, ServerConfig,
+};
 use crate::enroll::toml_string;
 use crate::server::validate_config;
 
@@ -57,6 +59,7 @@ const SUGGESTED_PORT: u16 = 4443;
 #[derive(Debug, Default)]
 pub struct AddListener {
     pub listen_addr: Option<SocketAddr>,
+    pub transport: Option<ListenerTransport>,
     pub mode: Option<AuthMode>,
     pub shards: Option<usize>,
     pub username: Option<String>,
@@ -106,9 +109,15 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     // prompt on and every other value has to come from a flag.
     let interactive = std::io::stdin().is_terminal() && !request.password_stdin;
 
+    let transport = match request.transport {
+        Some(transport) => transport,
+        None if interactive => prompt_transport(&config)?,
+        None => ListenerTransport::Http3,
+    };
+
     let listen_addr = match request.listen_addr {
         Some(addr) => addr,
-        None if interactive => prompt_listen_addr(&config)?,
+        None if interactive => prompt_listen_addr(&config, transport)?,
         None => bail!("--listen-addr is required when standard input is not a terminal"),
     };
 
@@ -131,10 +140,14 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         );
     }
 
-    let shards = match request.shards {
-        Some(shards) => shards,
-        None if interactive => prompt_shards()?,
-        None => 1,
+    let shards = match (transport, request.shards) {
+        (ListenerTransport::Http2, Some(1) | None) => 1,
+        (ListenerTransport::Http2, Some(shards)) => {
+            bail!("HTTP/2 listeners must use --shards 1, not {shards}")
+        }
+        (ListenerTransport::Http3, Some(shards)) => shards,
+        (ListenerTransport::Http3, None) if interactive => prompt_shards()?,
+        (ListenerTransport::Http3, None) => 1,
     };
 
     let mut generated_password: Option<Zeroizing<String>> = None;
@@ -176,6 +189,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
 
     let listener = ListenerSection {
         listen_addr,
+        transport,
         shards,
         auth,
     };
@@ -197,7 +211,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     })?;
 
     if !request.no_bind_check {
-        probe_listen_addr(listen_addr).with_context(|| {
+        probe_listen_addr(listen_addr, transport).with_context(|| {
             format!(
                 "the new listener would not bind, and a listener that cannot bind stops \
                  the whole server — including the sockets that work today; {} is unchanged \
@@ -234,7 +248,8 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     write_in_place(config_path, &text, &merged)?;
 
     println!(
-        "added listener {listen_addr} auth={} shards={shards} to {}",
+        "added listener {listen_addr} transport={} auth={} shards={shards} to {}",
+        transport.as_str(),
         auth_label(&listener.auth),
         config_path.display()
     );
@@ -247,7 +262,11 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     );
     if listen_addr.port() != 0 {
         println!(
-            "the firewall has to allow UDP {} as well",
+            "the firewall has to allow {} {} as well",
+            match transport {
+                ListenerTransport::Http3 => "UDP",
+                ListenerTransport::Http2 => "TCP",
+            },
             listen_addr.port()
         );
     }
@@ -283,7 +302,7 @@ fn print_generated_password(username: &str, password: &str) -> anyhow::Result<()
 ///
 /// This is a probe, not a reservation. The port is free at this instant; a
 /// service started in between can still take it.
-fn probe_listen_addr(addr: SocketAddr) -> anyhow::Result<()> {
+fn probe_listen_addr(addr: SocketAddr, transport: ListenerTransport) -> anyhow::Result<()> {
     // Port 0 asks the kernel for whichever port is free at startup, so there is
     // nothing to probe and no address to be in use.
     if addr.port() == 0 {
@@ -293,11 +312,12 @@ fn probe_listen_addr(addr: SocketAddr) -> anyhow::Result<()> {
     // Deliberately without SO_REUSEPORT: a listener that binds with it would
     // join an existing group and silently take a share of another socket's
     // traffic, which is exactly what has to be reported rather than allowed.
-    match std::net::UdpSocket::bind(addr) {
-        Ok(socket) => {
-            drop(socket);
-            Ok(())
-        }
+    let result = match transport {
+        ListenerTransport::Http3 => std::net::UdpSocket::bind(addr).map(drop),
+        ListenerTransport::Http2 => std::net::TcpListener::bind(addr).map(drop),
+    };
+    match result {
+        Ok(()) => Ok(()),
         // A privileged port without the privilege to bind it says nothing about
         // the server, which holds CAP_NET_BIND_SERVICE. Report and continue.
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -333,6 +353,10 @@ pub fn listener_toml_block(listener: &ListenerSection) -> String {
     block.push_str(&format!(
         "listen_addr = {}\n",
         toml_string(&listener.listen_addr.to_string())
+    ));
+    block.push_str(&format!(
+        "transport = {}\n",
+        toml_string(listener.transport.as_str())
     ));
     block.push_str(&format!("shards = {}\n", listener.shards));
     block.push_str("\n[listeners.auth]\n");
@@ -477,8 +501,11 @@ fn trim_newline(value: &str) -> &str {
 // Prompts and their echoes go to standard error, so `--dry-run | tee` and the
 // final summary on standard output stay usable in a pipeline.
 
-fn prompt_listen_addr(config: &ServerConfig) -> anyhow::Result<SocketAddr> {
-    let suggestion = suggest_listen_addr(config);
+fn prompt_listen_addr(
+    config: &ServerConfig,
+    transport: ListenerTransport,
+) -> anyhow::Result<SocketAddr> {
+    let suggestion = suggest_listen_addr(config, transport);
     prompt_until_valid(
         "Listen address (ip:port)",
         &suggestion.to_string(),
@@ -496,7 +523,7 @@ fn prompt_listen_addr(config: &ServerConfig) -> anyhow::Result<SocketAddr> {
 /// already decided to expose, and the first free port at or above the
 /// suggestion. Overlap is refused later anyway; this only keeps the default
 /// from being one that would be.
-fn suggest_listen_addr(config: &ServerConfig) -> SocketAddr {
+fn suggest_listen_addr(config: &ServerConfig, transport: ListenerTransport) -> SocketAddr {
     let mut addr = config
         .listeners
         .first()
@@ -507,7 +534,7 @@ fn suggest_listen_addr(config: &ServerConfig) -> SocketAddr {
         config
             .listeners
             .iter()
-            .any(|listener| listener.listen_addr.port() == port)
+            .any(|listener| listener.transport == transport && listener.listen_addr.port() == port)
     };
 
     let mut port = SUGGESTED_PORT;
@@ -516,6 +543,23 @@ fn suggest_listen_addr(config: &ServerConfig) -> SocketAddr {
     }
     addr.set_port(port);
     addr
+}
+
+fn prompt_transport(config: &ServerConfig) -> anyhow::Result<ListenerTransport> {
+    let suggestion = if config
+        .listeners
+        .iter()
+        .any(|listener| listener.transport == ListenerTransport::Http2)
+    {
+        "http3"
+    } else {
+        "http2"
+    };
+    prompt_until_valid("Transport (http3 | http2)", suggestion, |line| match line {
+        "http3" | "h3" => Ok(ListenerTransport::Http3),
+        "http2" | "h2" => Ok(ListenerTransport::Http2),
+        other => bail!("unknown transport {other:?}; write http3 or http2"),
+    })
 }
 
 fn prompt_mode(config: &ServerConfig) -> anyhow::Result<AuthMode> {
@@ -922,6 +966,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
     fn client_cert_listener(port: u16) -> ListenerSection {
         ListenerSection {
             listen_addr: format!("0.0.0.0:{port}").parse().unwrap(),
+            transport: config::ListenerTransport::Http3,
             shards: 1,
             auth: AuthSection {
                 enabled: true,
@@ -940,6 +985,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
         let parsed = config::parse_toml(&merged).unwrap();
         assert_eq!(parsed.listeners.len(), 2);
         assert_eq!(parsed.listeners[1], listener);
+        assert!(listener_toml_block(&listener).contains("transport = \"http3\""));
     }
 
     /// The edit is textual, so the comments an operator relies on must survive
@@ -958,6 +1004,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
     fn a_basic_listener_carries_its_own_credentials() {
         let listener = ListenerSection {
             listen_addr: "127.0.0.1:8443".parse().unwrap(),
+            transport: config::ListenerTransport::Http3,
             shards: 2,
             auth: AuthSection {
                 enabled: true,
@@ -985,6 +1032,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
     fn a_disabled_listener_states_only_that_it_is_disabled() {
         let listener = ListenerSection {
             listen_addr: "127.0.0.1:8443".parse().unwrap(),
+            transport: config::ListenerTransport::Http3,
             shards: 1,
             auth: AuthSection {
                 enabled: false,
@@ -1044,9 +1092,12 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
     fn the_suggested_port_skips_the_ports_already_in_use() {
         let mut config = config::parse_toml(BASIC_CONFIG).unwrap();
         config.listeners.push(client_cert_listener(SUGGESTED_PORT));
-        assert_eq!(suggest_listen_addr(&config).port(), SUGGESTED_PORT + 1);
         assert_eq!(
-            suggest_listen_addr(&config).ip(),
+            suggest_listen_addr(&config, ListenerTransport::Http3).port(),
+            SUGGESTED_PORT + 1
+        );
+        assert_eq!(
+            suggest_listen_addr(&config, ListenerTransport::Http3).ip(),
             config.listeners[0].listen_addr.ip()
         );
     }
@@ -1144,16 +1195,26 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
     fn the_bind_probe_reports_an_address_already_in_use() {
         let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = occupied.local_addr().unwrap();
-        assert!(probe_listen_addr(addr).is_err());
+        assert!(probe_listen_addr(addr, ListenerTransport::Http3).is_err());
 
         drop(occupied);
-        probe_listen_addr(addr).expect("a free address passes");
+        probe_listen_addr(addr, ListenerTransport::Http3).expect("a free address passes");
+    }
+
+    #[test]
+    fn the_http2_bind_probe_checks_tcp() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        assert!(probe_listen_addr(addr, ListenerTransport::Http2).is_err());
+
+        drop(occupied);
+        probe_listen_addr(addr, ListenerTransport::Http2).expect("a free TCP address passes");
     }
 
     /// Port 0 has nothing to probe: the kernel picks a free port when the
     /// server binds, which is a different port every time.
     #[test]
     fn the_bind_probe_accepts_an_ephemeral_port() {
-        probe_listen_addr("127.0.0.1:0".parse().unwrap()).unwrap();
+        probe_listen_addr("127.0.0.1:0".parse().unwrap(), ListenerTransport::Http3).unwrap();
     }
 }

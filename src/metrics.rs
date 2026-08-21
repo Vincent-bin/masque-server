@@ -53,14 +53,20 @@ impl Metrics {
     pub(crate) fn register_listener(
         &self,
         addr: SocketAddr,
+        transport: &'static str,
         auth: &'static str,
         shards: usize,
         udp_gso: bool,
         udp_gro: bool,
     ) -> Vec<Arc<ShardMetrics>> {
+        let label = format!(
+            "listener=\"{}\",transport=\"{}\",auth=\"{}\"",
+            escape_label(&addr.to_string()),
+            escape_label(transport),
+            escape_label(auth)
+        );
         let listener = ListenerMetrics::new(
-            addr,
-            auth,
+            label,
             shards,
             udp_gso,
             udp_gro,
@@ -229,8 +235,7 @@ struct ListenerMetrics {
 
 impl ListenerMetrics {
     fn new(
-        addr: SocketAddr,
-        auth: &'static str,
+        label: String,
         shards: usize,
         udp_gso: bool,
         udp_gro: bool,
@@ -238,11 +243,7 @@ impl ListenerMetrics {
         now_millis: u64,
     ) -> Self {
         Self {
-            label: format!(
-                "listener=\"{}\",auth=\"{}\"",
-                escape_label(&addr.to_string()),
-                escape_label(auth)
-            ),
+            label,
             shards: (0..shards)
                 .map(|_| Arc::new(ShardMetrics::new(enabled, now_millis, udp_gso, udp_gro)))
                 .collect(),
@@ -580,6 +581,20 @@ impl ShardMetrics {
         }
     }
 
+    /// Record one independently managed tunnel, used by transports whose
+    /// streams run as Tokio tasks rather than inside a shard-owned map.
+    pub(crate) fn tunnel_opened(&self, protocol_index: usize) {
+        if self.enabled {
+            self.tunnels_active[protocol_index].fetch_add(1, RELAXED);
+        }
+    }
+
+    pub(crate) fn tunnel_closed(&self, protocol_index: usize) {
+        if self.enabled {
+            subtract(&self.tunnels_active[protocol_index], 1);
+        }
+    }
+
     pub(crate) fn record_auth_success(&self) {
         if !self.enabled {
             return;
@@ -728,17 +743,17 @@ fn render_listener_headers(out: &mut String) {
         ),
         (
             "masque_connections_active",
-            "Currently active QUIC connections.",
+            "Currently active HTTP transport connections.",
             "gauge",
         ),
         (
             "masque_connections_accepted_total",
-            "Accepted QUIC connections.",
+            "Accepted HTTP transport connections.",
             "counter",
         ),
         (
             "masque_connections_rejected_total",
-            "Rejected QUIC connection attempts.",
+            "Rejected HTTP transport connection attempts.",
             "counter",
         ),
         (
@@ -836,8 +851,14 @@ mod tests {
     #[test]
     fn renders_prometheus_metrics_with_stable_low_cardinality_labels() {
         let metrics = Metrics::new(true);
-        let shards =
-            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 2, true, true);
+        let shards = metrics.register_listener(
+            "127.0.0.1:8449".parse().unwrap(),
+            "http3",
+            "basic",
+            2,
+            true,
+            true,
+        );
         let listener = &shards[0];
         metrics.set_ready(true);
         listener.connection_opened();
@@ -853,28 +874,28 @@ mod tests {
         assert!(rendered.contains("masque_server_ready 1\n"));
         assert!(
             rendered.contains(
-                "masque_connections_active{listener=\"127.0.0.1:8449\",auth=\"basic\"} 2"
+                "masque_connections_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 2"
             )
         );
         assert!(rendered.contains(
-            "masque_quic_receive_bytes_total{listener=\"127.0.0.1:8449\",auth=\"basic\"} 4800"
+            "masque_quic_receive_bytes_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 4800"
         ));
         assert!(
             rendered.contains(
-                "masque_quic_udp_gso_enabled{listener=\"127.0.0.1:8449\",auth=\"basic\"} 1"
+                "masque_quic_udp_gso_enabled{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 1"
             )
         );
         assert!(rendered.contains(
-            "masque_tcp_relay_events_total{listener=\"127.0.0.1:8449\",auth=\"basic\"} 4"
+            "masque_tcp_relay_events_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 4"
         ));
         assert!(rendered.contains(
-            "masque_tcp_relay_bytes_total{listener=\"127.0.0.1:8449\",auth=\"basic\"} 262144"
+            "masque_tcp_relay_bytes_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 262144"
         ));
         assert!(rendered.contains(
-            "masque_tunnels_active{listener=\"127.0.0.1:8449\",auth=\"basic\",protocol=\"udp\"} 2"
+            "masque_tunnels_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",protocol=\"udp\"} 2"
         ));
         assert!(rendered.contains(
-            "masque_event_loop_lag_seconds{listener=\"127.0.0.1:8449\",auth=\"basic\",shard=\"0\"} 0.025000"
+            "masque_event_loop_lag_seconds{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",shard=\"0\"} 0.025000"
         ));
         assert!(!rendered.contains("username="));
         assert!(!rendered.contains("target="));
@@ -883,7 +904,7 @@ mod tests {
         let after_fallback = metrics.render();
         assert!(
             after_fallback.contains(
-                "masque_quic_udp_gso_enabled{listener=\"127.0.0.1:8449\",auth=\"basic\"} 0"
+                "masque_quic_udp_gso_enabled{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 0"
             )
         );
     }
@@ -891,8 +912,14 @@ mod tests {
     #[test]
     fn gauge_guards_are_balanced_when_dropped() {
         let metrics = Metrics::new(true);
-        let shards =
-            metrics.register_listener("[::1]:9090".parse().unwrap(), "basic", 1, false, true);
+        let shards = metrics.register_listener(
+            "[::1]:9090".parse().unwrap(),
+            "http3",
+            "basic",
+            1,
+            false,
+            true,
+        );
         let listener = &shards[0];
         {
             let _pending = listener.auth_pending_guard();
@@ -907,8 +934,14 @@ mod tests {
     #[test]
     fn disabled_collection_does_not_touch_counters() {
         let metrics = Metrics::new(false);
-        let shards =
-            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1, false, false);
+        let shards = metrics.register_listener(
+            "127.0.0.1:8449".parse().unwrap(),
+            "http3",
+            "basic",
+            1,
+            false,
+            false,
+        );
         let shard = &shards[0];
         shard.connection_opened();
         shard.record_receive_batch(8, 9600);
@@ -930,8 +963,14 @@ mod tests {
     #[test]
     fn readiness_fails_closed_when_any_shard_heartbeat_is_stale() {
         let metrics = Metrics::new(false);
-        let shards =
-            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1, false, false);
+        let shards = metrics.register_listener(
+            "127.0.0.1:8449".parse().unwrap(),
+            "http3",
+            "basic",
+            1,
+            false,
+            false,
+        );
         let registered_at = shards[0].last_heartbeat_millis.load(RELAXED);
         let stale_after = SHARD_STALE_AFTER.as_millis() as u64;
         metrics.set_ready(true);

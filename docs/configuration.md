@@ -26,10 +26,11 @@ masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
   -V, --version             Print the server version
 ```
 
-`check-config` validates authentication, the TLS certificate/key pair, QUIC
-settings, client roster, and address pools without binding the UDP listener or
-creating a TUN device. It is suitable for upgrade preflight, but cannot detect
-runtime conditions such as an occupied port or unavailable kernel device.
+`check-config` validates authentication, the TLS certificate/key pair, HTTP/2
+and QUIC settings, client roster, and address pools without binding a listener
+socket or creating a TUN device. It is suitable for upgrade preflight, but
+cannot detect runtime conditions such as an occupied port or unavailable
+kernel device.
 
 `add-listener` appends a `[[listeners]]` block to the configuration file, and is
 described under [Adding a listener](#adding-a-listener).
@@ -64,7 +65,7 @@ max_tunnels_per_connection = 100
 | Key | Meaning |
 | --- | --- |
 | `idle_timeout_secs` | Inactive tunnel lifetime |
-| `max_connections` | Per-shard connection cap |
+| `max_connections` | Per-HTTP/3-shard or per-HTTP/2-listener connection cap |
 | `max_tunnels_per_connection` | CONNECT streams retained per connection |
 
 This section contains process-wide connection limits only. Socket addresses and
@@ -125,6 +126,7 @@ not authorize later streams that omit the header.
 ```toml
 [[listeners]]
 listen_addr = "0.0.0.0:443"
+transport = "http3"
 shards = 1
 
 [listeners.auth]
@@ -150,15 +152,16 @@ The server refuses to start if `username` is empty or contains `:`, or if
 
 ### `mode = "client_cert"`
 
-Clients authenticate once, with a TLS client certificate, during the QUIC
+Clients authenticate once, with a TLS client certificate, during the TLS
 handshake. Nothing is checked per request: every stream on an established
 connection is already authorized. Standard CONNECT and CONNECT-UDP keep working
-if their sections are enabled — the mode changes who may connect, not what they
-may ask for.
+alongside CONNECT-IP if their sections are enabled — the mode changes who may
+connect, not what they may ask for.
 
 ```toml
 [[listeners]]
 listen_addr = "0.0.0.0:443"
+transport = "http3"
 shards = 1
 
 [listeners.auth]
@@ -203,6 +206,10 @@ secret. Generating both spellings matters because the same key is encoded
 differently for each: usque takes the server key as PEM and addresses bare,
 mihomo takes it as bare base64 and addresses in CIDR form.
 
+The usque JSON fills both `endpoint_v4` / `endpoint_v6` and the corresponding
+`endpoint_h2_v4` / `endpoint_h2_v6` fields with the enrolled server address, so
+the same file works with its default HTTP/3 mode and its `--http2` fallback.
+
 The generated mihomo entry uses the active `ip_proxy.tun_mtu` value from the
 same server configuration, so a non-default MTU stays consistent on both ends.
 
@@ -231,6 +238,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
 [[listeners]]
 listen_addr = "0.0.0.0:4443"
+transport = "http2"
 shards = 1
 
 [listeners.auth]
@@ -241,24 +249,29 @@ mode = "client_cert"
 | `[[listeners]]` key | Meaning |
 | --- | --- |
 | `listen_addr` | Required; there is no default, so a typo cannot silently land on someone else's port |
-| `shards` | Event loops for this listener; defaults to `1` |
+| `transport` | `http3` (default) binds UDP/QUIC; `http2` binds TCP/TLS |
+| `shards` | HTTP/3 event loops; defaults to `1`. HTTP/2 must use exactly `1` |
 | `[listeners.auth]` | Required; authentication is always explicit per socket |
 
-Everything else stays server-wide: TLS and QUIC settings, TCP/UDP target
+Everything else stays server-wide: TLS, HTTP/2 and QUIC settings, TCP/UDP target
 policies, connection limits, one `[[clients]]` roster, one TUN device, one
 CONNECT-IP address pool, and one routing table. That is the reason to run two
 listeners in one process rather than two processes — two processes would need
 two TUN devices and two address pools, and overlapping pools hand the same
 tunnel address to two clients.
 
-Use one shard until a benchmark shows one event loop is CPU-bound. Memory and
-the effective connection capacity increase with the shard count.
+Use one HTTP/3 shard until a benchmark shows one event loop is CPU-bound.
+Memory and the effective connection capacity increase with the shard count.
+HTTP/2 uses Tokio tasks for its TCP connections and therefore requires
+`shards = 1`.
 
-The server refuses to start when two listeners contend for the same address.
-This is not left to the kernel to report: a listener with more than one shard
-opens its socket with `SO_REUSEPORT`, so a second listener on that address would
-join the load-balancing group and be handed connections meant for the other
-authentication mode.
+The server refuses to start when two listeners using the same transport contend
+for the same address. This is not left to the kernel to report: an HTTP/3
+listener with more than one shard opens its UDP socket with `SO_REUSEPORT`, so a
+second HTTP/3 listener on that address would join the load-balancing group and
+be handed connections meant for the other authentication mode. One HTTP/2 and
+one HTTP/3 listener may intentionally use the same numeric IP and port because
+they bind independent TCP and UDP sockets.
 
 Wildcards count as contention. `0.0.0.0` claims every IPv4 address on its port,
 so it conflicts with `127.0.0.1` on that port. `::` is treated as claiming IPv4
@@ -280,11 +293,12 @@ and the live `listening` log lines report that address. `check-config` is
 side-effect-free and therefore reports the configured `:0`; no port has been
 selected until the server binds.
 
-`shards = 0` (one per core) is rejected when more than one listener is
-configured; give each listener an explicit count. The 32-shard cap applies to
-the server's total, not to any one listener. The budget for concurrent password
-verification is sized from the Basic listeners' shards alone, so adding a
-certificate listener does not widen what unauthenticated callers can demand.
+For HTTP/3, `shards = 0` (one per core) is rejected when more than one listener
+is configured; give each listener an explicit count. The 32-shard cap applies
+to the total HTTP/3 shard count, not to HTTP/2 connection tasks. The budget for
+concurrent password verification is sized from Basic listener workers alone,
+so adding a certificate listener does not widen what unauthenticated callers
+can demand.
 
 Run `masque-server --config masque.toml check-config` to validate a listener
 file before restarting. It prints the resolved listeners, with the shard counts
@@ -292,15 +306,16 @@ the server will actually run rather than the ones written down
 — `shards = 0` expanded to one per core, and any excess capped:
 
 ```
-configuration is compatible with masque-server 0.6.0: /etc/masque/masque.toml
-listener 0.0.0.0:443 auth=basic shards=1
-listener 0.0.0.0:4443 auth=client_cert shards=1
+configuration is compatible with masque-server 0.7.0: /etc/masque/masque.toml
+listener 0.0.0.0:443 transport=http3 auth=basic shards=1
+listener 0.0.0.0:4443 transport=http2 auth=client_cert shards=1
 ```
 
 The usque JSON schema stores the endpoint IP but not its port, so enrollment
 also prints the matching launch argument — `--connect-port 443` for the example
 above, `--connect-port 8449` for a server on 8449. Omitting it silently falls
-back to the client's default port.
+back to the client's default port. Add `--http2` when selecting an HTTP/2
+listener.
 
 #### How the certificate is checked
 
@@ -397,10 +412,13 @@ masque-server --config /etc/masque/masque.toml add-listener
 ```
 
 ```
+Transport (http3 | http2) [http2]:
 Listen address (ip:port) [0.0.0.0:4443]:
 Authentication mode (basic | client_cert) [client_cert]:
-Event loops for this listener (shards) [1]:
 ```
+
+The shard prompt appears only for HTTP/3; HTTP/2 always uses one listener
+worker and schedules connections as Tokio tasks.
 
 A Basic listener also asks for a username and a password. The password is read
 without echo and confirmed; leaving it empty generates a strong one and prints
@@ -411,13 +429,16 @@ script must do — prompting requires a terminal, and without one a missing valu
 is an error rather than a hang:
 
 ```sh
-masque-server --config /etc/masque/masque.toml add-listener \
-    --listen-addr 0.0.0.0:4443 --mode client-cert --yes
+printf '%s' 'replace-this-password' | \
+  masque-server --config /etc/masque/masque.toml add-listener \
+    --transport http2 --listen-addr 0.0.0.0:443 \
+    --mode basic --password-stdin --username proxy-user --yes
 ```
 
 ```text
 add-listener options:
       --listen-addr <ADDR:PORT>  Address for the new socket
+      --transport <TRANSPORT>  http3 | http2 [scripted default: http3]
       --mode <MODE>         basic | client-cert
       --shards <N>          Event loops for this listener [default: 1]
       --username <NAME>     Basic username
@@ -477,9 +498,38 @@ Two ordering rules follow from the validation being real:
   explicit count first; that setting has no meaning once a second listener
   exists.
 
-A new socket is bound at startup, so restart the server afterwards, and open the
-new UDP port in the firewall. `SIGHUP` reloads the `[[clients]]` roster only —
-it never adds, removes, or rebinds a listener.
+A new socket is bound at startup, so restart the server afterwards, and open
+UDP for an HTTP/3 listener or TCP for an HTTP/2 listener. `SIGHUP` reloads the
+`[[clients]]` roster only — it never adds, removes, or rebinds a listener.
+
+## HTTP/2
+
+```toml
+[http2]
+initial_stream_window = 1048576
+initial_connection_window = 16777216
+max_concurrent_streams = 128
+max_header_list_size = 8192
+max_send_buffer_size = 262144
+data_frame_budget = 262144
+max_datagram_size = 65527
+```
+
+These values apply only to listeners with `transport = "http2"`:
+
+| Key | Meaning |
+| --- | --- |
+| `initial_stream_window` | Initial request-stream receive credit |
+| `initial_connection_window` | Initial aggregate receive credit per connection |
+| `max_concurrent_streams` | Concurrent request streams advertised per connection |
+| `max_header_list_size` | Maximum decoded request header list size |
+| `max_send_buffer_size` | Maximum response bytes buffered per stream by the H2 implementation |
+| `data_frame_budget` | Connection-level allowance for queued small DATA-frame overhead; `1..16777216`. Packetized CONNECT-IP needs more than h2's generic HTTP default, but raising it increases the memory an abusive connection can consume. |
+| `max_datagram_size` | Maximum UDP payload or IP packet carried in one DATAGRAM capsule; `1..65527` |
+
+HTTP/2 CONNECT-UDP and CONNECT-IP DATAGRAM capsules are reliable and ordered
+because they travel over TCP. Prefer HTTP/3 for normal operation and use
+HTTP/2 where UDP/QUIC is blocked.
 
 ## QUIC and UDP
 
@@ -573,11 +623,11 @@ ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
 ```
 
-`connect_protocols` lists the accepted `:protocol` values. RFC 9484 registers
-`connect-ip`; Cloudflare's endpoint uses `cf-connect-ip` and clients built
-against it send only that. Both are accepted by default, which costs nothing
-because an RFC client never sends the second one. Narrow the list to
-`["connect-ip"]` to accept only standards-compliant clients.
+`connect_protocols` lists the accepted CONNECT-IP protocol identifiers. RFC
+9484 registers `connect-ip`; Cloudflare's HTTP/3 endpoint uses
+`:protocol = cf-connect-ip`, while its HTTP/2 dialect carries the same value in
+`cf-connect-proto`. Both identifiers are accepted by default. Narrow the list
+to `["connect-ip"]` to accept only standards-compliant clients.
 
 CONNECT-IP is Linux-only. Pools must not overlap host, container, VPN, or
 upstream networks. The host is responsible for routing, forwarding, firewall,

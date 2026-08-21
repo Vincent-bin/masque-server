@@ -7,6 +7,43 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.7.0 - 2026-08-21
+
+### Added
+
+- Listeners can select `transport = "http2"` to serve standard CONNECT and
+  CONNECT-UDP/CONNECT-IP over TCP/TLS with the `h2` ALPN, Extended CONNECT,
+  RFC 9297 DATAGRAM capsules, explicit flow-control limits, and bounded
+  graceful drain. HTTP/3 remains the performance default.
+- CONNECT-IP also accepts the deployed Cloudflare/usque HTTP/2 dialect: a
+  regular CONNECT carrying `cf-connect-proto: cf-connect-ip`, with Context ID
+  zero omitted from DATAGRAM capsule values.
+- `enroll-client` fills usque's `endpoint_h2_v4` / `endpoint_h2_v6` fields and
+  prints the matching `--http2` launch hint.
+- HTTP/2 listeners support the same per-request Basic authentication, TLS
+  client-certificate roster, target policy, global authentication queue, and
+  per-connection tunnel limits as HTTP/3. Roster reloads also disconnect
+  revoked HTTP/2 clients.
+- `add-listener` accepts `--transport http2|http3`, probes the corresponding TCP
+  or UDP socket, and writes the transport explicitly.
+- Real TLS/H2 integration tests cover TCP CONNECT, CONNECT-UDP, standards-based
+  CONNECT-IP, the usque-compatible H2 shape, Basic authentication, and
+  client-certificate authentication.
+
+### Changed
+
+- Listener-scoped Prometheus series carry a bounded `transport="http2|http3"`
+  label so identical TCP and UDP listen addresses remain distinguishable.
+- Capsule decoding rejects an oversized declared value before buffering its
+  body, bounding malformed HTTP/2 CONNECT-UDP and CONNECT-IP input.
+
+### Fixed
+
+- HTTP/2 CONNECT-IP now pumps request and response DATA independently, and its
+  bounded small-frame budget accounts for packetized TCP ACK bursts. A blocked
+  response window can no longer make h2 misclassify normal bulk traffic as
+  `too_many_data_frames` and reset the connection.
+
 ## 0.6.0 - 2026-08-21
 
 ### Added

@@ -28,7 +28,9 @@ use quiche::h3::NameValue as _;
 
 use masque::capsule::decoder::{CapsuleDecoder, DecodeError};
 use masque::capsule::{CapsuleFrame, IpAddress};
-use masque::config::{AuthMode, AuthSection, ClientEntry, ListenerSection, ServerConfig};
+use masque::config::{
+    AuthMode, AuthSection, ClientEntry, ListenerSection, ListenerTransport, ServerConfig,
+};
 use masque::datagram::DatagramHeader;
 use masque::server::Server;
 
@@ -561,6 +563,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
     config.listeners = vec![
         ListenerSection {
             listen_addr: ephemeral_addr(),
+            transport: ListenerTransport::Http3,
             shards: 1,
             auth: AuthSection {
                 enabled: true,
@@ -571,6 +574,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
         },
         ListenerSection {
             listen_addr: ephemeral_addr(),
+            transport: ListenerTransport::Http3,
             shards: 1,
             auth: AuthSection {
                 enabled: true,
@@ -696,6 +700,7 @@ fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
     config.listeners = vec![
         ListenerSection {
             listen_addr: ephemeral_addr(),
+            transport: ListenerTransport::Http3,
             shards: 2,
             auth: AuthSection {
                 enabled: false,
@@ -704,6 +709,7 @@ fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
         },
         ListenerSection {
             listen_addr: ephemeral_addr(),
+            transport: ListenerTransport::Http3,
             shards: 2,
             auth: AuthSection {
                 enabled: false,

@@ -13,6 +13,8 @@ pub enum DecodeError {
     Incomplete,
     /// The capsule value could not be parsed.
     Malformed(String),
+    /// The declared capsule value exceeds the configured memory bound.
+    TooLarge { length: u64, max: usize },
 }
 
 impl std::fmt::Display for DecodeError {
@@ -20,6 +22,9 @@ impl std::fmt::Display for DecodeError {
         match self {
             DecodeError::Incomplete => write!(f, "incomplete capsule data"),
             DecodeError::Malformed(msg) => write!(f, "malformed capsule: {msg}"),
+            DecodeError::TooLarge { length, max } => {
+                write!(f, "capsule value is {length} bytes, limit is {max}")
+            }
         }
     }
 }
@@ -31,17 +36,26 @@ pub struct CapsuleDecoder {
     buf: Vec<u8>,
     /// Bytes at the front of `buf` that have already been decoded.
     consumed: usize,
+    max_capsule_size: usize,
 }
 
 /// Compact `buf` once the decoded prefix grows past this many bytes, so a long
 /// stream neither memmoves after every capsule nor grows without bound.
 const COMPACT_THRESHOLD: usize = 16 * 1024;
+const DEFAULT_MAX_CAPSULE_SIZE: usize = 1024 * 1024;
 
 impl CapsuleDecoder {
     pub fn new() -> Self {
+        Self::with_max_capsule_size(DEFAULT_MAX_CAPSULE_SIZE)
+    }
+
+    /// Build a decoder that rejects a capsule before buffering a value larger
+    /// than `max_capsule_size`.
+    pub fn with_max_capsule_size(max_capsule_size: usize) -> Self {
         Self {
             buf: Vec::new(),
             consumed: 0,
+            max_capsule_size,
         }
     }
 
@@ -63,7 +77,7 @@ impl CapsuleDecoder {
         let mut frames = Vec::new();
 
         loop {
-            match try_decode_one(&self.buf[self.consumed..]) {
+            match try_decode_one(&self.buf[self.consumed..], self.max_capsule_size) {
                 Ok((frame, consumed)) => {
                     frames.push(frame);
                     self.consumed += consumed;
@@ -89,15 +103,27 @@ impl Default for CapsuleDecoder {
 }
 
 /// Try to decode one capsule from `buf`. Returns `(frame, bytes_consumed)`.
-fn try_decode_one(buf: &[u8]) -> Result<(CapsuleFrame, usize), DecodeError> {
+fn try_decode_one(
+    buf: &[u8],
+    max_capsule_size: usize,
+) -> Result<(CapsuleFrame, usize), DecodeError> {
     // Parse Type varint
     let (capsule_type, tlen) = varint::decode(buf).map_err(|_| DecodeError::Incomplete)?;
 
     // Parse Length varint
     let (length, llen) = varint::decode(&buf[tlen..]).map_err(|_| DecodeError::Incomplete)?;
 
+    if length > max_capsule_size as u64 {
+        return Err(DecodeError::TooLarge {
+            length,
+            max: max_capsule_size,
+        });
+    }
+
     let header_len = tlen + llen;
-    let total_len = header_len + length as usize;
+    let total_len = header_len
+        .checked_add(length as usize)
+        .ok_or_else(|| DecodeError::Malformed("capsule length overflows usize".into()))?;
 
     if buf.len() < total_len {
         return Err(DecodeError::Incomplete);
@@ -518,5 +544,22 @@ mod tests {
         let mut dec = CapsuleDecoder::new();
         let result = dec.decode(&wire);
         assert!(matches!(result, Err(DecodeError::Malformed(_))));
+    }
+
+    #[test]
+    fn declared_value_over_the_limit_is_rejected_from_its_header() {
+        let mut wire = Vec::new();
+        crate::varint::encode_to_vec(CAPSULE_DATAGRAM, &mut wire).unwrap();
+        crate::varint::encode_to_vec(65_000, &mut wire).unwrap();
+
+        let mut decoder = CapsuleDecoder::with_max_capsule_size(1_200);
+        assert_eq!(
+            decoder.decode(&wire),
+            Err(DecodeError::TooLarge {
+                length: 65_000,
+                max: 1_200,
+            })
+        );
+        assert_eq!(decoder.buffered(), wire.len());
     }
 }

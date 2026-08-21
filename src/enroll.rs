@@ -195,9 +195,10 @@ pub fn write_client_config(path: &Path, contents: &str) -> anyhow::Result<()> {
 
 /// The client-side JSON configuration.
 ///
-/// `endpoint_v4` / `endpoint_v6` are bare addresses, not `host:port`: the port
-/// is a separate client-side flag. The `id` and `access_token` fields belong to
-/// the vendor API and are emitted empty so a client that reads them finds
+/// The UDP/HTTP3 and TCP/HTTP2 endpoint fields are bare addresses, not
+/// `host:port`: the port is a separate client-side flag. Both transports point
+/// at the enrolled server by default. The `id` and `access_token` fields belong
+/// to the vendor API and are emitted empty so a client that reads them finds
 /// something well formed rather than a missing key.
 pub fn client_config_json(
     private_key_b64: &str,
@@ -213,8 +214,10 @@ pub fn client_config_json(
 
     let fields = [
         ("private_key", private_key_b64.to_string()),
-        ("endpoint_v4", endpoint_v4),
-        ("endpoint_v6", endpoint_v6),
+        ("endpoint_v4", endpoint_v4.clone()),
+        ("endpoint_v6", endpoint_v6.clone()),
+        ("endpoint_h2_v4", endpoint_v4),
+        ("endpoint_h2_v6", endpoint_v6),
         ("endpoint_pub_key", server_public_key_pem.to_string()),
         ("id", String::new()),
         ("access_token", String::new()),
@@ -383,6 +386,8 @@ mod tests {
         assert!(json.contains("\\n"));
         assert!(!json.contains("KEY-----\n-"));
         assert!(json.contains("\"endpoint_v4\": \"203.0.113.9\""));
+        assert!(json.contains("\"endpoint_h2_v4\": \"203.0.113.9\""));
+        assert!(json.contains("\"endpoint_h2_v6\": \"\""));
         // The port travels as a client flag, so it must not leak into the field.
         assert!(!json.contains("203.0.113.9:443"));
         assert!(json.contains("\"ipv4\": \"10.89.0.2\""));
@@ -456,6 +461,8 @@ mod tests {
         );
         assert!(json.contains("\"endpoint_v6\": \"2001:db8::1\""));
         assert!(json.contains("\"endpoint_v4\": \"\""));
+        assert!(json.contains("\"endpoint_h2_v6\": \"2001:db8::1\""));
+        assert!(json.contains("\"endpoint_h2_v4\": \"\""));
     }
 
     #[test]
