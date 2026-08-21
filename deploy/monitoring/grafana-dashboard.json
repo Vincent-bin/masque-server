@@ -300,14 +300,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (rate(masque_quic_receive_bytes_total{listener=~\"$listener\"}[$__rate_interval])) * 8",
+          "expr": "sum by (listener) (rate(masque_quic_receive_bytes_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval])) * 8",
           "legendFormat": "{{listener}} receive",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (rate(masque_quic_send_bytes_total{listener=~\"$listener\"}[$__rate_interval])) * 8",
+          "expr": "sum by (listener) (rate(masque_quic_send_bytes_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval])) * 8",
           "legendFormat": "{{listener}} send",
           "range": true,
           "refId": "B"
@@ -364,14 +364,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (rate(masque_quic_receive_packets_total{listener=~\"$listener\"}[$__rate_interval]))",
+          "expr": "sum by (listener) (rate(masque_quic_receive_packets_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval]))",
           "legendFormat": "{{listener}} receive",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (rate(masque_quic_send_packets_total{listener=~\"$listener\"}[$__rate_interval]))",
+          "expr": "sum by (listener) (rate(masque_quic_send_packets_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval]))",
           "legendFormat": "{{listener}} send",
           "range": true,
           "refId": "B"
@@ -426,8 +426,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener, protocol) (masque_tunnels_active{listener=~\"$listener\"})",
-          "legendFormat": "{{listener}} {{protocol}}",
+          "expr": "sum by (listener, transport, protocol) (masque_tunnels_active{listener=~\"$listener\"})",
+          "legendFormat": "{{listener}} {{transport}} {{protocol}}",
           "range": true,
           "refId": "A"
         }
@@ -482,8 +482,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener, result) (rate(masque_auth_attempts_total{listener=~\"$listener\"}[$__rate_interval]))",
-          "legendFormat": "{{listener}} {{result}}",
+          "expr": "sum by (listener, transport, result) (rate(masque_auth_attempts_total{listener=~\"$listener\"}[$__rate_interval]))",
+          "legendFormat": "{{listener}} {{transport}} {{result}}",
           "range": true,
           "refId": "A"
         }
@@ -538,8 +538,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener, reason) (rate(masque_packets_dropped_total{listener=~\"$listener\"}[$__rate_interval]))",
-          "legendFormat": "{{listener}} {{reason}}",
+          "expr": "sum by (listener, transport, reason) (rate(masque_packets_dropped_total{listener=~\"$listener\"}[$__rate_interval]))",
+          "legendFormat": "{{listener}} {{transport}} {{reason}}",
           "range": true,
           "refId": "A"
         }
@@ -593,15 +593,15 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (masque_auth_pending{listener=~\"$listener\"})",
-          "legendFormat": "{{listener}} pending",
+          "expr": "sum by (listener, transport) (masque_auth_pending{listener=~\"$listener\"})",
+          "legendFormat": "{{listener}} {{transport}} pending",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (masque_auth_running{listener=~\"$listener\"})",
-          "legendFormat": "{{listener}} running",
+          "expr": "sum by (listener, transport) (masque_auth_running{listener=~\"$listener\"})",
+          "legendFormat": "{{listener}} {{transport}} running",
           "range": true,
           "refId": "B"
         }
@@ -655,14 +655,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (rate(masque_quic_receive_packets_total{listener=~\"$listener\"}[$__rate_interval])) / clamp_min(sum by (listener) (rate(masque_quic_receive_batches_total{listener=~\"$listener\"}[$__rate_interval])), 0.001)",
+          "expr": "sum by (listener) (rate(masque_quic_receive_packets_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval])) / clamp_min(sum by (listener) (rate(masque_quic_receive_batches_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval])), 0.001)",
           "legendFormat": "{{listener}} receive",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum by (listener) (rate(masque_quic_send_packets_total{listener=~\"$listener\"}[$__rate_interval])) / clamp_min(sum by (listener) (rate(masque_quic_send_batches_total{listener=~\"$listener\"}[$__rate_interval])), 0.001)",
+          "expr": "sum by (listener) (rate(masque_quic_send_packets_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval])) / clamp_min(sum by (listener) (rate(masque_quic_send_batches_total{listener=~\"$listener\",transport=\"http3\"}[$__rate_interval])), 0.001)",
           "legendFormat": "{{listener}} send",
           "range": true,
           "refId": "B"
@@ -693,7 +693,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (listener, auth) (masque_listener_shards{listener=~\"$listener\"})",
+          "expr": "sum by (listener, transport, auth) (masque_listener_shards{listener=~\"$listener\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "__auto",

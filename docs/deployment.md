@@ -168,8 +168,10 @@ changing production files.
 
 ## Network and firewall
 
-Open the configured UDP port, not TCP. For example, a server listening on 8449
-needs inbound UDP/8449.
+Open the socket protocol selected by each listener: `transport = "http3"`
+needs inbound UDP, while `transport = "http2"` needs inbound TCP. They may use
+the same numeric port because TCP and UDP are separate namespaces. For example,
+dual transport on port 8449 needs both UDP/8449 and TCP/8449.
 
 Standard CONNECT and CONNECT-UDP need ordinary outbound TCP/UDP access.
 CONNECT-IP additionally needs:
@@ -212,14 +214,14 @@ sudo masque-server --config /etc/masque/masque.toml add-listener
 sudo systemctl restart masque
 ```
 
-It prompts for the address, the authentication mode, and any credentials,
+It prompts for the transport, address, authentication mode, and any credentials,
 validates the merged file the way the upgrade preflight does, and test-binds the
 new address; anything wrong leaves the file byte for byte unchanged. The file is
 replaced atomically with its mode and owner preserved, so the service account
 keeps its access. Flags cover every value for unattended use; see
 [Adding a listener](configuration.md#adding-a-listener).
 
-Open the new UDP port in the firewall as well — see
+Open the new UDP or TCP port in the firewall as appropriate — see
 [Network and firewall](#network-and-firewall). A new socket is bound at startup,
 so the restart is required; `systemctl reload` only re-reads the `[[clients]]`
 roster.
@@ -240,10 +242,11 @@ does not keep a copy.
 ## Service lifecycle
 
 `systemctl stop` and `systemctl restart` send SIGTERM. The server receives that
-signal once and broadcasts the shutdown request to every shard, sends HTTP/3
-GOAWAY and QUIC CONNECTION_CLOSE, and drains existing connections for at most
-five seconds. The packaged unit sets `TimeoutStopSec=10s`, leaving a second
-five-second margin before systemd may escalate to SIGKILL.
+signal once and broadcasts the shutdown request to every worker. HTTP/3 sends
+GOAWAY and QUIC CONNECTION_CLOSE; HTTP/2 starts an H2 graceful shutdown. Both
+drain existing connections for at most five seconds. The packaged unit sets
+`TimeoutStopSec=10s`, leaving a second five-second margin before systemd may
+escalate to SIGKILL.
 
 systemd considers startup complete only after the process has bound every
 proxy listener and the optional observability endpoint and sent `READY=1`.
@@ -271,8 +274,8 @@ masque-server --config /etc/masque/masque.toml check-config
 
 This validates the parts of startup that do not need live resources. A 0.2
 configuration, a file that no longer satisfies fail-closed authentication, a bad
-certificate/key pair, an unsupported QUIC setting, or an invalid client/address
-pool therefore stops the upgrade before replacement. Edit and validate such a
+certificate/key pair, an unsupported HTTP/2 or QUIC setting, or an invalid
+client/address pool therefore stops the upgrade before replacement. Edit and validate such a
 configuration deliberately; the installer never migrates it automatically.
 
 After a successful upgrade, inspect service status and run a client
@@ -290,6 +293,7 @@ Confirm the listener and process:
 
 ```sh
 sudo ss -u -l -p | grep masque-server
+sudo ss -t -l -p | grep masque-server
 systemctl show masque -p MainPID -p ActiveState -p SubState
 ```
 

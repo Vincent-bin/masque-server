@@ -1,5 +1,5 @@
 [Unit]
-Description=MASQUE HTTP/3 CONNECT, CONNECT-UDP, and CONNECT-IP proxy
+Description=MASQUE HTTP/2 and HTTP/3 proxy server
 Documentation=https://github.com/Vincent-bin/masque-server
 Wants=network-online.target
 After=network-online.target

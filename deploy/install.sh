@@ -243,7 +243,7 @@ choose_auth_mode() {
 # leaves an open proxy in place.
 detect_existing_auth_mode() {
     detected_modes=$(printf '%s\n' "$CHECK_CONFIG_OUTPUT" |
-        sed -n 's/^listener [^ ]* auth=\([a-z_]*\) .*$/\1/p' | sort -u)
+        sed -n 's/^listener .* auth=\([a-z_]*\) .*$/\1/p' | sort -u)
 
     AUTH_MODE=
     for detected_mode in $detected_modes; do
@@ -365,6 +365,7 @@ append_certificate_listener() {
 # the CONNECT-IP address pool — is shared by the one process.
 [[listeners]]
 listen_addr = "0.0.0.0:$cert_port"
+transport = "http3"
 shards = 1
 
 [listeners.auth]
@@ -373,7 +374,7 @@ mode = "client_cert"
 EOF
 }
 
-# Read and validate one UDP port.
+# Read and validate the numeric port for a fresh HTTP/3 listener.
 choose_listen_port() {
     port_prompt=$1
     port_default=$2
@@ -724,4 +725,4 @@ echo "Review $CONFIG_PATH, especially the proxy allow/deny policy."
 echo
 echo "To serve another authentication mode, or another port, add a listener:"
 echo "  masque-server --config $CONFIG_PATH add-listener"
-echo "Then open its UDP port in the firewall and run: systemctl restart masque"
+echo "Then open its UDP (http3) or TCP (http2) port and run: systemctl restart masque"

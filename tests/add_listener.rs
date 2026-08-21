@@ -201,7 +201,7 @@ fn adds_a_certificate_listener_beside_a_basic_one() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&check.stdout);
     assert!(check.status.success(), "check-config rejected the edit");
-    assert!(stdout.contains("listener 127.0.0.1:8450 auth=client_cert shards=1"));
+    assert!(stdout.contains("listener 127.0.0.1:8450 transport=http3 auth=client_cert shards=1"));
 }
 
 #[test]
@@ -330,6 +330,37 @@ fn refuses_an_address_that_overlaps_the_existing_listener() {
         String::from_utf8_lossy(&output.stderr)
     );
     fixture.assert_unchanged();
+}
+
+#[test]
+fn adds_http2_on_the_same_numeric_port_as_http3() {
+    let fixture = Fixture::new(true);
+    let output = fixture.add_listener(&[
+        "--transport",
+        "http2",
+        "--listen-addr",
+        "127.0.0.1:8449",
+        "--mode",
+        "client-cert",
+        "--no-bind-check",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "add-listener failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fixture.config();
+    assert_eq!(
+        config.listeners[1].transport,
+        masque::config::ListenerTransport::Http2
+    );
+    assert_eq!(
+        config.listeners[1].listen_addr,
+        config.listeners[0].listen_addr
+    );
+    assert_eq!(config.listeners[1].shards, 1);
+    assert!(fixture.text().contains("transport = \"http2\""));
 }
 
 /// A certificate listener with an empty roster is refused at startup, so
@@ -478,7 +509,7 @@ fn writes_a_listener_that_demands_nothing_when_asked() {
     assert!(check.status.success());
     assert!(
         String::from_utf8_lossy(&check.stdout)
-            .contains("listener 127.0.0.1:8459 auth=disabled shards=1")
+            .contains("listener 127.0.0.1:8459 transport=http3 auth=disabled shards=1")
     );
 }
 

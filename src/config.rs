@@ -15,6 +15,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub quic: QuicSection,
     #[serde(default)]
+    pub http2: Http2Section,
+    #[serde(default)]
     pub tcp_proxy: TcpProxySection,
     #[serde(default)]
     pub udp_proxy: UdpProxySection,
@@ -63,11 +65,32 @@ pub enum AuthMode {
     #[default]
     Basic,
     /// A TLS client certificate, matched against the `[[clients]]` roster by
-    /// public key during the QUIC handshake.
+    /// public key during the TLS handshake.
     ///
     /// This is what Cloudflare's WARP MASQUE endpoint does, and what clients
     /// built against it (usque) expect: they never send `Proxy-Authorization`.
     ClientCert,
+}
+
+/// HTTP transport carried by one listener.
+///
+/// HTTP/3 listens on UDP and remains the default. HTTP/2 listens on TCP/TLS
+/// and carries HTTP Datagrams through reliable DATAGRAM capsules.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerTransport {
+    #[default]
+    Http3,
+    Http2,
+}
+
+impl ListenerTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http3 => "http3",
+            Self::Http2 => "http2",
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
@@ -119,6 +142,10 @@ impl AuthSection {
 #[serde(deny_unknown_fields)]
 pub struct ListenerSection {
     pub listen_addr: SocketAddr,
+    /// `http3` binds UDP; `http2` binds TCP/TLS. The default preserves
+    /// configurations written before HTTP/2 support was added.
+    #[serde(default)]
+    pub transport: ListenerTransport,
     /// Independent event loops for this listener. Each shard owns a
     /// `SO_REUSEPORT` socket and a disjoint share of the connections. `0` means
     /// one per available core and is accepted only for a single listener.
@@ -137,6 +164,7 @@ fn default_listener_shards() -> usize {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedListener {
     pub listen_addr: SocketAddr,
+    pub transport: ListenerTransport,
     pub shards: usize,
     pub auth: AuthSection,
 }
@@ -209,6 +237,31 @@ pub struct QuicSection {
     pub discover_pmtu: bool,
 }
 
+/// HTTP/2 flow-control and resource limits.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Http2Section {
+    /// Receive credit advertised for each request stream.
+    pub initial_stream_window: u32,
+    /// Receive credit advertised for the whole connection.
+    pub initial_connection_window: u32,
+    /// Maximum simultaneous streams accepted on one connection.
+    pub max_concurrent_streams: u32,
+    /// Maximum uncompressed request header list size.
+    pub max_header_list_size: u32,
+    /// Per-stream response bytes the h2 implementation may buffer.
+    pub max_send_buffer_size: usize,
+    /// Connection-level allowance for queued small DATA-frame overhead.
+    ///
+    /// CONNECT-IP clients commonly put one small inner TCP ACK in each DATA
+    /// frame. The generic h2 default is intentionally tiny and can mistake a
+    /// legitimate packet burst for abusive framing before the tunnel task gets
+    /// scheduled to consume it.
+    pub data_frame_budget: usize,
+    /// Largest UDP payload accepted in a CONNECT-UDP DATAGRAM capsule.
+    pub max_datagram_size: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct UdpProxySection {
@@ -274,6 +327,7 @@ impl Default for ServerConfig {
             server: ServerSection::default(),
             tls: TlsSection::default(),
             quic: QuicSection::default(),
+            http2: Http2Section::default(),
             tcp_proxy: TcpProxySection::default(),
             udp_proxy: UdpProxySection::default(),
             ip_proxy: IpProxySection::default(),
@@ -281,6 +335,7 @@ impl Default for ServerConfig {
             clients: Vec::new(),
             listeners: vec![ListenerSection {
                 listen_addr: "0.0.0.0:443".parse().unwrap(),
+                transport: ListenerTransport::Http3,
                 shards: default_listener_shards(),
                 auth: AuthSection::default(),
             }],
@@ -353,6 +408,23 @@ impl Default for QuicSection {
             dgram_recv_queue_len: 2048,
             dgram_send_queue_len: 2048,
             discover_pmtu: false,
+        }
+    }
+}
+
+impl Default for Http2Section {
+    fn default() -> Self {
+        Self {
+            initial_stream_window: 1024 * 1024,
+            initial_connection_window: 16 * 1024 * 1024,
+            max_concurrent_streams: 128,
+            max_header_list_size: 8 * 1024,
+            max_send_buffer_size: 256 * 1024,
+            // Enough for a TLS read containing thousands of packet-sized DATA
+            // frames, while retaining h2's connection-level abuse bound.
+            data_frame_budget: 256 * 1024,
+            // RFC 9298 caps a context-zero UDP payload at 65,527 bytes.
+            max_datagram_size: 65_527,
         }
     }
 }
@@ -432,6 +504,7 @@ enabled = false
         assert!(cfg.clients.is_empty());
         assert_eq!(cfg.listeners.len(), 1);
         assert_eq!(cfg.listeners[0].listen_addr.port(), 443);
+        assert_eq!(cfg.listeners[0].transport, ListenerTransport::Http3);
         assert_eq!(cfg.listeners[0].shards, 1);
         assert!(cfg.listeners[0].auth.basic_enabled());
         assert!(!cfg.listeners[0].auth.client_cert_enabled());
@@ -444,6 +517,7 @@ enabled = false
         assert!(cfg.quic.initial_max_stream_data <= cfg.quic.max_stream_window);
         assert!(cfg.quic.initial_max_data <= cfg.quic.max_connection_window);
         assert!(!cfg.quic.discover_pmtu);
+        assert_eq!(cfg.http2.data_frame_budget, 256 * 1024);
         assert!(cfg.tcp_proxy.enabled);
         assert_eq!(cfg.tcp_proxy.connect_timeout_secs, 10);
         assert!(cfg.udp_proxy.enabled);
@@ -617,6 +691,40 @@ mode = "client_cert"
         assert_eq!(cfg.listeners[1].shards, 2);
         assert!(cfg.listeners[1].auth.client_cert_enabled());
         assert!(!cfg.listeners[1].auth.basic_enabled());
+    }
+
+    #[test]
+    fn parses_http2_listener_and_tuning() {
+        let cfg = parse_toml(
+            r#"
+[http2]
+initial_stream_window = 2097152
+initial_connection_window = 33554432
+max_concurrent_streams = 64
+max_header_list_size = 4096
+max_send_buffer_size = 131072
+data_frame_budget = 524288
+max_datagram_size = 4096
+
+[[listeners]]
+listen_addr = "127.0.0.1:8443"
+transport = "http2"
+
+[listeners.auth]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.listeners[0].transport, ListenerTransport::Http2);
+        assert_eq!(cfg.listeners[0].shards, 1);
+        assert_eq!(cfg.http2.initial_stream_window, 2 * 1024 * 1024);
+        assert_eq!(cfg.http2.initial_connection_window, 32 * 1024 * 1024);
+        assert_eq!(cfg.http2.max_concurrent_streams, 64);
+        assert_eq!(cfg.http2.max_header_list_size, 4096);
+        assert_eq!(cfg.http2.max_send_buffer_size, 128 * 1024);
+        assert_eq!(cfg.http2.data_frame_budget, 512 * 1024);
+        assert_eq!(cfg.http2.max_datagram_size, 4096);
     }
 
     #[test]

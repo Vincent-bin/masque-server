@@ -30,6 +30,22 @@ pub fn encode(frame: &CapsuleFrame, buf: &mut Vec<u8>) {
     }
 }
 
+/// Encode a DATAGRAM capsule directly from its HTTP Datagram payload.
+///
+/// This avoids constructing an owned [`CapsuleFrame`] on relay paths that
+/// already have the payload in a reusable receive buffer.
+pub fn encode_datagram(payload: &[u8], buf: &mut Vec<u8>) {
+    encode_raw(CAPSULE_DATAGRAM, payload, buf);
+}
+
+/// Encode a DATAGRAM capsule whose HTTP Datagram payload uses Context ID zero.
+pub fn encode_datagram_context_zero(payload: &[u8], buf: &mut Vec<u8>) {
+    varint::encode_to_vec(CAPSULE_DATAGRAM, buf).expect("capsule type fits varint");
+    varint::encode_to_vec((payload.len() + 1) as u64, buf).expect("capsule length fits varint");
+    buf.push(0); // Context ID zero.
+    buf.extend_from_slice(payload);
+}
+
 /// Encode a raw capsule: Type(varint) + Length(varint) + Value.
 fn encode_raw(capsule_type: u64, value: &[u8], buf: &mut Vec<u8>) {
     varint::encode_to_vec(capsule_type, buf).expect("capsule type fits varint");

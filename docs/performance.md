@@ -16,6 +16,21 @@ Payload bit rate excludes QUIC, UDP, IP, Ethernet, TLS, and proxy framing. A
 1200-byte payload can show fewer packets per second than a 64-byte payload yet
 carry much more useful bandwidth. Always report both pps and Gbit/s.
 
+## HTTP/2 compatibility path
+
+HTTP/2 standard CONNECT uses H2 DATA frames with explicit flow-control
+backpressure in both directions. CONNECT-UDP and CONNECT-IP place each HTTP
+Datagram payload inside a DATAGRAM capsule carried by DATA frames. That makes
+loss recoverable and ordered by the outer TCP connection; it also introduces
+head-of-line blocking and nested loss recovery that HTTP/3 DATAGRAM avoids.
+Treat HTTP/2 as a reachability fallback, not as a replacement for HTTP/3 in
+performance comparisons.
+
+The current network benchmark drives HTTP/3. HTTP/2 is covered by real TLS/H2
+relay integration tests, but no HTTP/2 throughput number should be compared to
+the network benchmark until the same harness can drive both transports with
+the same targets, payloads, windows, and CPU placement.
+
 ## Linux fast paths
 
 ### QUIC socket
@@ -77,6 +92,11 @@ Important settings:
 | Setting | Effect |
 | --- | --- |
 | `listeners[].shards` | Aggregate multi-connection CPU parallelism for that listener |
+| `http2.initial_*_window` | HTTP/2 initial bandwidth-delay credit |
+| `http2.max_concurrent_streams` | HTTP/2 per-connection stream concurrency |
+| `http2.max_send_buffer_size` | HTTP/2 buffered response bound per stream |
+| `http2.data_frame_budget` | Small DATA-frame burst tolerance versus per-connection memory-abuse bound |
+| `http2.max_datagram_size` | HTTP/2 CONNECT-UDP payload / CONNECT-IP packet ceiling |
 | `quic.enable_udp_gso` | QUIC send syscall and per-packet overhead |
 | `quic.enable_udp_gro` | QUIC receive syscall overhead |
 | `udp_proxy.enable_udp_gso` | Client-to-target UDP kernel overhead |

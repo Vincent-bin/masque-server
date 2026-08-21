@@ -18,6 +18,10 @@ key_path = "/etc/masque/certs/server.key"
 
 [[listeners]]
 listen_addr = "0.0.0.0:443"
+# "http3" binds UDP/QUIC and is the preferred high-performance transport.
+# "http2" binds TCP/TLS for networks that block UDP; all three CONNECT forms
+# are supported, but datagrams then inherit TCP ordering and loss recovery.
+transport = "http3"
 # Independent event loops, each with its own SO_REUSEPORT socket and its own
 # share of the connections. A connection is always handled by one loop, so this
 # is what lets a CPU-bound server use more than one core. 0 = one per core for a
@@ -30,7 +34,7 @@ enabled = true
 # "client_cert" — a TLS client certificate, matched against [[clients]] below.
 #
 # Pick "client_cert" for VPN-style clients modelled on Cloudflare WARP MASQUE
-# (for example usque): they authenticate during the QUIC handshake and never
+# (for example usque): they authenticate during the TLS handshake and never
 # send Proxy-Authorization, so they cannot work against "basic".
 #
 # To serve both kinds of client, add the second listener shown at the end of
@@ -59,6 +63,20 @@ password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
 # public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
 # ipv4 = "10.89.0.2"
 # ipv6 = "fd00:abcd::2"
+
+[http2]
+# Flow-control and resource bounds for listeners with transport = "http2".
+initial_stream_window = 1048576
+initial_connection_window = 16777216
+max_concurrent_streams = 128
+max_header_list_size = 8192
+max_send_buffer_size = 262144
+# h2's generic default is too small for CONNECT-IP bursts where each inner TCP
+# ACK occupies one small DATA frame. This remains a bounded per-connection
+# allowance; raising it trades memory-abuse resistance for burst tolerance.
+data_frame_budget = 262144
+# Maximum UDP payload or CONNECT-IP packet in one DATAGRAM capsule.
+max_datagram_size = 65527
 
 [quic]
 max_datagram_size = 1350
@@ -157,15 +175,18 @@ ipv6_pool = "fd00:abcd::/64"
 # shared — TLS files, proxy policies, one [[clients]] roster, one TUN device,
 # one CONNECT-IP address pool, and one routing table.
 #
-# Two listeners may not contend for the same address. That is refused at startup
-# rather than left to the kernel: a listener with shards > 1 binds with
-# SO_REUSEPORT, so a second listener on that address would join its
-# load-balancing group and be handed connections meant for the other mode.
+# Two listeners using the same transport may not contend for the same address.
+# That is refused at startup rather than left to the kernel: an HTTP/3 listener
+# with shards > 1 binds with SO_REUSEPORT, so another HTTP/3 listener on that
+# address would join its load-balancing group and receive the wrong clients.
+# An HTTP/2 and HTTP/3 listener may share a numeric port because TCP and UDP are
+# independent sockets.
 # Wildcards count — 0.0.0.0 claims every IPv4 address on its port, and :: is
 # assumed to claim IPv4 too, since IPV6_V6ONLY is the kernel's to decide.
 #
 # [[listeners]]
 # listen_addr = "0.0.0.0:4443"
+# transport = "http3"
 # shards = 1
 #
 # [listeners.auth]

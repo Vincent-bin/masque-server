@@ -2,8 +2,9 @@
 
 ## Goals
 
-MASQUE Server is a single-process HTTP/3 proxy optimized for bounded resource
-use and high UDP throughput. Its core rules are:
+MASQUE Server is a single-process HTTP/2 and HTTP/3 proxy optimized for bounded
+resource use and high UDP throughput. HTTP/3 is the performance path; HTTP/2
+is a compatibility path for TCP-only networks. Its core rules are:
 
 - one owner event loop mutates each QUIC connection;
 - slow setup work never blocks that event loop;
@@ -35,7 +36,8 @@ TUN packet ----------->|                       |
 ```
 
 `Server` validates configuration, creates shared policy and routing state, and
-starts one or more `Shard` instances. A shard owns:
+starts HTTP/3 `Shard` instances and HTTP/2 TCP accept loops. An HTTP/3 shard
+owns:
 
 - one QUIC UDP socket, bound with `SO_REUSEPORT` when its listener has more
   than one shard;
@@ -45,6 +47,16 @@ starts one or more `Shard` instances. A shard owns:
 - bounded receivers for setup and relay events.
 
 No connection is concurrently mutated by two shards.
+
+Each HTTP/2 listener has one asynchronous TCP accept loop. Every accepted TLS/H2
+connection and CONNECT stream runs in its own bounded Tokio task, with H2 flow
+control carrying backpressure to the target socket. CONNECT-UDP and CONNECT-IP
+DATA frames are incrementally decoded into DATAGRAM capsules. These tasks share
+the same target policies, authentication admission semaphores, certificate
+roster, address pool, TUN routing table, limits, and metrics registry as the
+HTTP/3 shards. A bounded per-stream channel connects an HTTP/2 CONNECT-IP task
+to the shared TUN read side; HTTP/2 never participates in QUIC connection-ID
+routing.
 
 When configured, a separate loopback TCP task serves health, readiness, and
 Prometheus requests. Shards update fixed atomic counters in batches and never
@@ -58,6 +70,7 @@ bounded drain begins. The packaged watchdog uses the same liveness decision.
 | Path | Responsibility |
 | --- | --- |
 | `src/server/mod.rs` | Server startup, shard event loop, and tunnel coordination |
+| `src/server/http2.rs` | TCP/TLS accept loop, H2 connections, CONNECT relays, DATAGRAM capsules, and IP/TUN task integration |
 | `src/server/request.rs` | CONNECT classification, auth precheck, and authorized dispatch |
 | `src/server/authentication.rs` | Bounded Argon2 scheduling, cancellation, and request resumption |
 | `src/connection.rs` | Per-client QUIC/H3 state and deferred sends |
@@ -104,9 +117,10 @@ bounded UDP batch, and reschedules their next deadlines.
 
 ## Listeners and sharding
 
-`shards = N` on a listener creates N independent event loops on that listener's
-address using `SO_REUSEPORT`. The kernel normally keeps a client 4-tuple on one
-of them.
+`shards = N` on an HTTP/3 listener creates N independent event loops on that
+listener's UDP address using `SO_REUSEPORT`. The kernel normally keeps a client
+4-tuple on one of them. An HTTP/2 listener must use `shards = 1`; its one TCP
+accept loop dispatches connections across the Tokio runtime instead.
 
 QUIC permits address migration, so a packet can arrive on a shard that does
 not own its connection. A shared connection-ID registry identifies the owner,
@@ -114,16 +128,17 @@ and the receiving shard forwards the packet through a bounded channel. TUN
 input uses the same ownership model. This keeps connection state single-owner
 without dropping legitimate migration traffic.
 
-One connection still uses one shard. Sharding improves aggregate throughput
-across multiple connections; it cannot parallelize a single QUIC connection.
+One HTTP/3 connection still uses one shard. Sharding improves aggregate
+throughput across multiple connections; it cannot parallelize a single QUIC
+connection.
 
 `[[listeners]]` runs one or more listeners in one process. Startup resolves each
-entry into a small listener plan containing its address, shard count, and
-authentication. Every shard also references the same process-wide
-`ServerConfig`, so proxy policies, QUIC/TLS tuning, limits, and CONNECT-IP state
-are shared rather than copied per listener. The authentication mode decides
-which TLS context `build_quic_config` returns, and that is fixed when the socket
-binds.
+entry into a small listener plan containing its transport, address, shard count,
+and authentication. Every worker references the same process-wide
+`ServerConfig`, so proxy policies, TLS tuning, limits, and authentication state
+are shared rather than copied per listener. QUIC tuning applies only to HTTP/3,
+and HTTP/2 flow-control tuning applies only to HTTP/2. The authentication mode
+decides which TLS context is built, and that is fixed when the socket binds.
 
 Shards are numbered across the whole server rather than within a listener,
 which is what lets the cross-shard queues, the connection-ID registry, and the
@@ -134,16 +149,19 @@ by its owner using that shard's own local address, so a reply always leaves the
 socket the connection actually lives on — including when the owner belongs to a
 different listener.
 
-One shard reads the TUN device and distributes packets to the connections that
-own their addresses. Shard 0 is an arbitrary but stable choice, unrelated to
-which listener it serves.
+One worker reads the TUN device and distributes packets to the connections that
+own their addresses. In a mixed or HTTP/3-only process, shard 0 is the arbitrary
+but stable reader and hands HTTP/2-owned packets to their bounded stream queue.
+In an HTTP/2-only process, a small dedicated dispatcher performs the same read
+and lookup. There is never more than one TUN reader.
 
 ## Authentication pipeline
 
 Credential processing is split into two stages:
 
-1. The shard synchronously validates the request shape, Basic scheme, username,
-   encoded length, and configured authentication state.
+1. The owning HTTP/2 task or HTTP/3 shard synchronously validates the request
+   shape, Basic scheme, username, encoded length, and configured authentication
+   state.
 2. Argon2id verification runs on Tokio's blocking pool under shared permits.
 
 The queue has a global bound as well as a per-connection bound. A request must
@@ -183,7 +201,9 @@ the portable socket API.
 The server allocates IPv4/IPv6 addresses, publishes them through
 `ADDRESS_ASSIGN`, and advertises routes with `ROUTE_ADVERTISEMENT`. Client
 packets are accepted only when their source matches the tunnel assignment.
-A shared routing table maps return traffic to the owning connection and shard.
+A shared routing table maps return traffic to its owning HTTP stream. HTTP/3
+owners are reached through a shard queue; HTTP/2 owners use a per-stream queue
+whose packet capacity is derived from the configured H2 send-buffer budget.
 
 CONNECT-IP requires Linux TUN support and `CAP_NET_ADMIN`. With TUN offload,
 the file descriptor carries virtio headers and GSO aggregates; setup falls back

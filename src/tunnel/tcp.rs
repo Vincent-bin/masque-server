@@ -406,7 +406,7 @@ pub fn spawn_tcp_connect(
     })
 }
 
-async fn resolve_and_connect(
+pub(crate) async fn resolve_and_connect(
     target: TcpTarget,
     policy: &TargetPolicy,
     timeout: Duration,

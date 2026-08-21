@@ -1,7 +1,7 @@
 # Observability
 
 MASQUE Server can expose a small HTTP/1 operational endpoint independently of
-its HTTP/3 proxy listeners. It is disabled unless configured and is restricted
+its HTTP/2 and HTTP/3 proxy listeners. It is disabled unless configured and is restricted
 to an IPv4 or IPv6 loopback address because it has no authentication layer.
 
 ```toml
@@ -19,10 +19,10 @@ through a firewall rule or unauthenticated reverse proxy.
 | Path | Success | Meaning |
 | --- | --- | --- |
 | `/healthz` | `200 ok` | The process and operational HTTP task are alive |
-| `/readyz` | `200 ready` | All proxy sockets are bound and every shard heartbeat is current |
+| `/readyz` | `200 ready` | All proxy sockets are bound and every listener worker heartbeat is current |
 | `/metrics` | `200` | Prometheus text exposition |
 
-`/readyz` returns `503` before readiness, when any proxy shard has made no
+`/readyz` returns `503` before readiness, when any proxy worker has made no
 event-loop progress for five seconds, and as soon as graceful shutdown starts.
 `/healthz` and `/metrics` remain available during the bounded drain.
 Only `GET` and `HEAD` are accepted, requests time out after two seconds, request
@@ -91,38 +91,39 @@ All metric names start with `masque_`.
 | `masque_server_ready` | gauge | — | `1` while ready, `0` while starting or draining |
 | `masque_process_start_time_seconds` | gauge | — | Process start as a Unix timestamp |
 | `masque_process_uptime_seconds` | gauge | — | Current process uptime |
-| `masque_listener_shards` | gauge | `listener`, `auth` | Event loops assigned to the listener |
-| `masque_shard_heartbeat_age_seconds` | gauge | `listener`, `auth`, `shard` | Time since the shard last made event-loop progress |
-| `masque_event_loop_lag_seconds` | gauge | `listener`, `auth`, `shard` | Latest one-second heartbeat scheduling delay |
-| `masque_event_loop_lag_max_seconds` | gauge | `listener`, `auth`, `shard` | Largest heartbeat delay since startup |
-| `masque_connections_active` | gauge | `listener`, `auth` | Live QUIC connections |
-| `masque_connections_accepted_total` | counter | `listener`, `auth` | Accepted connection objects |
-| `masque_connections_rejected_total` | counter | `listener`, `auth`, `reason` | Connections rejected at a resource limit |
-| `masque_quic_receive_batches_total` | counter | `listener`, `auth` | Non-empty network receive batches |
-| `masque_quic_receive_packets_total` | counter | `listener`, `auth` | Received QUIC UDP datagrams |
-| `masque_quic_receive_bytes_total` | counter | `listener`, `auth` | Received QUIC UDP bytes |
-| `masque_quic_send_batches_total` | counter | `listener`, `auth` | Successful network send batches |
-| `masque_quic_send_packets_total` | counter | `listener`, `auth` | Sent QUIC UDP datagrams |
-| `masque_quic_send_bytes_total` | counter | `listener`, `auth` | Sent QUIC UDP bytes |
-| `masque_quic_udp_gso_enabled` | gauge | `listener`, `auth` | Bound QUIC socket is using UDP GSO |
-| `masque_quic_udp_gro_enabled` | gauge | `listener`, `auth` | Bound QUIC socket is using UDP GRO |
-| `masque_tcp_relay_batches_total` | counter | `listener`, `auth` | Event-loop rounds consuming target TCP events |
-| `masque_tcp_relay_events_total` | counter | `listener`, `auth` | Target TCP events consumed by shards |
-| `masque_tcp_relay_bytes_total` | counter | `listener`, `auth` | Target TCP response bytes handed to shards |
-| `masque_tunnels_active` | gauge | `listener`, `auth`, `protocol` | Live `tcp`, `udp`, or `ip` tunnels |
-| `masque_auth_attempts_total` | counter | `listener`, `auth`, `result` | Successful, failed, or load-shed verification |
-| `masque_auth_pending` | gauge | `listener`, `auth` | Admitted Basic checks not yet completed |
-| `masque_auth_running` | gauge | `listener`, `auth` | Argon2 jobs currently executing |
-| `masque_packets_dropped_total` | counter | `listener`, `auth`, `reason` | Drops at bounded shard, datagram, or TUN queues |
+| `masque_listener_shards` | gauge | `listener`, `transport`, `auth` | Event-loop workers assigned to the listener |
+| `masque_shard_heartbeat_age_seconds` | gauge | `listener`, `transport`, `auth`, `shard` | Time since the worker last made event-loop progress |
+| `masque_event_loop_lag_seconds` | gauge | `listener`, `transport`, `auth`, `shard` | Latest one-second heartbeat scheduling delay |
+| `masque_event_loop_lag_max_seconds` | gauge | `listener`, `transport`, `auth`, `shard` | Largest heartbeat delay since startup |
+| `masque_connections_active` | gauge | `listener`, `transport`, `auth` | Live HTTP transport connections |
+| `masque_connections_accepted_total` | counter | `listener`, `transport`, `auth` | Accepted connection objects |
+| `masque_connections_rejected_total` | counter | `listener`, `transport`, `auth`, `reason` | Connections rejected at a resource limit |
+| `masque_quic_receive_batches_total` | counter | `listener`, `transport`, `auth` | Non-empty HTTP/3 network receive batches |
+| `masque_quic_receive_packets_total` | counter | `listener`, `transport`, `auth` | Received HTTP/3 QUIC UDP datagrams |
+| `masque_quic_receive_bytes_total` | counter | `listener`, `transport`, `auth` | Received HTTP/3 QUIC UDP bytes |
+| `masque_quic_send_batches_total` | counter | `listener`, `transport`, `auth` | Successful HTTP/3 network send batches |
+| `masque_quic_send_packets_total` | counter | `listener`, `transport`, `auth` | Sent HTTP/3 QUIC UDP datagrams |
+| `masque_quic_send_bytes_total` | counter | `listener`, `transport`, `auth` | Sent HTTP/3 QUIC UDP bytes |
+| `masque_quic_udp_gso_enabled` | gauge | `listener`, `transport`, `auth` | Bound HTTP/3 socket is using UDP GSO |
+| `masque_quic_udp_gro_enabled` | gauge | `listener`, `transport`, `auth` | Bound HTTP/3 socket is using UDP GRO |
+| `masque_tcp_relay_batches_total` | counter | `listener`, `transport`, `auth` | HTTP/3 event-loop rounds consuming target TCP events |
+| `masque_tcp_relay_events_total` | counter | `listener`, `transport`, `auth` | Target TCP events consumed by HTTP/3 shards |
+| `masque_tcp_relay_bytes_total` | counter | `listener`, `transport`, `auth` | Target TCP response bytes handed to HTTP/3 shards |
+| `masque_tunnels_active` | gauge | `listener`, `transport`, `auth`, `protocol` | Live `tcp`, `udp`, or `ip` tunnels |
+| `masque_auth_attempts_total` | counter | `listener`, `transport`, `auth`, `result` | Successful, failed, or load-shed verification |
+| `masque_auth_pending` | gauge | `listener`, `transport`, `auth` | Admitted Basic checks not yet completed |
+| `masque_auth_running` | gauge | `listener`, `transport`, `auth` | Argon2 jobs currently executing |
+| `masque_packets_dropped_total` | counter | `listener`, `transport`, `auth`, `reason` | Drops at bounded shard, datagram, or TUN queues |
 | `masque_roster_reloads_total` | counter | `result` | Successful and rejected SIGHUP roster reloads |
 | `masque_forced_shutdowns_total` | counter | — | Process shutdowns that reached the drain deadline |
 
 Labels deliberately describe only configured listeners, authentication modes,
-protocols, and fixed result classes. Usernames, client identities, target
+transports, protocols, and fixed result classes. Usernames, client identities, target
 addresses, stream IDs, and connection IDs are never labels, which avoids both
 sensitive-data exposure and unbounded Prometheus cardinality.
 
-Receive, send, and TCP relay counters are updated once per batch rather than
+QUIC and HTTP/3 TCP-relay counters remain zero for HTTP/2 listeners. Receive,
+send, and TCP relay counters are updated once per batch rather than
 once per packet or relay event. Dividing relay events by relay batches shows
 the effective event-loop coalescing factor. Connection counts use object
 lifetime, while tunnel gauges are published once after a connection's
@@ -147,6 +148,6 @@ service, add `--log-format json` to an `ExecStart` override when desired.
 
 The supplied unit uses `Type=notify` and `WatchdogSec=30s`. The process sends
 `READY=1` only after all proxy sockets and the optional operational socket are
-bound, sends watchdog pings only while every shard heartbeat is current, and
+bound, sends watchdog pings only while every worker heartbeat is current, and
 sends `STOPPING=1` when graceful draining begins. Manual foreground runs need
 no special environment; notification is a no-op when `NOTIFY_SOCKET` is absent.

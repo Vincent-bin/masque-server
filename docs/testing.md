@@ -13,6 +13,7 @@
 | Network benchmark | `scripts/network-bench.sh` | Local direct-vs-MASQUE throughput and RTT |
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
 | Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, and both authentication modes served from one process |
+| HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT, CONNECT-UDP, RFC CONNECT-IP, usque-style CONNECT-IP, Basic auth, and client-certificate auth |
 | Observability assets | `cargo test --test monitoring_assets` | Prometheus metric references and importable Grafana JSON |
 | Service shutdown | `tests/systemd-shutdown.sh` | Real SIGTERM/SIGINT handling and every-shard drain; Linux exercises two shards |
 | Config preflight | `cargo test --test check_config` | `check-config` accepts what a server accepts, including multi-listener files |
@@ -28,9 +29,10 @@ cargo +1.88.0 check --workspace --locked
 cargo test --workspace --locked
 ```
 
-macOS covers portable CONNECT, CONNECT-UDP, authentication, protocol codecs,
-and scheduling. It does not validate Linux `recvmmsg`/`sendmmsg`, GSO/GRO,
-`SO_REUSEPORT`, TUN offload, capabilities, or systemd.
+macOS covers HTTP/2 CONNECT-IP setup plus portable HTTP/2 and HTTP/3 CONNECT,
+CONNECT-UDP, authentication, protocol codecs, and scheduling. It does not
+validate Linux `recvmmsg`/`sendmmsg`, GSO/GRO, `SO_REUSEPORT`, actual TUN
+forwarding/offload, capabilities, or systemd.
 
 ## Docker E2E
 
@@ -202,6 +204,10 @@ flag — enrollment prints the exact argument:
 sudo ./usque nativetun --config config.json --connect-port 4433
 ```
 
+Add `--http2` to that command when testing a listener with
+`transport = "http2"`; enrollment already fills the JSON's `endpoint_h2_v4` or
+`endpoint_h2_v6` field.
+
 **6. Verify.** The most decisive target is the server's own TUN address, because
 it exercises the tunnel end to end without depending on the host's egress path
 at all. Serve a large file there and pull it through the tunnel, comparing
@@ -267,7 +273,7 @@ that, and all three were hit while qualifying this feature:
 | In-tunnel traffic works, egress does not | The host's forwarding path, not the server. See [Egress testing needs an uncontended host](#egress-testing-needs-an-uncontended-host). |
 | Egress ICMP works but TCP hangs | Almost always a transparent proxy on the server host that exempts ICMP from its policy routing. Check `ip rule show`. |
 | Server logs `spoofed source address, dropping` | The client's interface address disagrees with its pinned address. Re-enroll so both sides match. |
-| Small packets work, bulk transfers stall | The framed MTU exceeds the datagram budget. Raise `quic.max_datagram_size` or lower the client's MTU; keep the client at 1280 unless both ends were changed together. |
+| Small packets work, bulk transfers stall | The framed MTU exceeds the selected transport's datagram budget. Raise `quic.max_datagram_size` for HTTP/3 or `http2.max_datagram_size` for HTTP/2, or lower the client's MTU; keep the client at 1280 unless both ends were changed together. |
 | Tunnel drops roughly every 30s | `server.idle_timeout_secs` is at or below the client's keepalive period. |
 
 ## Release checklist

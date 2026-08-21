@@ -233,7 +233,7 @@ fn check_config_keeps_an_ephemeral_port_unresolved() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("listener 127.0.0.1:0 auth=disabled shards=1"),
+        stdout.contains("listener 127.0.0.1:0 transport=http3 auth=disabled shards=1"),
         "check-config must not invent a runtime port: {stdout}"
     );
 }
@@ -492,7 +492,7 @@ enabled = false
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("listener 127.0.0.1:8449 auth=disabled shards="),
+        stdout.contains("listener 127.0.0.1:8449 transport=http3 auth=disabled shards="),
         "unexpected listener line: {stdout}"
     );
     assert!(

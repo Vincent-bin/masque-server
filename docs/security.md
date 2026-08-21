@@ -2,7 +2,8 @@
 
 ## Threat model
 
-The listener is expected to receive arbitrary UDP, QUIC, HTTP/3, CONNECT,
+The listeners are expected to receive arbitrary TCP, UDP, TLS, QUIC, HTTP/2,
+HTTP/3, CONNECT,
 credential, and target data from the internet. A successful client can ask the
 server to originate TCP/UDP traffic, and CONNECT-IP clients can exchange raw IP
 packets through the host. The principal risks are:

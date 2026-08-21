@@ -199,9 +199,9 @@ grep -q '^\[\[clients\]\]$' "$CONFIG_PATH" ||
 # The server itself must agree about what those listeners are.
 "$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/dual-check.log" 2>&1 ||
     die "the dual configuration failed check-config"
-grep -q '^listener 0.0.0.0:8449 auth=basic shards=1$' "$TEST_TMP/dual-check.log" ||
+grep -q '^listener 0.0.0.0:8449 transport=http3 auth=basic shards=1$' "$TEST_TMP/dual-check.log" ||
     die "the Basic listener was not reported by check-config"
-grep -q '^listener 0.0.0.0:8450 auth=client_cert shards=1$' "$TEST_TMP/dual-check.log" ||
+grep -q '^listener 0.0.0.0:8450 transport=http3 auth=client_cert shards=1$' "$TEST_TMP/dual-check.log" ||
     die "the certificate listener was not reported by check-config"
 # The installed binary must be able to add a third listener to the file the
 # installer wrote, in place, without an operator editing TOML.
@@ -222,7 +222,7 @@ grep -q '^\[quic\]$' "$CONFIG_PATH" ||
     die "add-listener changed the configuration file's owner or mode"
 "$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/added-check.log" 2>&1 ||
     die "the configuration failed check-config after add-listener"
-grep -q '^listener 0.0.0.0:8451 auth=client_cert shards=1$' "$TEST_TMP/added-check.log" ||
+grep -q '^listener 0.0.0.0:8451 transport=http3 auth=client_cert shards=1$' "$TEST_TMP/added-check.log" ||
     die "the added listener was not reported by check-config"
 
 printf '\n# private-upgrade-log-marker\n' >>"$CONFIG_PATH"
@@ -240,7 +240,7 @@ assert_sha_unchanged "$CONFIG_PATH" "$added_config_sha"
 assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
 assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
 assert_upgrade_output_is_summary_only "$TEST_TMP/dual-upgrade.log"
-grep -q '^listener 0.0.0.0:8451 auth=client_cert shards=1$' "$TEST_TMP/dual-upgrade.log" ||
+grep -q '^listener 0.0.0.0:8451 transport=http3 auth=client_cert shards=1$' "$TEST_TMP/dual-upgrade.log" ||
     die "the upgrade summary did not report the added listener"
 grep -q 'add-listener' "$TEST_TMP/dual-upgrade.log" ||
     die "the upgrade summary did not name the command that adds a listener"

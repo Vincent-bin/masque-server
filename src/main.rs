@@ -13,7 +13,8 @@ use masque::config_edit;
 use masque::enroll;
 use masque::server::{Server, validate_config};
 
-/// MASQUE proxy server (CONNECT / CONNECT-UDP / CONNECT-IP over HTTP/3).
+/// MASQUE proxy server (CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/2 or
+/// HTTP/3).
 #[derive(Parser)]
 #[command(name = "masque-server", version)]
 struct Cli {
@@ -104,6 +105,10 @@ enum Command {
         #[arg(long)]
         listen_addr: Option<SocketAddr>,
 
+        /// HTTP transport for this socket. Defaults to http3 for scripted use.
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
+
         /// Authentication this socket demands. One mode per listener: the mode
         /// decides which TLS context is built before clients connect.
         #[arg(long, value_enum)]
@@ -170,6 +175,21 @@ enum AuthModeArg {
     ClientCert,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TransportArg {
+    Http3,
+    Http2,
+}
+
+impl From<TransportArg> for config::ListenerTransport {
+    fn from(transport: TransportArg) -> Self {
+        match transport {
+            TransportArg::Http3 => Self::Http3,
+            TransportArg::Http2 => Self::Http2,
+        }
+    }
+}
+
 impl From<AuthModeArg> for config::AuthMode {
     fn from(mode: AuthModeArg) -> Self {
         match mode {
@@ -196,7 +216,9 @@ fn auth_label(auth: &config::AuthSection) -> &'static str {
 }
 
 fn usque_port_instruction(port: u16) -> String {
-    format!("# Start usque with --connect-port {port} (short form: -P {port}).")
+    format!(
+        "# Start usque with --connect-port {port} (short form: -P {port}); add --http2 for an HTTP/2 listener."
+    )
 }
 
 /// Generate and print one client enrollment.
@@ -331,6 +353,7 @@ async fn main() -> anyhow::Result<()> {
     // with this invocation's --cert/--key overrides applied.
     if let Some(Command::AddListener {
         listen_addr,
+        transport,
         mode,
         shards,
         username,
@@ -346,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
             &cli.config,
             config_edit::AddListener {
                 listen_addr,
+                transport: transport.map(Into::into),
                 mode: mode.map(Into::into),
                 shards,
                 username,
@@ -416,8 +440,9 @@ async fn main() -> anyhow::Result<()> {
         // a large value is capped, neither of which the file shows.
         for listener in listeners {
             println!(
-                "listener {} auth={} shards={}",
+                "listener {} transport={} auth={} shards={}",
                 listener.listen_addr,
+                listener.transport.as_str(),
                 auth_label(&listener.auth),
                 listener.shards
             );
@@ -457,6 +482,7 @@ mod tests {
         let instruction = usque_port_instruction(8449);
         assert!(instruction.contains("--connect-port 8449"));
         assert!(instruction.contains("-P 8449"));
+        assert!(instruction.contains("--http2"));
     }
 
     #[test]

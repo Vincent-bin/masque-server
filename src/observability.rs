@@ -278,8 +278,14 @@ mod tests {
     #[tokio::test]
     async fn exposes_health_readiness_and_metrics() {
         let metrics = Arc::new(Metrics::new(true));
-        let _ =
-            metrics.register_listener("127.0.0.1:8449".parse().unwrap(), "basic", 1, false, true);
+        let _ = metrics.register_listener(
+            "127.0.0.1:8449".parse().unwrap(),
+            "http3",
+            "basic",
+            1,
+            false,
+            true,
+        );
         let server =
             ObservabilityServer::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&metrics))
                 .await
