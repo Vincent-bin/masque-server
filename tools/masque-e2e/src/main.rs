@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -250,8 +249,8 @@ struct Client {
     local: SocketAddr,
     /// Honour quiche's pacing deadlines by sleeping before each send.
     ///
-    /// The load generator turns this off: it is trying to find the *server's*
-    /// ceiling, and a client that paces itself measures its own instead.
+    /// The load generator keeps this enabled too: bypassing pacing creates
+    /// unrealistic bursts and can make a real network path look slower.
     pace: bool,
 }
 
@@ -366,44 +365,6 @@ impl Client {
     fn drive(&mut self) -> Result<()> {
         self.flush()?;
         self.recv_once()?;
-        self.flush()?;
-        Ok(())
-    }
-
-    /// Drive the connection without parking for quiche's full timeout.
-    ///
-    /// `recv_once` waits up to `quic.timeout()`, which is fine for a test that
-    /// is waiting for one reply but caps a load generator at a handful of
-    /// round trips per second. This drains whatever has already arrived and
-    /// moves on.
-    fn drive_load(&mut self) -> Result<()> {
-        self.flush()?;
-        self.socket
-            .set_read_timeout(Some(Duration::from_millis(1)))?;
-
-        let mut buf = [0u8; BUF_SIZE];
-        for _ in 0..256 {
-            match self.socket.recv(&mut buf) {
-                Ok(len) => {
-                    let info = quiche::RecvInfo {
-                        from: self.peer,
-                        to: self.local,
-                    };
-                    match self.quic.recv(&mut buf[..len], info) {
-                        Ok(_) | Err(quiche::Error::Done) => {}
-                        Err(e) => bail!("QUIC recv: {e}"),
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
-                Err(e) => bail!("socket recv: {e}"),
-            }
-        }
-
         self.flush()?;
         Ok(())
     }
@@ -1641,25 +1602,65 @@ fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
 /// each from its own socket and therefore its own 4-tuple, which is what a
 /// connection-sharded server needs in order to use more than one core.
 fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
-    let conns = env_usize("MASQUE_LOAD_CONNS", 32);
-    let duration_secs = env_usize("MASQUE_LOAD_DURATION_SECS", 10) as u64;
-    let payload_size = env_usize("MASQUE_LOAD_PAYLOAD", 1200);
-    let window = env_usize("MASQUE_LOAD_WINDOW", 16);
+    const MAX_LOAD_CONNECTIONS: usize = 1_024;
+    const MAX_LOAD_DURATION_SECS: usize = 3_600;
+    const MAX_LOAD_WINDOW: usize = 1_000;
+    const MAX_LOAD_EXPIRY_MS: usize = 60_000;
 
-    if conns == 0 || duration_secs == 0 || payload_size == 0 || window == 0 {
-        bail!("load connections, duration, payload, and window must be non-zero");
+    let conns = env_usize("MASQUE_LOAD_CONNS", 32)?;
+    let duration_secs = env_usize("MASQUE_LOAD_DURATION_SECS", 10)?;
+    let payload_size = env_usize("MASQUE_LOAD_PAYLOAD", 1200)?;
+    let window = env_usize("MASQUE_LOAD_WINDOW", 16)?;
+    let expiry_ms = env_usize("MASQUE_LOAD_EXPIRY_MS", 1_000)?;
+
+    if conns == 0 || duration_secs == 0 || window == 0 || expiry_ms == 0 {
+        bail!("load connections, duration, window, and expiry must be non-zero");
+    }
+    if payload_size < 8 {
+        bail!("MASQUE_LOAD_PAYLOAD must be at least 8 bytes");
+    }
+    if conns > MAX_LOAD_CONNECTIONS {
+        bail!("MASQUE_LOAD_CONNS must not exceed {MAX_LOAD_CONNECTIONS}");
+    }
+    if duration_secs > MAX_LOAD_DURATION_SECS {
+        bail!("MASQUE_LOAD_DURATION_SECS must not exceed {MAX_LOAD_DURATION_SECS}");
+    }
+    if window > MAX_LOAD_WINDOW {
+        bail!(
+            "MASQUE_LOAD_WINDOW must not exceed the QUIC DATAGRAM queue size ({MAX_LOAD_WINDOW})"
+        );
+    }
+    if expiry_ms > MAX_LOAD_EXPIRY_MS {
+        bail!("MASQUE_LOAD_EXPIRY_MS must not exceed {MAX_LOAD_EXPIRY_MS}");
+    }
+    if payload_size > MAX_DATAGRAM_SIZE {
+        bail!("MASQUE_LOAD_PAYLOAD must not exceed {MAX_DATAGRAM_SIZE}");
     }
 
     println!(
         "Load test: {conns} connections, {duration_secs}s, {payload_size}B payload, \
-         window {window}/conn"
+         window {window}/conn, expiry {expiry_ms}ms"
     );
 
+    #[derive(Debug)]
+    struct WorkerStats {
+        setup: Duration,
+        sent: u64,
+        received: u64,
+        expired: u64,
+    }
+
+    #[derive(Debug)]
+    enum WorkerOutcome {
+        Finished(WorkerStats),
+        SetupFailed(String),
+        RuntimeFailed { setup: Duration, error: String },
+    }
+
     let ready = Arc::new(Barrier::new(conns + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-    let tx_total = Arc::new(AtomicU64::new(0));
-    let rx_total = Arc::new(AtomicU64::new(0));
-    let setup_failures = Arc::new(AtomicU64::new(0));
+    let start = Arc::new(Barrier::new(conns + 1));
+    let duration = Duration::from_secs(duration_secs as u64);
+    let expiry = Duration::from_millis(expiry_ms as u64);
 
     // Include thread creation in the time until the whole concurrent batch is
     // ready. Individual connection latency is measured inside each worker.
@@ -1669,90 +1670,88 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
         let server_addr = server_addr.to_string();
         let echo_addr = echo_addr.to_string();
         let ready = Arc::clone(&ready);
-        let stop = Arc::clone(&stop);
-        let tx_total = Arc::clone(&tx_total);
-        let rx_total = Arc::clone(&rx_total);
-        let setup_failures = Arc::clone(&setup_failures);
+        let start = Arc::clone(&start);
 
         workers.push(std::thread::spawn(move || {
             // Establish the tunnel before the barrier so every connection is
             // pushing traffic during the same measurement window.
             let setup_started = Instant::now();
             let tunnel = connect_udp_tunnel(&server_addr, &echo_addr);
-            let (mut client, stream_id) = match tunnel {
-                Ok(tunnel) => tunnel,
-                Err(error) => {
-                    warn!(%error, "load connection setup failed");
-                    setup_failures.fetch_add(1, Ordering::Relaxed);
-                    ready.wait();
-                    return None;
-                }
-            };
             let setup = setup_started.elapsed();
 
-            // Measure the server's ceiling, not the client's pacer.
-            client.pace = false;
-            let payload = vec![0x5a; payload_size];
-            let mut sent = 0u64;
-            let mut received = 0u64;
-            let mut inflight = 0usize;
-
+            // A failed setup still participates in both barriers, otherwise
+            // every successful worker and the coordinator would wait forever.
             ready.wait();
+            start.wait();
 
-            while !stop.load(Ordering::Relaxed) {
-                // Top the window up, then flush once for the whole burst
-                // rather than once per datagram.
-                while inflight < window {
-                    let encoded = match masque::datagram::encode_payload(stream_id, &payload) {
-                        Ok(encoded) => encoded,
-                        Err(_) => break,
-                    };
-                    match client.quic.dgram_send(&encoded) {
-                        Ok(()) => {
-                            inflight += 1;
-                            sent += 1;
-                        }
-                        // Send queue full: let the drive below make room.
-                        Err(_) => break,
-                    }
-                }
-                if client.drive_load().is_err() {
-                    break;
-                }
+            let (mut client, stream_id) = match tunnel {
+                Ok(tunnel) => tunnel,
+                Err(error) => return WorkerOutcome::SetupFailed(format!("{error:#}")),
+            };
 
-                let mut buf = [0u8; BUF_SIZE];
-                while client.quic.dgram_recv(&mut buf).is_ok() {
-                    received += 1;
-                    inflight = inflight.saturating_sub(1);
-                }
+            // Reuse the exact saturating loop used by the trusted
+            // single-connection benchmark. Keeping one packet engine avoids
+            // a second implementation silently changing pacing, draining, or
+            // expiry semantics.
+            match client.run_echo_throughput(stream_id, payload_size, duration, window, expiry) {
+                Ok((sent, received, expired)) => WorkerOutcome::Finished(WorkerStats {
+                    setup,
+                    sent,
+                    received,
+                    expired,
+                }),
+                Err(error) => WorkerOutcome::RuntimeFailed {
+                    setup,
+                    error: format!("{error:#}"),
+                },
             }
-
-            tx_total.fetch_add(sent, Ordering::Relaxed);
-            rx_total.fetch_add(received, Ordering::Relaxed);
-            Some(setup)
         }));
     }
 
     ready.wait();
     let setup_batch = setup_batch_started.elapsed();
-    let started = Instant::now();
-    std::thread::sleep(Duration::from_secs(duration_secs));
-    stop.store(true, Ordering::Relaxed);
+    start.wait();
+
     let mut setup_latencies = Vec::with_capacity(conns);
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let mut expired = 0u64;
+    let mut setup_failures = 0u64;
+    let mut runtime_failures = 0u64;
     for worker in workers {
-        if let Ok(Some(setup)) = worker.join() {
-            setup_latencies.push(setup.as_secs_f64() * 1e3);
+        match worker.join() {
+            Ok(WorkerOutcome::Finished(stats)) => {
+                setup_latencies.push(stats.setup.as_secs_f64() * 1e3);
+                sent += stats.sent;
+                received += stats.received;
+                expired += stats.expired;
+            }
+            Ok(WorkerOutcome::SetupFailed(error)) => {
+                setup_failures += 1;
+                warn!(%error, "load connection setup failed");
+            }
+            Ok(WorkerOutcome::RuntimeFailed { setup, error }) => {
+                setup_latencies.push(setup.as_secs_f64() * 1e3);
+                runtime_failures += 1;
+                warn!(%error, "load worker stopped early");
+            }
+            Err(_) => {
+                runtime_failures += 1;
+                warn!("load worker panicked");
+            }
         }
     }
-    let elapsed = started.elapsed().as_secs_f64();
 
-    let failures = setup_failures.load(Ordering::Relaxed);
-    let established = conns as u64 - failures;
-    let sent = tx_total.load(Ordering::Relaxed);
-    let received = rx_total.load(Ordering::Relaxed);
+    // Only workers that returned a measured setup duration definitely
+    // established a tunnel. A panic is not assumed to have happened after
+    // setup, so it cannot inflate this count.
+    let established = setup_latencies.len() as u64;
+    let elapsed = duration.as_secs_f64();
     let tx_pps = sent as f64 / elapsed;
     let rx_pps = received as f64 / elapsed;
     let goodput = rx_pps * payload_size as f64 * 8.0 / 1e9;
+    let response_shortfall = sent.saturating_sub(received);
+    let response_shortfall_pct = response_shortfall as f64 * 100.0 / sent.max(1) as f64;
 
     println!(
         "  connections established: {established}/{conns} in {:.0} ms ({:.1} conn/s)",
@@ -1762,8 +1761,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     if !setup_latencies.is_empty() {
         setup_latencies.sort_by(f64::total_cmp);
         let average = setup_latencies.iter().sum::<f64>() / setup_latencies.len() as f64;
-        let percentile =
-            |p: f64| setup_latencies[((setup_latencies.len() - 1) as f64 * p) as usize];
+        let percentile = |p: f64| percentile_nearest_rank(&setup_latencies, p).unwrap();
         println!(
             "  per-connection setup: avg {average:.1} ms   p50 {:.1} ms   p95 {:.1} ms   p99 {:.1} ms",
             percentile(0.50),
@@ -1773,23 +1771,51 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     }
     println!(
         "  tx {:>10.0} pkt/s   echo {:>10.0} pkt/s   app goodput {:.3} Gbit/s   \
-         bidirectional relay {:.3} Gbit/s",
+         bidirectional relay {:.3} Gbit/s   response shortfall {response_shortfall_pct:.2}% \
+         ({expired} expired)",
         tx_pps,
         rx_pps,
         goodput,
         goodput * 2.0
     );
+    println!(
+        "LOAD_RESULT connections={conns} established={established} duration_secs={duration_secs} \
+payload_bytes={payload_size} window={window} expiry_ms={expiry_ms} tx_packets={sent} \
+rx_packets={received} \
+tx_pps={tx_pps:.3} rx_pps={rx_pps:.3} app_goodput_gbps={goodput:.6} \
+bidirectional_relay_gbps={:.6} response_shortfall_pct={response_shortfall_pct:.6} \
+expired_packets={expired} \
+setup_failures={setup_failures} runtime_failures={runtime_failures}",
+        goodput * 2.0
+    );
     if established == 0 {
         bail!("no load connections were established");
+    }
+    if setup_failures != 0 || runtime_failures != 0 {
+        bail!(
+            "load test had {setup_failures} setup failure(s) and {runtime_failures} runtime failure(s)"
+        );
     }
     Ok(())
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
+fn env_usize(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be a non-negative integer")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} is not valid UTF-8"),
+    }
+}
+
+fn percentile_nearest_rank(sorted: &[f64], percentile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+
+    let rank = (percentile.clamp(0.0, 1.0) * sorted.len() as f64).ceil() as usize;
+    Some(sorted[rank.clamp(1, sorted.len()) - 1])
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -2353,5 +2379,17 @@ mod tests {
         assert_eq!(median(&mut []), None);
         assert_eq!(median(&mut [3.0, 1.0, 2.0]), Some(2.0));
         assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), Some(2.5));
+    }
+
+    #[test]
+    fn nearest_rank_percentiles_handle_small_samples() {
+        assert_eq!(percentile_nearest_rank(&[], 0.95), None);
+        assert_eq!(percentile_nearest_rank(&[10.0], 0.95), Some(10.0));
+        assert_eq!(percentile_nearest_rank(&[10.0, 20.0], 0.50), Some(10.0));
+        assert_eq!(percentile_nearest_rank(&[10.0, 20.0], 0.95), Some(20.0));
+        assert_eq!(
+            percentile_nearest_rank(&[10.0, 20.0, 30.0, 40.0], 0.75),
+            Some(30.0)
+        );
     }
 }

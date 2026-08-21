@@ -7,6 +7,36 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.6.0 - 2026-08-21
+
+### Added
+
+- The network benchmark supports focused `smoke`, `tcp`, `udp`, and `load`
+  modes, an explicit listener shard count, and an optional multi-connection
+  stage. Load runs emit one stable `LOAD_RESULT` record for automation.
+
+### Changed
+
+- Linux QUIC `sendmmsg` metadata is initialized only for messages in the
+  current batch instead of clearing storage for all 64 possible messages on
+  every syscall. In four interleaved, CPU-pinned two-client loopback runs with
+  one saturated server shard, median 1200-byte application goodput increased
+  from 1.069 to 1.101 Gbit/s (3.0%). Matching flat profiles reduced `memset`
+  samples from 2.91% to 1.71%; UDP GSO remained functional and showed no
+  material throughput change.
+
+### Fixed
+
+- The multi-connection load generator now uses the same paced, saturating
+  packet engine as the single-connection benchmark. Every worker records its
+  own tunnel setup latency, starts traffic behind a common barrier, drains
+  responses for a configurable expiry interval, and reports setup/runtime
+  failures plus response shortfall instead of silently folding them into a
+  misleading throughput number.
+- Load-test environment values are parsed strictly and bounded, so malformed
+  input no longer falls back to a default and accidental extreme runs are
+  rejected before threads are created.
+
 ## 0.5.1 - 2026-08-21
 
 ### Fixed

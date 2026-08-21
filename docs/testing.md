@@ -69,6 +69,22 @@ Set `MASQUE_BENCH_QUIC_GSO=0|1` and
 `MASQUE_BENCH_TARGET_GSO=0|1` independently. The former changes the outer QUIC
 socket; the latter changes only CONNECT-UDP target egress.
 
+Use a focused multi-connection run for shard or server-ceiling checks:
+
+```sh
+MASQUE_BENCH_MODE=load \
+MASQUE_BENCH_SHARDS=1 \
+MASQUE_LOAD_CONNS=2 \
+MASQUE_LOAD_DURATION_SECS=30 \
+MASQUE_LOAD_PAYLOAD=1200 \
+MASQUE_LOAD_WINDOW=256 \
+scripts/network-bench.sh
+```
+
+Treat `LOAD_RESULT` as the stable machine-readable record. A valid comparison
+keeps payload, duration, window, expiry, shards, CPU placement, and offload
+settings fixed, and compares both goodput and response shortfall.
+
 See [Performance](performance.md) for methodology and reporting requirements.
 
 ## Linux-specific checks
