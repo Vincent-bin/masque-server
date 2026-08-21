@@ -690,7 +690,12 @@ if [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     fi
 fi
 
-print_redacted_config
+if [ "$CONFIG_CHANGED" -eq 1 ]; then
+    print_redacted_config
+else
+    echo
+    echo "Existing configuration was preserved and is not printed during upgrades."
+fi
 
 if [ -n "$ENROLL_OUTPUT" ]; then
     echo

@@ -25,6 +25,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Validate release metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: scripts/validate-release.sh "$GITHUB_REF_NAME"
+
       - name: Install native build tools
         run: |
           sudo apt-get update

@@ -7,6 +7,21 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.5.1 - 2026-08-21
+
+### Fixed
+
+- Upgrades preserve the existing configuration without printing its full
+  contents into unattended installation logs. Fresh installations still show
+  the generated configuration with the password hash redacted.
+- Release builds now reject a tag that does not match both the Cargo package
+  version and a dated changelog heading, preventing incorrectly labelled
+  archives.
+- Installer regression tests now verify that an activated upgrade preserves
+  the configuration and TLS material as well as the rollback-managed files.
+
+## 0.5.0 - 2026-08-20
+
 ### Added
 
 - Prometheus now exposes target-to-HTTP/3 TCP relay batches, events, and bytes,

@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
     sh
 ```
 
-`MASQUE_VERSION=0.5.0` selects `v0.5.0`. This is also how to install a
+`MASQUE_VERSION=0.5.1` selects `v0.5.1`. This is also how to install a
 prerelease explicitly; automatic resolution deliberately chooses only GitHub's
 latest stable release. Authentication, listen, TLS-source, and client
 provisioning variables apply only when `/etc/masque/masque.toml` does not yet
@@ -106,7 +106,8 @@ service untouched. On success, the binary, packaged systemd unit, Prometheus
 rules, and Grafana dashboard are upgraded; the TOML and every TLS path it
 references remain unchanged. If the requested service restart then fails, the
 installer restores the previous release-managed files, enabled state, and
-active state.
+active state. Upgrade output reports the resolved listener and authentication
+summary but does not print the existing configuration contents.
 
 Version 0.3 does not migrate the 0.2 single-listener format. Before upgrading,
 move every socket into `[[listeners]]` with an explicit `[listeners.auth]` and
