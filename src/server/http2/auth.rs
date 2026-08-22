@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use super::ConnectionContext;
 use super::support::send_error;
+use crate::admission::SourceAdmission;
 use crate::auth::{AuthPrecheck, BasicAuthenticator};
 use crate::client_identity::{ClientIdentity, SharedRoster};
 use crate::metrics::ShardMetrics;
@@ -46,6 +47,7 @@ pub(super) async fn authorize_request(
     respond: &mut SendResponse<Bytes>,
     context: &ConnectionContext,
     auth_slots: Arc<Semaphore>,
+    source_ip: std::net::IpAddr,
 ) -> Authorization {
     let Some(auth) = &context.auth else {
         return Authorization::Granted;
@@ -72,6 +74,14 @@ pub(super) async fn authorize_request(
             return Authorization::ResponseSent;
         }
     };
+    let source_slot = match context.shared.auth_source_admissions.try_acquire(source_ip) {
+        Some(slot) => slot,
+        None => {
+            context.metrics.record_auth_overloaded();
+            let _ = send_error(respond, StatusCode::SERVICE_UNAVAILABLE);
+            return Authorization::ResponseSent;
+        }
+    };
     let verification = verify_password(
         Arc::clone(auth),
         password,
@@ -79,6 +89,7 @@ pub(super) async fn authorize_request(
         Arc::clone(&context.shared.auth_permits),
         Arc::clone(&context.metrics),
         auth_slot,
+        source_slot,
     );
     tokio::pin!(verification);
     let authorized = tokio::select! {
@@ -111,6 +122,7 @@ async fn verify_password(
     permits: Arc<Semaphore>,
     metrics: Arc<ShardMetrics>,
     _connection_slot: OwnedSemaphorePermit,
+    source_slot: SourceAdmission,
 ) -> AuthResult {
     let queue_slot = match queue_slots.try_acquire_owned() {
         Ok(slot) => slot,
@@ -128,6 +140,7 @@ async fn verify_password(
     let running = metrics.auth_running_guard();
     let completion_metrics = Arc::clone(&metrics);
     match tokio::task::spawn_blocking(move || {
+        let _source_slot = source_slot;
         let _queue_slot = queue_slot;
         let _permit = permit;
         let _running = running;

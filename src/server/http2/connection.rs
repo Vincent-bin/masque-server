@@ -19,6 +19,7 @@ use super::support::{ConnectionMetricsGuard, send_error};
 use super::{
     ConnectionContext, DRAIN_TIMEOUT, HEARTBEAT_INTERVAL, TLS_HANDSHAKE_TIMEOUT, ip, tcp, udp,
 };
+use crate::admission::SourceAdmission;
 use crate::client_identity::ClientIdentity;
 
 pub(super) async fn serve(
@@ -27,6 +28,7 @@ pub(super) async fn serve(
     context: ConnectionContext,
     mut shutdown: watch::Receiver<bool>,
     _connection_slot: OwnedSemaphorePermit,
+    _source_admission: SourceAdmission,
 ) {
     let _connection_metrics = ConnectionMetricsGuard::new(Arc::clone(&context.metrics));
     let tls = match tokio::time::timeout(
@@ -157,8 +159,11 @@ pub(super) async fn serve(
                             context.clone(),
                             connection_index,
                             authenticated_identity.as_ref().map(Arc::clone),
-                            Arc::clone(&tunnel_slots),
-                            Arc::clone(&auth_slots),
+                            RequestAdmission {
+                                tunnel_slots: Arc::clone(&tunnel_slots),
+                                auth_slots: Arc::clone(&auth_slots),
+                                source_ip: peer.ip(),
+                            },
                         ));
                     }
                     Some(Ok((_request, mut respond))) => {
@@ -179,14 +184,19 @@ pub(super) async fn serve(
     debug!(%peer, "HTTP/2 connection closed");
 }
 
+struct RequestAdmission {
+    tunnel_slots: Arc<Semaphore>,
+    auth_slots: Arc<Semaphore>,
+    source_ip: std::net::IpAddr,
+}
+
 async fn handle_request(
     request: Request<h2::RecvStream>,
     mut respond: SendResponse<Bytes>,
     context: ConnectionContext,
     connection_index: u64,
     authenticated_identity: Option<Arc<ClientIdentity>>,
-    tunnel_slots: Arc<Semaphore>,
-    auth_slots: Arc<Semaphore>,
+    admission: RequestAdmission,
 ) {
     let stream_id = respond.stream_id().as_u32();
     let Some(recognized) = request_handling::recognize(&request, &context.config) else {
@@ -195,7 +205,14 @@ async fn handle_request(
     };
 
     if matches!(
-        auth::authorize_request(&request, &mut respond, &context, auth_slots).await,
+        auth::authorize_request(
+            &request,
+            &mut respond,
+            &context,
+            admission.auth_slots,
+            admission.source_ip,
+        )
+        .await,
         Authorization::ResponseSent
     ) {
         return;
@@ -212,7 +229,7 @@ async fn handle_request(
         }
     };
 
-    let tunnel_slot = match tunnel_slots.try_acquire_owned() {
+    let tunnel_slot = match admission.tunnel_slots.try_acquire_owned() {
         Ok(slot) => slot,
         Err(_) => {
             let _ = send_error(&mut respond, StatusCode::SERVICE_UNAVAILABLE);

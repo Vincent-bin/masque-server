@@ -13,7 +13,7 @@ groups:
             minutes. Check systemd state and the service journal.
 
       - alert: MasqueConnectionLimitReached
-        expr: increase(masque_connections_rejected_total{reason="limit"}[5m]) > 0
+        expr: increase(masque_connections_rejected_total[5m]) > 0
         for: 1m
         labels:
           severity: warning

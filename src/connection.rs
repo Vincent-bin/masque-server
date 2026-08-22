@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::admission::SourceAdmission;
 use crate::client_identity::ClientIdentity;
 use crate::fxhash::FxHashMap;
 use crate::metrics::ShardMetrics;
@@ -116,12 +117,19 @@ pub struct ClientConnection {
     /// The deadline this connection currently holds in the server's timer
     /// queue, used to tell a live wakeup from one a later deadline superseded.
     pub(crate) scheduled_deadline: Option<std::time::Instant>,
+    /// Releases this source's process-wide connection admission on drop.
+    _source_admission: SourceAdmission,
     metrics: Arc<ShardMetrics>,
     published_tunnels: [usize; 3],
 }
 
 impl ClientConnection {
-    pub(crate) fn new(quic: quiche::Connection, index: u64, metrics: Arc<ShardMetrics>) -> Self {
+    pub(crate) fn new(
+        quic: quiche::Connection,
+        index: u64,
+        metrics: Arc<ShardMetrics>,
+        source_admission: SourceAdmission,
+    ) -> Self {
         metrics.connection_opened();
         Self {
             quic,
@@ -135,9 +143,14 @@ impl ClientConnection {
             identity: None,
             deferred_send: DeferredSend::default(),
             scheduled_deadline: None,
+            _source_admission: source_admission,
             metrics,
             published_tunnels: [0; 3],
         }
+    }
+
+    pub(crate) fn source_ip(&self) -> std::net::IpAddr {
+        self._source_admission.source()
     }
 
     /// The next instant this connection needs the event loop's attention:

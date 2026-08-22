@@ -7,6 +7,29 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- The network benchmark can drive HTTP/2 and HTTP/3 with the same TCP origin,
+  UDP echo target, authentication, payload sizes, flow-control windows, direct
+  baselines, and machine-readable result fields. `MASQUE_BENCH_TRANSPORT=both`
+  runs the transports sequentially against TCP and UDP listeners sharing one
+  numeric address.
+- Adaptive QUIC Retry validates source addresses before allocating connection
+  state once a shard reaches its configured threshold; `always` and `off`
+  policies are available for hardened deployments and controlled comparisons.
+- HTTP/2 and HTTP/3 share process-wide per-source limits for live connections
+  and queued or running Basic credential checks. Prometheus distinguishes
+  source-limit rejections and QUIC Retry outcomes.
+- A scheduled Linux workflow runs CONNECT-IP Docker E2E, dual-transport smoke
+  tests with QUIC Retry forced on, and bounded fuzzing of public protocol
+  parsers without adding those expensive jobs to every commit.
+
+### Fixed
+
+- Cross-shard QUIC migration now looks up the server-issued destination CID
+  directly before considering an Initial-derived CID, so an established packet
+  that moves to another `SO_REUSEPORT` socket reaches its owner.
+
 ## 0.7.0 - 2026-08-21
 
 ### Added

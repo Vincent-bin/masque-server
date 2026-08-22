@@ -325,6 +325,27 @@ impl ListenerMetrics {
             self.sum(|shard| &shard.connections_rejected_limit)
         )
         .unwrap();
+        writeln!(
+            out,
+            "masque_connections_rejected_total{{{label},reason=\"source_limit\"}} {}",
+            self.sum(|shard| &shard.connections_rejected_source_limit)
+        )
+        .unwrap();
+        for (result, field) in [
+            (
+                "sent",
+                (|shard: &ShardMetrics| &shard.quic_retries_sent)
+                    as fn(&ShardMetrics) -> &AtomicU64,
+            ),
+            ("invalid", |shard| &shard.quic_retries_invalid),
+        ] {
+            writeln!(
+                out,
+                "masque_quic_retries_total{{{label},result=\"{result}\"}} {}",
+                self.sum(field)
+            )
+            .unwrap();
+        }
         for (name, field) in [
             (
                 "masque_quic_receive_batches_total",
@@ -434,6 +455,9 @@ pub(crate) struct ShardMetrics {
     connections_active: AtomicU64,
     connections_accepted: AtomicU64,
     connections_rejected_limit: AtomicU64,
+    connections_rejected_source_limit: AtomicU64,
+    quic_retries_sent: AtomicU64,
+    quic_retries_invalid: AtomicU64,
     quic_receive_batches: AtomicU64,
     quic_receive_packets: AtomicU64,
     quic_receive_bytes: AtomicU64,
@@ -466,6 +490,9 @@ impl ShardMetrics {
             connections_active: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected_limit: AtomicU64::new(0),
+            connections_rejected_source_limit: AtomicU64::new(0),
+            quic_retries_sent: AtomicU64::new(0),
+            quic_retries_invalid: AtomicU64::new(0),
             quic_receive_batches: AtomicU64::new(0),
             quic_receive_packets: AtomicU64::new(0),
             quic_receive_bytes: AtomicU64::new(0),
@@ -536,6 +563,25 @@ impl ShardMetrics {
             return;
         }
         self.connections_rejected_limit.fetch_add(1, RELAXED);
+    }
+
+    pub(crate) fn connection_rejected_source_limit(&self) {
+        if !self.enabled {
+            return;
+        }
+        self.connections_rejected_source_limit.fetch_add(1, RELAXED);
+    }
+
+    pub(crate) fn record_quic_retries_sent(&self, count: usize) {
+        if self.enabled && count > 0 {
+            self.quic_retries_sent.fetch_add(count as u64, RELAXED);
+        }
+    }
+
+    pub(crate) fn record_quic_retry_invalid(&self) {
+        if self.enabled {
+            self.quic_retries_invalid.fetch_add(1, RELAXED);
+        }
     }
 
     #[inline]
@@ -757,6 +803,11 @@ fn render_listener_headers(out: &mut String) {
             "counter",
         ),
         (
+            "masque_quic_retries_total",
+            "QUIC Retry packets sent and invalid Retry tokens received.",
+            "counter",
+        ),
+        (
             "masque_quic_receive_batches_total",
             "Kernel receive batches containing QUIC packets.",
             "counter",
@@ -864,6 +915,9 @@ mod tests {
         listener.connection_opened();
         listener.record_receive_batch(4, 4800);
         listener.record_send_batch(3, 3600);
+        listener.connection_rejected_source_limit();
+        listener.record_quic_retries_sent(2);
+        listener.record_quic_retry_invalid();
         listener.record_tcp_relay_batch(4, 256 * 1024);
         listener.update_tunnels([0, 0, 0], [1, 2, 1]);
         listener.record_auth_success();
@@ -890,6 +944,15 @@ mod tests {
         ));
         assert!(rendered.contains(
             "masque_tcp_relay_bytes_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 262144"
+        ));
+        assert!(rendered.contains(
+            "masque_connections_rejected_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",reason=\"source_limit\"} 1"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_retries_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",result=\"sent\"} 2"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_retries_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",result=\"invalid\"} 1"
         ));
         assert!(rendered.contains(
             "masque_tunnels_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",protocol=\"udp\"} 2"
@@ -947,6 +1010,9 @@ mod tests {
         shard.record_receive_batch(8, 9600);
         shard.record_send_batch(8, 9600);
         shard.record_tcp_relay_batch(4, 256 * 1024);
+        shard.connection_rejected_source_limit();
+        shard.record_quic_retries_sent(2);
+        shard.record_quic_retry_invalid();
         shard.update_tunnels([0; 3], [1; 3]);
         shard.record_heartbeat(123, Duration::from_millis(25));
         let _pending = shard.auth_pending_guard();
@@ -955,6 +1021,9 @@ mod tests {
         assert_eq!(shard.quic_receive_packets.load(RELAXED), 0);
         assert_eq!(shard.quic_send_packets.load(RELAXED), 0);
         assert_eq!(shard.tcp_relay_events.load(RELAXED), 0);
+        assert_eq!(shard.connections_rejected_source_limit.load(RELAXED), 0);
+        assert_eq!(shard.quic_retries_sent.load(RELAXED), 0);
+        assert_eq!(shard.quic_retries_invalid.load(RELAXED), 0);
         assert_eq!(shard.auth_pending.load(RELAXED), 0);
         assert_eq!(shard.last_heartbeat_millis.load(RELAXED), 123);
         assert_eq!(shard.event_loop_lag_micros.load(RELAXED), 0);

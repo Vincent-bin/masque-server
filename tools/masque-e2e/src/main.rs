@@ -17,11 +17,39 @@ use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use tracing::{error, info, warn};
 
+mod http2;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const BUF_SIZE: usize = 65535;
 const MAX_HTTP_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const CLIENT_UDP_RECEIVE_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchTransport {
+    Http3,
+    Http2,
+}
+
+impl BenchTransport {
+    fn from_env() -> Result<Self> {
+        match std::env::var("MASQUE_BENCH_TRANSPORT").as_deref() {
+            Ok("http2") => Ok(Self::Http2),
+            Ok("http3") | Err(std::env::VarError::NotPresent) => Ok(Self::Http3),
+            Ok(other) => bail!("MASQUE_BENCH_TRANSPORT must be http2 or http3, got {other:?}"),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("MASQUE_BENCH_TRANSPORT is not valid UTF-8")
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http3 => "http3",
+            Self::Http2 => "http2",
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tune_udp_receive_buffer(socket: &UdpSocket) {
@@ -1029,16 +1057,24 @@ fn run_direct_echo_throughput(
 // Server readiness check
 // ---------------------------------------------------------------------------
 
-fn wait_for_server(server_addr: &str) -> Result<()> {
+fn wait_for_server(server_addr: &str, transport: BenchTransport) -> Result<()> {
     let mut delay = Duration::from_millis(250);
 
     for attempt in 1..=20 {
-        info!(attempt, "checking server readiness…");
-        match Client::connect(server_addr).and_then(|mut c| {
-            c.handshake()?;
-            c.init_h3()?;
-            Ok(())
-        }) {
+        info!(
+            attempt,
+            transport = transport.as_str(),
+            "checking server readiness…"
+        );
+        let ready = match transport {
+            BenchTransport::Http3 => Client::connect(server_addr).and_then(|mut client| {
+                client.handshake()?;
+                client.init_h3()?;
+                Ok(())
+            }),
+            BenchTransport::Http2 => http2::wait_for_server(server_addr),
+        };
+        match ready {
             Ok(()) => {
                 info!("server ready");
                 return Ok(());
@@ -1050,7 +1086,7 @@ fn wait_for_server(server_addr: &str) -> Result<()> {
             }
         }
     }
-    bail!("server not ready after 20 attempts")
+    bail!("{} server not ready after 20 attempts", transport.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,10 +1094,21 @@ fn wait_for_server(server_addr: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn append_proxy_authorization(headers: &mut Vec<quiche::h3::Header>) -> Result<()> {
+    let Some(value) = proxy_authorization_value()? else {
+        return Ok(());
+    };
+    headers.push(quiche::h3::Header::new(
+        b"proxy-authorization",
+        value.as_bytes(),
+    ));
+    Ok(())
+}
+
+fn proxy_authorization_value() -> Result<Option<String>> {
     let username = std::env::var_os("MASQUE_USERNAME");
     let password = std::env::var_os("MASQUE_PASSWORD");
     let (username, password) = match (username, password) {
-        (None, None) => return Ok(()),
+        (None, None) => return Ok(None),
         (Some(username), Some(password)) => (username, password),
         _ => bail!("MASQUE_USERNAME and MASQUE_PASSWORD must be set together"),
     };
@@ -1081,11 +1128,7 @@ fn append_proxy_authorization(headers: &mut Vec<quiche::h3::Header>) -> Result<(
 
     let user_pass = format!("{username}:{password}");
     let value = format!("Basic {}", STANDARD.encode(user_pass));
-    headers.push(quiche::h3::Header::new(
-        b"proxy-authorization",
-        value.as_bytes(),
-    ));
-    Ok(())
+    Ok(Some(value))
 }
 
 fn connect_udp_headers_without_auth(
@@ -1368,7 +1411,7 @@ fn benchmark_standard_connect_download(server_addr: &str) -> Result<()> {
             let sample_mbps = mbps(sample_elapsed);
             direct_transfer_rates.push(transfer_mbps);
             println!(
-                "DIRECT_TCP_DOWNLOAD_RESULT sample={sample} body_bytes={body_bytes} \
+                "DIRECT_TCP_DOWNLOAD_RESULT transport=http3 sample={sample} body_bytes={body_bytes} \
 connect_ms={:.3} ttfb_ms={:.3} request_ms={:.3} transfer_ms={:.3} sample_ms={:.3} \
 request_mbps={:.3} transfer_mbps={:.3} sample_mbps={:.3} stream_finished={}",
                 connect_elapsed.as_secs_f64() * 1000.0,
@@ -1462,13 +1505,14 @@ request_mbps={:.3} transfer_mbps={:.3} sample_mbps={:.3} stream_finished={}",
             .unwrap_or((0.0, 0, 0, 0.0));
 
         println!(
-            "TCP_DOWNLOAD_RESULT sample={sample} body_bytes={body_bytes} quic_setup_ms={:.3} \
+            "TCP_DOWNLOAD_RESULT transport=http3 sample={sample} body_bytes={body_bytes} transport_setup_ms={:.3} quic_setup_ms={:.3} \
 connect_ms={:.3} ttfb_ms={:.3} request_ms={:.3} transfer_ms={:.3} sample_ms={:.3} \
 request_mbps={:.3} transfer_mbps={:.3} sample_mbps={:.3} rtt_ms={rtt_ms:.3} \
 client_cwnd={client_cwnd} pmtu={pmtu} \
 client_delivery_rate_mbps={client_delivery_rate_mbps:.3} recv_packets={} \
 recv_wire_bytes={} client_lost_packets={} client_lost_bytes={} \
 data_blocked_received={} stream_blocked_received={} stream_finished={}",
+            quic_setup.as_secs_f64() * 1000.0,
             quic_setup.as_secs_f64() * 1000.0,
             connect_elapsed.as_secs_f64() * 1000.0,
             ttfb.as_secs_f64() * 1000.0,
@@ -1496,13 +1540,13 @@ data_blocked_received={} stream_blocked_received={} stream_finished={}",
         .expect("at least one MASQUE TCP download sample was required");
     if let Some(direct_median) = median(&mut direct_transfer_rates) {
         println!(
-            "TCP_DOWNLOAD_SUMMARY samples={repeats} direct_transfer_mbps_median={direct_median:.3} \
+            "TCP_DOWNLOAD_SUMMARY transport=http3 samples={repeats} direct_transfer_mbps_median={direct_median:.3} \
 masque_transfer_mbps_median={masque_median:.3} direct_ratio_pct={:.2}",
             masque_median * 100.0 / direct_median,
         );
     } else {
         println!(
-            "TCP_DOWNLOAD_SUMMARY samples={repeats} masque_transfer_mbps_median={masque_median:.3}"
+            "TCP_DOWNLOAD_SUMMARY transport=http3 samples={repeats} masque_transfer_mbps_median={masque_median:.3}"
         );
     }
 
@@ -1831,40 +1875,97 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
 }
 
-fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
-    let duration_secs = std::env::var("MASQUE_BENCH_DURATION_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5);
-    let window = std::env::var("MASQUE_BENCH_WINDOW")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(256);
-    let latency_samples = std::env::var("MASQUE_BENCH_RTT_SAMPLES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(50);
-    let expiry_ms = std::env::var("MASQUE_BENCH_EXPIRY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1_000);
+#[derive(Debug, Clone, Copy)]
+struct UdpBenchConfig {
+    duration: Duration,
+    window: usize,
+    latency_samples: usize,
+    expiry: Duration,
+}
 
-    if duration_secs == 0 || window == 0 || latency_samples == 0 || expiry_ms == 0 {
-        bail!("benchmark duration, window, RTT samples, and expiry must be non-zero");
+impl UdpBenchConfig {
+    fn from_env() -> Result<Self> {
+        const MAX_DURATION_SECS: usize = 3_600;
+        const MAX_WINDOW: usize = 1_000;
+        const MAX_RTT_SAMPLES: usize = 10_000;
+        const MAX_EXPIRY_MS: usize = 60_000;
+
+        let duration_secs = env_usize("MASQUE_BENCH_DURATION_SECS", 5)?;
+        let window = env_usize("MASQUE_BENCH_WINDOW", 256)?;
+        let latency_samples = env_usize("MASQUE_BENCH_RTT_SAMPLES", 50)?;
+        let expiry_ms = env_usize("MASQUE_BENCH_EXPIRY_MS", 1_000)?;
+
+        if duration_secs == 0 || window == 0 || latency_samples == 0 || expiry_ms == 0 {
+            bail!("benchmark duration, window, RTT samples, and expiry must be non-zero");
+        }
+        if duration_secs > MAX_DURATION_SECS {
+            bail!("MASQUE_BENCH_DURATION_SECS must not exceed {MAX_DURATION_SECS}");
+        }
+        if window > MAX_WINDOW {
+            bail!("MASQUE_BENCH_WINDOW must not exceed {MAX_WINDOW}");
+        }
+        if latency_samples > MAX_RTT_SAMPLES {
+            bail!("MASQUE_BENCH_RTT_SAMPLES must not exceed {MAX_RTT_SAMPLES}");
+        }
+        if expiry_ms > MAX_EXPIRY_MS {
+            bail!("MASQUE_BENCH_EXPIRY_MS must not exceed {MAX_EXPIRY_MS}");
+        }
+
+        Ok(Self {
+            duration: Duration::from_secs(duration_secs as u64),
+            window,
+            latency_samples,
+            expiry: Duration::from_millis(expiry_ms as u64),
+        })
     }
+}
 
-    let expiry = Duration::from_millis(expiry_ms);
+fn print_udp_result(
+    transport: &str,
+    path: &str,
+    payload_size: usize,
+    duration: Duration,
+    sent: u64,
+    received: u64,
+    expired: u64,
+) {
+    let seconds = duration.as_secs_f64();
+    let tx_pps = sent as f64 / seconds;
+    let rx_pps = received as f64 / seconds;
+    let goodput_gbps = received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
+    let response_shortfall_pct = sent.saturating_sub(received) as f64 * 100.0 / sent.max(1) as f64;
+    let relay_gbps = if path == "masque" {
+        Some(goodput_gbps * 2.0)
+    } else {
+        None
+    };
+
+    if let Some(relay_gbps) = relay_gbps {
+        println!(
+            "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, bidirectional relay {relay_gbps:.3} Gbit/s, interval shortfall {response_shortfall_pct:.2}% ({expired} expired)"
+        );
+    } else {
+        println!(
+            "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, interval shortfall {response_shortfall_pct:.2}% ({expired} expired)"
+        );
+    }
     println!(
-        "CONNECT-UDP benchmark: {duration_secs}s per payload, window {window}, expiry {expiry_ms}ms"
+        "UDP_RESULT transport={transport} path={path} payload_bytes={payload_size} duration_secs={seconds:.3} windowed_tx_packets={sent} rx_packets={received} tx_pps={tx_pps:.3} rx_pps={rx_pps:.3} app_goodput_gbps={goodput_gbps:.6} response_shortfall_pct={response_shortfall_pct:.6} expired_packets={expired}"
     );
+}
 
+fn benchmark_direct_udp(
+    echo_addr: &str,
+    config: UdpBenchConfig,
+    transport: BenchTransport,
+) -> Result<()> {
     println!("Direct UDP echo baseline:");
     let direct_socket = connect_echo_socket(echo_addr)?;
     direct_socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let latency_payload = vec![0x3c; 64];
     let mut response = [0u8; BUF_SIZE];
-    let mut direct_latencies = Vec::with_capacity(latency_samples);
-    for _ in 0..latency_samples {
+    let mut direct_latencies = Vec::with_capacity(config.latency_samples);
+    for _ in 0..config.latency_samples {
         let started = Instant::now();
         direct_socket.send(&latency_payload)?;
         let len = direct_socket.recv(&mut response)?;
@@ -1874,33 +1975,45 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         direct_latencies.push(started.elapsed().as_secs_f64() * 1e6);
     }
     direct_latencies.sort_by(f64::total_cmp);
-    let percentile = |values: &[f64], p: f64| values[((values.len() - 1) as f64 * p) as usize];
+    let percentile = |p: f64| percentile_nearest_rank(&direct_latencies, p).unwrap();
     println!(
-        "  RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
-        percentile(&direct_latencies, 0.50),
-        percentile(&direct_latencies, 0.95),
-        percentile(&direct_latencies, 0.99),
+        "  RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
+        config.latency_samples,
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
     );
 
-    let duration = Duration::from_secs(duration_secs);
     for payload_size in [64, 1_200] {
-        let (sent, received, expired) =
-            run_direct_echo_throughput(echo_addr, payload_size, duration, window, expiry)?;
-        let seconds = duration.as_secs_f64();
-        let tx_pps = sent as f64 / seconds;
-        let rx_pps = received as f64 / seconds;
-        let goodput_gbps = received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
-        let response_shortfall = (sent - received) as f64 * 100.0 / sent.max(1) as f64;
-        println!(
-            "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
+        let (sent, received, expired) = run_direct_echo_throughput(
+            echo_addr,
+            payload_size,
+            config.duration,
+            config.window,
+            config.expiry,
+        )?;
+        print_udp_result(
+            transport.as_str(),
+            "direct",
+            payload_size,
+            config.duration,
+            sent,
+            received,
+            expired,
         );
     }
+    Ok(())
+}
 
-    println!("MASQUE CONNECT-UDP:");
+fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfig) -> Result<()> {
+    println!("MASQUE CONNECT-UDP (transport=http3):");
+    let setup_started = Instant::now();
     let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
+    let setup = setup_started.elapsed();
 
-    let mut latencies = Vec::with_capacity(latency_samples);
-    for _ in 0..latency_samples {
+    let latency_payload = vec![0x3c; 64];
+    let mut latencies = Vec::with_capacity(config.latency_samples);
+    for _ in 0..config.latency_samples {
         let started = Instant::now();
         client.send_dgram(stream_id, &latency_payload)?;
         let response = client.recv_dgram(Duration::from_secs(2))?;
@@ -1910,34 +2023,58 @@ fn benchmark_connect_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
         latencies.push(started.elapsed().as_secs_f64() * 1e6);
     }
     latencies.sort_by(f64::total_cmp);
+    let percentile = |p: f64| percentile_nearest_rank(&latencies, p).unwrap();
     println!(
-        "  RTT 64B ({latency_samples} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
-        percentile(&latencies, 0.50),
-        percentile(&latencies, 0.95),
-        percentile(&latencies, 0.99),
+        "  setup {:.3} ms; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
+        setup.as_secs_f64() * 1e3,
+        config.latency_samples,
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
     );
 
     drop(client);
 
     for payload_size in [64, 1_200] {
         let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
-        let (sent, received, expired) =
-            client.run_echo_throughput(stream_id, payload_size, duration, window, expiry)?;
-        let seconds = duration.as_secs_f64();
-        let tx_pps = sent as f64 / seconds;
-        let rx_pps = received as f64 / seconds;
-        let goodput_gbps = received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
-        let relay_gbps = goodput_gbps * 2.0;
-        let response_shortfall = if sent == 0 {
-            0.0
-        } else {
-            (sent - received) as f64 * 100.0 / sent as f64
-        };
-        println!(
-            "  Throughput {payload_size:>4}B: tx {tx_pps:>10.0} pkt/s, echo {rx_pps:>10.0} pkt/s, app goodput {goodput_gbps:.3} Gbit/s, bidirectional relay {relay_gbps:.3} Gbit/s, interval shortfall {response_shortfall:.2}% ({expired} expired)"
+        let (sent, received, expired) = client.run_echo_throughput(
+            stream_id,
+            payload_size,
+            config.duration,
+            config.window,
+            config.expiry,
+        )?;
+        print_udp_result(
+            "http3",
+            "masque",
+            payload_size,
+            config.duration,
+            sent,
+            received,
+            expired,
         );
     }
     Ok(())
+}
+
+fn benchmark_connect_udp(
+    server_addr: &str,
+    echo_addr: &str,
+    transport: BenchTransport,
+) -> Result<()> {
+    let config = UdpBenchConfig::from_env()?;
+    println!(
+        "CONNECT-UDP benchmark: transport={}, {:.0}s per payload, window {}, expiry {:.0}ms",
+        transport.as_str(),
+        config.duration.as_secs_f64(),
+        config.window,
+        config.expiry.as_secs_f64() * 1e3,
+    );
+    benchmark_direct_udp(echo_addr, config, transport)?;
+    match transport {
+        BenchTransport::Http3 => benchmark_http3_udp(server_addr, echo_addr, config),
+        BenchTransport::Http2 => http2::benchmark_udp(server_addr, echo_addr, config),
+    }
 }
 
 fn test_connect_udp_policy_deny(server_addr: &str, _echo_addr: &str) -> Result<()> {
@@ -2224,16 +2361,27 @@ fn main() {
     let server_addr =
         std::env::var("MASQUE_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4433".into());
     let echo_addr = std::env::var("ECHO_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:9999".into());
+    let transport = match BenchTransport::from_env() {
+        Ok(transport) => transport,
+        Err(error) => {
+            error!(%error, "invalid benchmark transport");
+            std::process::exit(2);
+        }
+    };
 
-    info!(%server_addr, %echo_addr, "MASQUE E2E test suite");
+    info!(%server_addr, %echo_addr, transport = transport.as_str(), "MASQUE E2E test suite");
 
-    if let Err(e) = wait_for_server(&server_addr) {
+    if let Err(e) = wait_for_server(&server_addr, transport) {
         error!(%e, "server not ready");
         std::process::exit(1);
     }
 
     if std::env::var_os("MASQUE_AUTH_CHECK").is_some() {
-        if let Err(e) = test_proxy_auth_required(&server_addr, &echo_addr) {
+        let result = match transport {
+            BenchTransport::Http3 => test_proxy_auth_required(&server_addr, &echo_addr),
+            BenchTransport::Http2 => http2::test_auth_required(&server_addr, &echo_addr),
+        };
+        if let Err(e) = result {
             error!(%e, "proxy authentication check failed");
             std::process::exit(1);
         }
@@ -2241,7 +2389,11 @@ fn main() {
     }
 
     if std::env::var_os("MASQUE_TCP_DOWNLOAD").is_some() {
-        if let Err(e) = benchmark_standard_connect_download(&server_addr) {
+        let result = match transport {
+            BenchTransport::Http3 => benchmark_standard_connect_download(&server_addr),
+            BenchTransport::Http2 => http2::benchmark_tcp_download(&server_addr),
+        };
+        if let Err(e) = result {
             error!(%e, "standard CONNECT download benchmark failed");
             std::process::exit(1);
         }
@@ -2249,6 +2401,14 @@ fn main() {
     }
 
     if std::env::var_os("MASQUE_TCP_CHECK").is_some() {
+        if transport == BenchTransport::Http2 {
+            if let Err(error) = http2::test_tcp(&server_addr, &echo_addr) {
+                error!(%error, "HTTP/2 standard CONNECT check failed");
+                std::process::exit(1);
+            }
+            info!("MASQUE HTTP/2 TCP compatibility checks passed");
+            return;
+        }
         for (name, test) in [
             (
                 "server_capabilities",
@@ -2276,7 +2436,24 @@ fn main() {
         return;
     }
 
+    if std::env::var_os("MASQUE_UDP_CHECK").is_some() {
+        let result = match transport {
+            BenchTransport::Http3 => test_connect_udp_happy_path(&server_addr, &echo_addr),
+            BenchTransport::Http2 => http2::test_udp(&server_addr, &echo_addr),
+        };
+        if let Err(error) = result {
+            error!(%error, "CONNECT-UDP check failed");
+            std::process::exit(1);
+        }
+        info!(transport = transport.as_str(), "CONNECT-UDP check passed");
+        return;
+    }
+
     if std::env::var_os("MASQUE_LOAD").is_some() {
+        if transport == BenchTransport::Http2 {
+            error!("HTTP/2 multi-connection load mode is not implemented; use tcp or udp mode");
+            std::process::exit(2);
+        }
         if let Err(e) = load_test(&server_addr, &echo_addr) {
             error!(%e, "load test failed");
             std::process::exit(1);
@@ -2285,10 +2462,27 @@ fn main() {
     }
 
     if std::env::var_os("MASQUE_BENCH").is_some() {
-        if let Err(e) = benchmark_connect_udp(&server_addr, &echo_addr) {
+        if let Err(e) = benchmark_connect_udp(&server_addr, &echo_addr, transport) {
             error!(%e, "network benchmark failed");
             std::process::exit(1);
         }
+        return;
+    }
+
+    if transport == BenchTransport::Http2 {
+        for (name, result) in [
+            (
+                "standard_connect",
+                http2::test_tcp(&server_addr, &echo_addr),
+            ),
+            ("connect_udp", http2::test_udp(&server_addr, &echo_addr)),
+        ] {
+            if let Err(error) = result {
+                error!(%error, "{name} failed");
+                std::process::exit(1);
+            }
+        }
+        info!("HTTP/2 E2E checks passed");
         return;
     }
 

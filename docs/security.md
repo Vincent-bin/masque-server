@@ -26,7 +26,8 @@ prechecks.
 
 Argon2 work runs outside shard event loops. Running plus queued verifications
 are globally bounded, concurrent hashes are permit-limited, and each
-connection has a pending-request cap. Closing a stream or connection cancels
+connection has a pending-request cap. A per-source fair-share cap prevents one
+address from filling the global queue. Closing a stream or connection cancels
 work that has not started and discards results for work already running.
 
 Use a unique, high-entropy password. Basic credentials are protected by QUIC
@@ -67,6 +68,14 @@ buffer limits prevent application-level unbounded growth. These bounds do not
 replace host controls. Apply reasonable systemd limits, provider firewall rate
 limits, and monitoring for memory, CPU, file descriptors, authentication
 failures, connections, and datagram drops.
+
+HTTP/2 and HTTP/3 share a process-wide live-connection cap per canonical source
+IP. HTTP/3 additionally uses authenticated QUIC Retry tokens adaptively: once a
+shard reaches the configured threshold, a new source must prove it can receive
+at its claimed address before the server allocates connection state. The token
+binds the source IP and listener but not the source port, so normal NAT remaps
+do not break it. Use `retry_mode = "always"` where spoofed floods are a primary
+risk; it costs one extra handshake round trip.
 
 The optional operational endpoint has no authentication and therefore accepts
 only loopback addresses. It must stay host-local: use a local collector or a

@@ -1,3 +1,6 @@
 /target
 /dist
 certs/
+/fuzz/artifacts
+/fuzz/corpus
+/fuzz/target

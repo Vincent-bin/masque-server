@@ -29,7 +29,8 @@ use quiche::h3::NameValue as _;
 use masque::capsule::decoder::{CapsuleDecoder, DecodeError};
 use masque::capsule::{CapsuleFrame, IpAddress};
 use masque::config::{
-    AuthMode, AuthSection, ClientEntry, ListenerSection, ListenerTransport, ServerConfig,
+    AuthMode, AuthSection, ClientEntry, ListenerSection, ListenerTransport, QuicRetryMode,
+    ServerConfig,
 };
 use masque::datagram::DatagramHeader;
 use masque::server::Server;
@@ -461,7 +462,7 @@ struct Fixture {
 
 /// Start a server that knows one client, pinned to fixed addresses, and mint a
 /// second unregistered key pair to test rejection with.
-fn fixture(tag: &str) -> Fixture {
+fn fixture_with_retry(tag: &str, retry_mode: QuicRetryMode) -> Fixture {
     let dir = TempDir::new(tag);
 
     let server_key = p256_key();
@@ -488,7 +489,7 @@ fn fixture(tag: &str) -> Fixture {
         &self_signed(&stranger_key, None),
     );
 
-    let peer = spawn_server(server_config(
+    let mut config = server_config(
         cert_path,
         key_path,
         ephemeral_addr(),
@@ -498,7 +499,9 @@ fn fixture(tag: &str) -> Fixture {
             ipv4: Some(CLIENT_IPV4.into()),
             ipv6: Some(CLIENT_IPV6.into()),
         }],
-    ))[0];
+    );
+    config.quic.retry_mode = retry_mode;
+    let peer = spawn_server(config)[0];
 
     Fixture {
         _dir: dir,
@@ -508,6 +511,10 @@ fn fixture(tag: &str) -> Fixture {
         stranger_cert,
         stranger_key: stranger_key_path,
     }
+}
+
+fn fixture(tag: &str) -> Fixture {
+    fixture_with_retry(tag, QuicRetryMode::Adaptive)
 }
 
 // ── Multi-listener fixture ───────────────────────────────────────────
@@ -906,6 +913,23 @@ fn a_broken_reload_keeps_the_previous_roster() {
 /// The whole point of the exercise: a client that authenticates with a
 /// certificate and asks for `cf-connect-ip` gets a working tunnel, assigned the
 /// addresses its roster entry pins it to.
+#[test]
+fn quic_retry_always_completes_a_real_handshake() {
+    let fixture = fixture_with_retry("retry", QuicRetryMode::Always);
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let stream_id = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+}
+
 #[test]
 fn registered_client_gets_its_pinned_addresses_over_cf_connect_ip() {
     let fixture = fixture("happy");

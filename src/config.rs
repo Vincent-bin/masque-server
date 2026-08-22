@@ -47,6 +47,12 @@ pub struct ServerConfig {
 pub struct ServerSection {
     pub idle_timeout_secs: u64,
     pub max_connections: usize,
+    /// Process-wide cap for live HTTP/2 and HTTP/3 connections admitted from
+    /// one canonical source IP address.
+    pub max_connections_per_ip: usize,
+    /// Basic-auth requests from one source that may be running or waiting for
+    /// Argon2 verification across every listener and transport.
+    pub max_pending_auth_per_ip: usize,
     pub max_tunnels_per_connection: usize,
 }
 
@@ -82,6 +88,22 @@ pub enum ListenerTransport {
     #[default]
     Http3,
     Http2,
+}
+
+/// When an HTTP/3 listener validates a client's address before allocating
+/// connection state.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuicRetryMode {
+    /// Accept tokenless Initial packets until the configured live-state
+    /// threshold is reached, then require a valid Retry token.
+    #[default]
+    Adaptive,
+    /// Always allocate immediately. Useful only on a trusted network or for a
+    /// controlled latency comparison.
+    Off,
+    /// Require address validation for every new HTTP/3 connection.
+    Always,
 }
 
 impl ListenerTransport {
@@ -235,6 +257,13 @@ pub struct QuicSection {
     /// value is also raised above the path MTU the server would otherwise
     /// assume (for example to 1500 on a network known to carry it).
     pub discover_pmtu: bool,
+    /// Stateless address-validation policy for new HTTP/3 connections.
+    pub retry_mode: QuicRetryMode,
+    /// In adaptive mode, tokenless Initial packets stop allocating state when
+    /// this many connections are already live on the receiving shard.
+    pub retry_connection_threshold: usize,
+    /// Lifetime of an authenticated Retry token.
+    pub retry_token_ttl_secs: u64,
 }
 
 /// HTTP/2 flow-control and resource limits.
@@ -351,6 +380,8 @@ impl Default for ServerSection {
             // race its own keepalive to the timeout.
             idle_timeout_secs: 60,
             max_connections: 10_000,
+            max_connections_per_ip: 64,
+            max_pending_auth_per_ip: 8,
             max_tunnels_per_connection: 100,
         }
     }
@@ -408,6 +439,9 @@ impl Default for QuicSection {
             dgram_recv_queue_len: 2048,
             dgram_send_queue_len: 2048,
             discover_pmtu: false,
+            retry_mode: QuicRetryMode::Adaptive,
+            retry_connection_threshold: 64,
+            retry_token_ttl_secs: 30,
         }
     }
 }
@@ -549,6 +583,8 @@ idle_timeout_secs = 75
         assert_eq!(cfg.server.idle_timeout_secs, 75);
         // Other fields keep defaults
         assert_eq!(cfg.server.max_connections, 10_000);
+        assert_eq!(cfg.server.max_connections_per_ip, 64);
+        assert_eq!(cfg.server.max_pending_auth_per_ip, 8);
     }
 
     #[test]
@@ -562,6 +598,21 @@ key_path = "/etc/masque/key.pem"
         );
         assert_eq!(cfg.tls.cert_path, PathBuf::from("/etc/masque/cert.pem"));
         assert_eq!(cfg.tls.key_path, PathBuf::from("/etc/masque/key.pem"));
+    }
+
+    #[test]
+    fn parse_quic_retry_policy() {
+        let cfg = parse_with_listener(
+            r#"
+[quic]
+retry_mode = "always"
+retry_connection_threshold = 128
+retry_token_ttl_secs = 15
+"#,
+        );
+        assert_eq!(cfg.quic.retry_mode, QuicRetryMode::Always);
+        assert_eq!(cfg.quic.retry_connection_threshold, 128);
+        assert_eq!(cfg.quic.retry_token_ttl_secs, 15);
     }
 
     #[test]
@@ -865,6 +916,8 @@ ipv6_pool = "fd01::/64"
 [server]
 idle_timeout_secs = 60
 max_connections = 10000
+max_connections_per_ip = 64
+max_pending_auth_per_ip = 8
 max_tunnels_per_connection = 100
 
 [tls]
@@ -884,6 +937,9 @@ max_stream_window = 16777216
 dgram_recv_queue_len = 2048
 dgram_send_queue_len = 2048
 discover_pmtu = false
+retry_mode = "adaptive"
+retry_connection_threshold = 64
+retry_token_ttl_secs = 30
 
 [tcp_proxy]
 enabled = true
