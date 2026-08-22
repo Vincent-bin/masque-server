@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.8.0 - 2026-08-22
+
 ### Added
 
 - The network benchmark can drive HTTP/2 and HTTP/3 with the same TCP origin,
