@@ -42,6 +42,8 @@ HAD_GRAFANA_DASHBOARD=0
 WAS_SERVICE_ACTIVE=0
 WAS_SERVICE_ENABLED=0
 SERVICE_RESULT="enabled, not started"
+RUN_HOST_DIAGNOSTICS=1
+HOST_DIAGNOSTICS_RESULT="not run"
 
 cleanup() {
     cleanup_status=$?
@@ -156,6 +158,36 @@ parse_start_requested() {
             ;;
         *)
             die "MASQUE_START_SERVICE must be 0 or 1"
+            ;;
+    esac
+}
+
+parse_host_diagnostics_requested() {
+    requested=${MASQUE_RUN_HOST_DIAGNOSTICS:-}
+    if [ -z "$requested" ]; then
+        if can_prompt; then
+            {
+                echo
+                echo "CONNECT-IP host egress needs Linux forwarding, firewall routing,"
+                echo "and sometimes NAT. This installer never changes those settings."
+            } >/dev/tty
+            requested=$(prompt_value \
+                "Run read-only CONNECT-IP host diagnostics after installation? (yes/no)" yes)
+        else
+            requested=yes
+        fi
+    fi
+
+    case "$requested" in
+        1|true|yes)
+            RUN_HOST_DIAGNOSTICS=1
+            ;;
+        0|false|no)
+            RUN_HOST_DIAGNOSTICS=0
+            HOST_DIAGNOSTICS_RESULT="not requested"
+            ;;
+        *)
+            die "MASQUE_RUN_HOST_DIAGNOSTICS must be 0 or 1"
             ;;
     esac
 }
@@ -610,8 +642,29 @@ install_program_and_unit() {
     UPGRADE_BACKUP_DIR=
 }
 
+run_host_diagnostics() {
+    if [ "$RUN_HOST_DIAGNOSTICS" -eq 0 ]; then
+        return
+    fi
+    if [ ! -r "$TLS_CERT_PATH" ] || [ ! -r "$TLS_KEY_PATH" ]; then
+        HOST_DIAGNOSTICS_RESULT="deferred until TLS material is installed"
+        return
+    fi
+
+    echo
+    echo "Checking CONNECT-IP host prerequisites (read-only) ..."
+    if "$BIN_PATH" --config "$CONFIG_PATH" doctor; then
+        HOST_DIAGNOSTICS_RESULT="passed"
+    else
+        HOST_DIAGNOSTICS_RESULT="attention required; run masque-server --config $CONFIG_PATH doctor"
+        echo "warning: CONNECT-IP host diagnostics found missing or unverified prerequisites." >&2
+        echo "warning: installation continues; no forwarding, firewall, routing, or NAT setting was changed." >&2
+    fi
+}
+
 [ -x "$CANDIDATE_BIN" ] || die "release package is missing executable $CANDIDATE_BIN"
 parse_start_requested
+parse_host_diagnostics_requested
 
 if [ -e "$CONFIG_PATH" ]; then
     check_config_compatibility "$CONFIG_PATH"
@@ -655,6 +708,7 @@ if [ "$FRESH_CONFIG" -eq 1 ]; then
 fi
 
 install_program_and_unit
+run_host_diagnostics
 
 echo
 echo "MASQUE installation result"
@@ -663,6 +717,7 @@ echo "  Binary:         $BIN_PATH"
 echo "  Configuration:  $CONFIG_PATH"
 echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
+echo "  Host diagnostics: $HOST_DIAGNOSTICS_RESULT"
 echo "  Logs:           journalctl -u masque -f"
 echo "  Prometheus rules (optional): $PROMETHEUS_RULES_PATH"
 echo "  Grafana JSON (optional):     $GRAFANA_DASHBOARD_PATH"

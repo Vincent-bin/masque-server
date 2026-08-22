@@ -1,9 +1,9 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
@@ -11,6 +11,7 @@ use masque::auth;
 use masque::config::{self, ServerConfig};
 use masque::config_edit;
 use masque::enroll;
+use masque::host;
 use masque::server::{Server, validate_config};
 
 /// MASQUE proxy server (CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/2 or
@@ -56,6 +57,11 @@ enum Command {
     HashPassword,
     /// Validate the configuration without binding sockets or creating a TUN.
     CheckConfig,
+    /// Validate the configuration and inspect CONNECT-IP host prerequisites.
+    ///
+    /// This is read-only. It checks Linux forwarding switches and looks for
+    /// TUN, route, firewall, and NAT evidence without changing any of them.
+    Doctor,
     /// Generate a client key pair for a listener using client-certificate auth.
     ///
     /// Prints the `[[clients]]` block to add to the server config, and the JSON
@@ -342,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
     let config_exists = cli.config.exists();
     if matches!(
         cli.command,
-        Some(Command::CheckConfig | Command::AddListener { .. })
+        Some(Command::CheckConfig | Command::Doctor | Command::AddListener { .. })
     ) && !config_exists
     {
         anyhow::bail!("configuration file not found: {}", cli.config.display());
@@ -453,6 +459,53 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if matches!(cli.command, Some(Command::Doctor)) {
+        validate_config(&cfg)?;
+        println!(
+            "configuration is compatible with masque-server {}: {}",
+            env!("CARGO_PKG_VERSION"),
+            cli.config.display()
+        );
+        println!("CONNECT-IP host diagnostics (read-only):");
+        let report = host::diagnose_connect_ip(&cfg.ip_proxy);
+        for check in report.checks() {
+            println!("[{}] {}: {}", check.level.label(), check.name, check.detail);
+        }
+        println!(
+            "diagnostic result: {} error(s), {} warning(s); no system settings were changed",
+            report.error_count(),
+            report.warning_count()
+        );
+        std::io::stdout().flush()?;
+        if report.has_errors() {
+            anyhow::bail!("CONNECT-IP host prerequisites are not ready");
+        }
+        return Ok(());
+    }
+
+    if cfg.ip_proxy.enabled {
+        let report = host::diagnose_connect_ip_startup(&cfg.ip_proxy);
+        for check in report.checks().iter().filter(|check| {
+            matches!(
+                check.level,
+                host::DiagnosticLevel::Warning | host::DiagnosticLevel::Error
+            )
+        }) {
+            warn!(
+                check = check.name,
+                detail = %check.detail,
+                diagnostic_level = check.level.label(),
+                "CONNECT-IP host diagnostic"
+            );
+        }
+        info!(
+            tun = %cfg.ip_proxy.tun_name,
+            ipv4_pool = %cfg.ip_proxy.ipv4_pool,
+            ipv6_pool = %cfg.ip_proxy.ipv6_pool,
+            "CONNECT-IP host routing, firewall, and optional NAT remain operator-managed; run `masque-server doctor` to inspect them"
+        );
+    }
+
     info!(?cfg, "configuration loaded");
 
     // Pass the path so SIGHUP can re-read the [[clients]] roster. Only a
@@ -488,5 +541,10 @@ mod tests {
     #[test]
     fn check_config_subcommand_is_available() {
         assert!(Cli::command().find_subcommand("check-config").is_some());
+    }
+
+    #[test]
+    fn doctor_subcommand_is_available() {
+        assert!(Cli::command().find_subcommand("doctor").is_some());
     }
 }

@@ -159,6 +159,41 @@ fn check_config_validates_without_binding_the_listen_port() {
 }
 
 #[test]
+fn doctor_is_read_only_and_succeeds_when_connect_ip_is_disabled() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let config_path = dir.path().join("masque.toml");
+    std::fs::write(
+        &config_path,
+        config_text(
+            occupied.local_addr().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("CONNECT-IP host diagnostics (read-only)"));
+    assert!(stdout.contains("ip_proxy.enabled = false"));
+    assert!(stdout.contains("no system settings were changed"));
+}
+
+#[test]
 fn json_log_format_emits_machine_parseable_events() {
     let dir = TempDir::new();
     let (cert_path, key_path) = write_server_identity(dir.path());

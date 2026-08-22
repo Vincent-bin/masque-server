@@ -7,6 +7,14 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- `masque-server doctor` validates the configuration and performs read-only
+  CONNECT-IP host checks for Linux TUN, IPv4/IPv6 forwarding, pool routes,
+  firewall forwarding, and optional NAT evidence. Startup reads only hard TUN
+  and forwarding prerequisites and points to the full command, while the
+  installer offers that command without changing any host networking state.
+
 ## 0.8.0 - 2026-08-22
 
 ### Added

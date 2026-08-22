@@ -159,6 +159,13 @@ the deployment does not need.
 Keep host forwarding and NAT rules narrow to the configured TUN interface and
 address pools. The proxy does not manage the host firewall.
 
+`masque-server doctor` only reads sysctls, interface and route state, and
+available firewall rules. The daemon's smaller startup check reads only
+`/dev/net/tun` and forwarding sysctls; it does not execute firewall utilities.
+Neither check enables forwarding or writes routing, firewall, or NAT
+configuration. Treat a missing-rule result as evidence to investigate rather
+than permission to install a broad ACCEPT or MASQUERADE rule automatically.
+
 ## Unsafe and syscall code
 
 Linux batching constructs `mmsghdr`, `iovec`, socket-address, and control

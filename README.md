@@ -29,6 +29,8 @@ a staging environment.
 - Optional loopback health/readiness endpoints and low-overhead Prometheus
   metrics, with packaged static alert rules and a Grafana dashboard JSON
 - Optional JSON logs plus native systemd readiness and shard-liveness watchdog
+- Read-only `doctor` checks for CONNECT-IP TUN, forwarding, route, firewall,
+  and NAT prerequisites without modifying the host
 - Static Linux x86_64 release archives with a systemd installer
 
 ## Quick start
@@ -93,6 +95,18 @@ for provisioning scripts. See
 bound at startup, so open UDP for HTTP/3 or TCP for HTTP/2, restart the service,
 and confirm it came up.
 
+CONNECT-IP is independent of the authentication mode: it needs Linux host
+forwarding because it carries complete IP packets through `masque0`, while
+CONNECT and CONNECT-UDP use ordinary userspace sockets. Inspect the host before
+qualifying a CONNECT-IP client:
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml doctor
+```
+
+The command and the server's startup check are read-only. They never change
+routing, firewall, sysctl, or NAT state.
+
 ## One-command Linux install
 
 On Linux x86_64, download, verify, and install the latest stable release with:
@@ -109,7 +123,8 @@ prints the matching usque and mihomo configuration. Dual mode does both, writing
 a two-listener configuration that serves credentials on one port and
 certificates on another. At the end a fresh installation prints the installed
 version, service state, and effective server configuration with the password
-hash redacted.
+hash redacted. It also offers to run the read-only CONNECT-IP host diagnostic;
+the installer never configures forwarding, firewall rules, routes, or NAT.
 
 The same command is also the upgrade command. When
 `/etc/masque/masque.toml` already exists, the candidate binary checks that

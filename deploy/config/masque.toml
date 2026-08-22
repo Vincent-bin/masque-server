@@ -159,6 +159,10 @@ deny_targets = [
 
 [ip_proxy]
 enabled = true
+# The process creates the TUN and relays packets to it, but never changes host
+# forwarding, routes, firewall rules, or NAT. After startup, inspect those
+# operator-managed prerequisites with:
+#   masque-server --config /etc/masque/masque.toml doctor
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
 # Accepted `:protocol` values. RFC 9484 registers "connect-ip"; Cloudflare's
 # endpoint uses "cf-connect-ip" and clients built against it send only that.

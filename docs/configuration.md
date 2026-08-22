@@ -15,6 +15,7 @@ file is the canonical deployable example and is tested by the release flow.
 masque-server [OPTIONS]
 masque-server hash-password
 masque-server --config <PATH> check-config
+masque-server --config <PATH> doctor
 masque-server --config <PATH> add-listener [OPTIONS]
 masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 
@@ -31,6 +32,14 @@ and QUIC settings, client roster, and address pools without binding a listener
 socket or creating a TUN device. It is suitable for upgrade preflight, but
 cannot detect runtime conditions such as an occupied port or unavailable
 kernel device.
+
+`doctor` first performs the same configuration validation, then inspects the
+current CONNECT-IP host environment. Missing Linux TUN or disabled forwarding
+is an error. Interface, pool-route, firewall ACCEPT, and SNAT/MASQUERADE checks
+are advisory because the service may be stopped and routing may live in
+nftables, a network namespace, or an upstream gateway. The command prints what
+it could not prove and exits nonzero only for hard prerequisites. It is
+read-only and never configures the host.
 
 `add-listener` appends a `[[listeners]]` block to the configuration file, and is
 described under [Adding a listener](#adding-a-listener).
@@ -649,7 +658,19 @@ CONNECT-IP is Linux-only. Pools must not overlap host, container, VPN, or
 upstream networks. The host is responsible for routing, forwarding, firewall,
 and optional NAT outside the process. Disable the entire section when full IP
 proxying is unnecessary; this also lets you remove `CAP_NET_ADMIN` from the
-service.
+service. This requirement follows the CONNECT-IP protocol, not the listener's
+authentication mode: client certificates alone do not require forwarding.
+
+After starting the service, run:
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml doctor
+```
+
+Startup reads only the hard `/dev/net/tun` and forwarding prerequisites and
+reminds the operator to run `doctor`; it deliberately does not execute firewall
+utilities from the capability-bearing daemon. A failed startup check is logged
+without taking CONNECT and CONNECT-UDP down with optional CONNECT-IP egress.
 
 ## Validation and upgrades
 

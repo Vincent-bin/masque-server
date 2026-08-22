@@ -10,6 +10,7 @@ pub mod datagram;
 pub mod enroll;
 pub mod error;
 pub mod fxhash;
+pub mod host;
 pub mod ip_packet;
 mod metrics;
 mod net;

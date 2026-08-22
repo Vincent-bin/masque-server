@@ -4,6 +4,11 @@
 # hide exactly the replacement/rollback mistakes the test is meant to catch.
 set -eu
 
+# Host inspection has dedicated Rust coverage. Keeping it off here makes this
+# destructive installer test independent of a GitHub runner's TUN/firewall.
+MASQUE_RUN_HOST_DIAGNOSTICS=0
+export MASQUE_RUN_HOST_DIAGNOSTICS
+
 die() {
     echo "installer upgrade test: $*" >&2
     exit 1
@@ -180,6 +185,8 @@ grep -q 'Effective server configuration (password hash redacted)' "$TEST_TMP/dua
     die "fresh installation did not print its generated configuration"
 grep -Eq 'password_hash[[:space:]]*=[[:space:]]*"<redacted>"' "$TEST_TMP/dual.log" ||
     die "fresh installation did not redact its generated password hash"
+grep -q 'Host diagnostics: not requested' "$TEST_TMP/dual.log" ||
+    die "fresh installation did not report the explicitly skipped host diagnostics"
 
 [ "$(grep -c '^\[\[listeners\]\]$' "$CONFIG_PATH")" -eq 2 ] ||
     die "dual mode did not write two listeners"

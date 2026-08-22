@@ -74,6 +74,7 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_CLIENT_IPV4` / `MASQUE_CLIENT_IPV6` | Pinned addresses; use `none` to omit one family |
 | `MASQUE_CLIENT_CONFIG_OUT` | Absolute secret JSON output path; defaults to `/root/masque-client.json` |
 | `MASQUE_START_SERVICE` | `1` to start/restart, `0` to stage only; bootstrap default is `1` |
+| `MASQUE_RUN_HOST_DIAGNOSTICS` | `1` to run the read-only CONNECT-IP host check after installation (default), `0` to skip |
 
 For example, a non-interactive client-certificate installation is:
 
@@ -184,6 +185,25 @@ CONNECT-IP additionally needs:
 Avoid broad NAT or forwarding rules until the exact TUN name and address pools
 have been verified.
 
+These requirements come from CONNECT-IP, not from Basic versus client
+certificate authentication. A certificate-authenticated CONNECT or CONNECT-UDP
+client still uses userspace sockets; mihomo/usque-style clients combine client
+certificates with `cf-connect-ip`, which is why they need the host path below.
+
+After the service has created its TUN interface, run the read-only diagnostic:
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml doctor
+```
+
+It checks `/dev/net/tun`, IPv4/IPv6 forwarding, the configured interface and
+pool routes, and available iptables/nftables evidence for forwarding and NAT.
+Forwarding and TUN are hard prerequisites. Firewall and NAT results are warnings
+because a routed prefix or upstream gateway can be valid without a local
+MASQUERADE rule. Neither `doctor`, startup, nor the installer changes host
+networking. Persist any required rules through the firewall manager already
+used by the machine.
+
 ## systemd
 
 ```sh
@@ -289,9 +309,12 @@ assets but never installs or starts Prometheus or Grafana on the server.
 
 ## Diagnostics
 
-Confirm the listener and process:
+Start with configuration and host diagnostics, then confirm the listener and
+process:
 
 ```sh
+sudo masque-server --config /etc/masque/masque.toml check-config
+sudo masque-server --config /etc/masque/masque.toml doctor
 sudo ss -u -l -p | grep masque-server
 sudo ss -t -l -p | grep masque-server
 systemctl show masque -p MainPID -p ActiveState -p SubState
