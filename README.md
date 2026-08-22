@@ -21,6 +21,8 @@ a staging environment.
 - Multiple listeners in one process, each with its own Basic or client-certificate
   authentication mode while sharing proxy policies, client roster, and TUN state
 - CIDR allow and deny policies for TCP and UDP targets
+- Adaptive QUIC Retry plus process-wide per-source connection and Basic-auth
+  admission limits
 - Bounded queues and backpressure across authentication and tunnel I/O
 - Linux `recvmmsg`/`sendmmsg`, UDP GRO, optional UDP GSO, and TUN offload
 - Multi-core sharding with `SO_REUSEPORT`
@@ -170,6 +172,7 @@ src/                    Server library and CLI
 tools/masque-e2e/       E2E client and load generator
 tests/e2e/              Docker E2E environment and fixtures
 benches/                In-process microbenchmarks
+fuzz/                   Scheduled libFuzzer targets for public protocol parsers
 deploy/                 Example config, installer, systemd unit, and monitoring assets
 docs/                   Operator and contributor documentation
 scripts/                Test, benchmark, certificate, and packaging helpers

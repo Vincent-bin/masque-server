@@ -19,6 +19,7 @@
 | Config preflight | `cargo test --test check_config` | `check-config` accepts what a server accepts, including multi-listener files |
 | Config editing | `cargo test --test add_listener` | `add-listener` writes a listener that starts, or leaves the file untouched |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
+| Parser fuzzing | `cargo +nightly fuzz run protocol_parsers` | Incremental capsule, datagram, varint, IP, and URI parser safety |
 
 ## Local tests
 
@@ -57,6 +58,25 @@ Run several repetitions and preserve the direct UDP baseline. When changing
 batching, readiness, pacing, flow control, or buffers, test both 64-byte and
 1200-byte payloads. Use multiple connections for shard tests.
 
+Select one transport or run the directly comparable sequence with:
+
+```sh
+MASQUE_BENCH_MODE=udp \
+MASQUE_BENCH_TRANSPORT=both \
+MASQUE_BENCH_DURATION_SECS=10 \
+scripts/network-bench.sh
+```
+
+The `smoke`, `tcp`, and `udp` modes support `http2`, `http3`, and `both`.
+Multi-connection `load` mode is currently HTTP/3-only. Machine consumers should
+read `UDP_RESULT`, `TCP_DOWNLOAD_RESULT`, and `TCP_DOWNLOAD_SUMMARY` and retain
+their explicit `transport` field.
+
+HTTP/3 uses the production `adaptive` Retry policy by default. Set
+`MASQUE_BENCH_QUIC_RETRY=always` to exercise address validation on every
+benchmark connection; use `off` only for a controlled handshake-latency
+comparison.
+
 CONNECT-TCP runs include an alternating direct-origin sample by default and
 print `TCP_DOWNLOAD_SUMMARY` with both medians. Useful controls are:
 
@@ -88,6 +108,18 @@ keeps payload, duration, window, expiry, shards, CPU placement, and offload
 settings fixed, and compares both goodput and response shortfall.
 
 See [Performance](performance.md) for methodology and reporting requirements.
+
+## Scheduled verification
+
+The weekly and manually dispatchable `Scheduled verification` workflow keeps
+the expensive checks off ordinary commits. It runs the Docker CONNECT-IP E2E,
+an HTTP/2 + HTTP/3 smoke test with QUIC Retry forced on, and a bounded parser
+fuzz session. A longer local parser run is:
+
+```sh
+cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+cargo +nightly fuzz run protocol_parsers -- -max_total_time=3600
+```
 
 ## Linux-specific checks
 

@@ -59,6 +59,8 @@ default; `--log-format json` emits newline-delimited structured JSON.
 [server]
 idle_timeout_secs = 60
 max_connections = 10000
+max_connections_per_ip = 64
+max_pending_auth_per_ip = 8
 max_tunnels_per_connection = 100
 ```
 
@@ -66,6 +68,8 @@ max_tunnels_per_connection = 100
 | --- | --- |
 | `idle_timeout_secs` | Inactive tunnel lifetime |
 | `max_connections` | Per-HTTP/3-shard or per-HTTP/2-listener connection cap |
+| `max_connections_per_ip` | Process-wide live H2 + H3 connections from one source IP |
+| `max_pending_auth_per_ip` | Process-wide running + queued Basic/Argon2 checks from one source; `1..256` |
 | `max_tunnels_per_connection` | CONNECT streams retained per connection |
 
 This section contains process-wide connection limits only. Socket addresses and
@@ -549,6 +553,9 @@ max_stream_window = 16777216
 dgram_recv_queue_len = 2048
 dgram_send_queue_len = 2048
 discover_pmtu = false
+retry_mode = "adaptive"
+retry_connection_threshold = 64
+retry_token_ttl_secs = 30
 ```
 
 Important relationships:
@@ -562,6 +569,15 @@ Important relationships:
 - Supported congestion controllers are `cubic`, `reno`, and `bbr2`. CUBIC is
   the current default because the server's deferred-send behavior penalizes
   BBR2's fine-grained pacing.
+- `retry_mode = "adaptive"` accepts tokenless Initial packets below
+  `retry_connection_threshold`, avoiding an extra low-load round trip. At or
+  above the per-shard threshold, the server sends a stateless, authenticated
+  Retry token before allocating connection state. `always` validates every
+  source address; `off` is appropriate only for trusted networks or controlled
+  comparisons. Tokens expire after `retry_token_ttl_secs` (`1..300`), are
+  listener-bound, and tolerate source-port changes behind NAT.
+  A threshold above `server.max_connections` is valid: the smaller connection
+  cap then bounds state before adaptive Retry would activate.
 
 Queue depths trade memory and latency for burst tolerance. QUIC DATAGRAM frames
 are not retransmitted; a full queue drops traffic.

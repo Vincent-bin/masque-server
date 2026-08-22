@@ -149,6 +149,14 @@ impl Http2Listener {
                             continue;
                         }
                     };
+                    let source_admission = match self.shared.source_admissions.try_acquire(peer.ip()) {
+                        Some(admission) => admission,
+                        None => {
+                            self.metrics.connection_rejected_source_limit();
+                            warn!(%peer, "HTTP/2 source connection limit reached");
+                            continue;
+                        }
+                    };
 
                     let context = ConnectionContext {
                         acceptor: Arc::clone(&self.acceptor),
@@ -166,6 +174,7 @@ impl Http2Listener {
                         context,
                         connection_shutdown.clone(),
                         connection_slot,
+                        source_admission,
                     ));
                 }
             }

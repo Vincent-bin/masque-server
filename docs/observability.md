@@ -98,6 +98,7 @@ All metric names start with `masque_`.
 | `masque_connections_active` | gauge | `listener`, `transport`, `auth` | Live HTTP transport connections |
 | `masque_connections_accepted_total` | counter | `listener`, `transport`, `auth` | Accepted connection objects |
 | `masque_connections_rejected_total` | counter | `listener`, `transport`, `auth`, `reason` | Connections rejected at a resource limit |
+| `masque_quic_retries_total` | counter | `listener`, `transport`, `auth`, `result` | Retry packets sent or invalid Retry tokens received |
 | `masque_quic_receive_batches_total` | counter | `listener`, `transport`, `auth` | Non-empty HTTP/3 network receive batches |
 | `masque_quic_receive_packets_total` | counter | `listener`, `transport`, `auth` | Received HTTP/3 QUIC UDP datagrams |
 | `masque_quic_receive_bytes_total` | counter | `listener`, `transport`, `auth` | Received HTTP/3 QUIC UDP bytes |

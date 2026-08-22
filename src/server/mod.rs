@@ -3,6 +3,7 @@
 mod authentication;
 mod http2;
 mod request;
+mod retry;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use self::authentication::AuthOutcome;
 use self::request::{PendingAuth, PendingConnectSetups, RequestContext};
 use crate::address_pool::{AddressPool, PoolError};
+use crate::admission::SourceAdmissionLimiter;
 use crate::auth::BasicAuthenticator;
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
@@ -505,6 +507,32 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
 
+    if config.server.max_connections == 0 {
+        anyhow::bail!("server.max_connections must be at least 1");
+    }
+    if config.server.max_connections_per_ip == 0 {
+        anyhow::bail!("server.max_connections_per_ip must be at least 1");
+    }
+    if !(1..=MAX_PENDING_AUTH_GLOBAL).contains(&config.server.max_pending_auth_per_ip) {
+        anyhow::bail!(
+            "server.max_pending_auth_per_ip ({}) must be between 1 and {}",
+            config.server.max_pending_auth_per_ip,
+            MAX_PENDING_AUTH_GLOBAL
+        );
+    }
+    if config.server.max_tunnels_per_connection == 0 {
+        anyhow::bail!("server.max_tunnels_per_connection must be at least 1");
+    }
+    if config.quic.retry_connection_threshold == 0 {
+        anyhow::bail!("quic.retry_connection_threshold must be at least 1");
+    }
+    if !(1..=300).contains(&config.quic.retry_token_ttl_secs) {
+        anyhow::bail!(
+            "quic.retry_token_ttl_secs ({}) must be between 1 and 300",
+            config.quic.retry_token_ttl_secs
+        );
+    }
+
     if let Some(addr) = config.observability.listen_addr
         && !is_loopback(addr.ip())
     {
@@ -790,9 +818,9 @@ impl Server {
 
         let tun = build_tun(&config)?;
 
-        let mut key_bytes = [0u8; 32];
+        let mut key_bytes = [0u8; 64];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key_bytes)
-            .map_err(|_| anyhow::anyhow!("failed to seed connection ID key"))?;
+            .map_err(|_| anyhow::anyhow!("failed to seed connection admission keys"))?;
 
         // Every shard needs a handle to every other shard's inboxes, so the
         // channels are made before the shards that read them. Shards are
@@ -826,7 +854,15 @@ impl Server {
             index_shard: RwLock::new(FxHashMap::default()),
             http2_tun_routes: RwLock::new(FxHashMap::default()),
             next_conn_index: AtomicU64::new(0),
-            conn_id_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes),
+            conn_id_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes[..32]),
+            retry_tokens: retry::RetryTokenCodec::new(
+                ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes[32..]),
+                Duration::from_secs(config.quic.retry_token_ttl_secs),
+            ),
+            source_admissions: SourceAdmissionLimiter::new(config.server.max_connections_per_ip),
+            auth_source_admissions: SourceAdmissionLimiter::new(
+                config.server.max_pending_auth_per_ip,
+            ),
             tun,
             forward_tx,
             tun_tx,
@@ -1789,6 +1825,12 @@ struct Shared {
     /// Generated per-process, so a client cannot precompute which server
     /// connection ID — or which hash bucket — its DCID will map to.
     conn_id_key: ring::hmac::Key,
+    /// Authenticated address-validation tokens shared by every QUIC shard.
+    retry_tokens: retry::RetryTokenCodec,
+    /// Process-wide connection budget keyed by canonical source IP.
+    source_admissions: SourceAdmissionLimiter,
+    /// Fair-share bound for queued or running Basic credential checks.
+    auth_source_admissions: SourceAdmissionLimiter,
     /// Shared TUN device for CONNECT-IP tunnels (None if IP proxy disabled).
     tun: Option<TunManager>,
     /// Inbox per shard for packets forwarded after a migration.
@@ -2022,6 +2064,8 @@ impl Shard {
         let mut tun_send = TunSendBatch::new();
         let mut recv_batch = RecvPacketBatch::new(MAX_QUIC_RECV_BATCH);
         let mut send_batch = SendPacketBatch::new();
+        let mut stateless_out = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut stateless_batch = SendPacketBatch::new();
         // One shard reads the shared TUN device and hands each packet to the
         // connection that owns its address. Shard 0 is an arbitrary but stable
         // choice; nothing here depends on which listener that shard serves.
@@ -2049,6 +2093,8 @@ impl Shard {
         loop {
             self.dirty.end_round();
             serviced.clear();
+            stateless_batch.clear();
+            let mut stateless_retries = 0usize;
 
             // Wake for the earliest connection deadline rather than scanning
             // every connection for it. The idle sweep and, during shutdown, the
@@ -2146,7 +2192,14 @@ impl Shard {
                         packet_count += 1;
                         byte_count += packet.len();
                         if !shutting_down {
-                            self.handle_packet(packet, from, local_addr);
+                            self.handle_packet(
+                                packet,
+                                from,
+                                local_addr,
+                                &mut stateless_out,
+                                &mut stateless_batch,
+                                &mut stateless_retries,
+                            );
                             return;
                         }
 
@@ -2193,7 +2246,14 @@ impl Shard {
                     error!(%e, "TUN recv error");
                 }
                 Event::Forwarded(Some(mut packet)) => {
-                    self.handle_packet(&mut packet.data, packet.from, local_addr);
+                    self.handle_packet(
+                        &mut packet.data,
+                        packet.from,
+                        local_addr,
+                        &mut stateless_out,
+                        &mut stateless_batch,
+                        &mut stateless_retries,
+                    );
                 }
                 Event::Forwarded(None) => {}
                 Event::TunInbound(Some(packet)) => {
@@ -2205,6 +2265,23 @@ impl Shard {
                 }
                 Event::AuthDone(None) => {}
                 Event::Timeout => {}
+            }
+
+            if !stateless_batch.is_empty() {
+                let udp_gso_before_send = self.socket.udp_gso_enabled();
+                match self.socket.send_batch(&stateless_batch).await {
+                    Ok(()) => {
+                        self.metrics.record_send_batch(
+                            stateless_batch.packet_count(),
+                            stateless_batch.byte_count(),
+                        );
+                        self.metrics.record_quic_retries_sent(stateless_retries);
+                    }
+                    Err(error) => warn!(%error, "stateless QUIC response send failed"),
+                }
+                if udp_gso_before_send && !self.socket.udp_gso_enabled() {
+                    self.metrics.disable_udp_gso();
+                }
             }
 
             // A connection whose deadline has arrived needs driving even if
@@ -2379,8 +2456,56 @@ impl Shard {
         }
     }
 
+    fn derive_connection_id(
+        &self,
+        destination: &quiche::ConnectionId<'_>,
+    ) -> quiche::ConnectionId<'static> {
+        let signed = ring::hmac::sign(&self.shared.conn_id_key, destination);
+        quiche::ConnectionId::from_vec(signed.as_ref()[..CONN_ID_LEN].to_vec())
+    }
+
+    fn forward_packet(&self, shard: usize, packet: &[u8], from: SocketAddr) {
+        let forwarded = ForwardedPacket {
+            data: packet.to_vec(),
+            from,
+        };
+        // Dropping under pressure is what the network would have done; QUIC
+        // retransmits without making this unbounded cross-shard state.
+        if self.shared.forward_tx[shard].try_send(forwarded).is_err() {
+            self.shared.record_shard_queue_drop(shard);
+            debug!(shard, "shard forward queue full, dropping packet");
+        }
+    }
+
+    fn queue_stateless_packet(
+        &self,
+        packet: &[u8],
+        from: SocketAddr,
+        to: SocketAddr,
+        batch: &mut SendPacketBatch,
+    ) {
+        batch.push(
+            packet,
+            quiche::SendInfo {
+                from,
+                to,
+                at: Instant::now(),
+            },
+            self.socket.udp_gso_enabled(),
+            MAX_DATAGRAM_SIZE,
+        );
+    }
+
     /// Process an incoming UDP packet (QUIC).
-    fn handle_packet(&mut self, buf: &mut [u8], from: SocketAddr, local: SocketAddr) {
+    fn handle_packet(
+        &mut self,
+        buf: &mut [u8],
+        from: SocketAddr,
+        local: SocketAddr,
+        stateless_out: &mut [u8],
+        stateless_batch: &mut SendPacketBatch,
+        stateless_retries: &mut usize,
+    ) {
         let hdr = match quiche::Header::from_slice(buf, CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
@@ -2390,60 +2515,152 @@ impl Shard {
         };
 
         // Established packets carry the server-issued CID and take this fast
-        // path. Deriving a CID requires HMAC-SHA256, so only do that for a new
-        // Initial or for packets that still carry the original destination ID.
+        // path without hashing. If migration made the packet land on another
+        // SO_REUSEPORT shard, the shared ownership map names the right inbox.
         let key = if let Some((conn_id, _)) = self.connections.get_key_value(&hdr.dcid) {
             conn_id.clone()
         } else {
-            let conn_id = ring::hmac::sign(&self.shared.conn_id_key, &hdr.dcid);
-            let conn_id = quiche::ConnectionId::from_vec(conn_id.as_ref()[..CONN_ID_LEN].to_vec());
+            let direct_owner = self
+                .shared
+                .cid_shard
+                .read()
+                .expect("cid ownership poisoned")
+                .get(&hdr.dcid)
+                .copied();
+            if let Some(owner) = direct_owner {
+                if owner != self.index {
+                    self.forward_packet(owner, buf, from);
+                } else {
+                    debug!("connection ownership published without local state");
+                }
+                return;
+            }
 
-            if !self.connections.contains_key(&conn_id) {
-                if hdr.ty != quiche::Type::Initial {
-                    // The kernel steers by 4-tuple, so a client that changed
-                    // address can land here instead of on its owner. Hand the
-                    // packet over rather than dropping the connection.
-                    let owner = self
-                        .shared
-                        .cid_shard
-                        .read()
-                        .expect("cid ownership poisoned")
-                        .get(&conn_id)
-                        .copied();
-                    match owner {
-                        Some(shard) if shard != self.index => {
-                            let forwarded = ForwardedPacket {
-                                data: buf.to_vec(),
-                                from,
-                            };
-                            // Dropping under pressure is what the network
-                            // would have done; QUIC will retransmit.
-                            if self.shared.forward_tx[shard].try_send(forwarded).is_err() {
-                                self.shared.record_shard_queue_drop(shard);
-                                debug!(shard, "shard forward queue full, dropping packet");
-                            }
-                        }
-                        _ => debug!("non-initial packet for unknown connection"),
+            if hdr.ty != quiche::Type::Initial {
+                debug!("non-initial packet for unknown connection");
+                return;
+            }
+
+            // A client Initial datagram is required to be at least 1200 bytes.
+            // Reject a short spoofed packet before emitting Version
+            // Negotiation or Retry, preserving QUIC's amplification bound.
+            if buf.len() < quiche::MIN_CLIENT_INITIAL_LEN {
+                debug!(bytes = buf.len(), "dropping undersized QUIC Initial");
+                return;
+            }
+
+            if !quiche::version_is_supported(hdr.version) {
+                match quiche::negotiate_version(&hdr.scid, &hdr.dcid, stateless_out) {
+                    Ok(written) => self.queue_stateless_packet(
+                        &stateless_out[..written],
+                        local,
+                        from,
+                        stateless_batch,
+                    ),
+                    Err(error) => debug!(%error, "failed to build QUIC version negotiation"),
+                }
+                return;
+            }
+
+            // A retransmitted first Initial still carries the client's
+            // original destination CID. Find the state created for its first
+            // copy before deciding this is a new connection.
+            let derived = self.derive_connection_id(&hdr.dcid);
+            if self.connections.contains_key(&derived) {
+                derived
+            } else {
+                let derived_owner = self
+                    .shared
+                    .cid_shard
+                    .read()
+                    .expect("cid ownership poisoned")
+                    .get(&derived)
+                    .copied();
+                if let Some(owner) = derived_owner {
+                    if owner != self.index {
+                        self.forward_packet(owner, buf, from);
+                    } else {
+                        debug!("derived connection ownership published without local state");
                     }
                     return;
                 }
 
-                // Enforce max_connections limit.
+                let token = hdr.token.as_deref().unwrap_or_default();
+                let retry_required = retry::retry_required(
+                    self.config.quic.retry_mode,
+                    self.connections.len(),
+                    self.config.quic.retry_connection_threshold,
+                );
+
+                if token.is_empty() && retry_required {
+                    let retry_token = self.shared.retry_tokens.mint(from, local, &hdr.dcid);
+                    match quiche::retry(
+                        &hdr.scid,
+                        &hdr.dcid,
+                        &derived,
+                        &retry_token,
+                        hdr.version,
+                        stateless_out,
+                    ) {
+                        Ok(written) => {
+                            self.queue_stateless_packet(
+                                &stateless_out[..written],
+                                local,
+                                from,
+                                stateless_batch,
+                            );
+                            *stateless_retries += 1;
+                        }
+                        Err(error) => debug!(%error, "failed to build QUIC Retry"),
+                    }
+                    return;
+                }
+
+                let (scid, odcid) = if token.is_empty()
+                    || self.config.quic.retry_mode == crate::config::QuicRetryMode::Off
+                {
+                    (derived, None)
+                } else {
+                    let Some(odcid) = self.shared.retry_tokens.validate(from, local, token) else {
+                        self.metrics.record_quic_retry_invalid();
+                        debug!(%from, "invalid or expired QUIC Retry token");
+                        return;
+                    };
+                    let expected = self.derive_connection_id(&odcid);
+                    if expected != hdr.dcid {
+                        self.metrics.record_quic_retry_invalid();
+                        debug!(%from, "QUIC Retry destination connection ID mismatch");
+                        return;
+                    }
+                    (
+                        quiche::ConnectionId::from_vec(hdr.dcid.to_vec()),
+                        Some(odcid),
+                    )
+                };
+
+                // Stateful admission happens only after address validation, so
+                // a spoofed flood cannot consume either connection table.
                 if self.connections.len() >= self.config.server.max_connections {
                     self.metrics.connection_rejected_limit();
                     warn!("max connections reached, rejecting new connection");
                     return;
                 }
-
-                let scid = quiche::ConnectionId::from_vec(conn_id.as_ref().to_vec());
-
-                let quic = match quiche::accept(&scid, None, local, from, &mut self.quic_config) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(%e, "failed to accept connection");
-                        return;
-                    }
+                let Some(source_admission) = self.shared.source_admissions.try_acquire(from.ip())
+                else {
+                    self.metrics.connection_rejected_source_limit();
+                    warn!(%from, "source connection limit reached");
+                    return;
                 };
+
+                let quic =
+                    match quiche::accept(&scid, odcid.as_ref(), local, from, &mut self.quic_config)
+                    {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            error!(%error, "failed to accept connection");
+                            return;
+                        }
+                    };
 
                 info!(shard = self.index, ?scid, %from, "new connection");
 
@@ -2463,11 +2680,15 @@ impl Shard {
                     .expect("index ownership poisoned")
                     .insert(conn_idx, self.index);
 
-                let client = ClientConnection::new(quic, conn_idx, Arc::clone(&self.metrics));
-                self.connections.insert(scid, client);
+                let client = ClientConnection::new(
+                    quic,
+                    conn_idx,
+                    Arc::clone(&self.metrics),
+                    source_admission,
+                );
+                self.connections.insert(scid.clone(), client);
+                scid
             }
-
-            conn_id
         };
 
         let client = self.connections.get_mut(&key).unwrap();
@@ -4055,6 +4276,42 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("must use a loopback address"), "{error}");
+    }
+
+    #[test]
+    fn admission_limits_and_retry_settings_are_bounded() {
+        let mut config = ServerConfig::default();
+
+        config.server.max_connections_per_ip = 0;
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("zero per-source connection limit must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("max_connections_per_ip"));
+        config.server.max_connections_per_ip = 64;
+
+        config.server.max_pending_auth_per_ip = super::MAX_PENDING_AUTH_GLOBAL + 1;
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("oversized per-source auth limit must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("max_pending_auth_per_ip"));
+        config.server.max_pending_auth_per_ip = 8;
+
+        config.quic.retry_connection_threshold = 0;
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("zero Retry threshold must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("retry_connection_threshold"));
+        config.quic.retry_connection_threshold = 64;
+
+        config.quic.retry_token_ttl_secs = 301;
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("oversized Retry token lifetime must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("retry_token_ttl_secs"));
     }
 
     /// Planning keeps the listener-specific trust boundary separate from the

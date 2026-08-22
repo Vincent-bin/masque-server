@@ -1,4 +1,5 @@
 pub mod address_pool;
+mod admission;
 pub mod auth;
 pub mod capsule;
 pub mod client_identity;

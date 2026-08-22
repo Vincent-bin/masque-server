@@ -4,6 +4,10 @@
 # its own keepalive against the timeout.
 idle_timeout_secs = 60
 max_connections = 10000
+# Shared by HTTP/2 and HTTP/3. IPv4-mapped IPv6 addresses use the IPv4 count.
+max_connections_per_ip = 64
+# Running plus queued Basic/Argon2 checks one source may occupy process-wide.
+max_pending_auth_per_ip = 8
 max_tunnels_per_connection = 100
 
 # Optional loopback-only operational endpoint. Uncomment to expose health,
@@ -109,6 +113,14 @@ dgram_send_queue_len = 2048
 # Path MTU discovery probes stop at max_datagram_size, so enabling this only
 # helps if that value is also raised (e.g. to 1500 on a path known to carry it).
 discover_pmtu = false
+
+# "adaptive" adds no handshake RTT at low load, then validates source
+# addresses statelessly before allocating new QUIC connection state.
+# "always" validates every new connection; "off" is intended for trusted
+# networks and controlled latency comparisons only.
+retry_mode = "adaptive"
+retry_connection_threshold = 64
+retry_token_ttl_secs = 30
 
 [tcp_proxy]
 enabled = true

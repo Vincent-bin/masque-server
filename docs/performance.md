@@ -26,10 +26,14 @@ head-of-line blocking and nested loss recovery that HTTP/3 DATAGRAM avoids.
 Treat HTTP/2 as a reachability fallback, not as a replacement for HTTP/3 in
 performance comparisons.
 
-The current network benchmark drives HTTP/3. HTTP/2 is covered by real TLS/H2
-relay integration tests, but no HTTP/2 throughput number should be compared to
-the network benchmark until the same harness can drive both transports with
-the same targets, payloads, windows, and CPU placement.
+The network benchmark drives either transport with the same direct targets,
+credentials, payload sizes, windows, expiry rules, and result fields. Use
+`MASQUE_BENCH_TRANSPORT=both` to run HTTP/3 and HTTP/2 sequentially against two
+listeners sharing one numeric address. It still does not make the transports
+semantically identical: HTTP/2 DATAGRAM capsules are reliable and ordered,
+while HTTP/3 DATAGRAM frames are not. Compare reachability cost, application
+goodput, CPU, latency, and response shortfall rather than treating the result as
+a claim that the wire protocols have equal behavior.
 
 ## Linux fast paths
 
@@ -120,6 +124,7 @@ Useful controls include:
 
 ```sh
 MASQUE_BENCH_MODE=udp \
+MASQUE_BENCH_TRANSPORT=both \
 MASQUE_BENCH_DURATION_SECS=10 \
 MASQUE_BENCH_WINDOW=256 \
 MASQUE_BENCH_EXPIRY_MS=1000 \
@@ -136,6 +141,17 @@ scripts/network-bench.sh
 supporting processes needed by that measurement. `MASQUE_BENCH_SHARDS`
 selects the listener shard count; `0` retains the server's documented
 one-shard-per-core behavior.
+
+`MASQUE_BENCH_TRANSPORT` accepts `http3` (the default), `http2`, or `both` for
+the smoke, TCP, and UDP modes. `both` binds TCP and UDP on the same address and
+runs HTTP/3 first, then HTTP/2. It requires an explicit non-zero HTTP/3 shard
+count. Multi-connection `load` mode remains HTTP/3-only until its native-thread
+packet engine has an equivalent asynchronous HTTP/2 implementation.
+
+UDP runs emit one `UDP_RESULT` record per payload and path. TCP runs include a
+`transport` field in every `TCP_DOWNLOAD_RESULT` and `TCP_DOWNLOAD_SUMMARY`, so
+automation does not have to infer which listener produced a number from output
+order.
 
 For a repeatable multi-connection run:
 

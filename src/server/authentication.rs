@@ -35,6 +35,13 @@ impl Shard {
         let Some(conn_id) = self.conn_by_index.get(&conn_idx).cloned() else {
             return;
         };
+        let Some(source_ip) = self
+            .connections
+            .get(&conn_id)
+            .map(|client| client.source_ip())
+        else {
+            return;
+        };
 
         for request in pending {
             let stream_id = request.stream_id;
@@ -48,6 +55,20 @@ impl Shard {
                 continue;
             };
 
+            let source_slot = match self.shared.auth_source_admissions.try_acquire(source_ip) {
+                Some(slot) => slot,
+                None => {
+                    self.metrics.record_auth_overloaded();
+                    warn!(stream_id, %source_ip, "source credential verification limit reached");
+                    if let Some(client) = self.connections.get_mut(&conn_id) {
+                        client.awaiting_auth.remove(&stream_id);
+                        if let Some(h3) = &mut client.h3 {
+                            Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                        }
+                    }
+                    continue;
+                }
+            };
             let queue_slot = match Arc::clone(&self.shared.auth_queue_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
@@ -84,6 +105,8 @@ impl Shard {
                 let running_gauge = metrics.auth_running_guard();
 
                 let verified = tokio::task::spawn_blocking(move || {
+                    let _source_slot = source_slot;
+                    let _queue_slot = queue_slot;
                     let _running_gauge = running_gauge;
                     // Aborting an async task cannot stop spawn_blocking after
                     // it begins. This check prevents queued blocking work from
@@ -120,7 +143,6 @@ impl Shard {
                         authorized,
                     })
                     .await;
-                drop(queue_slot);
             });
 
             if let Some(waiting) = self

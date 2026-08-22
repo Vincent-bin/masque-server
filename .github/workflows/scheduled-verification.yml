@@ -1,0 +1,78 @@
+name: Scheduled verification
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-verification
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux-network:
+    name: Linux E2E and transport smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake openssl
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: scheduled-${{ runner.os }}-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            scheduled-${{ runner.os }}-1.97.1-
+
+      - name: Run Docker CONNECT-IP E2E
+        run: scripts/e2e-test.sh
+
+      - name: Exercise HTTP/2, HTTP/3, and QUIC Retry
+        env:
+          MASQUE_BENCH_MODE: smoke
+          MASQUE_BENCH_TRANSPORT: both
+          MASQUE_BENCH_QUIC_RETRY: always
+        run: scripts/network-bench.sh
+
+  parser-fuzz:
+    name: Protocol parser fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz public protocol parsers
+        run: cargo +nightly fuzz run protocol_parsers -- -max_total_time=180
