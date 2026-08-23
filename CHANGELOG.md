@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- `SIGHUP` atomically reloads the full server certificate chain and private key
+  for future HTTP/2 and HTTP/3 handshakes without dropping established
+  connections. A mismatched or invalid replacement retains the previous TLS
+  identity; when client-certificate authentication is active, TLS and roster
+  changes commit or roll back together.
+- `masque_tls_reloads_total` reports successful and rejected identity reloads,
+  and real H2/H3 integration tests cover full-chain delivery, live replacement,
+  established-connection continuity, and rollback.
+- Successful reloads advance the TLS session namespace, so tickets issued
+  before certificate rotation or client revocation fall back to a full
+  handshake instead of resuming stale authentication state.
+
 ## 0.8.1 - 2026-08-23
 
 ### Added

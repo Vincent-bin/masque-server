@@ -324,6 +324,13 @@ impl Client {
         anyhow::bail!("handshake timed out")
     }
 
+    fn peer_certificate_der(&self) -> Vec<u8> {
+        self.quic
+            .peer_cert()
+            .expect("server did not present a certificate")
+            .to_vec()
+    }
+
     /// Drive until the peer tears the connection down, or give up.
     ///
     /// A rejected client cannot be detected at `is_established()`: under TLS
@@ -907,6 +914,105 @@ fn a_broken_reload_keeps_the_previous_roster() {
             .unwrap(),
         200,
         "the previous roster must still be in force after a failed reload"
+    );
+}
+
+/// SIGHUP replaces the server identity used by future QUIC handshakes without
+/// rebuilding the UDP listener or disturbing an established connection. A bad
+/// follow-up key must leave the last complete identity in force.
+#[test]
+fn http3_tls_identity_reloads_without_dropping_existing_connections() {
+    let dir = TempDir::new("tls-reload-h3");
+
+    let original_key = p256_key();
+    let original_cert = self_signed(&original_key, Some("masque-server-original"));
+    let (cert_path, key_path) = write_pem(dir.path(), "server", &original_key, &original_cert);
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+
+    let config_path = dir.path().join("masque.toml");
+    let config_text = server_config_file(
+        &cert_path,
+        &key_path,
+        &[("laptop", &public_key_b64(&client_key))],
+    );
+    std::fs::write(&config_path, &config_text).unwrap();
+    let config = masque::config::parse_toml(&config_text).unwrap();
+    let peer = spawn_reloadable_server(config, config_path)[0];
+
+    let mut established = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+    established.handshake(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        established.peer_certificate_der(),
+        original_cert.to_der().unwrap()
+    );
+    established.init_h3().unwrap();
+
+    let replacement_key = p256_key();
+    let replacement_cert = self_signed(&replacement_key, Some("masque-server-replacement"));
+    std::fs::write(&cert_path, replacement_cert.to_pem().unwrap()).unwrap();
+    std::fs::write(
+        &key_path,
+        replacement_key
+            .ec_key()
+            .unwrap()
+            .private_key_to_pem()
+            .unwrap(),
+    )
+    .unwrap();
+    raise_sighup();
+
+    let replacement_der = replacement_cert.to_der().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut candidate = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+        candidate.handshake(Duration::from_secs(2)).unwrap();
+        if candidate.peer_certificate_der() == replacement_der {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new HTTP/3 handshakes did not pick up the replacement certificate"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The connection negotiated under the old certificate remains usable.
+    let stream = established.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        established
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert!(!established.quic.is_closed());
+
+    // A partial ACME deployment (new certificate with an unrelated key) is
+    // rejected as a pair; future handshakes keep using the previous snapshot.
+    let mismatched_key = p256_key();
+    std::fs::write(
+        &key_path,
+        mismatched_key
+            .ec_key()
+            .unwrap()
+            .private_key_to_pem()
+            .unwrap(),
+    )
+    .unwrap();
+    raise_sighup();
+    std::thread::sleep(Duration::from_millis(600));
+
+    let mut after_failure = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+    after_failure.handshake(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        after_failure.peer_certificate_der(),
+        replacement_der,
+        "a rejected reload must keep the previous complete TLS identity"
     );
 }
 

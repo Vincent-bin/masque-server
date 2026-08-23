@@ -17,6 +17,8 @@ max_tunnels_per_connection = 100
 # listen_addr = "127.0.0.1:9090"
 
 [tls]
+# Replace both files, then send SIGHUP (systemctl reload masque). New HTTP/2
+# and HTTP/3 handshakes use the validated pair; established connections stay up.
 cert_path = "/etc/masque/certs/server.crt"
 key_path = "/etc/masque/certs/server.key"
 
@@ -48,7 +50,7 @@ username = "__MASQUE_AUTH_USERNAME__"
 password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
 
 # Clients allowed in when mode = "client_cert". Generate an entry, then reload
-# or restart the service:
+# (which also re-reads the TLS identity) or restart the service:
 #
 #   masque-server enroll-client --name laptop --endpoint <public-ip>:443 \
 #       --ipv4 10.89.0.2 --ipv6 fd00:abcd::2

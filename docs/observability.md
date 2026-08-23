@@ -115,7 +115,8 @@ All metric names start with `masque_`.
 | `masque_auth_pending` | gauge | `listener`, `transport`, `auth` | Admitted Basic checks not yet completed |
 | `masque_auth_running` | gauge | `listener`, `transport`, `auth` | Argon2 jobs currently executing |
 | `masque_packets_dropped_total` | counter | `listener`, `transport`, `auth`, `reason` | Drops at bounded shard, datagram, or TUN queues |
-| `masque_roster_reloads_total` | counter | `result` | Successful and rejected SIGHUP roster reloads |
+| `masque_tls_reloads_total` | counter | `result` | Successful and rejected SIGHUP TLS identity reloads |
+| `masque_roster_reloads_total` | counter | `result` | Successful and rejected active client-roster reloads |
 | `masque_forced_shutdowns_total` | counter | — | Process shutdowns that reached the drain deadline |
 
 Labels deliberately describe only configured listeners, authentication modes,

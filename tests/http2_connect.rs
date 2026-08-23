@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -12,8 +13,10 @@ use boring::ec::{EcGroup, EcKey};
 use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::pkey::{PKey, Private};
-use boring::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
-use boring::x509::{X509Builder, X509NameBuilder};
+use boring::ssl::{
+    SslConnector, SslFiletype, SslMethod, SslSession, SslSessionCacheMode, SslVerifyMode,
+};
+use boring::x509::{X509, X509Builder, X509NameBuilder};
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -122,6 +125,45 @@ async fn spawn_http2_config(
     (addr, task)
 }
 
+async fn spawn_reloadable_http2_config(
+    config: ServerConfig,
+    config_path: PathBuf,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let mut server = Server::bind_with_reload(config, Some(config_path))
+        .await
+        .unwrap();
+    let addr = server.listen_addrs()[0];
+    let task = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    // `run` installs the process-wide SIGHUP listener before it reaches its
+    // worker join loop. The delay keeps the test from racing that setup.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (addr, task)
+}
+
+fn http2_reload_config_file(cert: &Path, key: &Path) -> String {
+    format!(
+        "[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
+         [tcp_proxy]\nenabled = false\n\n\
+         [udp_proxy]\nenabled = false\n\n\
+         [ip_proxy]\nenabled = false\n\n\
+         [[listeners]]\nlisten_addr = \"127.0.0.1:0\"\ntransport = \"http2\"\n\
+         shards = 1\n\n[listeners.auth]\nenabled = false\nmode = \"basic\"\n",
+        cert.display(),
+        key.display()
+    )
+}
+
+#[cfg(unix)]
+fn raise_sighup() {
+    let status = std::process::Command::new("kill")
+        .args(["-HUP", &std::process::id().to_string()])
+        .status()
+        .expect("failed to send SIGHUP");
+    assert!(status.success(), "kill -HUP failed");
+}
+
 async fn connect_h2(
     addr: std::net::SocketAddr,
 ) -> (
@@ -138,6 +180,19 @@ async fn connect_h2_with_identity(
     h2::client::SendRequest<Bytes>,
     tokio::task::JoinHandle<Result<(), h2::Error>>,
 ) {
+    let (client, driver, _, _) = connect_h2_with_identity_and_peer(addr, identity).await;
+    (client, driver)
+}
+
+async fn connect_h2_with_identity_and_peer(
+    addr: std::net::SocketAddr,
+    identity: Option<(&Path, &Path)>,
+) -> (
+    h2::client::SendRequest<Bytes>,
+    tokio::task::JoinHandle<Result<(), h2::Error>>,
+    Vec<u8>,
+    Vec<Vec<u8>>,
+) {
     let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
     connector.set_verify(SslVerifyMode::NONE);
     connector.set_alpn_protos(b"\x02h2").unwrap();
@@ -150,16 +205,62 @@ async fn connect_h2_with_identity(
             .expect("client private key is valid PEM");
         connector.check_private_key().unwrap();
     }
+    let (client, driver, peer_certificate, peer_chain, _) =
+        connect_h2_with_connector_and_peer(addr, &connector.build(), None).await;
+    (client, driver, peer_certificate, peer_chain)
+}
+
+async fn connect_h2_with_connector_and_peer(
+    addr: std::net::SocketAddr,
+    connector: &SslConnector,
+    session: Option<&SslSession>,
+) -> (
+    h2::client::SendRequest<Bytes>,
+    tokio::task::JoinHandle<Result<(), h2::Error>>,
+    Vec<u8>,
+    Vec<Vec<u8>>,
+    bool,
+) {
+    let mut configuration = connector.configure().unwrap();
+    if let Some(session) = session {
+        unsafe {
+            // SAFETY: the ticket was issued to this same connector context.
+            configuration.set_session(session).unwrap();
+        }
+    }
     let tls = tokio_boring::connect(
-        connector.build().configure().unwrap(),
+        configuration,
         "localhost",
         TcpStream::connect(addr).await.unwrap(),
     )
     .await
     .unwrap();
+    let session_reused = tls.ssl().session_reused();
+    let peer_certificate = tls
+        .ssl()
+        .peer_certificate()
+        .expect("server did not present a certificate")
+        .to_der()
+        .unwrap();
+    let peer_chain = tls
+        .ssl()
+        .peer_cert_chain()
+        .map(|chain| {
+            chain
+                .iter()
+                .map(|certificate| certificate.to_der().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
     let (client, connection) = h2::client::handshake(tls).await.unwrap();
     let driver = tokio::spawn(connection);
-    (client.ready().await.unwrap(), driver)
+    (
+        client.ready().await.unwrap(),
+        driver,
+        peer_certificate,
+        peer_chain,
+        session_reused,
+    )
 }
 
 fn connect_request(target: std::net::SocketAddr) -> Request<()> {
@@ -561,4 +662,139 @@ async fn client_certificate_pins_http2_connect_ip_addresses() {
     }
     server_task.abort();
     driver.abort();
+}
+
+/// A SIGHUP swaps the identity selected by future TCP/TLS handshakes while an
+/// established HTTP/2 connection keeps running. A mismatched replacement key
+/// is rejected without losing the last valid in-memory identity.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_tls_identity_reloads_without_dropping_existing_connections() {
+    let files = TestFiles::new();
+    let chain_key = p256_key();
+    let chain_certificate = self_signed(&chain_key);
+    let chain_der = chain_certificate.to_der().unwrap();
+    let mut original_chain_pem = std::fs::read(&files.cert).unwrap();
+    original_chain_pem.extend_from_slice(&chain_certificate.to_pem().unwrap());
+    std::fs::write(&files.cert, original_chain_pem).unwrap();
+    let original_der = X509::from_pem(&std::fs::read(&files.cert).unwrap())
+        .unwrap()
+        .to_der()
+        .unwrap();
+    let config_path = files.directory.join("masque.toml");
+    let config_text = http2_reload_config_file(&files.cert, &files.key);
+    std::fs::write(&config_path, &config_text).unwrap();
+    let config = masque::config::parse_toml(&config_text).unwrap();
+    let (server_addr, server_task) = spawn_reloadable_http2_config(config, config_path).await;
+
+    let session_der = Arc::new(Mutex::new(None));
+    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    connector.set_verify(SslVerifyMode::NONE);
+    connector.set_alpn_protos(b"\x02h2").unwrap();
+    connector.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+    connector.set_new_session_callback({
+        let session_der = Arc::clone(&session_der);
+        move |_, session| {
+            *session_der.lock().unwrap() = Some(session.to_der().unwrap());
+        }
+    });
+    let connector = connector.build();
+
+    let (established, established_driver, peer_der, peer_chain, reused) =
+        connect_h2_with_connector_and_peer(server_addr, &connector, None).await;
+    assert!(!reused);
+    assert_eq!(peer_der, original_der);
+    assert!(
+        peer_chain.contains(&chain_der),
+        "the dynamic identity omitted its configured certificate chain"
+    );
+
+    let original_session_der = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(der) = session_der.lock().unwrap().clone() {
+                break der;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server did not issue a TLS session ticket");
+    let original_session = SslSession::from_der(&original_session_der).unwrap();
+
+    // Prove that the ticket really is resumable before testing that reload
+    // invalidates its authentication context.
+    let (resumed, resumed_driver, _, _, reused) =
+        connect_h2_with_connector_and_peer(server_addr, &connector, Some(&original_session)).await;
+    assert!(reused, "the baseline TLS session ticket was not resumed");
+    drop(resumed);
+    resumed_driver.abort();
+
+    let replacement_key = p256_key();
+    let replacement_cert = self_signed(&replacement_key);
+    let mut replacement_chain_pem = replacement_cert.to_pem().unwrap();
+    replacement_chain_pem.extend_from_slice(&chain_certificate.to_pem().unwrap());
+    std::fs::write(&files.cert, replacement_chain_pem).unwrap();
+    std::fs::write(
+        &files.key,
+        replacement_key.private_key_to_pem_pkcs8().unwrap(),
+    )
+    .unwrap();
+    raise_sighup();
+
+    let replacement_der = replacement_cert.to_der().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (candidate, candidate_driver, peer_der, _, reused) =
+            connect_h2_with_connector_and_peer(server_addr, &connector, Some(&original_session))
+                .await;
+        drop(candidate);
+        candidate_driver.abort();
+        if peer_der == replacement_der {
+            assert!(
+                !reused,
+                "a pre-reload TLS ticket resumed across the new session context"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "new HTTP/2 handshakes did not pick up the replacement certificate"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut established = tokio::time::timeout(Duration::from_secs(2), established.ready())
+        .await
+        .expect("established HTTP/2 connection stalled after TLS reload")
+        .expect("established HTTP/2 connection closed after TLS reload");
+    assert!(!established_driver.is_finished());
+    let (response, _) = established
+        .send_request(connect_request("127.0.0.1:9".parse().unwrap()), true)
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), response)
+        .await
+        .expect("established HTTP/2 connection stopped responding after TLS reload")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let mismatched_key = p256_key();
+    std::fs::write(
+        &files.key,
+        mismatched_key.private_key_to_pem_pkcs8().unwrap(),
+    )
+    .unwrap();
+    raise_sighup();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let (after_failure, after_failure_driver, peer_der, _) =
+        connect_h2_with_identity_and_peer(server_addr, None).await;
+    assert_eq!(
+        peer_der, replacement_der,
+        "a rejected reload must keep the previous complete TLS identity"
+    );
+
+    drop(after_failure);
+    after_failure_driver.abort();
+    established_driver.abort();
+    server_task.abort();
 }

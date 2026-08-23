@@ -111,6 +111,22 @@ key_path = "/etc/masque/certs/server.key"
 The certificate must cover the hostname used by clients. The systemd unit runs
 as group `masque`; install both files as `root:masque` with mode `0640`.
 
+`SIGHUP` re-reads the full certificate chain and unencrypted private key from
+the effective paths used at startup. New HTTP/2 and HTTP/3 handshakes use the
+new identity; established connections retain the identity from their handshake
+and are not interrupted. Both files are parsed and their public keys are
+matched before one atomic in-memory swap, so a missing, malformed, or
+mismatched replacement leaves the previous identity active.
+
+Successful reloads also advance the TLS session namespace. A ticket issued
+before the reload cannot resume across it and falls back to one full handshake,
+so a renewed certificate or client-roster revocation takes effect immediately;
+tickets issued after the reload remain resumable.
+
+The file contents or symlink targets may change between reloads. Changing
+`cert_path`, `key_path`, or CLI path overrides still requires a restart because
+the effective startup paths themselves are deliberately fixed.
+
 ## Authentication
 
 Each `[listeners.auth]` selects how clients prove who they are on that socket.
@@ -367,23 +383,24 @@ own TUN interface.
 
 #### Revoking a client
 
-Edit the roster and send `SIGHUP`:
+Edit the roster and/or replace both TLS files, then send `SIGHUP`:
 
 ```sh
 systemctl reload masque            # or: kill -HUP $(pidof masque-server)
 ```
 
-The server re-reads `[[clients]]` from the same file it was started with,
-disconnects any live connection whose entry was removed or changed, and leaves
-every other tunnel untouched. A removed client's next attempt is refused at the
-handshake like any unenrolled key. Adding an entry works the same way, so a
-client can be re-enrolled without a restart either.
+The server always reloads the certificate chain and private key. When any
+listener uses `auth.mode = "client_cert"`, it also re-reads `[[clients]]` from
+the same configuration file, disconnects a live connection whose entry was
+removed or changed, and leaves every other tunnel untouched. A removed client's
+next attempt is refused at the handshake like any unenrolled key. Adding an
+entry works the same way, so a client can be re-enrolled without a restart.
 
-Only the roster is reloaded. Listen address, TLS material, pools, and tuning are
-fixed at bind time; changing those still needs a restart. A reload that does not
-validate — an unparseable key, a pinned address outside the pool, no listener
-using `auth.mode = "client_cert"` — is rejected as a whole and the running roster stays in
-force, so a typo cannot lock everyone out.
+TLS identity and an active roster form one validated reload transaction. A
+malformed certificate, mismatched private key, unparseable client key, or
+invalid pinned address rejects the whole update and leaves both running
+snapshots in force. Listen addresses, transports, authentication modes, Basic
+credentials, pools, and tuning remain fixed until restart.
 
 Editing an existing entry counts as revocation: the client is disconnected and
 must reconnect to pick up its new pinned addresses, which are chosen when the
@@ -512,8 +529,9 @@ Two ordering rules follow from the validation being real:
   exists.
 
 A new socket is bound at startup, so restart the server afterwards, and open
-UDP for an HTTP/3 listener or TCP for an HTTP/2 listener. `SIGHUP` reloads the
-`[[clients]]` roster only — it never adds, removes, or rebinds a listener.
+UDP for an HTTP/3 listener or TCP for an HTTP/2 listener. `SIGHUP` reloads TLS
+identity and the active `[[clients]]` roster — it never adds, removes, or
+rebinds a listener.
 
 ## HTTP/2
 

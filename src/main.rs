@@ -105,7 +105,7 @@ enum Command {
     /// rather than removing it: check that the server came up afterwards.
     ///
     /// A new socket is bound at startup, so a restart is required — SIGHUP
-    /// reloads only the `[[clients]]` roster.
+    /// reloads TLS material and the active `[[clients]]` roster, not listeners.
     AddListener {
         /// Address and port for the new socket, for example `0.0.0.0:4443`.
         #[arg(long)]
@@ -508,9 +508,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!(?cfg, "configuration loaded");
 
-    // Pass the path so SIGHUP can re-read the [[clients]] roster. Only a
-    // config that was actually loaded from disk is reloadable; defaults have
-    // no file to re-read.
+    // Pass the path so SIGHUP can re-read TLS material and the active
+    // [[clients]] roster. Only a config that was actually loaded from disk is
+    // reloadable; defaults have no file to re-read.
     let reload_path = cli.config.exists().then_some(cli.config);
     let mut server = Server::bind_with_reload(cfg, reload_path).await?;
     server.run().await

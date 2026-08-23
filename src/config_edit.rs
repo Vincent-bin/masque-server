@@ -258,7 +258,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     // `masque`, not the program name.
     println!(
         "restart the server to bind it (systemd: systemctl restart masque), then check \
-         that it came up; SIGHUP reloads only the [[clients]] roster"
+         that it came up; SIGHUP reloads TLS material and the active [[clients]] roster"
     );
     if listen_addr.port() != 0 {
         println!(
