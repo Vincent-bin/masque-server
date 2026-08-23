@@ -145,11 +145,6 @@ restores the prior binary, unit, monitoring assets, and service state. See
 [Deployment](docs/deployment.md#one-command-install) for non-interactive
 variables, certificate requirements, and installing a specific release.
 
-The 0.3 configuration format is intentionally not compatible with 0.2. Convert
-old `[auth]` and `[server]` listener keys into explicit `[[listeners]]` and
-`[listeners.auth]` entries before rerunning the installer; it does not migrate
-them automatically.
-
 ## Install a downloaded release on Linux
 
 Release archives contain the binary, an example configuration, a hardened
