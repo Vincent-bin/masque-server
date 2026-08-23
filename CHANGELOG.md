@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.8.2 - 2026-08-23
+
 ### Added
 
 - `SIGHUP` atomically reloads the full server certificate chain and private key
