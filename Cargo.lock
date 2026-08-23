@@ -774,14 +774,16 @@ dependencies = [
 
 [[package]]
 name = "masque-server"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "argon2",
  "base64",
  "boring",
+ "boring-sys",
  "bytes",
  "clap",
+ "foreign-types",
  "h2",
  "http",
  "ipnet",

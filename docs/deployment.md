@@ -163,9 +163,26 @@ sudo install -o root -g masque -m 0640 privkey.pem \
   /etc/masque/certs/server.key
 ```
 
-The service must be restarted after certificate renewal unless an external
-unit performs that restart. Validate hostname, validity, and chain before
-changing production files.
+After an ACME client has installed **both** renewed files with those ownership
+and mode settings, activate them without restarting the service:
+
+```sh
+sudo systemctl reload masque
+sudo journalctl -u masque -n 20 --no-pager
+```
+
+New HTTP/2 and HTTP/3 handshakes use the replacement identity. Established
+connections remain up with the identity selected by their original handshake.
+The server validates the full chain, private key, and public-key match before
+swapping one in-memory snapshot; on failure the journal reports the error and
+the previous identity stays active. `systemctl reload` only sends the signal,
+so use the journal or `masque_tls_reloads_total` to confirm the outcome.
+
+Put the install of both files and `systemctl reload masque` in the ACME deploy
+hook, which runs only after successful renewal. The paths must remain readable
+through the unit's filesystem sandbox; `/etc/masque/certs` is recommended.
+Replacing file contents or symlink targets is reloadable, but changing the
+configured paths requires a restart.
 
 ## Network and firewall
 
@@ -243,8 +260,8 @@ keeps its access. Flags cover every value for unattended use; see
 
 Open the new UDP or TCP port in the firewall as appropriate — see
 [Network and firewall](#network-and-firewall). A new socket is bound at startup,
-so the restart is required; `systemctl reload` only re-reads the `[[clients]]`
-roster.
+so the restart is required; `systemctl reload` only re-reads the TLS identity
+and active `[[clients]]` roster.
 
 The bind test describes the moment it ran, so confirm the service after the
 restart rather than assuming it:
@@ -275,7 +292,10 @@ its five-second liveness window, allowing systemd to restart a wedged process.
 Graceful shutdown sends `STOPPING=1` as readiness changes to false.
 
 SIGINT follows the same path for foreground runs. SIGHUP remains distinct: it
-reloads only the `[[clients]]` roster and does not stop the service.
+atomically reloads the TLS identity and, when client-certificate authentication
+is active, the `[[clients]]` roster. It does not stop the service or disturb
+established connections, except that roster revocation disconnects the affected
+client.
 
 ## Upgrade
 

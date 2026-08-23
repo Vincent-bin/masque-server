@@ -4,6 +4,7 @@ mod authentication;
 mod http2;
 mod request;
 mod retry;
+mod tls;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
 use crate::client_identity::{
     ClientIdentity, ClientRegistry, SharedRoster, configure_client_cert_verification,
 };
-use crate::config::{ListenerTransport, ResolvedListener, ServerConfig};
+use crate::config::{ListenerTransport, ResolvedListener, ServerConfig, TlsSection};
 use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
 use crate::fxhash::FxHashMap;
@@ -177,7 +178,9 @@ struct Http2TunRoute {
 ///
 /// A server may have several listeners, which is what lets one process serve
 /// more than one authentication mode: each listener's `auth.mode` decides which
-/// TLS context a shard builds, and that is fixed once its socket is bound.
+/// TLS verification policy a shard builds, and that policy is fixed once its
+/// socket is bound. The server certificate selected by new handshakes remains
+/// reloadable.
 /// Shards are numbered across the whole server, so everything shared between
 /// them — the address pool, routing table, TUN device, and cross-shard queues —
 /// stays single and needs no knowledge of which listener a shard serves.
@@ -200,6 +203,7 @@ pub struct Server {
 /// address-pool mistakes.
 struct ValidatedServerConfig {
     clients: ClientRegistry,
+    tls: Arc<tls::SharedTlsIdentity>,
     listeners: Vec<ListenerPlan>,
     total_shards: usize,
     address_pool: AddressPool,
@@ -677,6 +681,9 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     // Once per listener rather than once per server: the authentication mode
     // decides which of two TLS contexts is built, so validating one listener's
     // would say nothing about another's.
+    let tls = Arc::new(tls::SharedTlsIdentity::new(tls::TlsIdentity::load(
+        &config.tls,
+    )?));
     for plan in &listeners {
         let client_certs = plan
             .listener
@@ -685,11 +692,11 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
             .then(|| Arc::new(SharedRoster::new(clients.clone())));
         match plan.listener.transport {
             ListenerTransport::Http3 => {
-                build_quic_config(config, client_certs)
+                build_quic_config(config, client_certs, Arc::clone(&tls))
                     .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
             }
             ListenerTransport::Http2 => {
-                http2::build_acceptor(config, client_certs)
+                http2::build_acceptor(client_certs, Arc::clone(&tls))
                     .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
             }
         }
@@ -708,19 +715,21 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
         .sum();
     Ok(ValidatedServerConfig {
         clients,
+        tls,
         listeners,
         total_shards,
         address_pool,
     })
 }
 
-/// Capture only the startup state that a roster reload is allowed to use.
-fn roster_reload_settings(
+/// Capture only the startup state that a configuration reload may use.
+fn config_reload_settings(
     config: &ServerConfig,
     config_path: Option<std::path::PathBuf>,
-) -> Option<RosterReload> {
-    config_path.map(|path| RosterReload {
+) -> Option<ConfigReload> {
+    config_path.map(|path| ConfigReload {
         path,
+        tls: config.tls.clone(),
         client_cert_enabled: any_client_cert_listener(config),
         ip_proxy_enabled: config.ip_proxy.enabled,
     })
@@ -796,8 +805,8 @@ impl Server {
         Self::bind_with_reload(config, None).await
     }
 
-    /// Bind, and allow `SIGHUP` to re-read the `[[clients]]` roster from
-    /// `config_path`.
+    /// Bind, and allow `SIGHUP` to re-read TLS material and the active
+    /// `[[clients]]` roster from `config_path`.
     ///
     /// Revoking a client otherwise costs a restart, which drops every other
     /// client's tunnel to remove one.
@@ -807,6 +816,7 @@ impl Server {
     ) -> anyhow::Result<Self> {
         let ValidatedServerConfig {
             clients,
+            tls,
             listeners,
             total_shards,
             address_pool,
@@ -840,12 +850,11 @@ impl Server {
             tun_rx.push(rx);
         }
 
-        // A live switch from Basic to client-certificate authentication is not
-        // possible: the TLS context is fixed when each shard binds. Capture the
-        // startup mode so SIGHUP can be consumed safely but cannot fake a
-        // switch — including the switch from no client-certificate listener to
-        // one, which no reload can conjure a TLS context for.
-        let roster_reload = roster_reload_settings(&config, config_path);
+        // Listener authentication modes stay fixed because changing whether a
+        // socket requests client certificates changes its trust boundary.
+        // Capture that startup state while still allowing the shared server
+        // identity and an already-active client roster to be replaced.
+        let config_reload = config_reload_settings(&config, config_path);
 
         let shared = Arc::new(Shared {
             address_pool: Mutex::new(address_pool),
@@ -869,7 +878,8 @@ impl Server {
             auth_permits: Arc::new(Semaphore::new(auth_concurrency(basic_shards))),
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
             clients: Arc::new(SharedRoster::new(clients)),
-            roster_reload,
+            tls,
+            config_reload,
             metrics: Arc::clone(&metrics),
             shard_metrics: RwLock::new(Vec::with_capacity(total_shards)),
         });
@@ -1014,14 +1024,16 @@ impl Server {
             .and_then(|server| server.local_addr().ok())
     }
 
-    /// Reload the roster whenever `SIGHUP` arrives.
+    /// Reload TLS material and the active client roster whenever `SIGHUP`
+    /// arrives.
     ///
-    /// One task for the whole server rather than one per shard: the roster is
-    /// shared, so reloading it once is enough, and the shards pick the change
-    /// up through its generation counter on their next sweep.
+    /// One task owns the transaction for the whole server. The new certificate
+    /// pair and roster are fully parsed before either shared snapshot changes;
+    /// new handshakes then pick up the TLS generation immediately, while
+    /// established connections retain the identity they negotiated.
     #[cfg(unix)]
-    fn spawn_roster_reloader(shared: Arc<Shared>) {
-        if shared.roster_reload.is_none() {
+    fn spawn_config_reloader(shared: Arc<Shared>) {
+        if shared.config_reload.is_none() {
             return;
         }
 
@@ -1030,22 +1042,45 @@ impl Server {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                     Ok(signal) => signal,
                     Err(e) => {
-                        warn!(%e, "cannot listen for SIGHUP; roster reload is unavailable");
+                        warn!(%e, "cannot listen for SIGHUP; configuration reload is unavailable");
                         return;
                     }
                 };
 
             while sighup.recv().await.is_some() {
-                // A failed reload leaves the running roster untouched, so the
-                // server keeps serving the clients it already admitted.
-                match reload_roster(&shared) {
-                    Ok((generation, clients)) => {
-                        shared.metrics.record_roster_reload(true);
-                        info!(generation, clients, "roster reloaded")
+                let reloads_roster = shared
+                    .config_reload
+                    .as_ref()
+                    .is_some_and(|reload| reload.client_cert_enabled);
+                match reload_configuration(&shared) {
+                    Ok(outcome) => {
+                        shared.metrics.record_tls_reload(true);
+                        if reloads_roster {
+                            shared.metrics.record_roster_reload(true);
+                        }
+                        if let Some((roster_generation, clients)) = outcome.roster {
+                            info!(
+                                tls_generation = outcome.tls_generation,
+                                roster_generation,
+                                clients,
+                                "TLS identity and client roster reloaded"
+                            );
+                        } else {
+                            info!(
+                                tls_generation = outcome.tls_generation,
+                                "TLS identity reloaded"
+                            );
+                        }
                     }
                     Err(e) => {
-                        shared.metrics.record_roster_reload(false);
-                        warn!(error = %format!("{e:#}"), "roster reload failed, keeping the previous one")
+                        shared.metrics.record_tls_reload(false);
+                        if reloads_roster {
+                            shared.metrics.record_roster_reload(false);
+                        }
+                        warn!(
+                            error = %format!("{e:#}"),
+                            "configuration reload failed, keeping the previous TLS identity and roster"
+                        )
                     }
                 }
             }
@@ -1053,13 +1088,13 @@ impl Server {
     }
 
     #[cfg(not(unix))]
-    fn spawn_roster_reloader(_shared: Arc<Shared>) {}
+    fn spawn_config_reloader(_shared: Arc<Shared>) {}
 
     /// Run every shard until they all stop.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let watchdog_timeout =
             systemd::watchdog_timeout().context("invalid systemd watchdog environment")?;
-        Self::spawn_roster_reloader(Arc::clone(&self.shared));
+        Self::spawn_config_reloader(Arc::clone(&self.shared));
 
         // Install one process-wide signal listener before any shard starts.
         // Every shard receives the same latched watch value, so one SIGINT or
@@ -1329,42 +1364,50 @@ fn resolve_shard_count(configured: usize) -> usize {
         .min(MAX_SHARDS)
 }
 
-/// Re-read the `[[clients]]` roster from disk and install it.
+struct ReloadOutcome {
+    tls_generation: u64,
+    roster: Option<(u64, usize)>,
+}
+
+/// Re-read and atomically install reloadable configuration state.
 ///
-/// Only the roster is reloaded. Everything else — listen address, TLS key,
-/// pools, tuning — is fixed at bind time, and pretending otherwise would make
-/// a reload's effect depend on which fields happened to be reloadable.
-///
-/// Nothing is changed unless the whole new roster validates, so a typo leaves
-/// the running server exactly as it was.
-fn reload_roster(shared: &Shared) -> anyhow::Result<(u64, usize)> {
-    let Some(reload) = shared.roster_reload.as_ref() else {
+/// The effective startup certificate paths are read again, which covers ACME
+/// replacing files or symlink targets. Listener addresses, authentication
+/// modes, pools, credentials, and protocol tuning remain fixed until restart.
+/// If client-certificate authentication was active at startup, the roster is
+/// prepared in the same transaction. Every fallible step finishes before the
+/// shared TLS identity or roster changes.
+fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
+    let Some(reload) = shared.config_reload.as_ref() else {
         anyhow::bail!("no configuration file to reload");
     };
-    if !reload.client_cert_enabled {
-        anyhow::bail!(
-            "roster reload is unavailable because the server did not start in client_cert mode"
-        );
-    }
 
     let text = std::fs::read_to_string(&reload.path)
         .with_context(|| format!("failed to read {}", reload.path.display()))?;
     let config = crate::config::parse_toml(&text)
         .with_context(|| format!("failed to parse {}", reload.path.display()))?;
+    let tls_identity =
+        tls::TlsIdentity::load(&reload.tls).context("failed to load replacement TLS identity")?;
 
-    let any_client_cert = any_client_cert_listener(&config);
-    if !any_client_cert {
-        anyhow::bail!(
-            "refusing to reload: no listener uses auth.mode = \"client_cert\" any more, \
-             which cannot be changed without a restart"
-        );
-    }
+    let registry = if reload.client_cert_enabled {
+        let any_client_cert = any_client_cert_listener(&config);
+        if !any_client_cert {
+            anyhow::bail!(
+                "refusing to reload: no listener uses auth.mode = \"client_cert\" any more, \
+                 which cannot be changed without a restart"
+            );
+        }
+        Some(active_client_registry(&config, any_client_cert)?)
+    } else {
+        None
+    };
 
-    let registry = active_client_registry(&config, any_client_cert)?;
-
-    // Reservations are recomputed before the swap: if a pinned address became
-    // invalid, the roster is rejected rather than half-applied.
-    if reload.ip_proxy_enabled {
+    // Reservations are the final fallible operation and replace themselves
+    // transactionally. Once this succeeds, both shared snapshot swaps below
+    // are infallible.
+    if reload.ip_proxy_enabled
+        && let Some(registry) = &registry
+    {
         shared
             .address_pool
             .lock()
@@ -1377,8 +1420,15 @@ fn reload_roster(shared: &Shared) -> anyhow::Result<(u64, usize)> {
             })?;
     }
 
-    let count = registry.len();
-    Ok((shared.clients.replace(registry), count))
+    let roster = registry.map(|registry| {
+        let count = registry.len();
+        (shared.clients.replace(registry), count)
+    });
+    let tls_generation = shared.tls.replace(tls_identity);
+    Ok(ReloadOutcome {
+        tls_generation,
+        roster,
+    })
 }
 
 /// Take every address pinned to `identity`, or none of them.
@@ -1463,132 +1513,29 @@ fn encode_ip_setup_capsules(addresses: &[IpAddr]) -> Vec<u8> {
     capsules
 }
 
-/// Build a QUIC config that demands a client certificate and admits only keys
-/// on the roster.
-///
-/// quiche's own `Config` cannot express this. Its `verify_peer(true)` asks
-/// BoringSSL to validate the chain, which these certificates always fail: they
-/// are self-signed, minted fresh per connection, and carry an empty subject.
-/// `verify_peer(false)` on a server does not ask for a certificate at all. So
-/// the TLS context is built by hand, with a callback that ignores the chain and
-/// checks the key instead.
-///
-/// Rejecting inside the callback means an unregistered client is turned away
-/// with a TLS alert during the handshake, before it can open a stream — the
-/// same shape of failure the Cloudflare endpoint produces for an unenrolled
-/// key.
-fn build_client_cert_quic_config(
-    config: &ServerConfig,
-    roster: Arc<SharedRoster>,
-) -> anyhow::Result<quiche::Config> {
-    let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
-        .map_err(|e| anyhow::anyhow!("failed to create TLS context: {e}"))?;
-
-    builder
-        .set_certificate_chain_file(&config.tls.cert_path)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to load tls.cert_path {}: {e}",
-                config.tls.cert_path.display()
-            )
-        })?;
-    builder
-        .set_private_key_file(&config.tls.key_path, boring::ssl::SslFiletype::PEM)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to load tls.key_path {}: {e}",
-                config.tls.key_path.display()
-            )
-        })?;
-    builder.check_private_key().map_err(|e| {
-        anyhow::anyhow!(
-            "tls.key_path {} does not match tls.cert_path {}: {e}",
-            config.tls.key_path.display(),
-            config.tls.cert_path.display()
-        )
-    })?;
-
-    configure_client_cert_verification(&mut builder, roster);
-
-    quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
-        .map_err(|e| anyhow::anyhow!("failed to build QUIC config: {e}"))
-}
-
-/// Load the certificate and key together and verify that they match.
-///
-/// quiche's basic file loaders report malformed files, but checking the pair
-/// explicitly avoids deferring a mismatched key to the first handshake.
-fn validate_tls_pair(config: &ServerConfig) -> anyhow::Result<()> {
-    let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
-        .map_err(|e| anyhow::anyhow!("failed to create TLS context: {e}"))?;
-    builder
-        .set_certificate_chain_file(&config.tls.cert_path)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to load tls.cert_path {}: {e}",
-                config.tls.cert_path.display()
-            )
-        })?;
-    builder
-        .set_private_key_file(&config.tls.key_path, boring::ssl::SslFiletype::PEM)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to load tls.key_path {}: {e}",
-                config.tls.key_path.display()
-            )
-        })?;
-    builder.check_private_key().map_err(|e| {
-        anyhow::anyhow!(
-            "tls.key_path {} does not match tls.cert_path {}: {e}",
-            config.tls.key_path.display(),
-            config.tls.cert_path.display()
-        )
-    })
-}
-
 /// Build the complete QUIC configuration used by both preflight validation and
 /// live shards.
 fn build_quic_config(
     config: &ServerConfig,
     client_certs: Option<Arc<SharedRoster>>,
+    tls_identity: Arc<tls::SharedTlsIdentity>,
 ) -> anyhow::Result<quiche::Config> {
-    validate_tls_pair(config)?;
-
-    let mut quic_config = match client_certs {
-        Some(registry) => build_client_cert_quic_config(config, registry)?,
-        None => {
-            let cert_path = config.tls.cert_path.to_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tls.cert_path is not valid UTF-8: {}",
-                    config.tls.cert_path.display()
-                )
-            })?;
-            let key_path = config.tls.key_path.to_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tls.key_path is not valid UTF-8: {}",
-                    config.tls.key_path.display()
-                )
-            })?;
-            let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-            quic_config
-                .load_cert_chain_from_pem_file(cert_path)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to load tls.cert_path {} into quiche: {e}",
-                        config.tls.cert_path.display()
-                    )
-                })?;
-            quic_config
-                .load_priv_key_from_pem_file(key_path)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to load tls.key_path {} into quiche: {e}",
-                        config.tls.key_path.display()
-                    )
-                })?;
-            quic_config
-        }
-    };
+    // quiche's file-loading API fixes one identity into the context. Building
+    // the context directly lets the ClientHello callback select the current
+    // shared identity for every new connection while existing QUIC state keeps
+    // the identity it already negotiated.
+    let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
+        .map_err(|e| anyhow::anyhow!("failed to create TLS context: {e}"))?;
+    tls::configure_dynamic_identity(&mut builder, tls_identity);
+    if let Some(roster) = client_certs {
+        // quiche's normal peer verification cannot express the self-signed,
+        // public-key roster used by usque-compatible clients, so install the
+        // same custom verifier HTTP/2 uses.
+        configure_client_cert_verification(&mut builder, roster);
+    }
+    let mut quic_config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
+            .map_err(|e| anyhow::anyhow!("failed to build QUIC config: {e}"))?;
 
     quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
 
@@ -1782,9 +1729,13 @@ struct ForwardedPacket {
     from: SocketAddr,
 }
 
-/// Immutable facts needed to reload only the client roster.
-struct RosterReload {
+/// Immutable facts that govern SIGHUP reloads.
+struct ConfigReload {
     path: std::path::PathBuf,
+    /// Effective startup paths. ACME may replace their contents or symlink
+    /// targets, but changing the paths themselves still needs a restart so CLI
+    /// overrides cannot silently disappear on reload.
+    tls: TlsSection,
     /// Whether the bound TLS context actually requests client certificates.
     client_cert_enabled: bool,
     /// The IP proxy state this process actually bound with. The value in a
@@ -1854,9 +1805,12 @@ struct Shared {
     /// Replaceable at runtime so a client can be revoked without restarting
     /// the process and dropping every other client's tunnel.
     clients: Arc<SharedRoster>,
-    /// Present when the server started from a config file. The captured startup
-    /// mode prevents SIGHUP from pretending to change the bound TLS context.
-    roster_reload: Option<RosterReload>,
+    /// Parsed certificate chain and private key selected by new TLS handshakes.
+    /// Existing connections pin the identity they started with.
+    tls: Arc<tls::SharedTlsIdentity>,
+    /// Present when the server started from a config file. Captured startup
+    /// state keeps reload limited to TLS material and an already-active roster.
+    config_reload: Option<ConfigReload>,
     /// Process-wide counters and readiness state.
     metrics: Arc<Metrics>,
     /// Metric owner for each global shard index. Read only on a queue-drop
@@ -2012,7 +1966,11 @@ impl Shard {
             None
         };
 
-        let quic_config = build_quic_config(&config, client_certs.as_ref().map(Arc::clone))?;
+        let quic_config = build_quic_config(
+            &config,
+            client_certs.as_ref().map(Arc::clone),
+            Arc::clone(&shared.tls),
+        )?;
         let h3_config = build_h3_config()?;
 
         let tcp_policy = TargetPolicy::new(
@@ -4217,19 +4175,20 @@ mod tests {
     }
 
     #[test]
-    fn roster_reload_uses_the_auth_and_ip_proxy_state_from_startup() {
+    fn configuration_reload_uses_tls_auth_and_ip_proxy_state_from_startup() {
         let path = std::path::PathBuf::from("masque.toml");
         let mut config = ServerConfig::default();
 
         // Basic mode still consumes HUP safely (the systemd unit always exposes
         // ExecReload), but the captured startup bit prevents an edited file from
         // pretending the already-bound TLS context switched modes.
-        let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
+        let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
         assert!(!reload.client_cert_enabled);
+        assert_eq!(reload.tls, config.tls);
 
         config.listeners[0].auth.mode = AuthMode::ClientCert;
         config.ip_proxy.enabled = false;
-        let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
+        let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
         assert_eq!(reload.path, path);
         assert!(reload.client_cert_enabled);
         assert!(!reload.ip_proxy_enabled);
@@ -4240,11 +4199,11 @@ mod tests {
             listener("0.0.0.0:443", AuthMode::Basic),
             listener("0.0.0.0:4443", AuthMode::ClientCert),
         ]);
-        let reload = super::roster_reload_settings(&config, Some(path.clone())).unwrap();
+        let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
         assert!(reload.client_cert_enabled);
 
         // Programmatic servers have no source file to re-read.
-        assert!(super::roster_reload_settings(&config, None).is_none());
+        assert!(super::config_reload_settings(&config, None).is_none());
     }
 
     // ── Listener planning ────────────────────────────────────────────

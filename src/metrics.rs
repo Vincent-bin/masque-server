@@ -24,6 +24,8 @@ pub(crate) struct Metrics {
     started: Instant,
     start_time_seconds: u64,
     listeners: RwLock<Vec<ListenerMetrics>>,
+    tls_reload_success: AtomicU64,
+    tls_reload_failure: AtomicU64,
     roster_reload_success: AtomicU64,
     roster_reload_failure: AtomicU64,
     forced_shutdowns: AtomicU64,
@@ -40,6 +42,8 @@ impl Metrics {
                 .unwrap_or_default()
                 .as_secs(),
             listeners: RwLock::new(Vec::new()),
+            tls_reload_success: AtomicU64::new(0),
+            tls_reload_failure: AtomicU64::new(0),
             roster_reload_success: AtomicU64::new(0),
             roster_reload_failure: AtomicU64::new(0),
             forced_shutdowns: AtomicU64::new(0),
@@ -125,6 +129,17 @@ impl Metrics {
         }
     }
 
+    pub(crate) fn record_tls_reload(&self, success: bool) {
+        if !self.enabled {
+            return;
+        }
+        if success {
+            self.tls_reload_success.fetch_add(1, RELAXED);
+        } else {
+            self.tls_reload_failure.fetch_add(1, RELAXED);
+        }
+    }
+
     pub(crate) fn record_forced_shutdown(&self) {
         if !self.enabled {
             return;
@@ -180,6 +195,25 @@ impl Metrics {
             out,
             "masque_process_uptime_seconds {:.3}",
             self.started.elapsed().as_secs_f64()
+        )
+        .unwrap();
+
+        metric_header(
+            &mut out,
+            "masque_tls_reloads_total",
+            "Server TLS identity reload attempts.",
+            "counter",
+        );
+        writeln!(
+            out,
+            "masque_tls_reloads_total{{result=\"success\"}} {}",
+            self.tls_reload_success.load(RELAXED)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "masque_tls_reloads_total{{result=\"failure\"}} {}",
+            self.tls_reload_failure.load(RELAXED)
         )
         .unwrap();
 
@@ -923,9 +957,15 @@ mod tests {
         listener.record_auth_success();
         listener.record_heartbeat(metrics.elapsed_millis(), Duration::from_millis(25));
         shards[1].connection_opened();
+        metrics.record_tls_reload(true);
+        metrics.record_tls_reload(false);
+        metrics.record_roster_reload(true);
 
         let rendered = metrics.render();
         assert!(rendered.contains("masque_server_ready 1\n"));
+        assert!(rendered.contains("masque_tls_reloads_total{result=\"success\"} 1\n"));
+        assert!(rendered.contains("masque_tls_reloads_total{result=\"failure\"} 1\n"));
+        assert!(rendered.contains("masque_roster_reloads_total{result=\"success\"} 1\n"));
         assert!(
             rendered.contains(
                 "masque_connections_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 2"
@@ -1016,6 +1056,8 @@ mod tests {
         shard.update_tunnels([0; 3], [1; 3]);
         shard.record_heartbeat(123, Duration::from_millis(25));
         let _pending = shard.auth_pending_guard();
+        metrics.record_tls_reload(true);
+        metrics.record_roster_reload(true);
 
         assert_eq!(shard.connections_active.load(RELAXED), 0);
         assert_eq!(shard.quic_receive_packets.load(RELAXED), 0);
@@ -1027,6 +1069,8 @@ mod tests {
         assert_eq!(shard.auth_pending.load(RELAXED), 0);
         assert_eq!(shard.last_heartbeat_millis.load(RELAXED), 123);
         assert_eq!(shard.event_loop_lag_micros.load(RELAXED), 0);
+        assert_eq!(metrics.tls_reload_success.load(RELAXED), 0);
+        assert_eq!(metrics.roster_reload_success.load(RELAXED), 0);
     }
 
     #[test]

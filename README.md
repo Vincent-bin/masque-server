@@ -29,6 +29,9 @@ a staging environment.
 - Optional loopback health/readiness endpoints and low-overhead Prometheus
   metrics, with packaged static alert rules and a Grafana dashboard JSON
 - Optional JSON logs plus native systemd readiness and shard-liveness watchdog
+- Atomic `SIGHUP` reload of the full TLS certificate chain and private key
+  without dropping established connections; active roster updates disconnect
+  only revoked certificate clients
 - Read-only `doctor` checks for CONNECT-IP TUN, forwarding, route, firewall,
   and NAT prerequisites without modifying the host
 - Static Linux x86_64 release archives with a systemd installer
@@ -57,6 +60,11 @@ certificate, private key, username, and password hash, then start the server:
 ```sh
 target/release/masque-server --config ./masque.toml
 ```
+
+After replacing both TLS files, `systemctl reload masque` makes new HTTP/2 and
+HTTP/3 handshakes use them while established connections continue normally.
+Invalid or mismatched replacement material is rejected and the previous
+identity remains active.
 
 Authentication is fail-closed. In `basic` mode the server refuses to start until
 a valid username and Argon2id hash are configured.

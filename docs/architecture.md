@@ -147,14 +147,18 @@ and authentication. Every worker references the same process-wide
 `ServerConfig`, so proxy policies, TLS tuning, limits, and authentication state
 are shared rather than copied per listener. QUIC tuning applies only to HTTP/3,
 and HTTP/2 flow-control tuning applies only to HTTP/2. The authentication mode
-decides which TLS context is built, and that is fixed when the socket binds.
+decides which TLS context is built, and that policy is fixed when the socket
+binds. A process-wide TLS identity snapshot is selected once per new handshake;
+`SIGHUP` validates and atomically replaces it for both transports without
+rebuilding listeners, while established connections retain their original
+handshake snapshot.
 
 Shards are numbered across the whole server rather than within a listener,
 which is what lets the cross-shard queues, the connection-ID registry, and the
 TUN ownership map stay single and listener-agnostic. Everything in `Shared` is
-server-wide: the address pool, the routing table, the TUN device, the client
-roster, and the credential-verification budget. A forwarded packet is re-handled
-by its owner using that shard's own local address, so a reply always leaves the
+server-wide: the TLS identity, address pool, routing table, TUN device, client
+roster, and credential-verification budget. A forwarded packet is re-handled by
+its owner using that shard's own local address, so a reply always leaves the
 socket the connection actually lives on — including when the owner belongs to a
 different listener.
 

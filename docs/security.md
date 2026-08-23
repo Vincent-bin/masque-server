@@ -93,6 +93,19 @@ packet loss into seconds of latency and make memory exhaustion easier.
 - Do not commit real certificates, hashes, passwords, IPs, or server inventory.
 - Avoid trace logging in production except during a short controlled incident.
 
+Install both renewed TLS files before sending `SIGHUP`. The server builds and
+validates a complete certificate/key snapshot before publishing it; failed
+reads, malformed PEM, and mismatched keys leave the previous snapshot active.
+Existing connections pin the snapshot selected during their handshake, while
+new handshakes see the replacement. File paths are fixed at startup, so keep
+their parent directories and symlink update process writable only by the
+operator or ACME service account.
+
+Each successful reload advances the TLS session ID context. Session tickets
+from the previous identity or roster therefore cannot bypass certificate
+rotation or client revocation: BoringSSL falls back to a full handshake and
+issues tickets in the new context.
+
 The right server certificate depends on the authentication mode, because the
 two modes establish server identity in completely different ways.
 
@@ -147,7 +160,7 @@ Consequences worth planning for:
   `[[clients]]` entry and sending `SIGHUP`: the server disconnects that
   client's live connections and refuses its next handshake, without restarting
   and without disturbing other tunnels. A reload that fails validation keeps
-  the previous roster, so a bad edit cannot lock everyone out.
+  the previous TLS identity and roster, so a bad edit cannot lock everyone out.
 
 ## Linux privilege
 

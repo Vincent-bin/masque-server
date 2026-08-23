@@ -20,13 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use boring::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
+use boring::ssl::{AlpnError, SslAcceptor, SslMethod, select_next_proto};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use super::{MAX_EPHEMERAL_BIND_ATTEMPTS, Shared, listen_address_conflict};
+use super::{MAX_EPHEMERAL_BIND_ATTEMPTS, Shared, listen_address_conflict, tls};
 use crate::auth::BasicAuthenticator;
 use crate::client_identity::{SharedRoster, configure_client_cert_verification};
 use crate::config::{ResolvedListener, ServerConfig};
@@ -64,11 +64,11 @@ impl Http2Listener {
         unavailable: &[SocketAddr],
     ) -> anyhow::Result<Self> {
         let acceptor = Arc::new(build_acceptor(
-            &config,
             listener
                 .auth
                 .client_cert_enabled()
                 .then(|| Arc::clone(&shared.clients)),
+            Arc::clone(&shared.tls),
         )?);
 
         let (socket, listen_addr) = bind_tcp_listener(listener.listen_addr, unavailable).await?;
@@ -211,34 +211,12 @@ struct ConnectionContext {
 
 /// Validate and build the TLS context used by an H2 listener.
 pub(super) fn build_acceptor(
-    config: &ServerConfig,
     client_certs: Option<Arc<SharedRoster>>,
+    tls_identity: Arc<tls::SharedTlsIdentity>,
 ) -> anyhow::Result<SslAcceptor> {
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
         .context("failed to create HTTP/2 TLS context")?;
-    builder
-        .set_certificate_chain_file(&config.tls.cert_path)
-        .with_context(|| {
-            format!(
-                "failed to load tls.cert_path {}",
-                config.tls.cert_path.display()
-            )
-        })?;
-    builder
-        .set_private_key_file(&config.tls.key_path, SslFiletype::PEM)
-        .with_context(|| {
-            format!(
-                "failed to load tls.key_path {}",
-                config.tls.key_path.display()
-            )
-        })?;
-    builder.check_private_key().with_context(|| {
-        format!(
-            "tls.key_path {} does not match tls.cert_path {}",
-            config.tls.key_path.display(),
-            config.tls.cert_path.display()
-        )
-    })?;
+    tls::configure_dynamic_identity(&mut builder, tls_identity);
     builder.set_alpn_select_callback(|_, client| {
         select_next_proto(b"\x02h2", client).ok_or(AlpnError::NOACK)
     });
