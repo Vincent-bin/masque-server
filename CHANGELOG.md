@@ -7,6 +7,17 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.8.3 - 2026-08-24
+
+### Fixed
+
+- CONNECT-UDP URI percent decoding now reads hexadecimal escapes entirely from
+  bytes, so a malformed escape next to multibyte UTF-8 cannot panic a proxy
+  worker. The parser fuzz regression is covered by a permanent unit test.
+- Scheduled Linux verification now supplies the E2E client image with its
+  declared benchmark target and bindgen dependencies, while its echo target
+  serves TCP and UDP together so CONNECT, CONNECT-UDP, and CONNECT-IP all run.
+
 ## 0.8.2 - 2026-08-23
 
 ### Added
