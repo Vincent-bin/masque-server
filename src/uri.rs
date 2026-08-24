@@ -62,9 +62,9 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(high), Some(low)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
         {
-            result.push(byte);
+            result.push((high << 4) | low);
             i += 3;
             continue;
         }
@@ -72,6 +72,15 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&result).into_owned()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Parse a CONNECT-UDP URI path.
@@ -408,6 +417,18 @@ mod tests {
     #[test]
     fn percent_decode_space() {
         assert_eq!(percent_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn percent_decode_does_not_slice_through_utf8() {
+        // Regression for the scheduled fuzz crash: URI positions are byte
+        // offsets, so parsing the two bytes after '%' must not slice `str` at
+        // a possible UTF-8 continuation byte.
+        assert_eq!(percent_decode("%%%\u{6e1}065"), "%%%\u{6e1}065");
+
+        let error = parse_udp_path("/.well-known/masque/udp/host/%%%\u{6e1}065/", UDP_TEMPLATE)
+            .unwrap_err();
+        assert!(matches!(error, UriError::InvalidPort(_)));
     }
 
     // ── extract_prefix ────────────────────────────────────────────────
