@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.9.0 - 2026-08-26
+
 ### Added
 
 - One Basic listener can authenticate multiple independently managed accounts
