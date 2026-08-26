@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -24,10 +24,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use masque::capsule::decoder::CapsuleDecoder;
 use masque::capsule::{CapsuleFrame, IpAddress, encoder};
-use masque::config::{AuthMode, ClientEntry, ListenerTransport, ServerConfig};
+use masque::config::{AuthMode, BasicUser, ClientEntry, ListenerTransport, ServerConfig};
 use masque::server::Server;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+#[cfg(unix)]
+static SIGHUP_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct TestFiles {
     directory: PathBuf,
@@ -155,6 +158,26 @@ fn http2_reload_config_file(cert: &Path, key: &Path) -> String {
     )
 }
 
+fn http2_basic_reload_config_file(cert: &Path, key: &Path, users: &[(&str, &str)]) -> String {
+    let mut text = format!(
+        "[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n\
+         [tcp_proxy]\nenabled = true\nallow_targets = [\"127.0.0.0/8\"]\n\
+         deny_targets = []\n\n\
+         [udp_proxy]\nenabled = false\n\n\
+         [ip_proxy]\nenabled = false\n\n\
+         [[listeners]]\nlisten_addr = \"127.0.0.1:0\"\ntransport = \"http2\"\n\
+         shards = 1\n\n[listeners.auth]\nenabled = true\nmode = \"basic\"\n",
+        cert.display(),
+        key.display()
+    );
+    for (username, password_hash) in users {
+        text.push_str(&format!(
+            "\n[[listeners.auth.users]]\nusername = {username:?}\npassword_hash = {password_hash:?}\n"
+        ));
+    }
+    text
+}
+
 #[cfg(unix)]
 fn raise_sighup() {
     let status = std::process::Command::new("kill")
@@ -162,6 +185,26 @@ fn raise_sighup() {
         .status()
         .expect("failed to send SIGHUP");
     assert!(status.success(), "kill -HUP failed");
+}
+
+async fn basic_connect_status(
+    client: &h2::client::SendRequest<Bytes>,
+    username: &str,
+    password: &str,
+) -> StatusCode {
+    let mut client = client.clone().ready().await.unwrap();
+    let mut request = connect_request("127.0.0.1:9".parse().unwrap());
+    request.headers_mut().insert(
+        "proxy-authorization",
+        format!(
+            "Basic {}",
+            STANDARD.encode(format!("{username}:{password}"))
+        )
+        .parse()
+        .unwrap(),
+    );
+    let (response, _) = client.send_request(request, true).unwrap();
+    response.await.unwrap().status()
 }
 
 async fn connect_h2(
@@ -370,17 +413,27 @@ async fn basic_auth_challenges_missing_credentials_and_accepts_valid_credentials
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
     let target_task = tokio::spawn(async move {
-        let (mut stream, _) = target.accept().await.unwrap();
-        let mut byte = [0_u8; 1];
-        stream.read_exact(&mut byte).await.unwrap();
-        stream.write_all(&byte).await.unwrap();
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            stream.write_all(&byte).await.unwrap();
+        }
     });
 
     let mut config = http2_config(&files);
     config.listeners[0].auth.enabled = true;
     config.listeners[0].auth.mode = AuthMode::Basic;
-    config.listeners[0].auth.username = "alice".into();
-    config.listeners[0].auth.password_hash = masque::auth::hash_password(b"secret").unwrap();
+    config.listeners[0].auth.users = vec![
+        BasicUser {
+            username: "alice".into(),
+            password_hash: masque::auth::hash_password(b"alice-secret").unwrap(),
+        },
+        BasicUser {
+            username: "bob".into(),
+            password_hash: masque::auth::hash_password(b"bob-secret").unwrap(),
+        },
+    ];
     let (server_addr, server_task) = spawn_http2_config(config).await;
     let (mut client, driver) = connect_h2(server_addr).await;
 
@@ -398,7 +451,7 @@ async fn basic_auth_challenges_missing_credentials_and_accepts_valid_credentials
     let mut request = connect_request(target_addr);
     request.headers_mut().insert(
         "proxy-authorization",
-        "Basic YWxpY2U6c2VjcmV0".parse().unwrap(),
+        "Basic YWxpY2U6YWxpY2Utc2VjcmV0".parse().unwrap(),
     );
     let (response, mut request_body) = client.send_request(request, false).unwrap();
     let response = response.await.unwrap();
@@ -413,6 +466,30 @@ async fn basic_auth_challenges_missing_credentials_and_accepts_valid_credentials
         .unwrap()
         .unwrap();
     assert_eq!(&echoed[..], b"x");
+    response_body
+        .flow_control()
+        .release_capacity(echoed.len())
+        .unwrap();
+
+    client = client.ready().await.unwrap();
+    let mut request = connect_request(target_addr);
+    request.headers_mut().insert(
+        "proxy-authorization",
+        "Basic Ym9iOmJvYi1zZWNyZXQ=".parse().unwrap(),
+    );
+    let (response, mut request_body) = client.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    request_body
+        .send_data(Bytes::from_static(b"y"), true)
+        .unwrap();
+    let mut response_body = response.into_body();
+    let echoed = tokio::time::timeout(Duration::from_secs(2), response_body.data())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed[..], b"y");
     response_body
         .flow_control()
         .release_capacity(echoed.len())
@@ -664,12 +741,95 @@ async fn client_certificate_pins_http2_connect_ip_addresses() {
     driver.abort();
 }
 
+/// A SIGHUP swaps the complete Basic account snapshot used by new CONNECT
+/// requests, including requests on an already-established HTTP/2 connection.
+/// An invalid replacement leaves the last valid snapshot active.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn basic_users_reload_on_an_established_http2_connection() {
+    let _sighup_guard = SIGHUP_TEST_LOCK.lock().await;
+    let files = TestFiles::new();
+    let config_path = files.directory.join("masque-basic.toml");
+    let old_hash = masque::auth::hash_password(b"old-secret").unwrap();
+    let config_text =
+        http2_basic_reload_config_file(&files.cert, &files.key, &[("alice", &old_hash)]);
+    std::fs::write(&config_path, &config_text).unwrap();
+    let config = masque::config::parse_toml(&config_text).unwrap();
+    let (server_addr, server_task) =
+        spawn_reloadable_http2_config(config, config_path.clone()).await;
+    let (client, driver) = connect_h2(server_addr).await;
+
+    assert_eq!(
+        basic_connect_status(&client, "alice", "old-secret").await,
+        StatusCode::BAD_GATEWAY,
+        "the initial credential did not pass authentication"
+    );
+
+    let new_hash = masque::auth::hash_password(b"new-secret").unwrap();
+    let bob_hash = masque::auth::hash_password(b"bob-secret").unwrap();
+    std::fs::write(
+        &config_path,
+        http2_basic_reload_config_file(
+            &files.cert,
+            &files.key,
+            &[("alice", &new_hash), ("bob", &bob_hash)],
+        ),
+    )
+    .unwrap();
+    raise_sighup();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if basic_connect_status(&client, "alice", "old-secret").await
+            == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the old Basic credential remained active after SIGHUP"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        basic_connect_status(&client, "alice", "new-secret").await,
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        basic_connect_status(&client, "bob", "bob-secret").await,
+        StatusCode::BAD_GATEWAY
+    );
+
+    // A duplicate username makes the complete reload invalid. The last good
+    // credential snapshot must remain active.
+    std::fs::write(
+        &config_path,
+        http2_basic_reload_config_file(
+            &files.cert,
+            &files.key,
+            &[("bob", &bob_hash), ("bob", &new_hash)],
+        ),
+    )
+    .unwrap();
+    raise_sighup();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        basic_connect_status(&client, "bob", "bob-secret").await,
+        StatusCode::BAD_GATEWAY,
+        "a rejected reload replaced the last valid Basic credential set"
+    );
+
+    driver.abort();
+    server_task.abort();
+}
+
 /// A SIGHUP swaps the identity selected by future TCP/TLS handshakes while an
 /// established HTTP/2 connection keeps running. A mismatched replacement key
 /// is rejected without losing the last valid in-memory identity.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http2_tls_identity_reloads_without_dropping_existing_connections() {
+    let _sighup_guard = SIGHUP_TEST_LOCK.lock().await;
     let files = TestFiles::new();
     let chain_key = p256_key();
     let chain_certificate = self_signed(&chain_key);

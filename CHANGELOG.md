@@ -7,6 +7,17 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- One Basic listener can authenticate multiple independently managed accounts
+  from repeated `[[listeners.auth.users]]` tables. `list-users`, `add-user`,
+  `set-password`, and `remove-user` edit credentials atomically without exposing
+  hashes; the legacy scalar pair remains readable and is migrated on first edit.
+- `SIGHUP` validates and replaces active Basic account sets together with the
+  TLS identity and certificate roster. Existing tunnels continue, including
+  HTTP/2 connections whose later CONNECT requests immediately use the new
+  account snapshot; a bad account rejects the complete reload.
+
 ## 0.8.3 - 2026-08-24
 
 ### Fixed

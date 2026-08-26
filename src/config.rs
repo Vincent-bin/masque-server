@@ -121,8 +121,39 @@ pub struct AuthSection {
     /// Master switch. `false` disables authentication whatever `mode` says.
     pub enabled: bool,
     pub mode: AuthMode,
+    /// Legacy single-user spelling retained so existing configurations keep
+    /// working. New configurations should use repeated
+    /// `[[listeners.auth.users]]` tables instead.
+    pub username: String,
+    /// Legacy companion to [`username`](Self::username).
+    pub password_hash: String,
+    /// Basic credentials accepted by this listener.
+    #[serde(default)]
+    pub users: Vec<BasicUser>,
+}
+
+/// One Basic-auth principal.
+#[derive(Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BasicUser {
     pub username: String,
     pub password_hash: String,
+}
+
+impl std::fmt::Debug for BasicUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicUser")
+            .field("username", &self.username)
+            .field(
+                "password_hash",
+                &if self.password_hash.is_empty() {
+                    ""
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for AuthSection {
@@ -139,6 +170,7 @@ impl std::fmt::Debug for AuthSection {
                     "[REDACTED]"
                 },
             )
+            .field("users", &self.users)
             .finish()
     }
 }
@@ -405,6 +437,7 @@ impl Default for AuthSection {
             mode: AuthMode::Basic,
             username: String::new(),
             password_hash: String::new(),
+            users: Vec::new(),
         }
     }
 }
@@ -648,6 +681,37 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
 
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("$argon2id$"));
+    }
+
+    #[test]
+    fn parse_multiple_basic_users_and_redact_every_hash() {
+        let toml = r#"
+[[listeners]]
+listen_addr = "127.0.0.1:8443"
+
+[listeners.auth]
+enabled = true
+mode = "basic"
+
+[[listeners.auth.users]]
+username = "alice"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$YWxpY2U$aGFzaDE"
+
+[[listeners.auth.users]]
+username = "bob"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$Ym9i$aGFzaDI"
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        let auth = &cfg.listeners[0].auth;
+        assert!(auth.username.is_empty());
+        assert!(auth.password_hash.is_empty());
+        assert_eq!(auth.users.len(), 2);
+        assert_eq!(auth.users[0].username, "alice");
+        assert_eq!(auth.users[1].username, "bob");
+
+        let debug = format!("{cfg:?}");
+        assert_eq!(debug.matches("[REDACTED]").count(), 2);
         assert!(!debug.contains("$argon2id$"));
     }
 

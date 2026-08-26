@@ -29,9 +29,9 @@ impl Shard {
         if pending.is_empty() {
             return;
         }
-        let Some(auth) = self.auth.clone() else {
+        if self.auth.is_none() {
             return;
-        };
+        }
         let Some(conn_id) = self.conn_by_index.get(&conn_idx).cloned() else {
             return;
         };
@@ -85,12 +85,12 @@ impl Shard {
             };
             let pending_gauge = self.metrics.auth_pending_guard();
 
-            let auth = Arc::clone(&auth);
             let auth_tx = self.auth_tx.clone();
             let permits = Arc::clone(&self.shared.auth_permits);
             let metrics = Arc::clone(&self.metrics);
             let PendingAuth {
                 stream_id,
+                credential,
                 password,
                 request,
             } = request;
@@ -115,7 +115,7 @@ impl Shard {
                         drop(permit);
                         return None;
                     }
-                    let authorized = auth.verify(&password);
+                    let authorized = credential.verify(&password);
                     drop(permit);
                     Some(authorized)
                 })

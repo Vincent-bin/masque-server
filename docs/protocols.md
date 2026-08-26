@@ -26,7 +26,8 @@ same proxy authentication pipeline. The client supplies:
 Proxy-Authorization: Basic BASE64(username:password)
 ```
 
-The server validates syntax and username before scheduling Argon2id password
+The server validates syntax, looks up the username in that listener's account
+set, and snapshots only the matching Argon2id hash before scheduling password
 verification. Missing or invalid credentials return:
 
 ```text

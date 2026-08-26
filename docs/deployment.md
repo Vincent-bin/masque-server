@@ -33,8 +33,8 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
 Although the script arrives on standard input, interactive answers are read
 from `/dev/tty`. A new installation offers three modes:
 
-- `basic` generates a high-entropy password unless one is provided and prints
-  the credentials once;
+- `basic` creates the first account, generates a high-entropy password unless
+  one is provided, and prints the credentials once;
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
   entry, writes the usque JSON to a new `0600` file, and prints the mihomo block;
 - `dual` does both, writing a
@@ -109,11 +109,6 @@ references remain unchanged. If the requested service restart then fails, the
 installer restores the previous release-managed files, enabled state, and
 active state. Upgrade output reports the resolved listener and authentication
 summary but does not print the existing configuration contents.
-
-Version 0.3 does not migrate the 0.2 single-listener format. Before upgrading,
-move every socket into `[[listeners]]` with an explicit `[listeners.auth]` and
-remove top-level `[auth]`, `[server].listen_addr`, and `[server].shards`. The
-candidate rejects an old file and exits before replacing anything.
 
 ## Install a downloaded archive
 
@@ -292,10 +287,12 @@ its five-second liveness window, allowing systemd to restart a wedged process.
 Graceful shutdown sends `STOPPING=1` as readiness changes to false.
 
 SIGINT follows the same path for foreground runs. SIGHUP remains distinct: it
-atomically reloads the TLS identity and, when client-certificate authentication
-is active, the `[[clients]]` roster. It does not stop the service or disturb
-established connections, except that roster revocation disconnects the affected
-client.
+atomically reloads the TLS identity, every active Basic account set, and, when
+client-certificate authentication is active, the `[[clients]]` roster. It does
+not stop the service or disturb established tunnels, except that certificate
+roster revocation disconnects the affected client. Manage Basic accounts with
+`list-users`, `add-user`, `set-password`, and `remove-user`; see
+[Basic account management](configuration.md#basic-account-management).
 
 ## Upgrade
 

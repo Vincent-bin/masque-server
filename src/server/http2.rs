@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use super::{MAX_EPHEMERAL_BIND_ATTEMPTS, Shared, listen_address_conflict, tls};
-use crate::auth::BasicAuthenticator;
+use crate::auth::SharedBasicAuthenticator;
 use crate::client_identity::{SharedRoster, configure_client_cert_verification};
 use crate::config::{ResolvedListener, ServerConfig};
 use crate::metrics::{Metrics, ShardMetrics};
@@ -44,7 +44,7 @@ pub(super) struct Http2Listener {
     acceptor: Arc<SslAcceptor>,
     config: Arc<ServerConfig>,
     shared: Arc<Shared>,
-    auth: Option<Arc<BasicAuthenticator>>,
+    auth: Option<Arc<SharedBasicAuthenticator>>,
     client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
@@ -59,6 +59,7 @@ impl Http2Listener {
         config: Arc<ServerConfig>,
         shared: Arc<Shared>,
         listener: ResolvedListener,
+        auth: Option<Arc<SharedBasicAuthenticator>>,
         process_metrics: Arc<Metrics>,
         auth_label: &'static str,
         unavailable: &[SocketAddr],
@@ -77,14 +78,6 @@ impl Http2Listener {
             .into_iter()
             .next()
             .expect("one metrics owner was requested for the HTTP/2 listener");
-        let auth = listener
-            .auth
-            .basic_enabled()
-            .then(|| {
-                BasicAuthenticator::new(&listener.auth.username, &listener.auth.password_hash)
-                    .map(Arc::new)
-            })
-            .transpose()?;
         let client_certs = listener
             .auth
             .client_cert_enabled()
@@ -202,7 +195,7 @@ struct ConnectionContext {
     acceptor: Arc<SslAcceptor>,
     config: Arc<ServerConfig>,
     shared: Arc<Shared>,
-    auth: Option<Arc<BasicAuthenticator>>,
+    auth: Option<Arc<SharedBasicAuthenticator>>,
     client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,

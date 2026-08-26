@@ -24,13 +24,13 @@ use self::authentication::AuthOutcome;
 use self::request::{PendingAuth, PendingConnectSetups, RequestContext};
 use crate::address_pool::{AddressPool, PoolError};
 use crate::admission::SourceAdmissionLimiter;
-use crate::auth::BasicAuthenticator;
+use crate::auth::{BasicAuthenticator, SharedBasicAuthenticator};
 use crate::capsule;
 use crate::capsule::{AssignedAddress, CapsuleFrame, IpAddress, IpAddressRange};
 use crate::client_identity::{
     ClientIdentity, ClientRegistry, SharedRoster, configure_client_cert_verification,
 };
-use crate::config::{ListenerTransport, ResolvedListener, ServerConfig, TlsSection};
+use crate::config::{AuthSection, ListenerTransport, ResolvedListener, ServerConfig, TlsSection};
 use crate::connection::{AwaitingAuth, ClientConnection};
 use crate::datagram::{self, DatagramHeader};
 use crate::fxhash::FxHashMap;
@@ -567,11 +567,8 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     for plan in &listeners {
         let addr = plan.listener.listen_addr;
         if plan.listener.auth.basic_enabled() {
-            BasicAuthenticator::new(
-                &plan.listener.auth.username,
-                &plan.listener.auth.password_hash,
-            )
-            .with_context(|| format!("listener {addr}"))?;
+            BasicAuthenticator::from_section(&plan.listener.auth)
+                .with_context(|| format!("listener {addr}"))?;
         } else if !plan.listener.auth.client_cert_enabled() {
             warn!(%addr, "proxy authentication is disabled on this listener");
         }
@@ -732,6 +729,15 @@ fn config_reload_settings(
         tls: config.tls.clone(),
         client_cert_enabled: any_client_cert_listener(config),
         ip_proxy_enabled: config.ip_proxy.enabled,
+        listeners: config
+            .listeners
+            .iter()
+            .map(|listener| ReloadListener {
+                listen_addr: listener.listen_addr,
+                transport: listener.transport,
+                auth: ReloadAuthKind::from(&listener.auth),
+            })
+            .collect(),
     })
 }
 
@@ -805,8 +811,8 @@ impl Server {
         Self::bind_with_reload(config, None).await
     }
 
-    /// Bind, and allow `SIGHUP` to re-read TLS material and the active
-    /// `[[clients]]` roster from `config_path`.
+    /// Bind, and allow `SIGHUP` to re-read TLS material and active Basic/
+    /// certificate credentials from `config_path`.
     ///
     /// Revoking a client otherwise costs a restart, which drops every other
     /// client's tunnel to remove one.
@@ -823,6 +829,20 @@ impl Server {
         } = validate_server_config(&config)?;
 
         let basic_shards = basic_shard_count(&listeners);
+        let basic_auth = listeners
+            .iter()
+            .map(|plan| {
+                plan.listener
+                    .auth
+                    .basic_enabled()
+                    .then(|| {
+                        BasicAuthenticator::from_section(&plan.listener.auth)
+                            .map(SharedBasicAuthenticator::new)
+                            .map(Arc::new)
+                    })
+                    .transpose()
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let config = Arc::new(config);
         let metrics = Arc::new(Metrics::new(config.observability.listen_addr.is_some()));
 
@@ -877,6 +897,7 @@ impl Server {
             tun_tx,
             auth_permits: Arc::new(Semaphore::new(auth_concurrency(basic_shards))),
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
+            basic_auth,
             clients: Arc::new(SharedRoster::new(clients)),
             tls,
             config_reload,
@@ -905,12 +926,14 @@ impl Server {
             .filter(|addr| addr.port() != 0)
             .collect();
 
-        for mut plan in listeners {
+        for (listener_index, mut plan) in listeners.into_iter().enumerate() {
+            let listener_auth = shared.basic_auth[listener_index].as_ref().map(Arc::clone);
             if plan.listener.transport == ListenerTransport::Http2 {
                 let listener = http2::Http2Listener::bind(
                     Arc::clone(&config),
                     Arc::clone(&shared),
                     plan.listener.clone(),
+                    listener_auth,
                     Arc::clone(&metrics),
                     listener_auth_label(&plan.listener),
                     &unavailable_http2_addrs,
@@ -962,6 +985,7 @@ impl Server {
                 Arc::clone(&shared),
                 Arc::clone(&config),
                 plan.listener.clone(),
+                listener_auth.as_ref().map(Arc::clone),
                 first_socket,
                 Arc::clone(&listener_metrics[0]),
                 forward_rx,
@@ -978,6 +1002,7 @@ impl Server {
                         Arc::clone(&shared),
                         Arc::clone(&config),
                         plan.listener.clone(),
+                        listener_auth.as_ref().map(Arc::clone),
                         reuseport,
                         Arc::clone(shard_metrics),
                         forward_rx,
@@ -1024,8 +1049,8 @@ impl Server {
             .and_then(|server| server.local_addr().ok())
     }
 
-    /// Reload TLS material and the active client roster whenever `SIGHUP`
-    /// arrives.
+    /// Reload TLS material and active Basic/certificate credentials whenever
+    /// `SIGHUP` arrives.
     ///
     /// One task owns the transaction for the whole server. The new certificate
     /// pair and roster are fully parsed before either shared snapshot changes;
@@ -1058,12 +1083,16 @@ impl Server {
                         if reloads_roster {
                             shared.metrics.record_roster_reload(true);
                         }
-                        if let Some((roster_generation, clients)) = outcome.roster {
+                        if outcome.roster.is_some() || outcome.basic.is_some() {
+                            let (roster_generation, clients) = outcome.roster.unwrap_or((0, 0));
+                            let (basic_listeners, basic_users) = outcome.basic.unwrap_or((0, 0));
                             info!(
                                 tls_generation = outcome.tls_generation,
                                 roster_generation,
                                 clients,
-                                "TLS identity and client roster reloaded"
+                                basic_listeners,
+                                basic_users,
+                                "TLS identity and authentication state reloaded"
                             );
                         } else {
                             info!(
@@ -1079,7 +1108,7 @@ impl Server {
                         }
                         warn!(
                             error = %format!("{e:#}"),
-                            "configuration reload failed, keeping the previous TLS identity and roster"
+                            "configuration reload failed, keeping the previous TLS identity and authentication state"
                         )
                     }
                 }
@@ -1367,16 +1396,17 @@ fn resolve_shard_count(configured: usize) -> usize {
 struct ReloadOutcome {
     tls_generation: u64,
     roster: Option<(u64, usize)>,
+    basic: Option<(usize, usize)>,
 }
 
 /// Re-read and atomically install reloadable configuration state.
 ///
 /// The effective startup certificate paths are read again, which covers ACME
 /// replacing files or symlink targets. Listener addresses, authentication
-/// modes, pools, credentials, and protocol tuning remain fixed until restart.
-/// If client-certificate authentication was active at startup, the roster is
-/// prepared in the same transaction. Every fallible step finishes before the
-/// shared TLS identity or roster changes.
+/// modes, pools, and protocol tuning remain fixed until restart. Basic
+/// credentials and an active client-certificate roster are prepared in the
+/// same transaction. Every fallible step finishes before a shared snapshot
+/// changes.
 fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
     let Some(reload) = shared.config_reload.as_ref() else {
         anyhow::bail!("no configuration file to reload");
@@ -1386,6 +1416,42 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
         .with_context(|| format!("failed to read {}", reload.path.display()))?;
     let config = crate::config::parse_toml(&text)
         .with_context(|| format!("failed to parse {}", reload.path.display()))?;
+
+    if config.listeners.len() != reload.listeners.len() {
+        anyhow::bail!(
+            "refusing to reload: listener count changed from {} to {}; adding or removing a \
+             listener requires a restart",
+            reload.listeners.len(),
+            config.listeners.len()
+        );
+    }
+    let mut basic_auth = Vec::with_capacity(config.listeners.len());
+    for (index, (startup, current)) in reload
+        .listeners
+        .iter()
+        .zip(config.listeners.iter())
+        .enumerate()
+    {
+        let current_auth = ReloadAuthKind::from(&current.auth);
+        if startup.listen_addr != current.listen_addr
+            || startup.transport != current.transport
+            || startup.auth != current_auth
+        {
+            anyhow::bail!(
+                "refusing to reload listener {}: address, transport, order, or authentication \
+                 mode changed; restart the service to apply trust-boundary changes",
+                index + 1
+            );
+        }
+        basic_auth.push(
+            (startup.auth == ReloadAuthKind::Basic)
+                .then(|| {
+                    BasicAuthenticator::from_section(&current.auth)
+                        .with_context(|| format!("listener {} Basic credentials", index + 1))
+                })
+                .transpose()?,
+        );
+    }
     let tls_identity =
         tls::TlsIdentity::load(&reload.tls).context("failed to load replacement TLS identity")?;
 
@@ -1420,6 +1486,20 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
             })?;
     }
 
+    let mut basic_listener_count = 0;
+    let mut basic_user_count = 0;
+    for (replacement, target) in basic_auth.into_iter().zip(&shared.basic_auth) {
+        match (replacement, target) {
+            (Some(replacement), Some(target)) => {
+                basic_listener_count += 1;
+                basic_user_count += target.replace(replacement);
+            }
+            (None, None) => {}
+            _ => unreachable!("startup Basic-auth slots match the captured reload plan"),
+        }
+    }
+    let basic = (basic_listener_count > 0).then_some((basic_listener_count, basic_user_count));
+
     let roster = registry.map(|registry| {
         let count = registry.len();
         (shared.clients.replace(registry), count)
@@ -1428,6 +1508,7 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
     Ok(ReloadOutcome {
         tls_generation,
         roster,
+        basic,
     })
 }
 
@@ -1741,6 +1822,35 @@ struct ConfigReload {
     /// The IP proxy state this process actually bound with. The value in a
     /// subsequently edited file is intentionally ignored until restart.
     ip_proxy_enabled: bool,
+    /// Listener identity and trust boundary captured before sockets are bound.
+    /// Basic credentials may change in place; address, transport, order, and
+    /// authentication mode still require a restart.
+    listeners: Vec<ReloadListener>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReloadAuthKind {
+    Disabled,
+    Basic,
+    ClientCert,
+}
+
+impl From<&AuthSection> for ReloadAuthKind {
+    fn from(auth: &AuthSection) -> Self {
+        if auth.basic_enabled() {
+            Self::Basic
+        } else if auth.client_cert_enabled() {
+            Self::ClientCert
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+struct ReloadListener {
+    listen_addr: SocketAddr,
+    transport: ListenerTransport,
+    auth: ReloadAuthKind,
 }
 
 /// State every shard shares.
@@ -1800,6 +1910,10 @@ struct Shared {
     auth_permits: Arc<Semaphore>,
     /// Bounds both queued and running password verifications across all shards.
     auth_queue_slots: Arc<Semaphore>,
+    /// One atomically replaceable Basic credential set per configured
+    /// listener. Non-Basic listeners keep an empty slot so configuration order
+    /// remains a stable reload key.
+    basic_auth: Vec<Option<Arc<SharedBasicAuthenticator>>>,
     /// Pre-registered client identities, shared by every shard's TLS context.
     ///
     /// Replaceable at runtime so a client can be revoked without restarting
@@ -1809,7 +1923,8 @@ struct Shared {
     /// Existing connections pin the identity they started with.
     tls: Arc<tls::SharedTlsIdentity>,
     /// Present when the server started from a config file. Captured startup
-    /// state keeps reload limited to TLS material and an already-active roster.
+    /// state keeps reload limited to TLS material and already-active
+    /// authentication modes.
     config_reload: Option<ConfigReload>,
     /// Process-wide counters and readiness state.
     metrics: Arc<Metrics>,
@@ -1880,7 +1995,7 @@ struct Shard {
     quic_config: quiche::Config,
     h3_config: quiche::h3::Config,
     connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
-    auth: Option<Arc<BasicAuthenticator>>,
+    auth: Option<Arc<SharedBasicAuthenticator>>,
     /// Set when clients authenticate with a certificate instead of credentials.
     ///
     /// The TLS context already refuses unregistered keys, so this exists to
@@ -1914,6 +2029,7 @@ impl Shard {
         shared: Arc<Shared>,
         config: Arc<ServerConfig>,
         listener: ResolvedListener,
+        auth: Option<Arc<SharedBasicAuthenticator>>,
         reuseport: bool,
         metrics: Arc<ShardMetrics>,
         forward_rx: mpsc::Receiver<ForwardedPacket>,
@@ -1921,7 +2037,7 @@ impl Shard {
     ) -> anyhow::Result<Self> {
         let socket = open_quic_socket(&config, listener.listen_addr, reuseport).await?;
         Self::from_socket(
-            index, shared, config, listener, socket, metrics, forward_rx, tun_rx,
+            index, shared, config, listener, auth, socket, metrics, forward_rx, tun_rx,
         )
     }
 
@@ -1936,20 +2052,12 @@ impl Shard {
         shared: Arc<Shared>,
         config: Arc<ServerConfig>,
         listener: ResolvedListener,
+        auth: Option<Arc<SharedBasicAuthenticator>>,
         socket: QuicUdpSocket,
         metrics: Arc<ShardMetrics>,
         forward_rx: mpsc::Receiver<ForwardedPacket>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
-        let auth = if listener.auth.basic_enabled() {
-            Some(BasicAuthenticator::new(
-                &listener.auth.username,
-                &listener.auth.password_hash,
-            )?)
-        } else {
-            None
-        };
-
         let bound_addr = socket.local_addr()?;
         metrics.set_udp_offload_state(socket.udp_gso_enabled(), socket.udp_gro_enabled());
         info!(
@@ -1995,7 +2103,7 @@ impl Shard {
             quic_config,
             h3_config,
             connections: FxHashMap::default(),
-            auth: auth.map(Arc::new),
+            auth,
             client_certs,
             tcp_policy,
             udp_policy,
@@ -4122,6 +4230,7 @@ mod tests {
                 // parsed when a request actually arrives.
                 username: "alice".into(),
                 password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+                users: Vec::new(),
             },
         }
     }

@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use super::ConnectionContext;
 use super::support::send_error;
 use crate::admission::SourceAdmission;
-use crate::auth::{AuthPrecheck, BasicAuthenticator};
+use crate::auth::{AuthPrecheck, BasicCredential};
 use crate::client_identity::{ClientIdentity, SharedRoster};
 use crate::metrics::ShardMetrics;
 
@@ -59,12 +59,15 @@ pub(super) async fn authorize_request(
         let _ = send_proxy_auth_required(respond);
         return Authorization::ResponseSent;
     }
-    let password = match auth.precheck(first) {
+    let (credential, password) = match auth.precheck(first) {
         AuthPrecheck::Rejected => {
             let _ = send_proxy_auth_required(respond);
             return Authorization::ResponseSent;
         }
-        AuthPrecheck::NeedsVerify(password) => password,
+        AuthPrecheck::NeedsVerify {
+            credential,
+            password,
+        } => (credential, password),
     };
     let auth_slot = match auth_slots.try_acquire_owned() {
         Ok(slot) => slot,
@@ -83,7 +86,7 @@ pub(super) async fn authorize_request(
         }
     };
     let verification = verify_password(
-        Arc::clone(auth),
+        credential,
         password,
         Arc::clone(&context.shared.auth_queue_slots),
         Arc::clone(&context.shared.auth_permits),
@@ -116,7 +119,7 @@ enum AuthResult {
 }
 
 async fn verify_password(
-    auth: Arc<BasicAuthenticator>,
+    credential: Arc<BasicCredential>,
     password: Zeroizing<Vec<u8>>,
     queue_slots: Arc<Semaphore>,
     permits: Arc<Semaphore>,
@@ -144,7 +147,7 @@ async fn verify_password(
         let _queue_slot = queue_slot;
         let _permit = permit;
         let _running = running;
-        let authorized = auth.verify(&password);
+        let authorized = credential.verify(&password);
         if authorized {
             completion_metrics.record_auth_success();
         } else {

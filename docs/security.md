@@ -29,10 +29,15 @@ are globally bounded, concurrent hashes are permit-limited, and each
 connection has a pending-request cap. A per-source fair-share cap prevents one
 address from filling the global queue. Closing a stream or connection cancels
 work that has not started and discards results for work already running.
+Each Basic listener is also limited to 4,096 configured accounts; adding
+accounts does not enlarge any Argon2 concurrency or queue limit.
 
-Use a unique, high-entropy password. Basic credentials are protected by QUIC
-TLS in transit but are reusable bearer secrets at the HTTP layer. Rotate them
-after suspected client or log compromise.
+Give each client or operator a distinct account with a unique, high-entropy
+password. Basic credentials are protected by TLS in transit but are reusable
+bearer secrets at the HTTP layer. A compromised account can then be rotated or
+removed without changing every other client. Account edits become active on
+`SIGHUP`; existing tunnels remain, while later CONNECT requests use the new
+snapshot.
 
 With a listener's `auth.mode = "client_cert"` the cost profile is different: identity is
 established once during the handshake, by public key, so there is no per-request
@@ -94,11 +99,12 @@ packet loss into seconds of latency and make memory exhaustion easier.
 - Avoid trace logging in production except during a short controlled incident.
 
 Install both renewed TLS files before sending `SIGHUP`. The server builds and
-validates a complete certificate/key snapshot before publishing it; failed
-reads, malformed PEM, and mismatched keys leave the previous snapshot active.
-Existing connections pin the snapshot selected during their handshake, while
-new handshakes see the replacement. File paths are fixed at startup, so keep
-their parent directories and symlink update process writable only by the
+validates a complete certificate/key and Basic/certificate-credential
+transaction before publishing it; failed reads, malformed PEM, mismatched keys,
+duplicate usernames, and invalid password hashes leave the previous snapshots
+active. Existing connections pin the snapshot selected during their handshake,
+while new handshakes see the replacement. File paths are fixed at startup, so
+keep their parent directories and symlink update process writable only by the
 operator or ACME service account.
 
 Each successful reload advances the TLS session ID context. Session tickets

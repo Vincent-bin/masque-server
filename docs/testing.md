@@ -13,11 +13,11 @@
 | Network benchmark | `scripts/network-bench.sh` | Local direct-vs-MASQUE throughput and RTT |
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
 | Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, mixed authentication, and live HTTP/3 TLS reload/rollback |
-| HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT variants, both authentication modes, and full-chain TLS reload/rollback without dropping an established connection |
+| HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT variants, multiple Basic accounts, both authentication modes, and credential/TLS reload rollback without dropping an established connection |
 | Observability assets | `cargo test --test monitoring_assets` | Prometheus metric references and importable Grafana JSON |
 | Service shutdown | `tests/systemd-shutdown.sh` | Real SIGTERM/SIGINT handling and every-shard drain; Linux exercises two shards |
 | Config and host diagnostics | `cargo test --test check_config` | `check-config` accepts what a server accepts; `doctor` remains read-only and unit fixtures classify Linux host evidence |
-| Config editing | `cargo test --test add_listener` | `add-listener` writes a listener that starts, or leaves the file untouched |
+| Config editing | `cargo test --test add_listener` | Listener and Basic-account edits are validated, atomic, and preserve deployed comments and secrets |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 | Parser fuzzing | `cargo +nightly fuzz run protocol_parsers` | Incremental capsule, datagram, varint, IP, and URI parser safety |
 
