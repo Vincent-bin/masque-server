@@ -105,7 +105,8 @@ enum Command {
     /// rather than removing it: check that the server came up afterwards.
     ///
     /// A new socket is bound at startup, so a restart is required — SIGHUP
-    /// reloads TLS material and the active `[[clients]]` roster, not listeners.
+    /// reloads TLS material and active Basic/certificate credentials, not
+    /// listeners.
     AddListener {
         /// Address and port for the new socket, for example `0.0.0.0:4443`.
         #[arg(long)]
@@ -161,6 +162,64 @@ enum Command {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+    },
+    /// List Basic usernames without printing password hashes.
+    ListUsers {
+        /// Select a listener by configured address. Optional when there is only
+        /// one Basic listener.
+        #[arg(long)]
+        listen_addr: Option<SocketAddr>,
+
+        /// Disambiguate HTTP/2 and HTTP/3 listeners sharing a numeric address.
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
+    },
+    /// Add another username and password to one Basic listener.
+    AddUser {
+        #[arg(long)]
+        username: String,
+
+        #[arg(long)]
+        listen_addr: Option<SocketAddr>,
+
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
+
+        /// Argon2id PHC hash, as printed by `hash-password`.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password_hash: Option<String>,
+
+        /// Read the plaintext password from standard input and hash it.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Replace one Basic user's password without changing other accounts.
+    SetPassword {
+        #[arg(long)]
+        username: String,
+
+        #[arg(long)]
+        listen_addr: Option<SocketAddr>,
+
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
+
+        #[arg(long, conflicts_with = "password_stdin")]
+        password_hash: Option<String>,
+
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Remove one Basic user. Refuses to remove a listener's final account.
+    RemoveUser {
+        #[arg(long)]
+        username: String,
+
+        #[arg(long)]
+        listen_addr: Option<SocketAddr>,
+
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
     },
 }
 
@@ -348,7 +407,15 @@ async fn main() -> anyhow::Result<()> {
     let config_exists = cli.config.exists();
     if matches!(
         cli.command,
-        Some(Command::CheckConfig | Command::Doctor | Command::AddListener { .. })
+        Some(
+            Command::CheckConfig
+                | Command::Doctor
+                | Command::AddListener { .. }
+                | Command::ListUsers { .. }
+                | Command::AddUser { .. }
+                | Command::SetPassword { .. }
+                | Command::RemoveUser { .. }
+        )
     ) && !config_exists
     {
         anyhow::bail!("configuration file not found: {}", cli.config.display());
@@ -369,23 +436,93 @@ async fn main() -> anyhow::Result<()> {
         no_bind_check,
         dry_run,
         yes,
-    }) = cli.command
+    }) = &cli.command
     {
         return config_edit::add_listener(
             &cli.config,
             config_edit::AddListener {
-                listen_addr,
+                listen_addr: *listen_addr,
                 transport: transport.map(Into::into),
                 mode: mode.map(Into::into),
-                shards,
-                username,
-                password_hash,
-                password_stdin,
-                disable_auth,
-                no_bind_check,
-                dry_run,
-                assume_yes: yes,
+                shards: *shards,
+                username: username.clone(),
+                password_hash: password_hash.clone(),
+                password_stdin: *password_stdin,
+                disable_auth: *disable_auth,
+                no_bind_check: *no_bind_check,
+                dry_run: *dry_run,
+                assume_yes: *yes,
             },
+        );
+    }
+    if let Some(Command::ListUsers {
+        listen_addr,
+        transport,
+    }) = &cli.command
+    {
+        return config_edit::list_basic_users(
+            &cli.config,
+            config_edit::BasicListenerSelector {
+                listen_addr: *listen_addr,
+                transport: transport.map(Into::into),
+            },
+        );
+    }
+    if let Some(Command::AddUser {
+        username,
+        listen_addr,
+        transport,
+        password_hash,
+        password_stdin,
+    }) = &cli.command
+    {
+        return config_edit::add_basic_user(
+            &cli.config,
+            config_edit::BasicUserPassword {
+                selector: config_edit::BasicListenerSelector {
+                    listen_addr: *listen_addr,
+                    transport: transport.map(Into::into),
+                },
+                username: username.clone(),
+                password_hash: password_hash.clone(),
+                password_stdin: *password_stdin,
+            },
+        );
+    }
+    if let Some(Command::SetPassword {
+        username,
+        listen_addr,
+        transport,
+        password_hash,
+        password_stdin,
+    }) = &cli.command
+    {
+        return config_edit::set_basic_user_password(
+            &cli.config,
+            config_edit::BasicUserPassword {
+                selector: config_edit::BasicListenerSelector {
+                    listen_addr: *listen_addr,
+                    transport: transport.map(Into::into),
+                },
+                username: username.clone(),
+                password_hash: password_hash.clone(),
+                password_stdin: *password_stdin,
+            },
+        );
+    }
+    if let Some(Command::RemoveUser {
+        username,
+        listen_addr,
+        transport,
+    }) = &cli.command
+    {
+        return config_edit::remove_basic_user(
+            &cli.config,
+            config_edit::BasicListenerSelector {
+                listen_addr: *listen_addr,
+                transport: transport.map(Into::into),
+            },
+            username.clone(),
         );
     }
     let mut cfg = if config_exists {
@@ -508,9 +645,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!(?cfg, "configuration loaded");
 
-    // Pass the path so SIGHUP can re-read TLS material and the active
-    // [[clients]] roster. Only a config that was actually loaded from disk is
-    // reloadable; defaults have no file to re-read.
+    // Pass the path so SIGHUP can re-read TLS material and active Basic/
+    // certificate credentials. Only a config that was actually loaded from
+    // disk is reloadable; defaults have no file to re-read.
     let reload_path = cli.config.exists().then_some(cli.config);
     let mut server = Server::bind_with_reload(cfg, reload_path).await?;
     server.run().await
@@ -546,5 +683,13 @@ mod tests {
     #[test]
     fn doctor_subcommand_is_available() {
         assert!(Cli::command().find_subcommand("doctor").is_some());
+    }
+
+    #[test]
+    fn basic_user_management_subcommands_are_available() {
+        let command = Cli::command();
+        for name in ["list-users", "add-user", "set-password", "remove-user"] {
+            assert!(command.find_subcommand(name).is_some(), "missing {name}");
+        }
     }
 }

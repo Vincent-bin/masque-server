@@ -221,6 +221,8 @@ config_owner_before=$(stat -c '%U:%G %a' "$CONFIG_PATH")
     die "add-listener did not append a third listener"
 grep -q '^username = "proxy-user"$' "$CONFIG_PATH" ||
     die "add-listener lost the Basic credentials already in the file"
+grep -q '^\[\[listeners\.auth\.users\]\]$' "$CONFIG_PATH" ||
+    die "the installer did not use the canonical multi-account Basic schema"
 grep -q '^\[quic\]$' "$CONFIG_PATH" ||
     die "add-listener lost the sections the installer wrote"
 # The file holds a password hash and is read by the service account, so an

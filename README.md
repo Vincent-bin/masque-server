@@ -16,8 +16,9 @@ a staging environment.
 - CONNECT-IP ([RFC 9484]) with Linux TUN integration
 - HTTP/3 over UDP for performance, plus HTTP/2 Extended CONNECT and the
   Cloudflare/usque CONNECT-IP dialect over TCP/TLS as compatibility fallbacks
-- HTTP Basic authentication with Argon2id password verification, or TLS client
-  certificate authentication against a public-key roster
+- Multiple HTTP Basic accounts per listener with Argon2id password
+  verification, or TLS client-certificate authentication against a public-key
+  roster
 - Multiple listeners in one process, each with its own Basic or client-certificate
   authentication mode while sharing proxy policies, client roster, and TUN state
 - CIDR allow and deny policies for TCP and UDP targets
@@ -29,9 +30,9 @@ a staging environment.
 - Optional loopback health/readiness endpoints and low-overhead Prometheus
   metrics, with packaged static alert rules and a Grafana dashboard JSON
 - Optional JSON logs plus native systemd readiness and shard-liveness watchdog
-- Atomic `SIGHUP` reload of the full TLS certificate chain and private key
-  without dropping established connections; active roster updates disconnect
-  only revoked certificate clients
+- Atomic `SIGHUP` reload of the full TLS certificate chain, Basic account sets,
+  and certificate roster without dropping established tunnels; active roster
+  updates disconnect only revoked certificate clients
 - Read-only `doctor` checks for CONNECT-IP TUN, forwarding, route, firewall,
   and NAT prerequisites without modifying the host
 - Static Linux x86_64 release archives with a systemd installer
@@ -55,7 +56,8 @@ printf '%s' 'replace-this-password' | \
 ```
 
 Copy [`deploy/config/masque.toml`](deploy/config/masque.toml), set the server TLS
-certificate, private key, username, and password hash, then start the server:
+certificate and private key, and configure at least one
+`[[listeners.auth.users]]` username and password hash, then start the server:
 
 ```sh
 target/release/masque-server --config ./masque.toml
@@ -67,7 +69,7 @@ Invalid or mismatched replacement material is rejected and the previous
 identity remains active.
 
 Authentication is fail-closed. In `basic` mode the server refuses to start until
-a valid username and Argon2id hash are configured.
+at least one uniquely named account with a valid Argon2id hash is configured.
 
 Alternatively, set `mode = "client_cert"` in `[listeners.auth]` to authenticate
 clients during the TLS handshake. Generate each client's P-256 key and
@@ -103,6 +105,23 @@ for provisioning scripts. See
 bound at startup, so open UDP for HTTP/3 or TCP for HTTP/2, restart the service,
 and confirm it came up.
 
+Basic accounts on an existing listener can be managed without editing TOML or
+restarting the server. If the file has only one Basic listener, its address can
+be omitted:
+
+```sh
+printf '%s\n' 'a-strong-password' | sudo masque-server \
+  --config /etc/masque/masque.toml add-user \
+  --username phone --password-stdin
+sudo masque-server --config /etc/masque/masque.toml list-users
+sudo systemctl reload masque
+```
+
+`set-password` and `remove-user` update one account atomically; removing the
+last account is refused. Existing scalar `username` / `password_hash` files are
+accepted and are migrated to the multi-account form by the first account edit.
+See [Basic account management](docs/configuration.md#basic-account-management).
+
 CONNECT-IP is independent of the authentication mode: it needs Linux host
 forwarding because it carries complete IP packets through `masque0`, while
 CONNECT and CONNECT-UDP use ordinary userspace sockets. Inspect the host before
@@ -124,8 +143,9 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
 ```
 
 For a new configuration the installer prompts for `basic`, `client_cert`, or
-`dual` authentication and optional TLS file locations. Basic mode generates a
-random password when none is supplied. Client-certificate mode enrolls the first
+`dual` authentication and optional TLS file locations. Basic mode creates the
+first account and generates a random password when none is supplied.
+Client-certificate mode enrolls the first
 client, adds its `[[clients]]` entry, writes its secret JSON as mode `0600`, and
 prints the matching usque and mihomo configuration. Dual mode does both, writing
 a two-listener configuration that serves credentials on one port and

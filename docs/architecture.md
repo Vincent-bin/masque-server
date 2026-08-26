@@ -144,23 +144,25 @@ connection.
 `[[listeners]]` runs one or more listeners in one process. Startup resolves each
 entry into a small listener plan containing its transport, address, shard count,
 and authentication. Every worker references the same process-wide
-`ServerConfig`, so proxy policies, TLS tuning, limits, and authentication state
-are shared rather than copied per listener. QUIC tuning applies only to HTTP/3,
+`ServerConfig`, so proxy policies, TLS tuning, and limits are shared rather than
+copied. Each listener owns one authentication snapshot shared by its shards and
+established HTTP/2 connections. QUIC tuning applies only to HTTP/3,
 and HTTP/2 flow-control tuning applies only to HTTP/2. The authentication mode
 decides which TLS context is built, and that policy is fixed when the socket
 binds. A process-wide TLS identity snapshot is selected once per new handshake;
-`SIGHUP` validates and atomically replaces it for both transports without
-rebuilding listeners, while established connections retain their original
-handshake snapshot.
+`SIGHUP` validates and atomically replaces it and every active authentication
+snapshot without rebuilding listeners. Established connections retain their
+original TLS handshake identity; future Basic-auth requests on them use the new
+account snapshot.
 
 Shards are numbered across the whole server rather than within a listener,
 which is what lets the cross-shard queues, the connection-ID registry, and the
 TUN ownership map stay single and listener-agnostic. Everything in `Shared` is
-server-wide: the TLS identity, address pool, routing table, TUN device, client
-roster, and credential-verification budget. A forwarded packet is re-handled by
-its owner using that shard's own local address, so a reply always leaves the
-socket the connection actually lives on — including when the owner belongs to a
-different listener.
+server-wide: the TLS identity, per-listener Basic snapshots, address pool,
+routing table, TUN device, client roster, and credential-verification budget. A
+forwarded packet is re-handled by its owner using that shard's own local
+address, so a reply always leaves the socket the connection actually lives on —
+including when the owner belongs to a different listener.
 
 One worker reads the TUN device and distributes packets to the connections that
 own their addresses. In a mixed or HTTP/3-only process, shard 0 is the arbitrary
@@ -173,8 +175,8 @@ and lookup. There is never more than one TUN reader.
 Credential processing is split into two stages:
 
 1. The owning HTTP/2 task or HTTP/3 shard synchronously validates the request
-   shape, Basic scheme, username, encoded length, and configured authentication
-   state.
+   shape, Basic scheme, encoded length, and username lookup, then retains the
+   selected account's immutable hash snapshot.
 2. Argon2id verification runs on Tokio's blocking pool under shared permits.
 
 The queue has a global bound as well as a per-connection bound. A request must

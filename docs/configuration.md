@@ -3,8 +3,8 @@
 The server reads TOML from `--config` (default `masque.toml`). Global sections
 may use defaults, but every file must explicitly define at least one
 `[[listeners]]` entry and its `[listeners.auth]` table. Authentication is
-deliberately fail-closed: a Basic listener cannot start until valid credentials
-are set. Unknown keys are rejected rather than silently ignored.
+deliberately fail-closed: a Basic listener cannot start until at least one
+valid account is set. Unknown keys are rejected rather than silently ignored.
 
 Start from [`deploy/config/masque.toml`](../deploy/config/masque.toml). That
 file is the canonical deployable example and is tested by the release flow.
@@ -17,6 +17,10 @@ masque-server hash-password
 masque-server --config <PATH> check-config
 masque-server --config <PATH> doctor
 masque-server --config <PATH> add-listener [OPTIONS]
+masque-server --config <PATH> list-users [OPTIONS]
+masque-server --config <PATH> add-user --username <NAME> [OPTIONS]
+masque-server --config <PATH> set-password --username <NAME> [OPTIONS]
+masque-server --config <PATH> remove-user --username <NAME> [OPTIONS]
 masque-server enroll-client [OPTIONS] --name <NAME> --endpoint <ADDR:PORT>
 
   -c, --config <PATH>       Config file [default: masque.toml]
@@ -44,8 +48,8 @@ read-only and never configures the host.
 `add-listener` appends a `[[listeners]]` block to the configuration file, and is
 described under [Adding a listener](#adding-a-listener).
 
-`hash-password` reads a password on stdin and prints an Argon2id hash for
-`listeners.auth.password_hash`. `enroll-client` generates a client key pair for
+`hash-password` reads a password on stdin and prints an Argon2id hash for a
+`listeners.auth.users[].password_hash`. `enroll-client` generates a client key pair for
 a listener using `auth.mode = "client_cert"`; it reads `tls.cert_path` from
 `--config`, so pass the same config the server uses. Both are described under
 [Authentication](#authentication).
@@ -138,8 +142,9 @@ connect, and vice versa. To serve both kinds of client, define two listeners.
 | --- | --- |
 | `enabled` | Master switch. `false` disables authentication whatever `mode` says |
 | `mode` | `basic` (default) or `client_cert` |
-| `username` | `basic` only |
-| `password_hash` | `basic` only; Argon2id PHC string |
+| `[[listeners.auth.users]]` | `basic` only; one or more accounts on this socket |
+| `users[].username` | Unique Basic username on this listener |
+| `users[].password_hash` | Argon2id PHC string |
 | `[[clients]]` | `client_cert` only; the roster of allowed clients |
 
 Choose `basic` for standards-compliant MASQUE clients. Choose `client_cert` for
@@ -161,7 +166,13 @@ shards = 1
 [listeners.auth]
 enabled = true
 mode = "basic"
+
+[[listeners.auth.users]]
 username = "proxy-user"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+
+[[listeners.auth.users]]
+username = "phone"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 ```
 
@@ -176,8 +187,48 @@ Clients send `Proxy-Authorization: Basic BASE64(user:password)` on each
 request. Missing, malformed, duplicated, or wrong credentials receive
 `407 Proxy Authentication Required`.
 
-The server refuses to start if `username` is empty or contains `:`, or if
-`password_hash` is not a valid Argon2id PHC string.
+The server accepts at most 4,096 accounts on one listener and refuses to start
+if there are no users, usernames are duplicated, a username is empty or
+contains `:`, or a hash is not valid Argon2id. Existing single-user `username` /
+`password_hash` fields remain accepted for upgrade compatibility, but cannot be
+mixed with `[[listeners.auth.users]]`.
+
+#### Basic account management
+
+All accounts on one Basic listener use the same address, port, transport, TLS
+identity, and proxy policy. Only their username and password differ. The
+management commands preserve comments, validate the complete result, hold the
+same advisory edit lock as `add-listener`, and replace the file atomically:
+
+```sh
+printf '%s\n' 'phone-password' | sudo masque-server \
+  --config /etc/masque/masque.toml add-user \
+  --username phone --password-stdin
+
+sudo masque-server --config /etc/masque/masque.toml list-users
+
+printf '%s\n' 'replacement-password' | sudo masque-server \
+  --config /etc/masque/masque.toml set-password \
+  --username phone --password-stdin
+
+sudo masque-server --config /etc/masque/masque.toml remove-user \
+  --username phone
+sudo systemctl reload masque
+```
+
+When more than one Basic listener exists, select one with
+`--listen-addr <ADDR:PORT>`. Add `--transport http2|http3` only when TCP and UDP
+listeners share the same numeric address. `add-user` and `set-password` accept
+an existing `--password-hash`; `--password-stdin` hashes plaintext without
+putting it in process arguments. With neither option, an interactive terminal
+prompts securely and unattended use generates a strong password and prints it
+once before committing its hash.
+
+The first account edit migrates the legacy scalar pair to repeated user tables.
+Duplicate additions and unknown users are rejected without changing the file;
+the final account cannot be removed. Send `SIGHUP` after a successful edit.
+Future requests on existing HTTP/2 and HTTP/3 connections use the new account
+snapshot, while tunnels already authorized continue uninterrupted.
 
 ### `mode = "client_cert"`
 
@@ -262,6 +313,8 @@ shards = 1
 [listeners.auth]
 enabled = true
 mode = "basic"
+
+[[listeners.auth.users]]
 username = "proxy-user"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
@@ -389,18 +442,20 @@ Edit the roster and/or replace both TLS files, then send `SIGHUP`:
 systemctl reload masque            # or: kill -HUP $(pidof masque-server)
 ```
 
-The server always reloads the certificate chain and private key. When any
-listener uses `auth.mode = "client_cert"`, it also re-reads `[[clients]]` from
+The server always reloads the certificate chain, private key, and every active
+Basic account set. When any listener uses `auth.mode = "client_cert"`, it also
+re-reads `[[clients]]` from
 the same configuration file, disconnects a live connection whose entry was
 removed or changed, and leaves every other tunnel untouched. A removed client's
 next attempt is refused at the handshake like any unenrolled key. Adding an
 entry works the same way, so a client can be re-enrolled without a restart.
 
-TLS identity and an active roster form one validated reload transaction. A
-malformed certificate, mismatched private key, unparseable client key, or
-invalid pinned address rejects the whole update and leaves both running
-snapshots in force. Listen addresses, transports, authentication modes, Basic
-credentials, pools, and tuning remain fixed until restart.
+TLS identity and active Basic/certificate credentials form one validated reload
+transaction. A malformed certificate, mismatched private key, duplicate Basic
+username, invalid password hash, unparseable client key, or invalid pinned
+address rejects the whole update and leaves the running snapshots in force.
+Listen addresses, transports, authentication modes, pools, and tuning remain
+fixed until restart.
 
 Editing an existing entry counts as revocation: the client is disconnected and
 must reconnect to pick up its new pinned addresses, which are chosen when the
@@ -530,7 +585,7 @@ Two ordering rules follow from the validation being real:
 
 A new socket is bound at startup, so restart the server afterwards, and open
 UDP for an HTTP/3 listener or TCP for an HTTP/2 listener. `SIGHUP` reloads TLS
-identity and the active `[[clients]]` roster — it never adds, removes, or
+identity and active Basic/certificate credentials — it never adds, removes, or
 rebinds a listener.
 
 ## HTTP/2

@@ -1,9 +1,11 @@
 //! CONNECT request classification, authentication precheck, and dispatch.
 
+use std::sync::Arc;
+
 use quiche::h3::NameValue;
 use tracing::{info, warn};
 
-use crate::auth::{AuthPrecheck, BasicAuthenticator};
+use crate::auth::{AuthPrecheck, BasicCredential, SharedBasicAuthenticator};
 use crate::config::ServerConfig;
 use crate::policy::TargetPolicy;
 use crate::uri;
@@ -21,6 +23,7 @@ pub(super) enum ConnectRequest {
 /// A prechecked CONNECT request whose password still has to be verified.
 pub(super) struct PendingAuth {
     pub(super) stream_id: u64,
+    pub(super) credential: Arc<BasicCredential>,
     pub(super) password: zeroize::Zeroizing<Vec<u8>>,
     pub(super) request: ConnectRequest,
 }
@@ -92,7 +95,7 @@ pub(super) fn classify_connect_request(
 /// Shared request dependencies passed together to keep dispatch APIs focused.
 pub(super) struct RequestContext<'a> {
     pub(super) config: &'a ServerConfig,
-    pub(super) auth: Option<&'a BasicAuthenticator>,
+    pub(super) auth: Option<&'a SharedBasicAuthenticator>,
     pub(super) udp_policy: &'a TargetPolicy,
 }
 
@@ -163,9 +166,13 @@ impl Shard {
                     Self::send_proxy_auth_required(h3, quic, stream_id);
                     return None;
                 }
-                AuthPrecheck::NeedsVerify(password) => {
+                AuthPrecheck::NeedsVerify {
+                    credential,
+                    password,
+                } => {
                     return Some(PendingAuth {
                         stream_id,
+                        credential,
                         password,
                         request,
                     });

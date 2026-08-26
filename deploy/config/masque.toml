@@ -46,6 +46,11 @@ enabled = true
 # To serve both kinds of client, add the second listener shown at the end of
 # this file. Every listener has its own explicit authentication table.
 mode = "basic"
+
+# Repeat this table for independent accounts on the same address and port.
+# Account edits can be made with add-user/set-password/remove-user and applied
+# with `systemctl reload masque` without dropping established tunnels.
+[[listeners.auth.users]]
 username = "__MASQUE_AUTH_USERNAME__"
 password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
 

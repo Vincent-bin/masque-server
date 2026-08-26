@@ -124,6 +124,9 @@ fn packaged_config_uses_the_current_listener_schema() {
     assert_eq!(config.listeners.len(), 1);
     assert_eq!(config.listeners[0].listen_addr.to_string(), "0.0.0.0:443");
     assert!(config.listeners[0].auth.basic_enabled());
+    assert_eq!(config.listeners[0].auth.users.len(), 1);
+    assert!(config.listeners[0].auth.username.is_empty());
+    assert!(config.listeners[0].auth.password_hash.is_empty());
 }
 
 #[test]

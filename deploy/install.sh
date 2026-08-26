@@ -374,6 +374,7 @@ render_new_config() {
         client_cert)
             sed \
                 -e 's|^mode = "basic"$|mode = "client_cert"|' \
+                -e '/^\[\[listeners\.auth\.users\]\]$/d' \
                 -e '/^username = "__MASQUE_AUTH_USERNAME__"$/d' \
                 -e '/^password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"$/d' \
                 "$PACKAGE_DIR/config/masque.toml" >"$CONFIG_TMP"

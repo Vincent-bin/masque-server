@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use boring::asn1::Asn1Time;
@@ -150,6 +152,29 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    fn user_command(
+        &self,
+        subcommand: &str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_masque-server"));
+        command
+            .arg("--config")
+            .arg(&self.config_path)
+            .arg(subcommand)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(input) = stdin {
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            child.wait_with_output().unwrap()
+        } else {
+            command.output().unwrap()
+        }
+    }
+
     fn text(&self) -> String {
         std::fs::read_to_string(&self.config_path).unwrap()
     }
@@ -241,10 +266,9 @@ fn adds_a_basic_listener_with_a_password_read_from_stdin() {
 
     let config = fixture.config();
     assert_eq!(config.listeners.len(), 2);
-    assert_eq!(config.listeners[1].auth.username, "bob");
+    assert_eq!(config.listeners[1].auth.users[0].username, "bob");
     assert!(
-        config.listeners[1]
-            .auth
+        config.listeners[1].auth.users[0]
             .password_hash
             .starts_with("$argon2id$"),
         "the password must be written as an Argon2id hash, never in the clear"
@@ -285,8 +309,7 @@ fn generates_a_password_when_a_script_supplies_none() {
         "the only password copy must be delivered before its hash is committed: {stdout}"
     );
     assert!(
-        fixture.config().listeners[1]
-            .auth
+        fixture.config().listeners[1].auth.users[0]
             .password_hash
             .starts_with("$argon2id$")
     );
@@ -603,4 +626,146 @@ fn reports_a_missing_configuration_file_instead_of_creating_one() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!missing.exists());
+}
+
+#[test]
+fn add_user_migrates_legacy_credentials_and_list_users_redacts_hashes() {
+    let fixture = Fixture::new(false);
+    let output = fixture.user_command(
+        "add-user",
+        &["--username", "bob", "--password-stdin"],
+        Some(b"bob-secret\n"),
+    );
+    assert!(
+        output.status.success(),
+        "add-user failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = fixture.config();
+    let auth = &config.listeners[0].auth;
+    assert!(auth.username.is_empty());
+    assert!(auth.password_hash.is_empty());
+    assert_eq!(
+        auth.users
+            .iter()
+            .map(|user| user.username.as_str())
+            .collect::<Vec<_>>(),
+        ["alice", "bob"]
+    );
+    let bob = auth
+        .users
+        .iter()
+        .find(|user| user.username == "bob")
+        .unwrap();
+    assert!(
+        Argon2::default()
+            .verify_password(
+                b"bob-secret",
+                &PasswordHash::new(&bob.password_hash).unwrap()
+            )
+            .is_ok()
+    );
+    let text = fixture.text();
+    assert!(text.starts_with("# Deployed configuration."));
+    assert_eq!(text.matches("[[listeners.auth.users]]").count(), 2);
+    assert!(!text.contains("bob-secret"));
+
+    let listed = fixture.user_command("list-users", &[], None);
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("alice"));
+    assert!(stdout.contains("bob"));
+    assert!(!stdout.contains("argon2"));
+}
+
+#[test]
+fn set_password_changes_only_the_selected_user() {
+    let fixture = Fixture::new(false);
+    let added = fixture.user_command(
+        "add-user",
+        &["--username", "bob", "--password-stdin"],
+        Some(b"first-bob-secret\n"),
+    );
+    assert!(added.status.success());
+    let before = fixture.config();
+    let alice_hash = before.listeners[0].auth.users[0].password_hash.clone();
+
+    let changed = fixture.user_command(
+        "set-password",
+        &["--username", "bob", "--password-stdin"],
+        Some(b"second-bob-secret\n"),
+    );
+    assert!(
+        changed.status.success(),
+        "set-password failed: {}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let after = fixture.config();
+    let auth = &after.listeners[0].auth;
+    assert_eq!(auth.users[0].password_hash, alice_hash);
+    let bob = auth
+        .users
+        .iter()
+        .find(|user| user.username == "bob")
+        .unwrap();
+    assert!(
+        Argon2::default()
+            .verify_password(
+                b"second-bob-secret",
+                &PasswordHash::new(&bob.password_hash).unwrap()
+            )
+            .is_ok()
+    );
+    assert!(
+        Argon2::default()
+            .verify_password(
+                b"first-bob-secret",
+                &PasswordHash::new(&bob.password_hash).unwrap()
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn remove_user_is_atomic_and_refuses_to_remove_the_last_account() {
+    let fixture = Fixture::new(false);
+    let added = fixture.user_command(
+        "add-user",
+        &["--username", "bob", "--password-stdin"],
+        Some(b"bob-secret\n"),
+    );
+    assert!(added.status.success());
+
+    let removed = fixture.user_command("remove-user", &["--username", "alice"], None);
+    assert!(
+        removed.status.success(),
+        "remove-user failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_eq!(fixture.config().listeners[0].auth.users[0].username, "bob");
+
+    let before = fixture.text();
+    let rejected = fixture.user_command("remove-user", &["--username", "bob"], None);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("final Basic user"));
+    assert_eq!(
+        fixture.text(),
+        before,
+        "a rejected removal changed the file"
+    );
+}
+
+#[test]
+fn duplicate_user_is_rejected_without_changing_the_file() {
+    let fixture = Fixture::new(false);
+    let before = fixture.text();
+    let output = fixture.user_command(
+        "add-user",
+        &["--username", "alice", "--password-stdin"],
+        Some(b"replacement\n"),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
+    assert_eq!(fixture.text(), before);
 }

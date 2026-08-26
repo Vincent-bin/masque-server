@@ -34,11 +34,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use zeroize::Zeroizing;
 
 use crate::auth;
 use crate::config::{
-    self, AuthMode, AuthSection, ListenerSection, ListenerTransport, ServerConfig,
+    self, AuthMode, AuthSection, BasicUser, ListenerSection, ListenerTransport, ServerConfig,
 };
 use crate::enroll::toml_string;
 use crate::server::validate_config;
@@ -74,6 +75,23 @@ pub struct AddListener {
     pub dry_run: bool,
     /// Skip the confirmation prompt.
     pub assume_yes: bool,
+}
+
+/// Select one Basic listener. The address is normally enough; transport
+/// disambiguates the valid case where TCP/H2 and UDP/H3 share a numeric port.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BasicListenerSelector {
+    pub listen_addr: Option<SocketAddr>,
+    pub transport: Option<ListenerTransport>,
+}
+
+/// Add a user or replace one user's password hash.
+#[derive(Debug, Default)]
+pub struct BasicUserPassword {
+    pub selector: BasicListenerSelector,
+    pub username: String,
+    pub password_hash: Option<String>,
+    pub password_stdin: bool,
 }
 
 /// Append one `[[listeners]]` block to `config_path`.
@@ -157,6 +175,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
             mode,
             username: String::new(),
             password_hash: String::new(),
+            users: Vec::new(),
         }
     } else {
         match mode {
@@ -165,6 +184,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
                 mode,
                 username: String::new(),
                 password_hash: String::new(),
+                users: Vec::new(),
             },
             AuthMode::Basic => {
                 let username = match request.username.clone() {
@@ -180,8 +200,12 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
                 AuthSection {
                     enabled: true,
                     mode,
-                    username,
-                    password_hash,
+                    username: String::new(),
+                    password_hash: String::new(),
+                    users: vec![BasicUser {
+                        username,
+                        password_hash,
+                    }],
                 }
             }
         }
@@ -242,7 +266,13 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     // broken pipe or full redirected output must leave the configuration
     // untouched instead of installing a credential the operator never saw.
     if let Some(password) = generated_password.as_ref() {
-        print_generated_password(&listener.auth.username, password)?;
+        let username = listener
+            .auth
+            .users
+            .first()
+            .map(|user| user.username.as_str())
+            .unwrap_or(&listener.auth.username);
+        print_generated_password(username, password)?;
     }
 
     write_in_place(config_path, &text, &merged)?;
@@ -258,7 +288,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     // `masque`, not the program name.
     println!(
         "restart the server to bind it (systemd: systemctl restart masque), then check \
-         that it came up; SIGHUP reloads TLS material and the active [[clients]] roster"
+         that it came up; SIGHUP reloads TLS material and active Basic/certificate credentials"
     );
     if listen_addr.port() != 0 {
         println!(
@@ -272,6 +302,381 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+/// Print Basic usernames without exposing password hashes.
+pub fn list_basic_users(config_path: &Path, selector: BasicListenerSelector) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = config::parse_toml(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    validate_config(&config)?;
+
+    let indices = if selector.listen_addr.is_none() && selector.transport.is_none() {
+        config
+            .listeners
+            .iter()
+            .enumerate()
+            .filter_map(|(index, listener)| listener.auth.basic_enabled().then_some(index))
+            .collect::<Vec<_>>()
+    } else {
+        vec![select_basic_listener(&config, selector)?]
+    };
+    if indices.is_empty() {
+        bail!("the configuration has no Basic listener");
+    }
+
+    for index in indices {
+        let listener = &config.listeners[index];
+        println!(
+            "listener {} transport={}",
+            listener.listen_addr,
+            listener.transport.as_str()
+        );
+        for (username, _) in effective_basic_users(&listener.auth) {
+            println!("  {username}");
+        }
+    }
+    Ok(())
+}
+
+/// Add one independently revocable credential to a Basic listener.
+pub fn add_basic_user(config_path: &Path, request: BasicUserPassword) -> anyhow::Result<()> {
+    edit_basic_user(config_path, UserEdit::Add(request))
+}
+
+/// Replace one Basic user's Argon2id hash.
+pub fn set_basic_user_password(
+    config_path: &Path,
+    request: BasicUserPassword,
+) -> anyhow::Result<()> {
+    edit_basic_user(config_path, UserEdit::SetPassword(request))
+}
+
+/// Remove one Basic credential. The final user cannot be removed because that
+/// would make the listener fail closed on its next reload or restart.
+pub fn remove_basic_user(
+    config_path: &Path,
+    selector: BasicListenerSelector,
+    username: String,
+) -> anyhow::Result<()> {
+    edit_basic_user(config_path, UserEdit::Remove { selector, username })
+}
+
+enum UserEdit {
+    Add(BasicUserPassword),
+    SetPassword(BasicUserPassword),
+    Remove {
+        selector: BasicListenerSelector,
+        username: String,
+    },
+}
+
+impl UserEdit {
+    fn selector(&self) -> BasicListenerSelector {
+        match self {
+            Self::Add(request) | Self::SetPassword(request) => request.selector,
+            Self::Remove { selector, .. } => *selector,
+        }
+    }
+
+    fn username(&self) -> &str {
+        match self {
+            Self::Add(request) | Self::SetPassword(request) => &request.username,
+            Self::Remove { username, .. } => username,
+        }
+    }
+}
+
+fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
+    auth::check_username(edit.username())?;
+    let _lock = EditLock::acquire(config_path)?;
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = config::parse_toml(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    validate_config(&config).with_context(|| {
+        format!(
+            "{} is not a valid configuration; no user was changed",
+            config_path.display()
+        )
+    })?;
+    let listener_index = select_basic_listener(&config, edit.selector())?;
+    let mut expected = config.clone();
+    let expected_auth = &mut expected.listeners[listener_index].auth;
+    migrate_legacy_basic_user(expected_auth);
+    let username = edit.username().to_owned();
+    let existing_position = expected_auth
+        .users
+        .iter()
+        .position(|user| user.username == username);
+
+    // Reject a semantic mistake before prompting for or hashing a password.
+    // This matters interactively, and avoids spending an Argon2 slot locally
+    // for an edit that can never be committed.
+    match &edit {
+        UserEdit::Add(_) => {
+            ensure!(
+                existing_position.is_none(),
+                "Basic user {username:?} already exists; use set-password to replace its password"
+            );
+            ensure!(
+                expected_auth.users.len() < auth::MAX_BASIC_USERS_PER_LISTENER,
+                "a Basic listener may configure at most {} users",
+                auth::MAX_BASIC_USERS_PER_LISTENER
+            );
+        }
+        UserEdit::SetPassword(_) => {
+            ensure!(
+                existing_position.is_some(),
+                "Basic user {username:?} does not exist"
+            );
+        }
+        UserEdit::Remove { .. } => {
+            ensure!(
+                existing_position.is_some(),
+                "Basic user {username:?} does not exist"
+            );
+            ensure!(
+                expected_auth.users.len() > 1,
+                "cannot remove the final Basic user from a listener"
+            );
+        }
+    }
+
+    let (replacement_hash, generated_password) = match &edit {
+        UserEdit::Add(request) | UserEdit::SetPassword(request) => {
+            let (hash, generated) = resolve_user_password(request)?;
+            (Some(hash), generated)
+        }
+        UserEdit::Remove { .. } => (None, None),
+    };
+
+    match &edit {
+        UserEdit::Add(_) => {
+            expected_auth.users.push(BasicUser {
+                username: username.clone(),
+                password_hash: replacement_hash
+                    .as_ref()
+                    .expect("password edits resolve a hash")
+                    .clone(),
+            });
+        }
+        UserEdit::SetPassword(_) => {
+            let user = &mut expected_auth.users
+                [existing_position.expect("set-password checked that the user exists")];
+            user.password_hash = replacement_hash
+                .as_ref()
+                .expect("password edits resolve a hash")
+                .clone();
+        }
+        UserEdit::Remove { .. } => {
+            expected_auth
+                .users
+                .remove(existing_position.expect("remove-user checked that the user exists"));
+        }
+    }
+
+    let mut document = text
+        .parse::<DocumentMut>()
+        .context("failed to parse configuration as an editable TOML document")?;
+    let auth_table = editable_auth_table(&mut document, listener_index)?;
+    let users = canonical_users_table(auth_table)?;
+    match &edit {
+        UserEdit::Add(_) => {
+            users.push(basic_user_table(
+                &username,
+                replacement_hash
+                    .as_deref()
+                    .expect("password edits resolve a hash"),
+            ));
+        }
+        UserEdit::SetPassword(_) => {
+            let table = users
+                .iter_mut()
+                .find(|table| table_username(table) == Some(username.as_str()))
+                .with_context(|| format!("Basic user {username:?} does not exist"))?;
+            table["password_hash"] = value(
+                replacement_hash
+                    .as_deref()
+                    .expect("password edits resolve a hash"),
+            );
+        }
+        UserEdit::Remove { .. } => {
+            let position = users
+                .iter()
+                .position(|table| table_username(table) == Some(username.as_str()))
+                .with_context(|| format!("Basic user {username:?} does not exist"))?;
+            users.remove(position);
+        }
+    }
+
+    let merged = document.to_string();
+    let parsed = config::parse_toml(&merged)
+        .context("the edited configuration would not parse; nothing was written")?;
+    ensure!(
+        parsed == expected,
+        "the user edit would have changed unrelated configuration; nothing was written"
+    );
+    validate_config(&parsed).context("the edited configuration is invalid; nothing was written")?;
+
+    // As with add-listener, deliver a generated secret before committing the
+    // only usable representation of it (the hash) to disk.
+    if let Some(password) = generated_password.as_ref() {
+        print_generated_password(&username, password)?;
+    }
+    write_in_place(config_path, &text, &merged)?;
+
+    let action = match edit {
+        UserEdit::Add(_) => "added",
+        UserEdit::SetPassword(_) => "updated password for",
+        UserEdit::Remove { .. } => "removed",
+    };
+    let listener = &parsed.listeners[listener_index];
+    println!(
+        "{action} Basic user {username} on listener {} transport={} in {}",
+        listener.listen_addr,
+        listener.transport.as_str(),
+        config_path.display()
+    );
+    println!(
+        "reload the service to apply it without dropping tunnels (systemd: systemctl reload masque)"
+    );
+    Ok(())
+}
+
+fn resolve_user_password(
+    request: &BasicUserPassword,
+) -> anyhow::Result<(String, Option<Zeroizing<String>>)> {
+    ensure!(
+        !(request.password_hash.is_some() && request.password_stdin),
+        "--password-hash conflicts with --password-stdin"
+    );
+    if let Some(hash) = &request.password_hash {
+        return Ok((hash.clone(), None));
+    }
+    if request.password_stdin {
+        let mut password = Zeroizing::new(String::new());
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)?;
+        let password = Zeroizing::new(trim_newline(&password).to_owned());
+        check_password(&password)?;
+        return Ok((auth::hash_password(password.as_bytes())?, None));
+    }
+    if std::io::stdin().is_terminal()
+        && let Some(password) = prompt_password(true)?
+    {
+        return Ok((auth::hash_password(password.as_bytes())?, None));
+    }
+
+    let password = generate_password()?;
+    Ok((auth::hash_password(password.as_bytes())?, Some(password)))
+}
+
+fn select_basic_listener(
+    config: &ServerConfig,
+    selector: BasicListenerSelector,
+) -> anyhow::Result<usize> {
+    let matches = config
+        .listeners
+        .iter()
+        .enumerate()
+        .filter(|(_, listener)| {
+            listener.auth.basic_enabled()
+                && selector
+                    .listen_addr
+                    .is_none_or(|addr| listener.listen_addr == addr)
+                && selector
+                    .transport
+                    .is_none_or(|transport| listener.transport == transport)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => bail!("no Basic listener matches the requested address and transport"),
+        _ => bail!(
+            "more than one Basic listener matches; select one with --listen-addr and, when \
+             TCP and UDP share a numeric address, --transport"
+        ),
+    }
+}
+
+fn effective_basic_users(auth: &AuthSection) -> Vec<(&str, &str)> {
+    if auth.users.is_empty() {
+        vec![(auth.username.as_str(), auth.password_hash.as_str())]
+    } else {
+        auth.users
+            .iter()
+            .map(|user| (user.username.as_str(), user.password_hash.as_str()))
+            .collect()
+    }
+}
+
+fn migrate_legacy_basic_user(auth: &mut AuthSection) {
+    if auth.users.is_empty() {
+        auth.users.push(BasicUser {
+            username: std::mem::take(&mut auth.username),
+            password_hash: std::mem::take(&mut auth.password_hash),
+        });
+    }
+}
+
+fn editable_auth_table(
+    document: &mut DocumentMut,
+    listener_index: usize,
+) -> anyhow::Result<&mut Table> {
+    document
+        .get_mut("listeners")
+        .and_then(Item::as_array_of_tables_mut)
+        .and_then(|listeners| listeners.get_mut(listener_index))
+        .and_then(|listener| listener.get_mut("auth"))
+        .and_then(Item::as_table_mut)
+        .with_context(|| format!("listener {} has no editable auth table", listener_index + 1))
+}
+
+fn canonical_users_table(auth: &mut Table) -> anyhow::Result<&mut ArrayOfTables> {
+    let legacy_username = auth
+        .get("username")
+        .and_then(Item::as_str)
+        .map(str::to_owned);
+    let legacy_hash = auth
+        .get("password_hash")
+        .and_then(Item::as_str)
+        .map(str::to_owned);
+
+    if !auth.contains_key("users") {
+        auth.insert("users", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let users = auth
+        .get_mut("users")
+        .and_then(Item::as_array_of_tables_mut)
+        .context("listeners.auth.users is not an array of tables")?;
+
+    match (legacy_username, legacy_hash) {
+        (Some(username), Some(password_hash)) => {
+            users.push(basic_user_table(&username, &password_hash));
+            auth.remove("username");
+            auth.remove("password_hash");
+        }
+        (None, None) => {}
+        _ => bail!("legacy Basic username and password_hash must be configured together"),
+    }
+    Ok(auth
+        .get_mut("users")
+        .and_then(Item::as_array_of_tables_mut)
+        .expect("users table was created above"))
+}
+
+fn basic_user_table(username: &str, password_hash: &str) -> Table {
+    let mut table = Table::new();
+    table["username"] = value(username);
+    table["password_hash"] = value(password_hash);
+    table
+}
+
+fn table_username(table: &Table) -> Option<&str> {
+    table.get("username").and_then(Item::as_str)
 }
 
 /// Deliver a generated credential and make output failure observable before
@@ -371,14 +776,11 @@ pub fn listener_toml_block(listener: &ListenerSection) -> String {
     match listener.auth.mode {
         AuthMode::Basic => {
             block.push_str("mode = \"basic\"\n");
-            block.push_str(&format!(
-                "username = {}\n",
-                toml_string(&listener.auth.username)
-            ));
-            block.push_str(&format!(
-                "password_hash = {}\n",
-                toml_string(&listener.auth.password_hash)
-            ));
+            for (username, password_hash) in effective_basic_users(&listener.auth) {
+                block.push_str("\n[[listeners.auth.users]]\n");
+                block.push_str(&format!("username = {}\n", toml_string(username)));
+                block.push_str(&format!("password_hash = {}\n", toml_string(password_hash)));
+            }
         }
         AuthMode::ClientCert => {
             block.push_str("mode = \"client_cert\"\n");
@@ -973,6 +1375,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
                 mode: AuthMode::ClientCert,
                 username: String::new(),
                 password_hash: String::new(),
+                users: Vec::new(),
             },
         }
     }
@@ -1009,8 +1412,12 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
-                username: "bob".into(),
-                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash".into(),
+                username: String::new(),
+                password_hash: String::new(),
+                users: vec![BasicUser {
+                    username: "bob".into(),
+                    password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash".into(),
+                }],
             },
         };
         let parsed =
@@ -1039,6 +1446,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
                 mode: AuthMode::Basic,
                 username: String::new(),
                 password_hash: String::new(),
+                users: Vec::new(),
             },
         };
         let block = listener_toml_block(&listener);

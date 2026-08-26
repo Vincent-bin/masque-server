@@ -584,6 +584,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
                 mode: AuthMode::Basic,
                 username: BASIC_USERNAME.into(),
                 password_hash: masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap(),
+                users: Vec::new(),
             },
         },
         ListenerSection {
@@ -595,6 +596,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
                 mode: AuthMode::ClientCert,
                 username: String::new(),
                 password_hash: String::new(),
+                users: Vec::new(),
             },
         },
     ];
