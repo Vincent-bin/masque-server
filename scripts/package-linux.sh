@@ -27,10 +27,10 @@ PROBE_VERSION=$(awk '
     /^\[/ { in_package=0 }
     in_package && /^version = / { gsub(/[" ]/, "", $3); print $3; exit }
 ' tools/masque-probe/Cargo.toml)
-[ -n "$PACKAGE_VERSION" ] && [ "$PACKAGE_VERSION" = "$PROBE_VERSION" ] || {
+if [ -z "$PACKAGE_VERSION" ] || [ "$PACKAGE_VERSION" != "$PROBE_VERSION" ]; then
     echo "error: masque-server and masque-probe package versions must match" >&2
     exit 1
-}
+fi
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 OUTPUT_DIR="${OUTPUT_DIR:-dist}"
 ARCHIVE_NAME="masque-v${VERSION}-linux-${ARCH}"
