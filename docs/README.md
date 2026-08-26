@@ -8,6 +8,8 @@
 - [Performance](performance.md): fast paths, tuning, and benchmark rules.
 - [Observability](observability.md): health, readiness, Prometheus, Grafana,
   structured logs, and systemd notification.
+- [Troubleshooting](troubleshooting.md): client-side protocol probing,
+  shareable server diagnostics, and failure isolation.
 - [Testing](testing.md): local, E2E, Linux, and release validation.
 - [Security](security.md): threat model and operator hardening.
 

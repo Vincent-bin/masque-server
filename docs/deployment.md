@@ -2,10 +2,12 @@
 
 ## Supported release artifact
 
-GitHub Actions builds a static `x86_64-unknown-linux-musl` binary and packages:
+GitHub Actions builds static `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` binaries and packages:
 
 ```text
 bin/masque-server
+bin/masque-probe
 config/masque.toml
 monitoring/prometheus-rules.yml
 monitoring/grafana-dashboard.json
@@ -17,14 +19,14 @@ README.md
 Verify the archive before extraction:
 
 ```sh
-sha256sum --check masque-vVERSION-linux-x86_64.tar.gz.sha256
+sha256sum --check masque-vVERSION-linux-ARCH.tar.gz.sha256
 ```
 
 ## One-command install
 
-On Linux x86_64, the bootstrap installer resolves the latest stable GitHub
-release, downloads its archive and checksum, verifies SHA-256, and invokes the
-installer from that archive:
+On Linux x86_64 or ARM64, the bootstrap installer detects the architecture,
+resolves the latest stable GitHub release, downloads its archive and checksum,
+verifies SHA-256, and invokes the installer from that archive:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
@@ -34,7 +36,8 @@ Although the script arrives on standard input, interactive answers are read
 from `/dev/tty`. A new installation offers three modes:
 
 - `basic` creates the first account, generates a high-entropy password unless
-  one is provided, and prints the credentials once;
+  one is provided, prints the credentials once, and optionally writes a secret
+  Surge configuration while the plaintext is available;
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
   entry, writes the usque JSON to a new `0600` file, and prints the mihomo block;
 - `dual` does both, writing a
@@ -66,6 +69,9 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_AUTH_MODE` | `basic`, `client_cert`, or `dual` |
 | `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
+| `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables Surge configuration generation |
+| `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated Surge configuration |
+| `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret Surge output path; defaults to `/root/masque-surge.conf` when generation is enabled |
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
 | `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |
 | `MASQUE_TLS_CERT` / `MASQUE_TLS_KEY` | Source PEM certificate and key copied into `/etc/masque/certs` |
@@ -102,8 +108,8 @@ exist.
 The same one-command installer is safe to reuse for later releases. If the
 configuration already exists, the downloaded candidate runs `check-config`
 against it before any installed file is replaced. A failed check leaves the
-binary, systemd unit, monitoring assets, configuration, TLS files, and running
-service untouched. On success, the binary, packaged systemd unit, Prometheus
+server/probe binaries, systemd unit, monitoring assets, configuration, TLS
+files, and running service untouched. On success, both binaries, the packaged systemd unit, Prometheus
 rules, and Grafana dashboard are upgraded; the TOML and every TLS path it
 references remain unchanged. If the requested service restart then fails, the
 installer restores the previous release-managed files, enabled state, and
@@ -113,8 +119,8 @@ summary but does not print the existing configuration contents.
 ## Install a downloaded archive
 
 ```sh
-tar xzf masque-vVERSION-linux-x86_64.tar.gz
-cd masque-vVERSION-linux-x86_64
+tar xzf masque-vVERSION-linux-ARCH.tar.gz
+cd masque-vVERSION-linux-ARCH
 sudo ./install.sh
 ```
 
@@ -137,6 +143,7 @@ sets it to `1` by default.
 The installer creates:
 
 - `/usr/local/bin/masque-server`;
+- `/usr/local/bin/masque-probe`;
 - `/etc/masque/masque.toml`;
 - `/etc/masque/certs/`;
 - `/etc/systemd/system/masque.service`;
@@ -309,8 +316,8 @@ The candidate first runs the equivalent of:
 masque-server --config /etc/masque/masque.toml check-config
 ```
 
-This validates the parts of startup that do not need live resources. A 0.2
-configuration, a file that no longer satisfies fail-closed authentication, a bad
+This validates the parts of startup that do not need live resources. A file
+that no longer satisfies fail-closed authentication, a bad
 certificate/key pair, an unsupported HTTP/2 or QUIC setting, or an invalid
 client/address pool therefore stops the upgrade before replacement. Edit and validate such a
 configuration deliberately; the installer never migrates it automatically.
@@ -318,7 +325,7 @@ configuration deliberately; the installer never migrates it automatically.
 After a successful upgrade, inspect service status and run a client
 connectivity and throughput smoke test. Keep independent backups as part of
 normal operations even though the installer performs a temporary transactional
-rollback around the binary, unit, and packaged monitoring-asset replacement.
+rollback around both binaries, the unit, and packaged monitoring-asset replacement.
 
 For optional health checks, Prometheus scraping, alert rules, and the dashboard
 JSON, see [Observability](observability.md). The installer copies those static
@@ -337,6 +344,28 @@ sudo ss -t -l -p | grep masque-server
 systemctl show masque -p MainPID -p ActiveState -p SubState
 ```
 
+From the affected client network, run `masque-probe` with Basic credentials or
+an enrollment JSON. It validates real upstream TCP CONNECT establishment and a
+CONNECT-UDP DNS round trip instead of merely checking whether the port opens:
+
+```sh
+printf '%s' 'client-password' | masque-probe proxy.example.com:8449 \
+  --username client-name --password-stdin
+masque-probe proxy.example.com:4443 --client-config client.json --connect-ip
+```
+
+Create a private, shareable server report with:
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml support-bundle \
+  --out /root/masque-support.json
+```
+
+The command refuses to overwrite an existing file and excludes raw
+configuration, credentials, client identities, key material, environment,
+logs, and traffic details. Review it before sharing. See
+[Troubleshooting](troubleshooting.md) for the full diagnostic flow.
+
 Inspect UDP batching during a controlled benchmark:
 
 ```sh
@@ -347,7 +376,7 @@ sudo strace -f -c -e trace=sendmmsg,sendmsg,recvmmsg \
 The musl release should show real `sendmmsg` and `recvmmsg` calls. Run tracing
 only briefly; it changes timing.
 
-For persistent failures, collect the version, configuration with secrets
-redacted, kernel version, interface offload state, service status, and a short
-log excerpt. Never publish certificates, password hashes, credentials, or
-captured user traffic.
+For persistent failures, attach the support bundle and the probe's `--json`
+output. Keep any separately requested log excerpt private until it has been
+reviewed; never publish certificates, password hashes, credentials, or captured
+user traffic.

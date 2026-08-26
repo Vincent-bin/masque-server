@@ -279,6 +279,86 @@ fn adds_a_basic_listener_with_a_password_read_from_stdin() {
     );
 }
 
+#[test]
+fn adding_a_basic_listener_can_emit_its_private_surge_configuration() {
+    let fixture = Fixture::new(false);
+    let client_path = fixture._dir.path().join("new-listener.conf");
+    let output = fixture.user_command(
+        "add-listener",
+        &[
+            "--listen-addr",
+            "127.0.0.1:8465",
+            "--mode",
+            "basic",
+            "--username",
+            "phone",
+            "--password-stdin",
+            "--emit-client",
+            "surge",
+            "--client-endpoint",
+            "proxy.example:8465",
+            "--client-name",
+            "phone",
+            "--client-out",
+            client_path.to_str().unwrap(),
+            "--no-bind-check",
+        ],
+        Some(b"listener-secret\n"),
+    );
+    assert!(
+        output.status.success(),
+        "add-listener failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&client_path).unwrap(),
+        "[Proxy]\nphone = masque, proxy.example, 8465, username=phone, password=listener-secret\n"
+    );
+    assert!(!fixture.text().contains("listener-secret"));
+    assert_eq!(
+        fixture.config().listeners[1].auth.users[0].username,
+        "phone"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(client_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn surge_output_is_rejected_for_an_http2_listener_without_editing_config() {
+    let fixture = Fixture::new(false);
+    let client_path = fixture._dir.path().join("unused.conf");
+    let output = fixture.user_command(
+        "add-listener",
+        &[
+            "--transport",
+            "http2",
+            "--listen-addr",
+            "127.0.0.1:8465",
+            "--mode",
+            "basic",
+            "--username",
+            "phone",
+            "--password-stdin",
+            "--emit-client",
+            "surge",
+            "--client-endpoint",
+            "proxy.example:8465",
+            "--client-out",
+            client_path.to_str().unwrap(),
+        ],
+        Some(b"listener-secret\n"),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires an HTTP/3 listener"));
+    fixture.assert_unchanged();
+}
+
 /// Without a flag or a terminal there is no password to write, and a Basic
 /// listener with none cannot start. One is generated and printed instead — the
 /// same choice the installer makes.
@@ -677,6 +757,97 @@ fn add_user_migrates_legacy_credentials_and_list_users_redacts_hashes() {
     assert!(stdout.contains("alice"));
     assert!(stdout.contains("bob"));
     assert!(!stdout.contains("argon2"));
+}
+
+#[test]
+fn add_user_can_write_a_private_surge_configuration() {
+    let fixture = Fixture::new(false);
+    let client_path = fixture._dir.path().join("phone.conf");
+    let output = fixture.user_command(
+        "add-user",
+        &[
+            "--username",
+            "bob",
+            "--password-stdin",
+            "--emit-client",
+            "surge",
+            "--client-endpoint",
+            "proxy.example:8449",
+            "--client-name",
+            "phone",
+            "--client-out",
+            client_path.to_str().unwrap(),
+        ],
+        Some(b"bob secret,with comma\n"),
+    );
+    assert!(
+        output.status.success(),
+        "add-user failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("bob secret"));
+    assert_eq!(
+        std::fs::read_to_string(&client_path).unwrap(),
+        "[Proxy]\nphone = masque, proxy.example, 8449, username=bob, password=\"bob secret,with comma\"\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&client_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let config = fixture.config();
+    let bob = config.listeners[0]
+        .auth
+        .users
+        .iter()
+        .find(|user| user.username == "bob")
+        .unwrap();
+    assert!(
+        Argon2::default()
+            .verify_password(
+                b"bob secret,with comma",
+                &PasswordHash::new(&bob.password_hash).unwrap()
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn failed_client_output_leaves_the_account_file_unchanged() {
+    let fixture = Fixture::new(false);
+    let before = fixture.text();
+    let client_path = fixture._dir.path().join("existing.conf");
+    std::fs::write(&client_path, "do not replace").unwrap();
+    let output = fixture.user_command(
+        "add-user",
+        &[
+            "--username",
+            "bob",
+            "--password-stdin",
+            "--emit-client",
+            "surge",
+            "--client-endpoint",
+            "proxy.example:8449",
+            "--client-out",
+            client_path.to_str().unwrap(),
+        ],
+        Some(b"bob-secret\n"),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to overwrite"));
+    assert_eq!(fixture.text(), before);
+    assert_eq!(
+        std::fs::read_to_string(client_path).unwrap(),
+        "do not replace"
+    );
 }
 
 #[test]

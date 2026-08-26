@@ -13,6 +13,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::str::FromStr as _;
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
@@ -144,6 +145,129 @@ pub fn mihomo_proxy_yaml(
     block.push_str(&format!("    mtu: {mtu}\n"));
     block.push_str("    udp: true\n");
     block
+}
+
+/// Public address placed in a generated client configuration.
+///
+/// Listener addresses such as `[::]:8449` describe where the server binds,
+/// not what a remote client dials, so credential-management commands require
+/// this value explicitly instead of guessing from the server configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl ClientEndpoint {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        if value.contains('@') {
+            bail!("client endpoint must not contain user information");
+        }
+        let authority = http::uri::Authority::from_str(value)
+            .with_context(|| format!("invalid client endpoint {value:?}"))?;
+        let port = authority
+            .port_u16()
+            .with_context(|| format!("client endpoint {value:?} has no port"))?;
+        if port == 0 {
+            bail!("client endpoint port must be between 1 and 65535");
+        }
+        let host = authority.host();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        if host.is_empty()
+            || host
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            bail!("client endpoint host is empty or contains whitespace");
+        }
+        if IpAddr::from_str(host).is_err()
+            && !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        {
+            bail!(
+                "client endpoint host must be an IP address or an ASCII DNS name containing only letters, digits, dots, and hyphens"
+            );
+        }
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
+
+    fn surge_host(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
+}
+
+/// A complete Surge `[Proxy]` block for one standard HTTP/3 MASQUE account.
+///
+/// This intentionally takes the plaintext password. The server stores only an
+/// Argon2id hash and cannot export the configuration later, so callers invoke
+/// it while creating or replacing the credential and immediately zeroize the
+/// plaintext afterwards.
+pub fn surge_proxy_config(
+    name: &str,
+    endpoint: &ClientEndpoint,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<String> {
+    if name.is_empty() || name.contains(['\r', '\n', '=']) || name.chars().any(char::is_control) {
+        bail!(
+            "Surge proxy name must be non-empty and contain no '=', newline, or control character"
+        );
+    }
+    if username.is_empty()
+        || username.contains(['\r', '\n'])
+        || username.chars().any(char::is_control)
+    {
+        bail!("Surge username cannot be represented safely in a proxy declaration");
+    }
+    if password.is_empty() || password.chars().any(char::is_control) {
+        bail!("Surge password must be non-empty and contain no control character");
+    }
+
+    Ok(format!(
+        "[Proxy]\n{name} = masque, {}, {}, username={}, password={}\n",
+        endpoint.surge_host(),
+        endpoint.port,
+        surge_value(username),
+        surge_value(password),
+    ))
+}
+
+/// A stable default that remains readable when several server accounts are
+/// imported into the same Surge configuration.
+pub fn default_surge_proxy_name(endpoint: &ClientEndpoint) -> String {
+    format!("[masque] {}:{}", endpoint.surge_host(), endpoint.port)
+}
+
+fn surge_value(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~'))
+    {
+        return value.to_owned();
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// The `[[clients]]` block to append to the server's config file.
@@ -448,6 +572,39 @@ mod tests {
         );
         assert!(!yaml.contains("ip:"));
         assert!(!yaml.contains("ipv6:"));
+    }
+
+    #[test]
+    fn surge_block_carries_basic_credentials_and_public_endpoint() {
+        let endpoint = ClientEndpoint::parse("proxy.example:8449").unwrap();
+        let block = surge_proxy_config(
+            "phone",
+            &endpoint,
+            "alice",
+            "password with spaces, and commas",
+        )
+        .unwrap();
+        assert_eq!(
+            block,
+            "[Proxy]\nphone = masque, proxy.example, 8449, username=alice, password=\"password with spaces, and commas\"\n"
+        );
+    }
+
+    #[test]
+    fn surge_endpoint_accepts_bracketed_ipv6() {
+        let endpoint = ClientEndpoint::parse("[2001:db8::1]:443").unwrap();
+        assert_eq!(endpoint.host, "2001:db8::1");
+        assert_eq!(
+            default_surge_proxy_name(&endpoint),
+            "[masque] [2001:db8::1]:443"
+        );
+    }
+
+    #[test]
+    fn surge_endpoint_rejects_user_information_and_port_zero() {
+        assert!(ClientEndpoint::parse("user@proxy.example:443").is_err());
+        assert!(ClientEndpoint::parse("proxy.example:0").is_err());
+        assert!(ClientEndpoint::parse("proxy.example,udp-relay=true:443").is_err());
     }
 
     #[test]

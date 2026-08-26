@@ -14,8 +14,10 @@ file is the canonical deployable example and is tested by the release flow.
 ```text
 masque-server [OPTIONS]
 masque-server hash-password
+masque-server client-config surge --endpoint <HOST:PORT> --username <NAME> [OPTIONS]
 masque-server --config <PATH> check-config
 masque-server --config <PATH> doctor
+masque-server --config <PATH> support-bundle --out <PATH>
 masque-server --config <PATH> add-listener [OPTIONS]
 masque-server --config <PATH> list-users [OPTIONS]
 masque-server --config <PATH> add-user --username <NAME> [OPTIONS]
@@ -44,6 +46,12 @@ are advisory because the service may be stopped and routing may live in
 nftables, a network namespace, or an upstream gateway. The command prints what
 it could not prove and exits nonzero only for hard prerequisites. It is
 read-only and never configures the host.
+
+`support-bundle` runs configuration validation and the same read-only host
+inspection, then writes a new mode-`0600` JSON report. It summarizes only typed
+operational fields and deliberately excludes the raw TOML, credential values,
+client identities and addresses, key material, environment, logs, and traffic
+details. See [Troubleshooting](troubleshooting.md#server-side-support-bundle).
 
 `add-listener` appends a `[[listeners]]` block to the configuration file, and is
 described under [Adding a listener](#adding-a-listener).
@@ -229,6 +237,33 @@ Duplicate additions and unknown users are rejected without changing the file;
 the final account cannot be removed. Send `SIGHUP` after a successful edit.
 Future requests on existing HTTP/2 and HTTP/3 connections use the new account
 snapshot, while tunnels already authorized continue uninterrupted.
+
+When adding an account, the same command can write the matching Surge proxy
+declaration before discarding the plaintext password:
+
+```sh
+printf '%s' 'phone-password' | sudo masque-server \
+  --config /etc/masque/masque.toml add-user \
+  --username phone --password-stdin \
+  --emit-client surge --client-endpoint proxy.example.com:8449 \
+  --client-name phone --client-out /root/phone-surge.conf
+```
+
+`--client-endpoint` is intentionally explicit: a wildcard listener such as
+`0.0.0.0:8449` is not an address a remote client can dial. Surge MASQUE uses
+HTTP/3, so client output is refused for an HTTP/2 listener. The output is a new
+mode-`0600` file and an existing path is never replaced. If `--client-out` is
+omitted the secret declaration goes to stdout with a warning.
+
+The server retains only Argon2id hashes, so it cannot export an old account's
+password. If the plaintext is known, generate a client file without editing the
+account:
+
+```sh
+printf '%s' 'phone-password' | masque-server client-config surge \
+  --endpoint proxy.example.com:8449 --username phone \
+  --out /root/phone-surge.conf
+```
 
 ### `mode = "client_cert"`
 
@@ -529,6 +564,10 @@ add-listener options:
       --username <NAME>     Basic username
       --password-hash <PHC>  Argon2id hash, as printed by hash-password
       --password-stdin      Read the password from stdin and hash it here
+      --emit-client surge   Emit the Basic credential in Surge syntax
+      --client-endpoint <HOST:PORT>  Public endpoint written to that client config
+      --client-name <NAME>  Optional Surge proxy name
+      --client-out <PATH>   Create a private client file instead of using stdout
       --disable-auth        Write enabled = false (trusted networks only)
       --no-bind-check       Do not test-bind the new address
       --dry-run             Print the block; leave the file unchanged
@@ -539,6 +578,12 @@ Combinations that would be ignored are refused rather than dropped:
 `--username`, `--password-hash`, and `--password-stdin` apply to `--mode basic`
 only, and `--disable-auth` cannot be combined with `--mode`, since a listener
 that demands nothing has no mode to record.
+
+The four client-output options have the same safety and file format described
+under [Basic account management](#basic-account-management). They apply only to
+an authenticated HTTP/3 Basic listener; `--password-hash` cannot produce a
+client file because the plaintext is intentionally unrecoverable, and
+`--dry-run` cannot promise a two-file result.
 
 A Basic `--dry-run` must be given a password through `--password-stdin` or an
 existing hash through `--password-hash`. It never generates a password whose

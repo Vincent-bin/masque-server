@@ -1,0 +1,33 @@
+[package]
+name = "masque-probe"
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.88"
+description = "End-to-end connectivity diagnostics for MASQUE proxies"
+license = "MIT"
+repository = "https://github.com/Vincent-bin/masque-server"
+publish = false
+
+[[bin]]
+name = "masque-probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22.1"
+boring = "4.3"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+h2 = "0.4.18"
+http = "1"
+masque = { package = "masque-server", path = "../.." }
+quiche = "0.29.3"
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-boring = "4.19"
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -91,6 +91,14 @@ connection IDs.
 Do not respond to overload by making queues arbitrarily deep; this can turn
 packet loss into seconds of latency and make memory exhaustion easier.
 
+`masque-server support-bundle` is deliberately a metadata-only diagnostic. It
+does not copy the configuration, logs, environment, usernames, password hashes,
+client labels or keys, certificate identities, target addresses, or traffic
+data. The generated file is created as mode `0600` and never overwrites an
+existing path. It can still reveal operational details such as listener counts,
+enabled transports, kernel version, and certificate validity windows, so review
+the JSON before sharing it outside the operator team.
+
 ## TLS and credentials
 
 - Keep the private key and configuration `root:masque` mode `0640`.

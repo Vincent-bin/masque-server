@@ -13,6 +13,7 @@ use masque::config_edit;
 use masque::enroll;
 use masque::host;
 use masque::server::{Server, validate_config};
+use masque::support;
 
 /// MASQUE proxy server (CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/2 or
 /// HTTP/3).
@@ -55,6 +56,28 @@ enum LogFormat {
 enum Command {
     /// Read a password from standard input and print an Argon2id PHC hash.
     HashPassword,
+    /// Read a Basic password from stdin and emit an importable client configuration.
+    ClientConfig {
+        /// Client configuration syntax.
+        #[arg(value_enum)]
+        format: BasicClientArg,
+
+        /// Public host:port the client dials.
+        #[arg(long)]
+        endpoint: String,
+
+        /// Basic username.
+        #[arg(long)]
+        username: String,
+
+        /// Client-side proxy name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Write to a new mode-0600 file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Validate the configuration without binding sockets or creating a TUN.
     CheckConfig,
     /// Validate the configuration and inspect CONNECT-IP host prerequisites.
@@ -62,6 +85,13 @@ enum Command {
     /// This is read-only. It checks Linux forwarding switches and looks for
     /// TUN, route, firewall, and NAT evidence without changing any of them.
     Doctor,
+    /// Write a private, shareable JSON diagnostic report with credentials,
+    /// key material, raw configuration, logs, and traffic details excluded.
+    SupportBundle {
+        /// Create the report at this path; an existing path is never replaced.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Generate a client key pair for a listener using client-certificate auth.
     ///
     /// Prints the `[[clients]]` block to add to the server config, and the JSON
@@ -137,13 +167,47 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
 
+        /// Emit a ready-to-import client configuration while the plaintext
+        /// password is still available.
+        #[arg(
+            long,
+            value_enum,
+            requires = "client_endpoint",
+            conflicts_with_all = ["password_hash", "dry_run"]
+        )]
+        emit_client: Option<BasicClientArg>,
+
+        /// Public host:port the client dials; never inferred from a wildcard bind address.
+        #[arg(long, requires = "emit_client")]
+        client_endpoint: Option<String>,
+
+        /// Proxy name in the generated client configuration.
+        #[arg(long, requires = "emit_client")]
+        client_name: Option<String>,
+
+        /// Write the secret client configuration to a new mode-0600 file.
+        #[arg(long, requires = "emit_client")]
+        client_out: Option<PathBuf>,
+
         /// Write `enabled = false`. Anyone who reaches the socket may use the
         /// proxy, so this is for a listener on a trusted network only.
         ///
         /// Conflicts with `--mode`: a listener that demands nothing has no
         /// authentication mode to pick, and writing one down would describe a
         /// requirement that is not enforced.
-        #[arg(long, conflicts_with_all = ["mode", "username", "password_hash", "password_stdin"])]
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "mode",
+                "username",
+                "password_hash",
+                "password_stdin",
+                "emit_client",
+                "client_endpoint",
+                "client_name",
+                "client_out"
+            ]
+        )]
         disable_auth: bool,
 
         /// Do not try to bind the new address before writing it.
@@ -192,6 +256,28 @@ enum Command {
         /// Read the plaintext password from standard input and hash it.
         #[arg(long)]
         password_stdin: bool,
+
+        /// Emit a ready-to-import client configuration while the plaintext
+        /// password is still available.
+        #[arg(
+            long,
+            value_enum,
+            requires = "client_endpoint",
+            conflicts_with = "password_hash"
+        )]
+        emit_client: Option<BasicClientArg>,
+
+        /// Public host:port the client dials; never inferred from a wildcard bind address.
+        #[arg(long, requires = "emit_client")]
+        client_endpoint: Option<String>,
+
+        /// Proxy name in the generated client configuration.
+        #[arg(long, requires = "emit_client")]
+        client_name: Option<String>,
+
+        /// Write the secret client configuration to a new mode-0600 file.
+        #[arg(long, requires = "emit_client")]
+        client_out: Option<PathBuf>,
     },
     /// Replace one Basic user's password without changing other accounts.
     SetPassword {
@@ -244,6 +330,19 @@ enum AuthModeArg {
 enum TransportArg {
     Http3,
     Http2,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum BasicClientArg {
+    Surge,
+}
+
+impl From<BasicClientArg> for config_edit::BasicClientFormat {
+    fn from(format: BasicClientArg) -> Self {
+        match format {
+            BasicClientArg::Surge => Self::Surge,
+        }
+    }
 }
 
 impl From<TransportArg> for config::ListenerTransport {
@@ -382,6 +481,43 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", auth::hash_password(password.as_bytes())?);
         return Ok(());
     }
+    if let Some(Command::ClientConfig {
+        format,
+        endpoint,
+        username,
+        name,
+        out,
+    }) = &cli.command
+    {
+        auth::check_username(username)?;
+        let endpoint = enroll::ClientEndpoint::parse(endpoint)?;
+        let password = read_password_from_stdin()?;
+        let name = name
+            .clone()
+            .unwrap_or_else(|| enroll::default_surge_proxy_name(&endpoint));
+        let contents = Zeroizing::new(match format {
+            BasicClientArg::Surge => {
+                enroll::surge_proxy_config(&name, &endpoint, username, &password)?
+            }
+        });
+        match out {
+            Some(path) => {
+                enroll::write_client_config(path, &contents)?;
+                println!(
+                    "Surge client configuration written to {} (contains the plaintext password)",
+                    path.display()
+                );
+            }
+            None => {
+                eprintln!(
+                    "warning: client configuration on stdout contains the plaintext password"
+                );
+                print!("{}", contents.as_str());
+                std::io::stdout().flush()?;
+            }
+        }
+        return Ok(());
+    }
 
     // Logging
     let default_filter = match cli.verbose {
@@ -410,6 +546,7 @@ async fn main() -> anyhow::Result<()> {
         Some(
             Command::CheckConfig
                 | Command::Doctor
+                | Command::SupportBundle { .. }
                 | Command::AddListener { .. }
                 | Command::ListUsers { .. }
                 | Command::AddUser { .. }
@@ -432,12 +569,29 @@ async fn main() -> anyhow::Result<()> {
         username,
         password_hash,
         password_stdin,
+        emit_client,
+        client_endpoint,
+        client_name,
+        client_out,
         disable_auth,
         no_bind_check,
         dry_run,
         yes,
     }) = &cli.command
     {
+        let client_output = match emit_client {
+            Some(format) => Some(config_edit::BasicClientOutput {
+                format: (*format).into(),
+                endpoint: enroll::ClientEndpoint::parse(
+                    client_endpoint
+                        .as_deref()
+                        .expect("clap requires --client-endpoint with --emit-client"),
+                )?,
+                name: client_name.clone(),
+                out: client_out.clone(),
+            }),
+            None => None,
+        };
         return config_edit::add_listener(
             &cli.config,
             config_edit::AddListener {
@@ -448,6 +602,7 @@ async fn main() -> anyhow::Result<()> {
                 username: username.clone(),
                 password_hash: password_hash.clone(),
                 password_stdin: *password_stdin,
+                client_output,
                 disable_auth: *disable_auth,
                 no_bind_check: *no_bind_check,
                 dry_run: *dry_run,
@@ -474,8 +629,25 @@ async fn main() -> anyhow::Result<()> {
         transport,
         password_hash,
         password_stdin,
+        emit_client,
+        client_endpoint,
+        client_name,
+        client_out,
     }) = &cli.command
     {
+        let client_output = match emit_client {
+            Some(format) => Some(config_edit::BasicClientOutput {
+                format: (*format).into(),
+                endpoint: enroll::ClientEndpoint::parse(
+                    client_endpoint
+                        .as_deref()
+                        .expect("clap requires --client-endpoint with --emit-client"),
+                )?,
+                name: client_name.clone(),
+                out: client_out.clone(),
+            }),
+            None => None,
+        };
         return config_edit::add_basic_user(
             &cli.config,
             config_edit::BasicUserPassword {
@@ -486,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
                 username: username.clone(),
                 password_hash: password_hash.clone(),
                 password_stdin: *password_stdin,
+                client_output,
             },
         );
     }
@@ -507,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
                 username: username.clone(),
                 password_hash: password_hash.clone(),
                 password_stdin: *password_stdin,
+                client_output: None,
             },
         );
     }
@@ -620,6 +794,17 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::SupportBundle { out }) = &cli.command {
+        let listeners = validate_config(&cfg)?;
+        let bundle = support::collect(&cli.config, &cfg, &listeners);
+        support::write(out, &bundle)?;
+        println!(
+            "support bundle written to {} (mode 0600; review before sharing)",
+            out.display()
+        );
+        return Ok(());
+    }
+
     if cfg.ip_proxy.enabled {
         let report = host::diagnose_connect_ip_startup(&cfg.ip_proxy);
         for check in report.checks().iter().filter(|check| {
@@ -653,6 +838,21 @@ async fn main() -> anyhow::Result<()> {
     server.run().await
 }
 
+fn read_password_from_stdin() -> anyhow::Result<Zeroizing<String>> {
+    let mut password = Zeroizing::new(String::new());
+    std::io::stdin().read_to_string(&mut password)?;
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+    if password.is_empty() || password.chars().any(char::is_control) {
+        anyhow::bail!("password must be non-empty and contain no control characters");
+    }
+    Ok(password)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
@@ -665,6 +865,11 @@ mod tests {
             Cli::command().get_version(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
     }
 
     #[test]
@@ -683,6 +888,11 @@ mod tests {
     #[test]
     fn doctor_subcommand_is_available() {
         assert!(Cli::command().find_subcommand("doctor").is_some());
+    }
+
+    #[test]
+    fn support_bundle_subcommand_is_available() {
+        assert!(Cli::command().find_subcommand("support-bundle").is_some());
     }
 
     #[test]
