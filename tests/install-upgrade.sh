@@ -20,14 +20,17 @@ die() {
 
 CANDIDATE=${MASQUE_TEST_PACKAGE_BIN:-}
 [ -x "$CANDIDATE" ] || die "MASQUE_TEST_PACKAGE_BIN must name an executable"
+CANDIDATE_PROBE=${MASQUE_TEST_PACKAGE_PROBE:-}
+[ -x "$CANDIDATE_PROBE" ] || die "MASQUE_TEST_PACKAGE_PROBE must name an executable"
 
 BIN_PATH=/usr/local/bin/masque-server
+PROBE_PATH=/usr/local/bin/masque-probe
 CONFIG_PATH=/etc/masque/masque.toml
 UNIT_PATH=/etc/systemd/system/masque.service
 MONITORING_DIR=/usr/local/share/masque-server/monitoring
 PROMETHEUS_RULES_PATH=$MONITORING_DIR/prometheus-rules.yml
 GRAFANA_DASHBOARD_PATH=$MONITORING_DIR/grafana-dashboard.json
-for protected_path in "$BIN_PATH" "$CONFIG_PATH" "$UNIT_PATH" \
+for protected_path in "$BIN_PATH" "$PROBE_PATH" "$CONFIG_PATH" "$UNIT_PATH" \
     "$PROMETHEUS_RULES_PATH" "$GRAFANA_DASHBOARD_PATH"; do
     [ ! -e "$protected_path" ] || die "runner is not clean: $protected_path already exists"
 done
@@ -40,6 +43,7 @@ cleanup() {
     set +e
     rm -f -- \
         "$BIN_PATH" \
+        "$PROBE_PATH" \
         "$CONFIG_PATH" \
         /etc/masque/.masque.toml.lock \
         "$UNIT_PATH" \
@@ -61,6 +65,7 @@ MOCK_STATE=$TEST_TMP/restart-count
 install -d "$PACKAGE_DIR/bin" "$PACKAGE_DIR/config" "$PACKAGE_DIR/monitoring" \
     "$PACKAGE_DIR/systemd" "$MOCK_BIN"
 install -m 0755 "$CANDIDATE" "$PACKAGE_DIR/bin/masque-server"
+install -m 0755 "$CANDIDATE_PROBE" "$PACKAGE_DIR/bin/masque-probe"
 install -m 0755 deploy/install.sh "$PACKAGE_DIR/install.sh"
 install -m 0644 deploy/config/masque.toml "$PACKAGE_DIR/config/masque.toml"
 install -m 0644 deploy/systemd/masque.service "$PACKAGE_DIR/systemd/masque.service"
@@ -139,6 +144,11 @@ write_old_installation() {
 echo old-masque-server
 EOF
     chmod 0755 "$BIN_PATH"
+    cat >"$PROBE_PATH" <<'EOF'
+#!/usr/bin/env sh
+echo old-masque-probe
+EOF
+    chmod 0755 "$PROBE_PATH"
     printf '%s\n' 'old systemd unit' >"$UNIT_PATH"
     chmod 0644 "$UNIT_PATH"
     install -d "$MONITORING_DIR"
@@ -170,6 +180,7 @@ assert_upgrade_output_is_summary_only() {
 # both authentication modes. This runs first, while the runner still has no
 # configuration; the upgrade cases below overwrite everything it leaves behind.
 DUAL_CLIENT_JSON=$TEST_TMP/dual-client.json
+DUAL_SURGE_CONFIG=$TEST_TMP/dual-surge.conf
 MASQUE_AUTH_MODE=dual \
     MASQUE_AUTH_USERNAME=proxy-user \
     MASQUE_AUTH_PASSWORD=a-strong-password \
@@ -178,6 +189,9 @@ MASQUE_AUTH_MODE=dual \
     MASQUE_CLIENT_NAME=laptop \
     MASQUE_CLIENT_ENDPOINT=203.0.113.9:8450 \
     MASQUE_CLIENT_CONFIG_OUT="$DUAL_CLIENT_JSON" \
+    MASQUE_BASIC_CLIENT_ENDPOINT=proxy.example:8449 \
+    MASQUE_BASIC_CLIENT_NAME=dual-proxy \
+    MASQUE_BASIC_CLIENT_CONFIG_OUT="$DUAL_SURGE_CONFIG" \
     MASQUE_START_SERVICE=0 \
     "$PACKAGE_DIR/install.sh" >"$TEST_TMP/dual.log" 2>&1 ||
     die "fresh dual installation failed; see $TEST_TMP/dual.log"
@@ -202,6 +216,12 @@ grep -q '^\[server\]$' "$CONFIG_PATH" ||
 grep -q '^\[\[clients\]\]$' "$CONFIG_PATH" ||
     die "dual mode did not enroll the first certificate client"
 [ -s "$DUAL_CLIENT_JSON" ] || die "dual mode did not write the client JSON"
+[ -s "$DUAL_SURGE_CONFIG" ] || die "dual mode did not write the Surge configuration"
+grep -q '^dual-proxy = masque, proxy.example, 8449, username=proxy-user, password=a-strong-password$' \
+    "$DUAL_SURGE_CONFIG" || die "the generated Surge configuration is not importable"
+[ "$(stat -c '%a' "$DUAL_SURGE_CONFIG")" = 600 ] ||
+    die "the generated Surge configuration is not mode 0600"
+[ -x "$PROBE_PATH" ] || die "the diagnostic probe was not installed"
 
 # The server itself must agree about what those listeners are.
 "$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/dual-check.log" 2>&1 ||
@@ -260,6 +280,7 @@ rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
 write_old_installation
 write_config not-a-controller
 old_binary_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+old_probe_sha=$(sha256sum "$PROBE_PATH" | awk '{print $1}')
 old_unit_sha=$(sha256sum "$UNIT_PATH" | awk '{print $1}')
 old_rules_sha=$(sha256sum "$PROMETHEUS_RULES_PATH" | awk '{print $1}')
 old_dashboard_sha=$(sha256sum "$GRAFANA_DASHBOARD_PATH" | awk '{print $1}')
@@ -268,6 +289,7 @@ if MASQUE_START_SERVICE=0 "$PACKAGE_DIR/install.sh" >"$TEST_TMP/preflight.log" 2
     die "incompatible configuration unexpectedly passed"
 fi
 assert_sha_unchanged "$BIN_PATH" "$old_binary_sha"
+assert_sha_unchanged "$PROBE_PATH" "$old_probe_sha"
 assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
 assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
 assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
@@ -283,7 +305,9 @@ assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
 assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
 assert_upgrade_output_is_summary_only "$TEST_TMP/staged.log"
 candidate_sha=$(sha256sum "$CANDIDATE" | awk '{print $1}')
+candidate_probe_sha=$(sha256sum "$CANDIDATE_PROBE" | awk '{print $1}')
 assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
+assert_sha_unchanged "$PROBE_PATH" "$candidate_probe_sha"
 
 # A successful activation restarts once and preserves operator-managed files.
 write_old_installation
@@ -293,6 +317,7 @@ MOCK_ACTIVE=1 MOCK_ENABLED=1 MASQUE_START_SERVICE=1 \
 [ "$(sed -n '1p' "$MOCK_STATE")" -eq 1 ] ||
     die "successful activation did not restart the service exactly once"
 assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
+assert_sha_unchanged "$PROBE_PATH" "$candidate_probe_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
 assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
 assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
@@ -303,6 +328,7 @@ grep -q 'Service:        started or restarted' "$TEST_TMP/activated.log" ||
 # A failed activation restores every release-managed file and the prior service state.
 write_old_installation
 old_binary_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+old_probe_sha=$(sha256sum "$PROBE_PATH" | awk '{print $1}')
 old_unit_sha=$(sha256sum "$UNIT_PATH" | awk '{print $1}')
 old_rules_sha=$(sha256sum "$PROMETHEUS_RULES_PATH" | awk '{print $1}')
 old_dashboard_sha=$(sha256sum "$GRAFANA_DASHBOARD_PATH" | awk '{print $1}')
@@ -313,13 +339,14 @@ if MOCK_ACTIVE=1 MOCK_ENABLED=1 MOCK_FAIL_FIRST_RESTART=1 \
     die "failed activation unexpectedly reported success"
 fi
 assert_sha_unchanged "$BIN_PATH" "$old_binary_sha"
+assert_sha_unchanged "$PROBE_PATH" "$old_probe_sha"
 assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
 assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
 assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
 assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
 assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
-grep -q 'Previous binary, systemd unit, monitoring assets, and service state restored' \
+grep -q 'Previous binaries, systemd unit, monitoring assets, and service state restored' \
     "$TEST_TMP/rollback.log" || die "rollback confirmation was not printed"
 
 echo "installer upgrade preflight, preservation, and rollback passed"

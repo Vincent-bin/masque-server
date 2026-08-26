@@ -19,6 +19,7 @@ pub mod policy;
 pub mod routing;
 mod scheduler;
 pub mod server;
+pub mod support;
 mod systemd;
 pub mod tun;
 pub mod tunnel;

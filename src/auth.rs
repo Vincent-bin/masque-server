@@ -41,7 +41,7 @@ pub(crate) struct SharedBasicAuthenticator {
 /// colon inside the username makes the pair ambiguous. Shared with
 /// Configuration-editing commands also use this check before changing a file,
 /// so an operator sees the error before any Argon2 work or write is attempted.
-pub(crate) fn check_username(username: &str) -> anyhow::Result<()> {
+pub fn check_username(username: &str) -> anyhow::Result<()> {
     if username.is_empty() {
         bail!("auth.username must not be empty when authentication is enabled");
     }

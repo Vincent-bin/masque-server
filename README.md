@@ -35,7 +35,11 @@ a staging environment.
   updates disconnect only revoked certificate clients
 - Read-only `doctor` checks for CONNECT-IP TUN, forwarding, route, firewall,
   and NAT prerequisites without modifying the host
-- Static Linux x86_64 release archives with a systemd installer
+- A packaged client-side `masque-probe` that verifies TLS, authentication,
+  CONNECT-TCP, CONNECT-UDP, and optional CONNECT-IP over HTTP/3 or HTTP/2
+- Credential-safe client configuration generation and a redacted JSON support
+  bundle for reproducible troubleshooting
+- Static Linux x86_64 and ARM64 release archives with a systemd installer
 
 ## Quick start
 
@@ -103,7 +107,9 @@ Every value, including `--transport http2|http3`, is also available as a flag
 for provisioning scripts. See
 [Adding a listener](docs/configuration.md#adding-a-listener). A new socket is
 bound at startup, so open UDP for HTTP/3 or TCP for HTTP/2, restart the service,
-and confirm it came up.
+and confirm it came up. A new HTTP/3 Basic listener accepts the same
+`--emit-client surge --client-endpoint ... --client-out ...` options shown
+below, so its only plaintext credential can be delivered in the same operation.
 
 Basic accounts on an existing listener can be managed without editing TOML or
 restarting the server. If the file has only one Basic listener, its address can
@@ -112,7 +118,9 @@ be omitted:
 ```sh
 printf '%s\n' 'a-strong-password' | sudo masque-server \
   --config /etc/masque/masque.toml add-user \
-  --username phone --password-stdin
+  --username phone --password-stdin \
+  --emit-client surge --client-endpoint proxy.example.com:8449 \
+  --client-out /root/phone-surge.conf
 sudo masque-server --config /etc/masque/masque.toml list-users
 sudo systemctl reload masque
 ```
@@ -121,6 +129,16 @@ sudo systemctl reload masque
 last account is refused. Existing scalar `username` / `password_hash` files are
 accepted and are migrated to the multi-account form by the first account edit.
 See [Basic account management](docs/configuration.md#basic-account-management).
+
+The generated Surge file is created as mode `0600` and contains the plaintext
+password. If an account already exists and its password is still known, generate
+the same file without changing the server configuration:
+
+```sh
+printf '%s' 'a-strong-password' | masque-server client-config surge \
+  --endpoint proxy.example.com:8449 --username phone \
+  --out /root/phone-surge.conf
+```
 
 CONNECT-IP is independent of the authentication mode: it needs Linux host
 forwarding because it carries complete IP packets through `masque0`, while
@@ -134,9 +152,33 @@ sudo masque-server --config /etc/masque/masque.toml doctor
 The command and the server's startup check are read-only. They never change
 routing, firewall, sysctl, or NAT state.
 
+Run the packaged probe from the same client network that is failing. It tries
+HTTP/3 first and falls back to HTTP/2, then establishes a real upstream TCP
+CONNECT and performs a DNS-over-UDP round trip through the proxy:
+
+```sh
+printf '%s' 'a-strong-password' | masque-probe proxy.example.com:8449 \
+  --username phone --password-stdin
+masque-probe proxy.example.com:4443 --client-config laptop.json --connect-ip
+```
+
+For a shareable server-side report, create a structured bundle rather than
+copying the TOML or logs by hand:
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml support-bundle \
+  --out /root/masque-support.json
+```
+
+The report omits raw configuration, credentials, identities, key material,
+environment variables, logs, and traffic details. Review it before sharing.
+See [Troubleshooting](docs/troubleshooting.md) for probe options and result
+codes.
+
 ## One-command Linux install
 
-On Linux x86_64, download, verify, and install the latest stable release with:
+On Linux x86_64 or ARM64, download, verify, and install the latest stable
+release with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
@@ -144,7 +186,8 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
 
 For a new configuration the installer prompts for `basic`, `client_cert`, or
 `dual` authentication and optional TLS file locations. Basic mode creates the
-first account and generates a random password when none is supplied.
+first account, generates a random password when none is supplied, and can write
+a ready-to-import Surge configuration while the plaintext is still available.
 Client-certificate mode enrolls the first
 client, adds its `[[clients]]` entry, writes its secret JSON as mode `0600`, and
 prints the matching usque and mihomo configuration. Dual mode does both, writing
@@ -156,23 +199,24 @@ the installer never configures forwarding, firewall rules, routes, or NAT.
 
 The same command is also the upgrade command. When
 `/etc/masque/masque.toml` already exists, the candidate binary checks that
-configuration without binding a port or creating a TUN, then upgrades the
-binary, systemd unit, and versioned monitoring assets. It never rewrites the
+configuration without binding a port or creating a TUN, then upgrades both
+binaries, the systemd unit, and versioned monitoring assets. It never rewrites the
 TOML or referenced TLS files, and it does not copy the existing configuration
 into unattended upgrade logs. An
 incompatible configuration aborts before replacement; a failed service restart
-restores the prior binary, unit, monitoring assets, and service state. See
+restores the prior binaries, unit, monitoring assets, and service state. See
 [Deployment](docs/deployment.md#one-command-install) for non-interactive
 variables, certificate requirements, and installing a specific release.
 
 ## Install a downloaded release on Linux
 
-Release archives contain the binary, an example configuration, a hardened
-systemd unit, Prometheus rules, a Grafana dashboard, and an installer:
+Release archives contain `masque-server`, `masque-probe`, an example
+configuration, a hardened systemd unit, Prometheus rules, a Grafana dashboard,
+and an installer. Replace `ARCH` with `x86_64` or `aarch64`:
 
 ```sh
-tar xzf masque-vVERSION-linux-x86_64.tar.gz
-cd masque-vVERSION-linux-x86_64
+tar xzf masque-vVERSION-linux-ARCH.tar.gz
+cd masque-vVERSION-linux-ARCH
 sudo ./install.sh
 ```
 
@@ -197,6 +241,7 @@ upgrades, and diagnostics.
 | [Protocols](docs/protocols.md) | Supported RFCs and CONNECT request behavior |
 | [Performance](docs/performance.md) | Benchmark methodology and Linux fast paths |
 | [Observability](docs/observability.md) | Health/readiness, metrics, alerts, dashboard, and structured logs |
+| [Troubleshooting](docs/troubleshooting.md) | Client probe, redacted support bundle, and failure isolation |
 | [Testing](docs/testing.md) | Unit, E2E, benchmark, and release validation |
 | [Security](docs/security.md) | Threat model, safe defaults, and operational guidance |
 
@@ -208,6 +253,7 @@ src/                    Server library and CLI
   net/                  Platform UDP adapters and Linux batch I/O
   tunnel/               TCP, UDP, and IP tunnel implementations
 tools/masque-e2e/       E2E client and load generator
+tools/masque-probe/     Packaged end-user connectivity diagnostic
 tests/e2e/              Docker E2E environment and fixtures
 benches/                In-process microbenchmarks
 fuzz/                   Scheduled libFuzzer targets for public protocol parsers

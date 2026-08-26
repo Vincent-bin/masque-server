@@ -14,10 +14,12 @@
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
 | Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, mixed authentication, and live HTTP/3 TLS reload/rollback |
 | HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT variants, multiple Basic accounts, both authentication modes, and credential/TLS reload rollback without dropping an established connection |
+| End-user probe | `cargo test -p masque-probe` | Basic/certificate authentication over H2/H3 with live TCP CONNECT and CONNECT-UDP echo round trips, plus stable result/error handling |
 | Observability assets | `cargo test --test monitoring_assets` | Prometheus metric references and importable Grafana JSON |
 | Service shutdown | `tests/systemd-shutdown.sh` | Real SIGTERM/SIGINT handling and every-shard drain; Linux exercises two shards |
-| Config and host diagnostics | `cargo test --test check_config` | `check-config` accepts what a server accepts; `doctor` remains read-only and unit fixtures classify Linux host evidence |
+| Config and host diagnostics | `cargo test --test check_config` | `check-config` accepts what a server accepts; `doctor` remains read-only; support bundles omit credential/identity sentinels |
 | Config editing | `cargo test --test add_listener` | Listener and Basic-account edits are validated, atomic, and preserve deployed comments and secrets |
+| Client config | `cargo test --test client_config` | Surge output is importable, private, secret-aware, and never overwritten |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 | Parser fuzzing | `cargo +nightly fuzz run protocol_parsers` | Incremental capsule, datagram, varint, IP, and URI parser safety |
 
@@ -312,11 +314,13 @@ that, and all three were hit while qualifying this feature:
 
 - Update `CHANGELOG.md` and package version.
 - Run formatting, Clippy with warnings denied, and release tests.
-- Build `x86_64-unknown-linux-musl` with the same command used by CI.
+- Build both `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` with
+  the same matrix used by CI.
 - Extract the archive into a temporary directory and inspect permissions and
   paths.
-- Verify `masque-server --help`, `hash-password`, side-effect-free
-  `check-config`, and read-only `doctor` from the packaged binary.
+- Verify `masque-server --help`, `hash-password`, `client-config`,
+  side-effect-free `check-config`, read-only `doctor`, `support-bundle`, and
+  `masque-probe --help` from the packaged binaries.
 - Install on a disposable Linux host and run a client smoke test.
 - Tag only the commit that passed these checks.
 

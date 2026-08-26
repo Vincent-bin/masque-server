@@ -41,7 +41,7 @@ use crate::auth;
 use crate::config::{
     self, AuthMode, AuthSection, BasicUser, ListenerSection, ListenerTransport, ServerConfig,
 };
-use crate::enroll::toml_string;
+use crate::enroll::{self, ClientEndpoint, toml_string};
 use crate::server::validate_config;
 
 /// Bytes of entropy in a generated password, matching the installer's.
@@ -67,6 +67,8 @@ pub struct AddListener {
     pub password_hash: Option<String>,
     /// Read the password from standard input and hash it.
     pub password_stdin: bool,
+    /// Optionally emit the client half of this newly created credential.
+    pub client_output: Option<BasicClientOutput>,
     /// Write `enabled = false`, for a listener on a trusted network.
     pub disable_auth: bool,
     /// Do not try to bind the new address before writing it.
@@ -92,6 +94,20 @@ pub struct BasicUserPassword {
     pub username: String,
     pub password_hash: Option<String>,
     pub password_stdin: bool,
+    pub client_output: Option<BasicClientOutput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasicClientFormat {
+    Surge,
+}
+
+#[derive(Debug)]
+pub struct BasicClientOutput {
+    pub format: BasicClientFormat,
+    pub endpoint: ClientEndpoint,
+    pub name: Option<String>,
+    pub out: Option<PathBuf>,
 }
 
 /// Append one `[[listeners]]` block to `config_path`.
@@ -157,6 +173,16 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
              enroll the client instead"
         );
     }
+    if request.client_output.is_some() {
+        ensure!(
+            !request.disable_auth && mode == AuthMode::Basic,
+            "client configuration output applies only to an authenticated Basic listener"
+        );
+        ensure!(
+            transport == ListenerTransport::Http3,
+            "Surge MASQUE client output requires an HTTP/3 listener"
+        );
+    }
 
     let shards = match (transport, request.shards) {
         (ListenerTransport::Http2, Some(1) | None) => 1,
@@ -168,7 +194,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         (ListenerTransport::Http3, None) => 1,
     };
 
-    let mut generated_password: Option<Zeroizing<String>> = None;
+    let mut resolved_password: Option<ResolvedUserPassword> = None;
     let auth = if request.disable_auth {
         AuthSection {
             enabled: false,
@@ -195,8 +221,10 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
                     None if interactive => prompt_username()?,
                     None => bail!("--username is required when standard input is not a terminal"),
                 };
-                let (password_hash, generated) = resolve_password(&request, interactive)?;
-                generated_password = generated;
+                let resolved =
+                    resolve_password(&request, interactive, request.client_output.is_some())?;
+                let password_hash = resolved.password_hash.clone();
+                resolved_password = Some(resolved);
                 AuthSection {
                     enabled: true,
                     mode,
@@ -265,7 +293,11 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
     // Deliver the only copy before committing the hash. In particular, a
     // broken pipe or full redirected output must leave the configuration
     // untouched instead of installing a credential the operator never saw.
-    if let Some(password) = generated_password.as_ref() {
+    if let Some(password) = resolved_password
+        .as_ref()
+        .filter(|resolved| resolved.generated)
+        .and_then(|resolved| resolved.plaintext.as_ref())
+    {
         let username = listener
             .auth
             .users
@@ -273,6 +305,19 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
             .map(|user| user.username.as_str())
             .unwrap_or(&listener.auth.username);
         print_generated_password(username, password)?;
+    }
+    if let Some(output) = request.client_output.as_ref() {
+        let username = listener
+            .auth
+            .users
+            .first()
+            .map(|user| user.username.as_str())
+            .unwrap_or(&listener.auth.username);
+        let password = resolved_password
+            .as_ref()
+            .and_then(|resolved| resolved.plaintext.as_ref())
+            .context("client output requires a plaintext password")?;
+        deliver_basic_client_config(output, username, password)?;
     }
 
     write_in_place(config_path, &text, &merged)?;
@@ -402,6 +447,16 @@ fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
         )
     })?;
     let listener_index = select_basic_listener(&config, edit.selector())?;
+    let client_output = match &edit {
+        UserEdit::Add(request) => request.client_output.as_ref(),
+        UserEdit::SetPassword(_) | UserEdit::Remove { .. } => None,
+    };
+    if client_output.is_some() {
+        ensure!(
+            config.listeners[listener_index].transport == ListenerTransport::Http3,
+            "Surge MASQUE client output requires an HTTP/3 listener"
+        );
+    }
     let mut expected = config.clone();
     let expected_auth = &mut expected.listeners[listener_index].auth;
     migrate_legacy_basic_user(expected_auth);
@@ -444,13 +499,15 @@ fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
         }
     }
 
-    let (replacement_hash, generated_password) = match &edit {
+    let resolved_password = match &edit {
         UserEdit::Add(request) | UserEdit::SetPassword(request) => {
-            let (hash, generated) = resolve_user_password(request)?;
-            (Some(hash), generated)
+            Some(resolve_user_password(request, client_output.is_some())?)
         }
-        UserEdit::Remove { .. } => (None, None),
+        UserEdit::Remove { .. } => None,
     };
+    let replacement_hash = resolved_password
+        .as_ref()
+        .map(|resolved| resolved.password_hash.clone());
 
     match &edit {
         UserEdit::Add(_) => {
@@ -522,8 +579,19 @@ fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
 
     // As with add-listener, deliver a generated secret before committing the
     // only usable representation of it (the hash) to disk.
-    if let Some(password) = generated_password.as_ref() {
+    if let Some(password) = resolved_password
+        .as_ref()
+        .filter(|resolved| resolved.generated)
+        .and_then(|resolved| resolved.plaintext.as_ref())
+    {
         print_generated_password(&username, password)?;
+    }
+    if let Some(output) = client_output {
+        let password = resolved_password
+            .as_ref()
+            .and_then(|resolved| resolved.plaintext.as_ref())
+            .context("client output requires a plaintext password")?;
+        deliver_basic_client_config(output, &username, password)?;
     }
     write_in_place(config_path, &text, &merged)?;
 
@@ -545,31 +613,95 @@ fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct ResolvedUserPassword {
+    password_hash: String,
+    plaintext: Option<Zeroizing<String>>,
+    generated: bool,
+}
+
 fn resolve_user_password(
     request: &BasicUserPassword,
-) -> anyhow::Result<(String, Option<Zeroizing<String>>)> {
+    retain_plaintext: bool,
+) -> anyhow::Result<ResolvedUserPassword> {
     ensure!(
         !(request.password_hash.is_some() && request.password_stdin),
         "--password-hash conflicts with --password-stdin"
     );
     if let Some(hash) = &request.password_hash {
-        return Ok((hash.clone(), None));
+        ensure!(
+            !retain_plaintext,
+            "--password-hash cannot be combined with client configuration output because the plaintext password is unavailable"
+        );
+        return Ok(ResolvedUserPassword {
+            password_hash: hash.clone(),
+            plaintext: None,
+            generated: false,
+        });
     }
     if request.password_stdin {
         let mut password = Zeroizing::new(String::new());
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)?;
         let password = Zeroizing::new(trim_newline(&password).to_owned());
         check_password(&password)?;
-        return Ok((auth::hash_password(password.as_bytes())?, None));
+        let password_hash = auth::hash_password(password.as_bytes())?;
+        return Ok(ResolvedUserPassword {
+            password_hash,
+            plaintext: retain_plaintext.then_some(password),
+            generated: false,
+        });
     }
     if std::io::stdin().is_terminal()
         && let Some(password) = prompt_password(true)?
     {
-        return Ok((auth::hash_password(password.as_bytes())?, None));
+        let password_hash = auth::hash_password(password.as_bytes())?;
+        return Ok(ResolvedUserPassword {
+            password_hash,
+            plaintext: retain_plaintext.then_some(password),
+            generated: false,
+        });
     }
 
     let password = generate_password()?;
-    Ok((auth::hash_password(password.as_bytes())?, Some(password)))
+    Ok(ResolvedUserPassword {
+        password_hash: auth::hash_password(password.as_bytes())?,
+        plaintext: Some(password),
+        generated: true,
+    })
+}
+
+fn deliver_basic_client_config(
+    output: &BasicClientOutput,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    let name = output
+        .name
+        .clone()
+        .unwrap_or_else(|| enroll::default_surge_proxy_name(&output.endpoint));
+    let contents = Zeroizing::new(match output.format {
+        BasicClientFormat::Surge => {
+            enroll::surge_proxy_config(&name, &output.endpoint, username, password)?
+        }
+    });
+    if let Some(path) = &output.out {
+        enroll::write_client_config(path, &contents)?;
+        println!(
+            "Surge client configuration written to {} (contains the plaintext password)",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    writeln!(
+        writer,
+        "\n# Surge client configuration (contains the plaintext password):"
+    )?;
+    writer.write_all(contents.as_bytes())?;
+    writer
+        .flush()
+        .context("failed to print the client configuration; configuration is unchanged")
 }
 
 fn select_basic_listener(
@@ -830,9 +962,18 @@ fn verify_merge(
 fn resolve_password(
     request: &AddListener,
     interactive: bool,
-) -> anyhow::Result<(String, Option<Zeroizing<String>>)> {
+    retain_plaintext: bool,
+) -> anyhow::Result<ResolvedUserPassword> {
     if let Some(hash) = &request.password_hash {
-        return Ok((hash.clone(), None));
+        ensure!(
+            !retain_plaintext,
+            "--password-hash cannot be combined with client configuration output because the plaintext password is unavailable"
+        );
+        return Ok(ResolvedUserPassword {
+            password_hash: hash.clone(),
+            plaintext: None,
+            generated: false,
+        });
     }
 
     if request.password_stdin {
@@ -840,13 +981,21 @@ fn resolve_password(
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)?;
         let password = Zeroizing::new(trim_newline(&password).to_owned());
         check_password(&password)?;
-        return Ok((auth::hash_password(password.as_bytes())?, None));
+        return Ok(ResolvedUserPassword {
+            password_hash: auth::hash_password(password.as_bytes())?,
+            plaintext: retain_plaintext.then_some(password),
+            generated: false,
+        });
     }
 
     if interactive {
         let password = prompt_password(!request.dry_run)?;
         if let Some(password) = password {
-            return Ok((auth::hash_password(password.as_bytes())?, None));
+            return Ok(ResolvedUserPassword {
+                password_hash: auth::hash_password(password.as_bytes())?,
+                plaintext: retain_plaintext.then_some(password),
+                generated: false,
+            });
         }
     }
 
@@ -864,7 +1013,11 @@ fn resolve_password(
     // alternative is a listener that cannot start — but it exists only in this
     // output, so the caller prints it exactly once.
     let password = generate_password()?;
-    Ok((auth::hash_password(password.as_bytes())?, Some(password)))
+    Ok(ResolvedUserPassword {
+        password_hash: auth::hash_password(password.as_bytes())?,
+        plaintext: Some(password),
+        generated: true,
+    })
 }
 
 /// A random password, hex encoded, matching what the installer generates.

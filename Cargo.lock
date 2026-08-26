@@ -773,8 +773,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "masque-probe"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "boring",
+ "bytes",
+ "clap",
+ "h2",
+ "http",
+ "libc",
+ "masque-server",
+ "quiche",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-boring",
+ "zeroize",
+]
+
+[[package]]
 name = "masque-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "argon2",

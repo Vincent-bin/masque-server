@@ -197,6 +197,73 @@ fn doctor_is_read_only_and_succeeds_when_connect_ip_is_disabled() {
 }
 
 #[test]
+fn support_bundle_is_private_and_omits_configured_identities() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let listen_addr = "127.0.0.1:8449".parse().unwrap();
+    let password_hash = masque::auth::hash_password(b"PRIVATE-PLAINTEXT-PASSWORD").unwrap();
+    let config = config_text(listen_addr, &cert_path, &key_path, "cubic").replace(
+        "[listeners.auth]\nenabled = false",
+        &format!(
+            r#"[listeners.auth]
+enabled = true
+mode = "basic"
+
+[[listeners.auth.users]]
+username = "PRIVATE-USERNAME"
+password_hash = "{password_hash}"
+
+[[clients]]
+name = "PRIVATE-CLIENT-LABEL"
+public_key = "PRIVATE-PUBLIC-KEY""#
+        ),
+    );
+    let config_path = dir.path().join("masque.toml");
+    let bundle_path = dir.path().join("support.json");
+    std::fs::write(&config_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("support-bundle")
+        .arg("--out")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "support-bundle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    assert!(bundle.contains("\"schema_version\": 1"));
+    assert!(bundle.contains("\"authentication\": \"basic\""));
+    assert!(bundle.contains("\"basic_user_count\": 1"));
+    assert!(bundle.contains("\"registered_client_count\": 1"));
+    for private in [
+        "PRIVATE-PLAINTEXT-PASSWORD",
+        "PRIVATE-USERNAME",
+        "PRIVATE-CLIENT-LABEL",
+        "PRIVATE-PUBLIC-KEY",
+        &password_hash,
+        config_path.to_str().unwrap(),
+        cert_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+    ] {
+        assert!(!bundle.contains(private), "support bundle leaked {private}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(bundle_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
 fn json_log_format_emits_machine_parseable_events() {
     let dir = TempDir::new();
     let (cert_path, key_path) = write_server_identity(dir.path());

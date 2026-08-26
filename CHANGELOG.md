@@ -7,6 +7,30 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.10.0 - 2026-08-26
+
+### Added
+
+- `masque-probe` is shipped beside the server and diagnoses an endpoint from
+  the affected client network. It supports Basic and enrollment credentials,
+  HTTP/3 with HTTP/2 fallback, public TLS validation or endpoint-key pinning,
+  real CONNECT-TCP establishment and a CONNECT-UDP round trip, optional
+  CONNECT-IP setup, fake-DNS overrides, interface binding, and stable JSON
+  output.
+- Basic listener and account creation can emit a mode-`0600` Surge configuration
+  while the plaintext password is available. The standalone `client-config`
+  command provides the same safe output for an already known credential, and
+  fresh installs can generate it through installer prompts or environment
+  variables.
+- `masque-server support-bundle` writes a mode-`0600` structured JSON report
+  containing version, platform, effective listener/tuning summaries, TLS file
+  state and validity window, CONNECT-IP diagnostics, and bounded systemd state.
+  It is built from typed fields and excludes raw TOML, usernames, hashes,
+  roster identities, keys, environment variables, logs, and traffic details.
+- GitHub releases now include static Linux ARM64 (`aarch64`) archives in
+  addition to x86_64. Both architectures package and transactionally install
+  the server and client probe.
+
 ## 0.9.0 - 2026-08-26
 
 ### Added

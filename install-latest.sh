@@ -24,8 +24,9 @@ if [ "$(uname -s)" != Linux ]; then
     die "the prebuilt service package supports Linux only"
 fi
 case "$(uname -m)" in
-    x86_64|amd64) ;;
-    *) die "the prebuilt service package supports Linux x86_64 only" ;;
+    x86_64|amd64) ARCH=x86_64 ;;
+    aarch64|arm64) ARCH=aarch64 ;;
+    *) die "the prebuilt service package supports Linux x86_64 and ARM64 only" ;;
 esac
 
 for required_command in curl tar sha256sum awk grep mktemp; do
@@ -65,7 +66,7 @@ case "$RELEASE_TAG" in
 esac
 
 VERSION=${RELEASE_TAG#v}
-ARCHIVE_NAME=masque-v${VERSION}-linux-x86_64.tar.gz
+ARCHIVE_NAME=masque-v${VERSION}-linux-${ARCH}.tar.gz
 CHECKSUM_NAME=$ARCHIVE_NAME.sha256
 DOWNLOAD_BASE=https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG
 
@@ -93,7 +94,7 @@ if tar tzf "$ARCHIVE_PATH" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
 fi
 tar xzf "$ARCHIVE_PATH" -C "$DOWNLOAD_DIR"
 
-PACKAGE_DIR=$DOWNLOAD_DIR/masque-v${VERSION}-linux-x86_64
+PACKAGE_DIR=$DOWNLOAD_DIR/masque-v${VERSION}-linux-${ARCH}
 if [ ! -x "$PACKAGE_DIR/install.sh" ]; then
     die "the release archive does not contain an executable install.sh"
 fi

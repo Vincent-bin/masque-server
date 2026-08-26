@@ -146,15 +146,24 @@ jobs:
             CI=true \
             MASQUE_INSTALLER_TEST=1 \
             MASQUE_TEST_PACKAGE_BIN="$PWD/target/debug/masque-server" \
+            MASQUE_TEST_PACKAGE_PROBE="$PWD/target/debug/masque-probe" \
             "$PWD/tests/install-upgrade.sh"
 
   release-build:
-    name: Linux musl release build
+    name: Linux ${{ matrix.arch }} release build
     # Packaging is deliberately omitted from ordinary PR commits. It runs once
     # after merge and can still be exercised together with every other job via
     # workflow_dispatch.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -162,13 +171,13 @@ jobs:
       - name: Install native tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake musl-tools
+          sudo apt-get install --yes clang cmake
 
       - name: Install Rust target
         run: |
           rustup toolchain install 1.97.1 --profile minimal
           rustup default 1.97.1
-          rustup target add x86_64-unknown-linux-musl
+          rustup target add "${{ matrix.target }}"
 
       - name: Install Zig cross-linker
         run: |
@@ -182,20 +191,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-1.97.1-musl-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-1.97.1-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-1.97.1-musl-
+            cargo-${{ runner.os }}-1.97.1-${{ matrix.target }}-
 
       - name: Build archive
         env:
-          TARGET: x86_64-unknown-linux-musl
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
           USE_ZIGBUILD: "1"
           VERSION: ci-${{ github.sha }}
         run: scripts/package-linux.sh
 
       - name: Inspect archive
         run: |
-          tar tzf dist/masque-vci-${GITHUB_SHA}-linux-x86_64.tar.gz
+          tar tzf "dist/masque-vci-${GITHUB_SHA}-linux-${{ matrix.arch }}.tar.gz"
           cd dist
           sha256sum --check \
-            masque-vci-${GITHUB_SHA}-linux-x86_64.tar.gz.sha256
+            "masque-vci-${GITHUB_SHA}-linux-${{ matrix.arch }}.tar.gz.sha256"

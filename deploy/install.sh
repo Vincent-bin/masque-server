@@ -8,7 +8,9 @@ fi
 
 PACKAGE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 CANDIDATE_BIN=$PACKAGE_DIR/bin/masque-server
+CANDIDATE_PROBE=$PACKAGE_DIR/bin/masque-probe
 BIN_PATH=/usr/local/bin/masque-server
+PROBE_PATH=/usr/local/bin/masque-probe
 CONFIG_PATH=/etc/masque/masque.toml
 TLS_CERT_PATH=/etc/masque/certs/server.crt
 TLS_KEY_PATH=/etc/masque/certs/server.key
@@ -29,13 +31,17 @@ CHECK_CONFIG_OUTPUT=
 ENROLL_OUTPUT=
 CLIENT_BLOCK_TMP=
 CLIENT_CONFIG_OUT=
+BASIC_CLIENT_CONFIG_OUT=
+BASIC_CLIENT_CONFIG_CREATED=0
 BINARY_INSTALL_TMP=
+PROBE_INSTALL_TMP=
 UNIT_INSTALL_TMP=
 PROMETHEUS_RULES_INSTALL_TMP=
 GRAFANA_DASHBOARD_INSTALL_TMP=
 UPGRADE_BACKUP_DIR=
 ROLLBACK_PENDING=0
 HAD_BINARY=0
+HAD_PROBE=0
 HAD_UNIT=0
 HAD_PROMETHEUS_RULES=0
 HAD_GRAFANA_DASHBOARD=0
@@ -58,10 +64,14 @@ cleanup() {
     [ -z "$ENROLL_OUTPUT" ] || rm -f -- "$ENROLL_OUTPUT"
     [ -z "$CLIENT_BLOCK_TMP" ] || rm -f -- "$CLIENT_BLOCK_TMP"
     [ -z "$BINARY_INSTALL_TMP" ] || rm -f -- "$BINARY_INSTALL_TMP"
+    [ -z "$PROBE_INSTALL_TMP" ] || rm -f -- "$PROBE_INSTALL_TMP"
     [ -z "$UNIT_INSTALL_TMP" ] || rm -f -- "$UNIT_INSTALL_TMP"
     [ -z "$PROMETHEUS_RULES_INSTALL_TMP" ] || rm -f -- "$PROMETHEUS_RULES_INSTALL_TMP"
     [ -z "$GRAFANA_DASHBOARD_INSTALL_TMP" ] || rm -f -- "$GRAFANA_DASHBOARD_INSTALL_TMP"
     [ -z "$UPGRADE_BACKUP_DIR" ] || rm -rf -- "$UPGRADE_BACKUP_DIR"
+    if [ "$cleanup_status" -ne 0 ] && [ "$BASIC_CLIENT_CONFIG_CREATED" -eq 1 ]; then
+        rm -f -- "$BASIC_CLIENT_CONFIG_OUT"
+    fi
     exit "$cleanup_status"
 }
 trap cleanup EXIT
@@ -82,6 +92,16 @@ rollback_installation() {
         fi
     elif ! rm -f -- "$BIN_PATH"; then
         echo "error: could not remove the newly installed $BIN_PATH" >&2
+        rollback_ok=0
+    fi
+
+    if [ "$HAD_PROBE" -eq 1 ]; then
+        if ! cp -p -- "$UPGRADE_BACKUP_DIR/masque-probe" "$PROBE_PATH"; then
+            echo "error: could not restore $PROBE_PATH" >&2
+            rollback_ok=0
+        fi
+    elif ! rm -f -- "$PROBE_PATH"; then
+        echo "error: could not remove the newly installed $PROBE_PATH" >&2
         rollback_ok=0
     fi
 
@@ -142,7 +162,7 @@ rollback_installation() {
 
     ROLLBACK_PENDING=0
     if [ "$rollback_ok" -eq 1 ]; then
-        echo "Previous binary, systemd unit, monitoring assets, and service state restored." >&2
+        echo "Previous binaries, systemd unit, monitoring assets, and service state restored." >&2
     else
         echo "error: rollback was incomplete; inspect the paths and service above" >&2
     fi
@@ -311,6 +331,51 @@ generate_auth_credentials() {
         GENERATED_PASSWORD=1
     fi
     AUTH_PASSWORD_HASH=$(printf '%s' "$AUTH_PASSWORD" | "$CANDIDATE_BIN" hash-password)
+}
+
+generate_basic_client_config() {
+    basic_client_endpoint=${MASQUE_BASIC_CLIENT_ENDPOINT:-}
+    if [ -z "$basic_client_endpoint" ] && can_prompt; then
+        {
+            echo
+            echo "A Surge configuration can be generated while the plaintext Basic"
+            echo "password is available. The server cannot recover it from its hash later."
+        } >/dev/tty
+        basic_client_endpoint=$(prompt_value \
+            "Public Basic endpoint (host:port; leave empty to skip)" "")
+    fi
+    [ -n "$basic_client_endpoint" ] || return
+
+    BASIC_CLIENT_CONFIG_OUT=${MASQUE_BASIC_CLIENT_CONFIG_OUT:-}
+    if [ -z "$BASIC_CLIENT_CONFIG_OUT" ]; then
+        if can_prompt; then
+            BASIC_CLIENT_CONFIG_OUT=$(prompt_value \
+                "Secret Surge configuration output path" /root/masque-surge.conf)
+        else
+            BASIC_CLIENT_CONFIG_OUT=/root/masque-surge.conf
+        fi
+    fi
+    case "$BASIC_CLIENT_CONFIG_OUT" in
+        /*) ;;
+        *) die "the Basic client configuration output path must be absolute" ;;
+    esac
+    [ ! -e "$BASIC_CLIENT_CONFIG_OUT" ] || die \
+        "refusing to overwrite existing client configuration: $BASIC_CLIENT_CONFIG_OUT"
+
+    set -- "$CANDIDATE_BIN" client-config surge \
+        --endpoint "$basic_client_endpoint" --username "$AUTH_USERNAME" \
+        --out "$BASIC_CLIENT_CONFIG_OUT"
+    if [ -n "${MASQUE_BASIC_CLIENT_NAME:-}" ]; then
+        set -- "$@" --name "$MASQUE_BASIC_CLIENT_NAME"
+    fi
+    if ! printf '%s' "$AUTH_PASSWORD" | "$@"; then
+        # client-config normally creates atomically and then exits. If a later
+        # output/sync error happens after creation, do not leave a secret for a
+        # credential the fresh installation will not commit.
+        rm -f -- "$BASIC_CLIENT_CONFIG_OUT"
+        die "failed to generate the Basic client configuration"
+    fi
+    BASIC_CLIENT_CONFIG_CREATED=1
 }
 
 install_tls_material() {
@@ -581,6 +646,10 @@ snapshot_installed_files() {
         cp -p -- "$BIN_PATH" "$UPGRADE_BACKUP_DIR/masque-server"
         HAD_BINARY=1
     fi
+    if [ -e "$PROBE_PATH" ]; then
+        cp -p -- "$PROBE_PATH" "$UPGRADE_BACKUP_DIR/masque-probe"
+        HAD_PROBE=1
+    fi
     if [ -e "$UNIT_PATH" ]; then
         cp -p -- "$UNIT_PATH" "$UPGRADE_BACKUP_DIR/masque.service"
         HAD_UNIT=1
@@ -603,10 +672,12 @@ snapshot_installed_files() {
 
 install_program_and_unit() {
     BINARY_INSTALL_TMP=$(mktemp /usr/local/bin/.masque-server.install.XXXXXX)
+    PROBE_INSTALL_TMP=$(mktemp /usr/local/bin/.masque-probe.install.XXXXXX)
     UNIT_INSTALL_TMP=$(mktemp /etc/systemd/system/.masque.service.install.XXXXXX)
     PROMETHEUS_RULES_INSTALL_TMP=$(mktemp "$MONITORING_DIR/.prometheus-rules.install.XXXXXX")
     GRAFANA_DASHBOARD_INSTALL_TMP=$(mktemp "$MONITORING_DIR/.grafana-dashboard.install.XXXXXX")
     install -m 0755 "$CANDIDATE_BIN" "$BINARY_INSTALL_TMP"
+    install -m 0755 "$CANDIDATE_PROBE" "$PROBE_INSTALL_TMP"
     install -m 0644 "$PACKAGE_DIR/systemd/masque.service" "$UNIT_INSTALL_TMP"
     install -m 0644 "$PACKAGE_DIR/monitoring/prometheus-rules.yml" \
         "$PROMETHEUS_RULES_INSTALL_TMP"
@@ -618,6 +689,8 @@ install_program_and_unit() {
 
     mv -f -- "$BINARY_INSTALL_TMP" "$BIN_PATH"
     BINARY_INSTALL_TMP=
+    mv -f -- "$PROBE_INSTALL_TMP" "$PROBE_PATH"
+    PROBE_INSTALL_TMP=
     mv -f -- "$UNIT_INSTALL_TMP" "$UNIT_PATH"
     UNIT_INSTALL_TMP=
     mv -f -- "$PROMETHEUS_RULES_INSTALL_TMP" "$PROMETHEUS_RULES_PATH"
@@ -664,6 +737,19 @@ run_host_diagnostics() {
 }
 
 [ -x "$CANDIDATE_BIN" ] || die "release package is missing executable $CANDIDATE_BIN"
+[ -x "$CANDIDATE_PROBE" ] || die "release package is missing executable $CANDIDATE_PROBE"
+if ! CANDIDATE_VERSION_OUTPUT=$("$CANDIDATE_BIN" --version); then
+    die "the packaged server binary cannot run on this host"
+fi
+if ! CANDIDATE_PROBE_VERSION_OUTPUT=$("$CANDIDATE_PROBE" --version); then
+    die "the packaged probe binary cannot run on this host"
+fi
+CANDIDATE_VERSION=$(printf '%s\n' "$CANDIDATE_VERSION_OUTPUT" | awk '{print $NF}')
+CANDIDATE_PROBE_VERSION=$(printf '%s\n' "$CANDIDATE_PROBE_VERSION_OUTPUT" | awk '{print $NF}')
+[ -n "$CANDIDATE_VERSION" ] && [ -n "$CANDIDATE_PROBE_VERSION" ] || die \
+    "could not read the packaged binary versions"
+[ "$CANDIDATE_VERSION" = "$CANDIDATE_PROBE_VERSION" ] || die \
+    "packaged binary versions differ: server $CANDIDATE_VERSION, probe $CANDIDATE_PROBE_VERSION"
 parse_start_requested
 parse_host_diagnostics_requested
 
@@ -694,6 +780,10 @@ if [ "$FRESH_CONFIG" -eq 1 ]; then
     render_new_config
     configure_fresh_listen_port
 
+    if mode_uses_basic; then
+        generate_basic_client_config
+    fi
+
     if mode_uses_client_certs; then
         enroll_first_client
     fi
@@ -715,6 +805,7 @@ echo
 echo "MASQUE installation result"
 echo "  Version:        $("$BIN_PATH" --version)"
 echo "  Binary:         $BIN_PATH"
+echo "  Probe:          $PROBE_PATH"
 echo "  Configuration:  $CONFIG_PATH"
 echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
@@ -745,6 +836,9 @@ if [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     else
         echo "  Password: supplied through MASQUE_AUTH_PASSWORD (not repeated)"
     fi
+    if [ -n "$BASIC_CLIENT_CONFIG_OUT" ]; then
+        echo "  Secret Surge configuration: $BASIC_CLIENT_CONFIG_OUT"
+    fi
 fi
 
 if [ "$CONFIG_CHANGED" -eq 1 ]; then
@@ -774,6 +868,8 @@ elif [ "$START_REQUESTED" -eq 0 ]; then
     echo "Start the service with: systemctl start masque"
 fi
 echo "Review $CONFIG_PATH, especially the proxy allow/deny policy."
+echo "Diagnose from a client host with: masque-probe <host:port> --username <user> --password-stdin"
+echo "Create a support report with: masque-server --config $CONFIG_PATH support-bundle --out masque-support.json"
 
 # Listeners are written only for a fresh installation; an upgrade keeps the
 # existing file. Adding one later is a separate, deliberate command, so name it
