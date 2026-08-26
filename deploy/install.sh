@@ -746,8 +746,9 @@ if ! CANDIDATE_PROBE_VERSION_OUTPUT=$("$CANDIDATE_PROBE" --version); then
 fi
 CANDIDATE_VERSION=$(printf '%s\n' "$CANDIDATE_VERSION_OUTPUT" | awk '{print $NF}')
 CANDIDATE_PROBE_VERSION=$(printf '%s\n' "$CANDIDATE_PROBE_VERSION_OUTPUT" | awk '{print $NF}')
-[ -n "$CANDIDATE_VERSION" ] && [ -n "$CANDIDATE_PROBE_VERSION" ] || die \
-    "could not read the packaged binary versions"
+if [ -z "$CANDIDATE_VERSION" ] || [ -z "$CANDIDATE_PROBE_VERSION" ]; then
+    die "could not read the packaged binary versions"
+fi
 [ "$CANDIDATE_VERSION" = "$CANDIDATE_PROBE_VERSION" ] || die \
     "packaged binary versions differ: server $CANDIDATE_VERSION, probe $CANDIDATE_PROBE_VERSION"
 parse_start_requested
