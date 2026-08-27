@@ -9,7 +9,7 @@ use crate::fxhash::FxHashMap;
 use crate::metrics::ShardMetrics;
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
-use crate::tunnel::udp::UdpTunnel;
+use crate::tunnel::udp::{PendingUdpTunnel, UdpTunnel};
 
 /// One CONNECT stream waiting for its credentials to be verified.
 pub(crate) struct AwaitingAuth {
@@ -92,6 +92,8 @@ pub struct ClientConnection {
     pub pending_tcp_tunnels: FxHashMap<u64, PendingTcpTunnel>,
     /// Active standard CONNECT TCP tunnels, keyed by stream ID.
     pub tcp_tunnels: FxHashMap<u64, TcpTunnel>,
+    /// CONNECT-UDP streams waiting for asynchronous target setup.
+    pub(crate) pending_udp_tunnels: FxHashMap<u64, PendingUdpTunnel>,
     /// Active UDP tunnels, keyed by stream ID.
     pub udp_tunnels: FxHashMap<u64, UdpTunnel>,
     /// Active IP tunnels, keyed by stream ID.
@@ -136,6 +138,7 @@ impl ClientConnection {
             h3: None,
             pending_tcp_tunnels: FxHashMap::default(),
             tcp_tunnels: FxHashMap::default(),
+            pending_udp_tunnels: FxHashMap::default(),
             udp_tunnels: FxHashMap::default(),
             ip_tunnels: FxHashMap::default(),
             awaiting_auth: FxHashMap::default(),
@@ -167,6 +170,7 @@ impl ClientConnection {
     pub fn tunnel_count(&self) -> usize {
         self.pending_tcp_tunnels.len()
             + self.tcp_tunnels.len()
+            + self.pending_udp_tunnels.len()
             + self.udp_tunnels.len()
             + self.ip_tunnels.len()
     }

@@ -32,7 +32,7 @@ use crate::client_identity::{
 };
 use crate::config::{AuthSection, ListenerTransport, ResolvedListener, ServerConfig, TlsSection};
 use crate::connection::{AwaitingAuth, ClientConnection};
-use crate::datagram::{self, DatagramHeader};
+use crate::datagram;
 use crate::fxhash::FxHashMap;
 use crate::ip_packet;
 use crate::metrics::{Metrics, ShardMetrics};
@@ -50,7 +50,7 @@ use crate::systemd;
 use crate::tun::{self, TunManager, TunRecvBatch, TunSendBatch};
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpRelayEvent, TcpTunnel, spawn_tcp_connect};
-use crate::tunnel::udp::UdpTunnel;
+use crate::tunnel::udp::{PendingUdpTunnel, UdpSetupResult, UdpTunnel, spawn_udp_setup};
 
 /// Unique connection ID length.
 const CONN_ID_LEN: usize = 16;
@@ -60,6 +60,11 @@ const CONN_ID_LEN: usize = 16;
 /// Counted in batches, so the datagram bound is this times
 /// [`MAX_UDP_RECV_BATCH`].
 const UDP_RESPONSE_QUEUE_CAPACITY: usize = 256;
+
+/// Completed UDP target setups waiting for their owning shard. The live
+/// pending-tunnel maps provide the per-connection bound; this queue prevents a
+/// burst across many connections from growing shard memory without limit.
+const UDP_SETUP_QUEUE_CAPACITY: usize = 256;
 
 /// TCP readers wait for the main loop to acknowledge each chunk, so this
 /// queue bounds both wakeups and response memory across all tunnels.
@@ -526,6 +531,21 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     }
     if config.server.max_tunnels_per_connection == 0 {
         anyhow::bail!("server.max_tunnels_per_connection must be at least 1");
+    }
+    const MAX_TARGET_CONNECT_TIMEOUT_SECS: u64 = 300;
+    if !(1..=MAX_TARGET_CONNECT_TIMEOUT_SECS).contains(&config.tcp_proxy.connect_timeout_secs) {
+        anyhow::bail!(
+            "tcp_proxy.connect_timeout_secs ({}) must be between 1 and {}",
+            config.tcp_proxy.connect_timeout_secs,
+            MAX_TARGET_CONNECT_TIMEOUT_SECS
+        );
+    }
+    if !(1..=MAX_TARGET_CONNECT_TIMEOUT_SECS).contains(&config.udp_proxy.connect_timeout_secs) {
+        anyhow::bail!(
+            "udp_proxy.connect_timeout_secs ({}) must be between 1 and {}",
+            config.udp_proxy.connect_timeout_secs,
+            MAX_TARGET_CONNECT_TIMEOUT_SECS
+        );
     }
     if config.quic.retry_connection_threshold == 0 {
         anyhow::bail!("quic.retry_connection_threshold must be at least 1");
@@ -2009,6 +2029,8 @@ struct Shard {
     conn_by_index: FxHashMap<u64, quiche::ConnectionId<'static>>,
     udp_response_tx: mpsc::Sender<UdpResponse>,
     udp_response_rx: mpsc::Receiver<UdpResponse>,
+    udp_setup_tx: mpsc::Sender<UdpSetupResult>,
+    udp_setup_rx: mpsc::Receiver<UdpSetupResult>,
     tcp_event_tx: mpsc::Sender<TcpRelayEvent>,
     tcp_event_rx: mpsc::Receiver<TcpRelayEvent>,
     forward_rx: mpsc::Receiver<ForwardedPacket>,
@@ -2092,6 +2114,7 @@ impl Shard {
         );
 
         let (udp_response_tx, udp_response_rx) = mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
+        let (udp_setup_tx, udp_setup_rx) = mpsc::channel(UDP_SETUP_QUEUE_CAPACITY);
         let (tcp_event_tx, tcp_event_rx) = mpsc::channel(TCP_RELAY_QUEUE_CAPACITY);
         let (auth_tx, auth_rx) = mpsc::channel(AUTH_RESULT_QUEUE_CAPACITY);
 
@@ -2111,6 +2134,8 @@ impl Shard {
             conn_by_index: FxHashMap::default(),
             udp_response_tx,
             udp_response_rx,
+            udp_setup_tx,
+            udp_setup_rx,
             tcp_event_tx,
             tcp_event_rx,
             forward_rx,
@@ -2179,6 +2204,8 @@ impl Shard {
             enum Event {
                 PacketBatch(std::io::Result<usize>),
                 TargetDatagram(Option<UdpResponse>),
+                /// DNS and socket setup completed for one CONNECT-UDP stream.
+                UdpSetup(Option<UdpSetupResult>),
                 TcpRelay(Option<TcpRelayEvent>),
                 TunPacket(std::io::Result<usize>),
                 /// A QUIC packet another shard received for one of ours.
@@ -2198,6 +2225,9 @@ impl Shard {
                     }
                     response = self.udp_response_rx.recv(), if !shutting_down => {
                         Event::TargetDatagram(response)
+                    }
+                    result = self.udp_setup_rx.recv(), if !shutting_down => {
+                        Event::UdpSetup(result)
                     }
                     response = self.tcp_event_rx.recv(), if !shutting_down => {
                         Event::TcpRelay(response)
@@ -2292,6 +2322,10 @@ impl Shard {
                     self.relay_target_datagrams(response);
                 }
                 Event::TargetDatagram(None) => {}
+                Event::UdpSetup(Some(result)) => {
+                    self.handle_udp_setup_result(result);
+                }
+                Event::UdpSetup(None) => {}
                 Event::TcpRelay(Some(event)) => {
                     self.handle_tcp_event_batch(event);
                 }
@@ -2833,10 +2867,10 @@ impl Shard {
                 match h3.poll(&mut client.quic) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                         let tcp_setup_count = pending_setups.tcp.len();
+                        let udp_setup_count = pending_setups.udp.len();
                         let request_context = RequestContext {
                             config: &self.config,
                             auth: self.auth.as_deref(),
-                            udp_policy: &self.udp_policy,
                         };
                         if let Some(pending) = Self::handle_request(
                             h3,
@@ -2863,6 +2897,15 @@ impl Shard {
                             client
                                 .pending_tcp_tunnels
                                 .insert(stream_id, PendingTcpTunnel::staging(stream_id));
+                        }
+                        if pending_setups.udp.len() > udp_setup_count {
+                            debug_assert_eq!(pending_setups.udp.len(), udp_setup_count + 1);
+                            let (pending_stream, _, header) =
+                                pending_setups.udp.last().expect("one UDP setup added");
+                            debug_assert_eq!(*pending_stream, stream_id);
+                            client
+                                .pending_udp_tunnels
+                                .insert(stream_id, PendingUdpTunnel::new(*header));
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -2892,6 +2935,9 @@ impl Shard {
                         if let Some(tunnel) = client.tcp_tunnels.get_mut(&stream_id) {
                             tunnel.finish_client();
                         }
+                        if client.pending_udp_tunnels.remove(&stream_id).is_some() {
+                            info!(stream_id, "pending UDP tunnel closed by client");
+                        }
                         // Stream closed by client — remove tunnel if any.
                         if client.udp_tunnels.remove(&stream_id).is_some() {
                             info!(stream_id, "UDP tunnel closed by client");
@@ -2908,6 +2954,9 @@ impl Shard {
                         }
                         if client.tcp_tunnels.remove(&stream_id).is_some() {
                             info!(stream_id, "TCP tunnel reset by client");
+                        }
+                        if client.pending_udp_tunnels.remove(&stream_id).is_some() {
+                            info!(stream_id, "pending UDP tunnel reset by client");
                         }
                         if client.udp_tunnels.remove(&stream_id).is_some() {
                             info!(stream_id, "UDP tunnel reset by client");
@@ -2996,11 +3045,6 @@ impl Shard {
             }
         }
 
-        let udp_response_tx = if pending_udp_setups.is_empty() {
-            None
-        } else {
-            Some(self.udp_response_tx.clone())
-        };
         // The listener itself cannot receive a larger UDP datagram than this,
         // so matching that effective QUIC limit keeps target responses intact
         // without allowing a bad configuration to allocate unbounded buffers
@@ -3011,8 +3055,11 @@ impl Shard {
             .max_datagram_size
             .clamp(1, MAX_DATAGRAM_SIZE);
         let enable_target_udp_gso = self.config.udp_proxy.enable_udp_gso;
-        for (stream_id, target) in pending_udp_setups {
-            if client.tunnel_count() >= max_tunnels {
+        for (stream_id, target, _header) in pending_udp_setups {
+            if !client.pending_udp_tunnels.contains_key(&stream_id) {
+                continue;
+            }
+            if client.tunnel_count() > max_tunnels {
                 warn!(
                     stream_id,
                     total_tunnels = client.tunnel_count(),
@@ -3021,166 +3068,21 @@ impl Shard {
                 if let Some(h3) = &mut client.h3 {
                     Self::send_error_response(h3, &mut client.quic, stream_id, 503);
                 }
+                client.pending_udp_tunnels.remove(&stream_id);
                 continue;
             }
-
-            // Frame the datagram header once per tunnel, rather than re-running
-            // the varint encoder for every relayed packet.
-            let header = match DatagramHeader::new(stream_id) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(stream_id, %e, "cannot frame datagrams for stream");
-                    if let Some(h3) = &mut client.h3 {
-                        Self::send_error_response(h3, &mut client.quic, stream_id, 400);
-                    }
-                    continue;
-                }
-            };
-
-            match target.resolve() {
-                Ok(addrs) => {
-                    // Use the first resolved address.
-                    let addr = addrs[0];
-                    // We can't await here (not async fn), so create the
-                    // UdpTunnel synchronously using std::net, then convert.
-                    match std::net::UdpSocket::bind(if addr.is_ipv4() {
-                        "0.0.0.0:0"
-                    } else {
-                        "[::]:0"
-                    }) {
-                        Ok(std_sock) => {
-                            if let Err(e) = std_sock.connect(addr) {
-                                warn!(stream_id, %e, "UDP connect failed");
-                                if let Some(h3) = &mut client.h3 {
-                                    Self::send_error_response(h3, &mut client.quic, stream_id, 502);
-                                }
-                                continue;
-                            }
-                            if let Err(e) = std_sock.set_nonblocking(true) {
-                                warn!(stream_id, %e, "UDP nonblocking setup failed");
-                                if let Some(h3) = &mut client.h3 {
-                                    Self::send_error_response(h3, &mut client.quic, stream_id, 502);
-                                }
-                                continue;
-                            }
-                            #[cfg(target_os = "linux")]
-                            let target_udp_gso = if enable_target_udp_gso {
-                                use std::os::fd::AsRawFd as _;
-                                target_udp::detect_udp_gso(
-                                    std_sock.as_raw_fd(),
-                                    target_datagram_size,
-                                )
-                            } else {
-                                false
-                            };
-                            #[cfg(not(target_os = "linux"))]
-                            let target_udp_gso = {
-                                let _ = enable_target_udp_gso;
-                                false
-                            };
-                            let recv_std = match std_sock.try_clone() {
-                                Ok(socket) => socket,
-                                Err(e) => {
-                                    warn!(stream_id, %e, "UDP socket clone failed");
-                                    if let Some(h3) = &mut client.h3 {
-                                        Self::send_error_response(
-                                            h3,
-                                            &mut client.quic,
-                                            stream_id,
-                                            502,
-                                        );
-                                    }
-                                    continue;
-                                }
-                            };
-                            match UdpSocket::from_std(recv_std) {
-                                Ok(tok_sock) => {
-                                    let socket = Arc::new(tok_sock);
-                                    let recv_socket = Arc::clone(&socket);
-                                    let response_tx = udp_response_tx.as_ref().unwrap().clone();
-                                    let recv_task = tokio::spawn(async move {
-                                        // One `recvmmsg` per readiness instead
-                                        // of a `recvfrom` per datagram, and one
-                                        // channel send — so a burst costs one
-                                        // syscall and one wakeup of the loop.
-                                        let mut batch = TargetRecvBatch::new(target_datagram_size);
-                                        loop {
-                                            let received =
-                                                match recv_target_batch(&recv_socket, &mut batch)
-                                                    .await
-                                                {
-                                                    Ok(received) => received,
-                                                    Err(e) => {
-                                                        debug!(
-                                                            stream_id,
-                                                            %e,
-                                                            "target recv failed"
-                                                        );
-                                                        break;
-                                                    }
-                                                };
-
-                                            let datagrams: Vec<Vec<u8>> = batch
-                                                .datagrams(received)
-                                                .map(|payload| header.encode(payload))
-                                                .collect();
-                                            if datagrams.is_empty() {
-                                                continue;
-                                            }
-
-                                            let response = UdpResponse {
-                                                connection_index: conn_idx,
-                                                stream_id,
-                                                datagrams,
-                                            };
-                                            if response_tx.send(response).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    });
-                                    let tunnel = UdpTunnel::from_socket(
-                                        stream_id,
-                                        addr,
-                                        std_sock,
-                                        socket,
-                                        recv_task,
-                                        target_udp_gso,
-                                    );
-                                    info!(
-                                        stream_id,
-                                        target = %addr,
-                                        udp_gso = target_udp_gso,
-                                        "UDP tunnel established"
-                                    );
-                                    client.udp_tunnels.insert(stream_id, tunnel);
-                                }
-                                Err(e) => {
-                                    warn!(stream_id, %e, "tokio socket convert failed");
-                                    if let Some(h3) = &mut client.h3 {
-                                        Self::send_error_response(
-                                            h3,
-                                            &mut client.quic,
-                                            stream_id,
-                                            502,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(stream_id, %e, "UDP bind failed");
-                            if let Some(h3) = &mut client.h3 {
-                                Self::send_error_response(h3, &mut client.quic, stream_id, 502);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(stream_id, %e, "DNS resolution failed");
-                    if let Some(h3) = &mut client.h3 {
-                        Self::send_error_response(h3, &mut client.quic, stream_id, 502);
-                    }
-                }
+            let setup_task = spawn_udp_setup(
+                conn_idx,
+                stream_id,
+                target,
+                self.udp_policy.clone(),
+                Duration::from_secs(self.config.udp_proxy.connect_timeout_secs),
+                enable_target_udp_gso,
+                target_datagram_size,
+                self.udp_setup_tx.clone(),
+            );
+            if let Some(pending) = client.pending_udp_tunnels.get_mut(&stream_id) {
+                pending.start_setup(setup_task);
             }
         }
 
@@ -3388,6 +3290,114 @@ impl Shard {
                 return false;
             }
         }
+    }
+
+    /// Install a target socket prepared by the asynchronous CONNECT-UDP setup
+    /// task, then send the first successful response for the stream.
+    fn handle_udp_setup_result(&mut self, setup: UdpSetupResult) {
+        let UdpSetupResult {
+            connection_index,
+            stream_id,
+            result,
+        } = setup;
+        let Some(conn_id) = self.conn_by_index.get(&connection_index).cloned() else {
+            return;
+        };
+        let Some(client) = self.connections.get_mut(&conn_id) else {
+            return;
+        };
+        let Some(pending) = client.pending_udp_tunnels.remove(&stream_id) else {
+            // The stream or connection disappeared while DNS was in flight.
+            return;
+        };
+        let header = pending.header();
+        drop(pending);
+        self.dirty.mark(connection_index);
+
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                warn!(
+                    stream_id,
+                    status = failure.status,
+                    reason = %failure.reason,
+                    "UDP tunnel setup failed"
+                );
+                if let Some(h3) = client.h3.as_mut() {
+                    Self::send_error_response(h3, &mut client.quic, stream_id, failure.status);
+                }
+                return;
+            }
+        };
+
+        let Some(h3) = client.h3.as_mut() else {
+            return;
+        };
+        let headers = [
+            quiche::h3::Header::new(b":status", b"200"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        if let Err(error) = h3.send_response(&mut client.quic, stream_id, &headers, false) {
+            warn!(stream_id, %error, "failed to send CONNECT-UDP response");
+            return;
+        }
+
+        let (send_socket, socket, target_addr, target_udp_gso) = prepared.into_http3();
+        let recv_socket = Arc::clone(&socket);
+        let response_tx = self.udp_response_tx.clone();
+        let target_datagram_size = self
+            .config
+            .quic
+            .max_datagram_size
+            .clamp(1, MAX_DATAGRAM_SIZE);
+        let recv_task = tokio::spawn(async move {
+            // One `recvmmsg` per readiness instead of a `recvfrom` per
+            // datagram, and one channel send per batch.
+            let mut batch = TargetRecvBatch::new(target_datagram_size);
+            loop {
+                let received = match recv_target_batch(&recv_socket, &mut batch).await {
+                    Ok(received) => received,
+                    Err(error) => {
+                        debug!(stream_id, %error, "target recv failed");
+                        break;
+                    }
+                };
+
+                let datagrams: Vec<Vec<u8>> = batch
+                    .datagrams(received)
+                    .map(|payload| header.encode(payload))
+                    .collect();
+                if datagrams.is_empty() {
+                    continue;
+                }
+                if response_tx
+                    .send(UdpResponse {
+                        connection_index,
+                        stream_id,
+                        datagrams,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let tunnel = UdpTunnel::from_socket(
+            stream_id,
+            target_addr,
+            send_socket,
+            socket,
+            recv_task,
+            target_udp_gso,
+        );
+        info!(
+            stream_id,
+            target = %target_addr,
+            udp_gso = target_udp_gso,
+            "UDP tunnel established"
+        );
+        client.udp_tunnels.insert(stream_id, tunnel);
     }
 
     /// Apply an event generated by an asynchronous target TCP task.
@@ -3957,6 +3967,7 @@ impl Shard {
                 h3,
                 pending_tcp_tunnels,
                 tcp_tunnels,
+                pending_udp_tunnels,
                 udp_tunnels,
                 ip_tunnels,
                 index,
@@ -3974,6 +3985,18 @@ impl Shard {
                     return true;
                 }
                 info!(stream_id, "closing idle pending TCP tunnel");
+                if let Some(h3) = h3.as_mut() {
+                    Self::send_error_response(h3, quic, *stream_id, 504);
+                    wrote = true;
+                }
+                false
+            });
+
+            pending_udp_tunnels.retain(|stream_id, tunnel| {
+                if !tunnel.is_idle(timeout) {
+                    return true;
+                }
+                info!(stream_id, "closing idle pending UDP tunnel");
                 if let Some(h3) = h3.as_mut() {
                     Self::send_error_response(h3, quic, *stream_id, 504);
                     wrote = true;
@@ -4380,6 +4403,26 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("retry_token_ttl_secs"));
+    }
+
+    #[test]
+    fn target_setup_timeouts_are_bounded() {
+        let mut config = ServerConfig::default();
+
+        config.tcp_proxy.connect_timeout_secs = 0;
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("zero TCP setup timeout must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("tcp_proxy.connect_timeout_secs"));
+
+        config.tcp_proxy.connect_timeout_secs = 10;
+        config.udp_proxy.connect_timeout_secs = 301;
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("oversized UDP setup timeout must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("udp_proxy.connect_timeout_secs"));
     }
 
     /// Planning keeps the listener-specific trust boundary separate from the

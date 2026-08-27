@@ -207,7 +207,6 @@ impl Shard {
             let request_context = RequestContext {
                 config: &self.config,
                 auth: self.auth.as_deref(),
-                udp_policy: &self.udp_policy,
             };
             Self::dispatch_connect(
                 h3,
@@ -241,6 +240,13 @@ impl Shard {
                 {
                     pending.client_finished = true;
                 }
+            }
+            if let Some((pending_stream, _, header)) = pending_setups.udp.last() {
+                debug_assert_eq!(*pending_stream, stream_id);
+                client.pending_udp_tunnels.insert(
+                    stream_id,
+                    crate::tunnel::udp::PendingUdpTunnel::new(*header),
+                );
             }
         }
 

@@ -327,6 +327,8 @@ pub struct Http2Section {
 #[serde(default, deny_unknown_fields)]
 pub struct UdpProxySection {
     pub enabled: bool,
+    /// Total deadline for DNS resolution and target socket setup.
+    pub connect_timeout_secs: u64,
     pub uri_template: String,
     pub allow_targets: Vec<String>,
     pub deny_targets: Vec<String>,
@@ -500,6 +502,7 @@ impl Default for UdpProxySection {
     fn default() -> Self {
         Self {
             enabled: true,
+            connect_timeout_secs: 10,
             uri_template: "/.well-known/masque/udp/{target_host}/{target_port}/".into(),
             allow_targets: vec!["0.0.0.0/0".into()],
             deny_targets: vec!["127.0.0.0/8".into(), "10.0.0.0/8".into(), "::1/128".into()],
@@ -588,6 +591,7 @@ enabled = false
         assert!(cfg.tcp_proxy.enabled);
         assert_eq!(cfg.tcp_proxy.connect_timeout_secs, 10);
         assert!(cfg.udp_proxy.enabled);
+        assert_eq!(cfg.udp_proxy.connect_timeout_secs, 10);
         assert!(cfg.ip_proxy.enabled);
         assert_eq!(cfg.ip_proxy.tun_mtu, 1280);
         assert_eq!(cfg.observability.listen_addr, None);
@@ -928,12 +932,14 @@ discover_pmtu = true
             r#"
 [udp_proxy]
 enabled = false
+connect_timeout_secs = 7
 allow_targets = ["192.168.0.0/16"]
 deny_targets = []
 enable_udp_gso = true
 "#,
         );
         assert!(!cfg.udp_proxy.enabled);
+        assert_eq!(cfg.udp_proxy.connect_timeout_secs, 7);
         assert_eq!(cfg.udp_proxy.allow_targets, vec!["192.168.0.0/16"]);
         assert!(cfg.udp_proxy.deny_targets.is_empty());
         assert!(cfg.udp_proxy.enable_udp_gso);

@@ -1,6 +1,5 @@
 //! CONNECT-UDP relay over DATAGRAM capsules on one HTTP/2 stream.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +7,6 @@ use bytes::Bytes;
 use h2::Reason;
 use h2::server::SendResponse;
 use http::{Response, StatusCode};
-use tokio::net::UdpSocket;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, info, warn};
 
@@ -17,6 +15,7 @@ use super::request::CAPSULE_PROTOCOL;
 use super::support::{Activity, TunnelMetricsGuard, send_data, send_error, wait_until_idle};
 use crate::capsule::decoder::CapsuleDecoder;
 use crate::capsule::{CapsuleFrame, encoder};
+use crate::tunnel::udp::connect_udp_target;
 use crate::uri::UdpTarget;
 use crate::varint;
 
@@ -30,46 +29,30 @@ pub(super) async fn serve(
     context: ConnectionContext,
     _tunnel_slot: OwnedSemaphorePermit,
 ) -> anyhow::Result<()> {
-    let addrs: Vec<SocketAddr> =
-        match tokio::net::lookup_host((target.host.as_str(), target.port)).await {
-            Ok(addrs) => addrs.collect(),
-            Err(error) => {
-                warn!(stream_id, %error, "HTTP/2 UDP target DNS resolution failed");
-                send_error(&mut respond, StatusCode::BAD_GATEWAY)?;
-                return Ok(());
-            }
-        };
-    if addrs.is_empty() {
-        send_error(&mut respond, StatusCode::BAD_GATEWAY)?;
-        return Ok(());
-    }
-    if !context
-        .udp_policy
-        .all_allowed(&addrs.iter().map(|addr| addr.ip()).collect::<Vec<_>>())
-    {
-        send_error(&mut respond, StatusCode::FORBIDDEN)?;
-        return Ok(());
-    }
-    let target_addr = addrs[0];
-    let socket = match UdpSocket::bind(if target_addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
+    let max_payload = context.config.http2.max_datagram_size.min(MAX_UDP_PAYLOAD);
+    let prepared = match connect_udp_target(
+        target,
+        &context.udp_policy,
+        Duration::from_secs(context.config.udp_proxy.connect_timeout_secs),
+        false,
+        max_payload,
+    )
     .await
     {
-        Ok(socket) => socket,
-        Err(error) => {
-            warn!(stream_id, %error, "HTTP/2 UDP socket bind failed");
-            send_error(&mut respond, StatusCode::BAD_GATEWAY)?;
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            warn!(
+                stream_id,
+                status = failure.status,
+                reason = %failure.reason,
+                "HTTP/2 UDP target setup failed"
+            );
+            let status = StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            send_error(&mut respond, status)?;
             return Ok(());
         }
     };
-    if let Err(error) = socket.connect(target_addr).await {
-        warn!(stream_id, %error, "HTTP/2 UDP target connect failed");
-        send_error(&mut respond, StatusCode::BAD_GATEWAY)?;
-        return Ok(());
-    }
+    let (socket, target_addr) = prepared.into_http2();
 
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -79,7 +62,6 @@ pub(super) async fn serve(
     info!(stream_id, %target_addr, transport = "http2", "UDP tunnel established");
     let _metrics = TunnelMetricsGuard::new(Arc::clone(&context.metrics), 1);
     let activity = Arc::new(Activity::new());
-    let max_payload = context.config.http2.max_datagram_size.min(MAX_UDP_PAYLOAD);
     // One extra byte admits the context ID zero before the UDP payload.
     let mut decoder = CapsuleDecoder::with_max_capsule_size(max_payload + 1);
 

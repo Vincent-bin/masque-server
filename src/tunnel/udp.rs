@@ -5,9 +5,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::debug;
 #[cfg(target_os = "linux")]
@@ -16,6 +17,173 @@ use tracing::warn;
 #[cfg(target_os = "linux")]
 use crate::net::target_udp;
 use crate::net::target_udp::TARGET_BATCH_SIZE;
+use crate::policy::TargetPolicy;
+use crate::uri::UdpTarget;
+
+use super::target::{TargetSetupFailure, resolve_allowed};
+
+/// A connected target socket prepared off the HTTP/3 event loop.
+pub(crate) struct ConnectedUdpTarget {
+    target_addr: SocketAddr,
+    send_socket: std::net::UdpSocket,
+    recv_socket: UdpSocket,
+    udp_gso: bool,
+}
+
+impl ConnectedUdpTarget {
+    /// HTTP/2 uses Tokio's socket in both directions and does not need the
+    /// duplicate descriptor retained by the HTTP/3 batching path.
+    pub(crate) fn into_http2(self) -> (UdpSocket, SocketAddr) {
+        (self.recv_socket, self.target_addr)
+    }
+
+    /// Split out every descriptor and the negotiated offload state HTTP/3
+    /// needs when it installs the live tunnel.
+    pub(crate) fn into_http3(self) -> (std::net::UdpSocket, Arc<UdpSocket>, SocketAddr, bool) {
+        (
+            self.send_socket,
+            Arc::new(self.recv_socket),
+            self.target_addr,
+            self.udp_gso,
+        )
+    }
+}
+
+/// Completion sent from an asynchronous HTTP/3 UDP setup task to its shard.
+pub(crate) struct UdpSetupResult {
+    pub(crate) connection_index: u64,
+    pub(crate) stream_id: u64,
+    pub(crate) result: Result<ConnectedUdpTarget, TargetSetupFailure>,
+}
+
+/// A CONNECT-UDP stream whose one-shot resolution/socket setup is in flight.
+pub(crate) struct PendingUdpTunnel {
+    header: crate::datagram::DatagramHeader,
+    started_at: Instant,
+    setup_task: Option<JoinHandle<()>>,
+}
+
+impl PendingUdpTunnel {
+    pub(crate) fn new(header: crate::datagram::DatagramHeader) -> Self {
+        Self {
+            header,
+            started_at: Instant::now(),
+            setup_task: None,
+        }
+    }
+
+    pub(crate) fn start_setup(&mut self, task: JoinHandle<()>) {
+        debug_assert!(self.setup_task.is_none());
+        self.setup_task = Some(task);
+    }
+
+    pub(crate) fn header(&self) -> crate::datagram::DatagramHeader {
+        self.header
+    }
+
+    pub(crate) fn is_idle(&self, timeout: Duration) -> bool {
+        self.started_at.elapsed() > timeout
+    }
+}
+
+impl Drop for PendingUdpTunnel {
+    fn drop(&mut self) {
+        if let Some(task) = self.setup_task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Resolve and connect one UDP target under a single deadline. Both HTTP/2 and
+/// HTTP/3 call this function, so policy always evaluates the same address
+/// snapshot the socket subsequently uses.
+pub(crate) async fn connect_udp_target(
+    target: UdpTarget,
+    policy: &TargetPolicy,
+    timeout: Duration,
+    enable_udp_gso: bool,
+    max_datagram_size: usize,
+) -> Result<ConnectedUdpTarget, TargetSetupFailure> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let resolved = resolve_allowed(&target.host, target.port, policy, deadline).await?;
+    let mut last_error = None;
+
+    for target_addr in resolved.into_addresses() {
+        match open_connected_udp(target_addr, enable_udp_gso, max_datagram_size) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(TargetSetupFailure::connect(
+        "UDP",
+        last_error.expect("resolved target contains at least one address"),
+    ))
+}
+
+fn open_connected_udp(
+    target_addr: SocketAddr,
+    enable_udp_gso: bool,
+    max_datagram_size: usize,
+) -> std::io::Result<ConnectedUdpTarget> {
+    let bind_addr: SocketAddr = if target_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let send_socket = std::net::UdpSocket::bind(bind_addr)?;
+    send_socket.connect(target_addr)?;
+    send_socket.set_nonblocking(true)?;
+
+    #[cfg(target_os = "linux")]
+    let udp_gso = if enable_udp_gso {
+        use std::os::fd::AsRawFd as _;
+        target_udp::detect_udp_gso(send_socket.as_raw_fd(), max_datagram_size)
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "linux"))]
+    let udp_gso = {
+        let _ = (enable_udp_gso, max_datagram_size);
+        false
+    };
+
+    let recv_socket = send_socket.try_clone()?;
+    recv_socket.set_nonblocking(true)?;
+    let recv_socket = UdpSocket::from_std(recv_socket)?;
+
+    Ok(ConnectedUdpTarget {
+        target_addr,
+        send_socket,
+        recv_socket,
+        udp_gso,
+    })
+}
+
+/// Start HTTP/3 UDP target setup without blocking its shard.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_udp_setup(
+    connection_index: u64,
+    stream_id: u64,
+    target: UdpTarget,
+    policy: TargetPolicy,
+    timeout: Duration,
+    enable_udp_gso: bool,
+    max_datagram_size: usize,
+    result_tx: mpsc::Sender<UdpSetupResult>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result =
+            connect_udp_target(target, &policy, timeout, enable_udp_gso, max_datagram_size).await;
+        let _ = result_tx
+            .send(UdpSetupResult {
+                connection_index,
+                stream_id,
+                result,
+            })
+            .await;
+    })
+}
 
 /// State for a single CONNECT-UDP tunnel.
 pub struct UdpTunnel {
@@ -245,7 +413,67 @@ impl Drop for UdpTunnel {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    fn loopback_policy() -> TargetPolicy {
+        TargetPolicy::new(&["127.0.0.0/8".into()], &[])
+    }
+
+    #[tokio::test]
+    async fn shared_target_setup_connects_the_checked_address() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let prepared = connect_udp_target(
+            UdpTarget {
+                host: target_addr.ip().to_string(),
+                port: target_addr.port(),
+            },
+            &loopback_policy(),
+            Duration::from_secs(1),
+            false,
+            1350,
+        )
+        .await
+        .unwrap();
+        let (socket, connected_addr) = prepared.into_http2();
+        assert_eq!(connected_addr, target_addr);
+
+        socket.send(b"checked snapshot").await.unwrap();
+        let mut received = [0_u8; 64];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), target.recv_from(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&received[..len], b"checked snapshot");
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_udp_setup_cancels_its_task() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _drop = Dropped(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let mut pending = PendingUdpTunnel::new(crate::datagram::DatagramHeader::new(0).unwrap());
+        pending.start_setup(task);
+        drop(pending);
+        tokio::task::yield_now().await;
+
+        assert!(dropped.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn immediate_nonblocking_send_reaches_target() {
