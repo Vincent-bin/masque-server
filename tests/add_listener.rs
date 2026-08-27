@@ -168,8 +168,16 @@ impl Fixture {
             .stderr(Stdio::piped());
         if let Some(input) = stdin {
             let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
-            child.stdin.take().unwrap().write_all(input).unwrap();
-            child.wait_with_output().unwrap()
+            let write_result = child.stdin.take().unwrap().write_all(input);
+            let output = child.wait_with_output().unwrap();
+            if let Err(error) = write_result {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "failed to write command input: {error}"
+                );
+            }
+            output
         } else {
             command.output().unwrap()
         }
