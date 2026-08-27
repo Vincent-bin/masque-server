@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.10.1 - 2026-08-27
+
+### Added
+
+- TCP target setup uses staggered Happy Eyeballs attempts across interleaved
+  IPv6 and IPv4 results, and UDP setup has a configurable bounded deadline.
+
+### Fixed
+
+- HTTP/3 CONNECT-UDP now resolves targets asynchronously off the shard, checks
+  and connects one immutable DNS snapshot, and sends `200` only after the
+  target socket exists. HTTP/2 shares the same resolver and policy path, which
+  also closes the prior DNS-rebinding gap between policy and socket setup.
+
 ## 0.10.0 - 2026-08-26
 
 ### Added

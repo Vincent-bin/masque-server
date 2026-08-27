@@ -731,19 +731,25 @@ deny_targets = [
 Resolved addresses must match an allow prefix and must not match a deny prefix.
 Deny rules take precedence. Keep loopback, link-local, private, metadata, and
 management networks denied unless access is intentional.
+`connect_timeout_secs` (`1..300`) covers both DNS resolution and the staggered
+IPv6/IPv4 connection attempts. The server starts the other address family after
+250 ms, or immediately when the preceding attempt fails.
 
 ## UDP policy
 
 ```toml
 [udp_proxy]
 enabled = true
+connect_timeout_secs = 10
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
 enable_udp_gso = false
 allow_targets = ["0.0.0.0/0", "::/0"]
 deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
 ```
 
-The template must retain `{target_host}` and `{target_port}`. Apply the same
+The template must retain `{target_host}` and `{target_port}`.
+`connect_timeout_secs` (`1..300`) bounds the complete DNS and socket setup; a
+timeout returns `504` before the server accepts the CONNECT stream. Apply the same
 internal-network restrictions used for TCP unless UDP access is intentionally
 different. `enable_udp_gso` batches equal-sized large client payloads into
 Linux UDP super-packets without first copying them into one contiguous

@@ -3,8 +3,6 @@
 // CONNECT-UDP: /.well-known/masque/udp/{target_host}/{target_port}/
 // CONNECT-IP:  /.well-known/masque/ip/{target}/{ipproto}/
 
-use std::net::{IpAddr, SocketAddr};
-
 /// Parsed CONNECT-UDP target from the URI path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpTarget {
@@ -194,29 +192,6 @@ fn extract_prefix(template: &str) -> String {
     match template.find('{') {
         Some(pos) => template[..pos].to_string(),
         None => template.to_string(),
-    }
-}
-
-impl UdpTarget {
-    /// Resolve the target to a socket address.
-    ///
-    /// If the host is already an IP address, no DNS lookup is performed.
-    pub fn resolve(&self) -> Result<Vec<SocketAddr>, std::io::Error> {
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<SocketAddr> = (self.host.as_str(), self.port).to_socket_addrs()?.collect();
-        if addrs.is_empty() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no addresses found for {}:{}", self.host, self.port),
-            ))
-        } else {
-            Ok(addrs)
-        }
-    }
-
-    /// Get the target IP addresses (for policy checking).
-    pub fn resolved_ips(&self) -> Result<Vec<IpAddr>, std::io::Error> {
-        Ok(self.resolve()?.into_iter().map(|a| a.ip()).collect())
     }
 }
 
@@ -446,30 +421,5 @@ mod tests {
     #[test]
     fn extract_prefix_no_braces() {
         assert_eq!(extract_prefix("/static/path/"), "/static/path/");
-    }
-
-    // ── UdpTarget::resolve ────────────────────────────────────────────
-
-    #[test]
-    fn resolve_ip_address() {
-        let target = UdpTarget {
-            host: "127.0.0.1".into(),
-            port: 53,
-        };
-        let addrs = target.resolve().unwrap();
-        assert!(!addrs.is_empty());
-        assert_eq!(addrs[0].ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
-        assert_eq!(addrs[0].port(), 53);
-    }
-
-    #[test]
-    fn resolve_ipv6_address() {
-        let target = UdpTarget {
-            host: "::1".into(),
-            port: 443,
-        };
-        let addrs = target.resolve().unwrap();
-        assert!(!addrs.is_empty());
-        assert_eq!(addrs[0].port(), 443);
     }
 }

@@ -60,9 +60,11 @@ adapt it to their environment. Explicitly deny:
 - internal DNS, databases, and service meshes not intended for clients; and
 - link-local and unique-local ranges where inappropriate.
 
-DNS names are evaluated after resolution so a hostname cannot bypass CIDR
-policy merely by resolving to a denied address. Rebinding and multi-address
-behavior should be retested when resolver logic changes.
+DNS names are resolved once under a bounded setup deadline. The complete
+snapshot must pass CIDR policy, and socket setup consumes that same snapshot
+rather than looking the name up again. This closes the policy/connect gap an
+attacker-controlled short-TTL name could otherwise use for DNS rebinding.
+Mixed allowed and denied answers fail closed.
 
 Disable TCP, UDP, or IP proxy sections that are not required.
 

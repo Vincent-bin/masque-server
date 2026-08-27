@@ -19,6 +19,10 @@ pub fn ensure_success_status(status: u16, target: &str) -> Result<(), ProbeFailu
             "TARGET_CONNECT_FAILED",
             format!("proxy was reached, but it could not connect to target {target} (HTTP 502)"),
         )),
+        504 => Err(ProbeFailure::new(
+            "TARGET_CONNECT_TIMEOUT",
+            format!("proxy target setup timed out for {target} (HTTP 504)"),
+        )),
         status => Err(ProbeFailure::new(
             "CONNECT_REJECTED",
             format!("server rejected CONNECT with HTTP {status}"),
@@ -104,6 +108,12 @@ mod tests {
                 .unwrap_err()
                 .code,
             "TARGET_CONNECT_FAILED"
+        );
+        assert_eq!(
+            ensure_success_status(504, "example.com:443")
+                .unwrap_err()
+                .code,
+            "TARGET_CONNECT_TIMEOUT"
         );
     }
 }

@@ -122,6 +122,14 @@ async fn spawn_server(
     tls: &TempTls,
     transport: ListenerTransport,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    spawn_server_with_udp_policy(tls, transport, true).await
+}
+
+async fn spawn_server_with_udp_policy(
+    tls: &TempTls,
+    transport: ListenerTransport,
+    allow_loopback_udp: bool,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let mut config = ServerConfig::default();
     config.tls.cert_path = tls.cert.clone();
     config.tls.key_path = tls.key.clone();
@@ -137,8 +145,13 @@ async fn spawn_server(
     config.tcp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
     config.tcp_proxy.deny_targets.clear();
     config.udp_proxy.enabled = true;
-    config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
-    config.udp_proxy.deny_targets.clear();
+    if allow_loopback_udp {
+        config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
+        config.udp_proxy.deny_targets.clear();
+    } else {
+        config.udp_proxy.allow_targets = vec!["0.0.0.0/0".into()];
+        config.udp_proxy.deny_targets = vec!["127.0.0.0/8".into()];
+    }
     config.ip_proxy.enabled = false;
 
     let mut server = Server::bind(config).await.unwrap();
@@ -274,6 +287,31 @@ async fn released_probe_checks_basic_http2_and_http3_end_to_end() {
         server.abort();
     }
 
+    tcp_echo.abort();
+    udp_echo.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http3_udp_policy_failure_is_returned_instead_of_an_early_200() {
+    let tls = TempTls::new();
+    let (target, tcp_echo, udp_echo) = spawn_echo().await;
+    let (endpoint, server) =
+        spawn_server_with_udp_policy(&tls, ListenerTransport::Http3, false).await;
+
+    let output = tokio::task::block_in_place(|| run_probe(endpoint, target, "http3"));
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let udp = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "connect_udp")
+        .unwrap();
+    assert_eq!(udp["status"], "fail");
+    assert_eq!(udp["code"], "TARGET_POLICY_DENIED");
+    assert!(udp["detail"].as_str().unwrap().contains("HTTP 403"));
+
+    server.abort();
     tcp_echo.abort();
     udp_echo.abort();
 }

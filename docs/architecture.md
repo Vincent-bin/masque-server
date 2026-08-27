@@ -110,6 +110,7 @@ Each shard waits directly on all sources that can make progress:
 
 - QUIC socket readability;
 - target UDP response batches;
+- completed UDP target setups;
 - TCP relay events;
 - completed authentication;
 - forwarded packets from another shard;
@@ -119,6 +120,13 @@ Each shard waits directly on all sources that can make progress:
 Target UDP readability participates directly in the wakeup path. It is not
 polled by a coarse periodic timer, so idle-to-active traffic does not inherit a
 timer-sized latency penalty.
+
+Hostname resolution and target socket creation never run on an HTTP/3 shard.
+CONNECT-UDP keeps a cancellable pending entry while an asynchronous task
+resolves one address snapshot, validates it, and opens the socket. The shard
+sends `200` only after that task succeeds. HTTP/2 uses the same resolver and
+policy path; TCP connections stagger interleaved IPv6/IPv4 attempts so a dead
+address family does not consume the complete setup timeout.
 
 When work arrives, only affected connections enter the dirty set. The shard
 drives those connections, stages output using quiche's send quantum, emits a

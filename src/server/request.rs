@@ -7,7 +7,6 @@ use tracing::{info, warn};
 
 use crate::auth::{AuthPrecheck, BasicCredential, SharedBasicAuthenticator};
 use crate::config::ServerConfig;
-use crate::policy::TargetPolicy;
 use crate::uri;
 
 use super::Shard;
@@ -34,7 +33,7 @@ pub(super) struct PendingAuth {
 #[derive(Default)]
 pub(super) struct PendingConnectSetups {
     pub(super) tcp: Vec<(u64, uri::TcpTarget)>,
-    pub(super) udp: Vec<(u64, uri::UdpTarget)>,
+    pub(super) udp: Vec<(u64, uri::UdpTarget, crate::datagram::DatagramHeader)>,
     pub(super) ip: Vec<u64>,
 }
 
@@ -96,7 +95,6 @@ pub(super) fn classify_connect_request(
 pub(super) struct RequestContext<'a> {
     pub(super) config: &'a ServerConfig,
     pub(super) auth: Option<&'a SharedBasicAuthenticator>,
-    pub(super) udp_policy: &'a TargetPolicy,
 }
 
 impl Shard {
@@ -217,7 +215,6 @@ impl Shard {
                     stream_id,
                     path,
                     context.config,
-                    context.udp_policy,
                     &mut pending.udp,
                 );
             }
@@ -232,15 +229,17 @@ impl Shard {
         }
     }
 
-    /// Parse and authorize CONNECT-UDP, respond, then defer socket creation.
+    /// Parse CONNECT-UDP and defer resolution, policy, and socket setup.
+    ///
+    /// The eventual setup result sends either the final error or the first
+    /// `200`, so a failed target cannot leave an already-accepted stream.
     fn handle_connect_udp(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
         stream_id: u64,
         path: &str,
         config: &ServerConfig,
-        udp_policy: &TargetPolicy,
-        pending_udp_setups: &mut Vec<(u64, uri::UdpTarget)>,
+        pending_udp_setups: &mut Vec<(u64, uri::UdpTarget, crate::datagram::DatagramHeader)>,
     ) {
         let target = match uri::parse_udp_path(path, &config.udp_proxy.uri_template) {
             Ok(target) => target,
@@ -252,33 +251,15 @@ impl Shard {
         };
 
         info!(stream_id, host = %target.host, port = target.port, "CONNECT-UDP");
-
-        match target.resolved_ips() {
-            Ok(ips) => {
-                if !udp_policy.all_allowed(&ips) {
-                    warn!(stream_id, host = %target.host, "target denied by policy");
-                    Self::send_error_response(h3, quic, stream_id, 403);
-                    return;
-                }
-            }
-            Err(e) => {
-                warn!(stream_id, %e, "DNS resolution failed for policy check");
-                Self::send_error_response(h3, quic, stream_id, 502);
+        let header = match crate::datagram::DatagramHeader::new(stream_id) {
+            Ok(header) => header,
+            Err(error) => {
+                warn!(stream_id, %error, "cannot frame datagrams for stream");
+                Self::send_error_response(h3, quic, stream_id, 400);
                 return;
             }
-        }
-
-        let headers = vec![
-            quiche::h3::Header::new(b":status", b"200"),
-            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        ];
-
-        if let Err(e) = h3.send_response(quic, stream_id, &headers, false) {
-            warn!(stream_id, %e, "failed to send CONNECT-UDP 200");
-            return;
-        }
-
-        pending_udp_setups.push((stream_id, target));
+        };
+        pending_udp_setups.push((stream_id, target, header));
     }
 }
 

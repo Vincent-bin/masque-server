@@ -1,6 +1,7 @@
 // Standard HTTP CONNECT tunnel implementation over HTTP/3.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,10 +11,14 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::policy::TargetPolicy;
 use crate::uri::TcpTarget;
+
+use super::target::resolve_allowed;
+
+pub use super::target::TargetSetupFailure as TcpSetupFailure;
 
 const TCP_READ_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_BUFFERED_CLIENT_BYTES: usize = 1024 * 1024;
@@ -29,11 +34,6 @@ pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 256 * 1024;
 // The reader reserves a whole chunk before each read, so a budget smaller than
 // one chunk would never be satisfiable and the reader would hang forever.
 const _: () = assert!(MAX_BUFFERED_RESPONSE_BYTES >= TCP_READ_CHUNK_SIZE);
-
-pub struct TcpSetupFailure {
-    pub status: u16,
-    pub reason: String,
-}
 
 pub enum TcpRelayEvent {
     ConnectResult {
@@ -411,61 +411,190 @@ pub(crate) async fn resolve_and_connect(
     policy: &TargetPolicy,
     timeout: Duration,
 ) -> Result<(TcpStream, SocketAddr), TcpSetupFailure> {
-    let setup = async {
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((target.host.as_str(), target.port))
+    let deadline = tokio::time::Instant::now() + timeout;
+    let resolved = resolve_allowed(&target.host, target.port, policy, deadline).await?;
+    let connected =
+        tokio::time::timeout_at(deadline, happy_eyeballs_connect(resolved.into_addresses()))
             .await
-            .map_err(|error| TcpSetupFailure {
-                status: 502,
-                reason: format!("target DNS resolution failed: {error}"),
-            })?
-            .collect();
+            .map_err(|_| TcpSetupFailure::timeout("DNS resolution or TCP connect"))?
+            .map_err(|error| TcpSetupFailure::connect("TCP", error))?;
 
-        if addrs.is_empty() {
-            return Err(TcpSetupFailure {
-                status: 502,
-                reason: "target DNS resolution returned no addresses".into(),
-            });
-        }
-        let ips: Vec<_> = addrs.iter().map(|addr| addr.ip()).collect();
-        if !policy.all_allowed(&ips) {
-            return Err(TcpSetupFailure {
-                status: 403,
-                reason: "target denied by TCP policy".into(),
-            });
-        }
+    let (stream, address) = connected;
+    let _ = stream.set_nodelay(true);
+    Ok((stream, address))
+}
 
-        let mut last_error = None;
-        for addr in addrs {
-            match TcpStream::connect(addr).await {
-                Ok(stream) => return Ok((stream, addr)),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(TcpSetupFailure {
-            status: 502,
-            reason: format!(
-                "target TCP connect failed: {}",
-                last_error.expect("non-empty target address list")
-            ),
-        })
-    };
+/// RFC 8305-style stagger between address-family attempts. An immediate
+/// failure starts the next address without waiting for this delay.
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
-    match tokio::time::timeout(timeout, setup).await {
-        Ok(Ok((stream, addr))) => {
-            let _ = stream.set_nodelay(true);
-            Ok((stream, addr))
-        }
-        Ok(Err(failure)) => Err(failure),
-        Err(_) => Err(TcpSetupFailure {
-            status: 504,
-            reason: "target DNS resolution or TCP connect timed out".into(),
-        }),
+async fn happy_eyeballs_connect(
+    addresses: Vec<SocketAddr>,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    happy_eyeballs_connect_with(addresses, HAPPY_EYEBALLS_DELAY, |address| async move {
+        TcpStream::connect(address).await
+    })
+    .await
+}
+
+/// Race interleaved IPv6/IPv4 candidates while retaining a deterministic hook
+/// for dual-stack fallback tests.
+async fn happy_eyeballs_connect_with<C, Fut, T>(
+    addresses: Vec<SocketAddr>,
+    attempt_delay: Duration,
+    connector: C,
+) -> std::io::Result<(T, SocketAddr)>
+where
+    C: Fn(SocketAddr) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::io::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let addresses = interleave_address_families(addresses);
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no target addresses to connect",
+        ));
     }
+
+    let mut attempts = JoinSet::new();
+    let mut next = 0usize;
+    let mut next_launch = tokio::time::Instant::now();
+    let mut last_error = None;
+
+    while next < addresses.len() || !attempts.is_empty() {
+        // Start the first candidate immediately. If every in-flight attempt
+        // failed synchronously, also start its successor immediately.
+        if attempts.is_empty() && next < addresses.len() {
+            spawn_connect_attempt(&mut attempts, connector.clone(), addresses[next]);
+            next += 1;
+            next_launch = tokio::time::Instant::now() + attempt_delay;
+        }
+
+        let joined = if next < addresses.len() {
+            tokio::select! {
+                joined = attempts.join_next() => joined,
+                _ = tokio::time::sleep_until(next_launch) => {
+                    spawn_connect_attempt(&mut attempts, connector.clone(), addresses[next]);
+                    next += 1;
+                    next_launch = tokio::time::Instant::now() + attempt_delay;
+                    continue;
+                }
+            }
+        } else {
+            attempts.join_next().await
+        };
+
+        match joined {
+            Some(Ok((address, Ok(value)))) => return Ok((value, address)),
+            Some(Ok((_, Err(error)))) => last_error = Some(error),
+            Some(Err(error)) => {
+                last_error = Some(std::io::Error::other(format!(
+                    "target TCP connect task failed: {error}"
+                )));
+            }
+            None => break,
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no target address connected")
+    }))
+}
+
+fn spawn_connect_attempt<C, Fut, T>(
+    attempts: &mut JoinSet<(SocketAddr, std::io::Result<T>)>,
+    connector: C,
+    address: SocketAddr,
+) where
+    C: Fn(SocketAddr) -> Fut + Send + 'static,
+    Fut: Future<Output = std::io::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    attempts.spawn(async move { (address, connector(address).await) });
+}
+
+/// Preserve resolver preference while alternating address families. This
+/// avoids waiting for every IPv6 record before the first IPv4 attempt (or the
+/// reverse when the resolver prefers IPv4).
+fn interleave_address_families(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(prefer_ipv6) = addresses.first().map(SocketAddr::is_ipv6) else {
+        return addresses;
+    };
+    let mut ipv4 = VecDeque::new();
+    let mut ipv6 = VecDeque::new();
+    for address in addresses {
+        if address.is_ipv4() {
+            ipv4.push_back(address);
+        } else {
+            ipv6.push_back(address);
+        }
+    }
+
+    let mut prefer_ipv6 = prefer_ipv6;
+    let mut interleaved = Vec::with_capacity(ipv4.len() + ipv6.len());
+    while !ipv4.is_empty() || !ipv6.is_empty() {
+        let address = if prefer_ipv6 {
+            ipv6.pop_front().or_else(|| ipv4.pop_front())
+        } else {
+            ipv4.pop_front().or_else(|| ipv6.pop_front())
+        };
+        interleaved.push(address.expect("one address family remains"));
+        prefer_ipv6 = !prefer_ipv6;
+    }
+    interleaved
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn happy_eyeballs_interleaves_families_without_losing_resolver_preference() {
+        let v6_first: Vec<SocketAddr> = [
+            "[2001:db8::1]:443",
+            "[2001:db8::2]:443",
+            "192.0.2.1:443",
+            "192.0.2.2:443",
+        ]
+        .into_iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+        let ordered = interleave_address_families(v6_first);
+        assert_eq!(ordered[0], "[2001:db8::1]:443".parse().unwrap());
+        assert_eq!(ordered[1], "192.0.2.1:443".parse().unwrap());
+        assert_eq!(ordered[2], "[2001:db8::2]:443".parse().unwrap());
+        assert_eq!(ordered[3], "192.0.2.2:443".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_falls_back_to_ipv4_while_ipv6_is_stalled() {
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let ipv4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            happy_eyeballs_connect_with(
+                vec![ipv6, ipv4],
+                Duration::from_millis(20),
+                move |address| async move {
+                    if address.is_ipv6() {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "simulated unreachable IPv6 path",
+                        ))
+                    } else {
+                        Ok(address)
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("IPv4 should race the stalled IPv6 attempt")
+        .unwrap();
+
+        assert_eq!(result, (ipv4, ipv4));
+    }
 
     #[test]
     fn relay_event_payload_length_counts_only_data() {
