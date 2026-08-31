@@ -17,19 +17,22 @@ WORKDIR /build
 # sources and replaced by the real one below.
 COPY Cargo.toml Cargo.lock ./
 COPY tools/masque-e2e/Cargo.toml tools/masque-e2e/Cargo.toml
-RUN mkdir -p src benches tools/masque-e2e/src \
+COPY tools/masque-probe/Cargo.toml tools/masque-probe/Cargo.toml
+RUN mkdir -p src benches tools/masque-e2e/src tools/masque-probe/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/core.rs \
     && echo "fn main() {}" > tools/masque-e2e/src/main.rs \
+    && echo "fn main() {}" > tools/masque-probe/src/main.rs \
     && cargo build --release -p masque-server 2>/dev/null || true \
     && rm -f target/release/masque-server target/release/deps/masque_server-* \
-    && rm -rf src tools/masque-e2e/src
+    && rm -rf src tools/masque-e2e/src tools/masque-probe/src
 
 # Copy real source and build.
 COPY src/ src/
 COPY benches/ benches/
 COPY tools/masque-e2e/ tools/masque-e2e/
+COPY tools/masque-probe/ tools/masque-probe/
 RUN touch src/main.rs src/lib.rs && cargo build --release -p masque-server --bin masque-server
 
 # Stage 2: minimal runtime
