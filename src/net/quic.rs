@@ -598,6 +598,12 @@ fn gro_segment_size(header: &libc::msghdr) -> Option<usize> {
     unsafe {
         let control = libc::CMSG_FIRSTHDR(header);
         let required = libc::CMSG_LEN(std::mem::size_of::<u16>() as _) as usize;
+        // libc models socklen_t as u32 for musl and usize for glibc. Keep the
+        // conversion explicit only where the source type actually differs so
+        // both static release builds and the GNU Clippy gate agree.
+        #[cfg(target_env = "musl")]
+        let control_len = header.msg_controllen as usize;
+        #[cfg(not(target_env = "musl"))]
         let control_len = header.msg_controllen;
         if control.is_null()
             || control_len < required
