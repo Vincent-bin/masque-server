@@ -7,6 +7,33 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.11.0 - 2026-09-01
+
+### Added
+
+- Weekly security verification runs pinned `cargo-audit` and `cargo-deny`
+  versions for RustSec vulnerabilities, license policy, duplicate versions, and
+  non-registry dependency sources.
+- Linux GNU AddressSanitizer exercises the QUIC and target-UDP syscall paths,
+  the real HTTP/3 session-ticket regression, and an isolated resource-pressure
+  suite covering wrong passwords, half-open TLS peers, excess streams, and
+  sustained DATAGRAM capsules.
+- Prometheus exports process-lifetime high-water marks for active connections,
+  tunnels, pending authentication, and concurrent Argon2 work.
+
+### Changed
+
+- TLS 1.3 Early Data is explicitly disabled in BoringSSL and guarded again at
+  HTTP/3 initialization, so CONNECT, CONNECT-UDP, and CONNECT-IP cannot execute
+  before the full handshake. A real resumed session verifies the ticket never
+  advertises 0-RTT while ordinary resumption remains available.
+- Configuration validation now caps connection/tunnel counts, QUIC/H2 streams
+  and flow-control windows, header/send buffers, and QUIC DATAGRAM queues at
+  auditable hard limits.
+- Workspace lint policy denies unsafe operations outside explicit `unsafe`
+  blocks and undocumented unsafe blocks. Target UDP batching exposes safe
+  wrappers; only the private raw-syscall boundary remains unsafe.
+
 ## 0.10.1 - 2026-08-27
 
 ### Added

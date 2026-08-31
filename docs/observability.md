@@ -96,6 +96,7 @@ All metric names start with `masque_`.
 | `masque_event_loop_lag_seconds` | gauge | `listener`, `transport`, `auth`, `shard` | Latest one-second heartbeat scheduling delay |
 | `masque_event_loop_lag_max_seconds` | gauge | `listener`, `transport`, `auth`, `shard` | Largest heartbeat delay since startup |
 | `masque_connections_active` | gauge | `listener`, `transport`, `auth` | Live HTTP transport connections |
+| `masque_connections_active_max` | gauge | `listener`, `transport`, `auth` | Largest live connection count since process start |
 | `masque_connections_accepted_total` | counter | `listener`, `transport`, `auth` | Accepted connection objects |
 | `masque_connections_rejected_total` | counter | `listener`, `transport`, `auth`, `reason` | Connections rejected at a resource limit |
 | `masque_quic_retries_total` | counter | `listener`, `transport`, `auth`, `result` | Retry packets sent or invalid Retry tokens received |
@@ -111,9 +112,12 @@ All metric names start with `masque_`.
 | `masque_tcp_relay_events_total` | counter | `listener`, `transport`, `auth` | Target TCP events consumed by HTTP/3 shards |
 | `masque_tcp_relay_bytes_total` | counter | `listener`, `transport`, `auth` | Target TCP response bytes handed to HTTP/3 shards |
 | `masque_tunnels_active` | gauge | `listener`, `transport`, `auth`, `protocol` | Live `tcp`, `udp`, or `ip` tunnels |
+| `masque_tunnels_active_max` | gauge | `listener`, `transport`, `auth`, `protocol` | Largest live tunnel count since process start |
 | `masque_auth_attempts_total` | counter | `listener`, `transport`, `auth`, `result` | Successful, failed, or load-shed verification |
 | `masque_auth_pending` | gauge | `listener`, `transport`, `auth` | Admitted Basic checks not yet completed |
+| `masque_auth_pending_max` | gauge | `listener`, `transport`, `auth` | Largest pending Basic-check count since process start |
 | `masque_auth_running` | gauge | `listener`, `transport`, `auth` | Argon2 jobs currently executing |
+| `masque_auth_running_max` | gauge | `listener`, `transport`, `auth` | Largest concurrent Argon2 count since process start |
 | `masque_packets_dropped_total` | counter | `listener`, `transport`, `auth`, `reason` | Drops at bounded shard, datagram, or TUN queues |
 | `masque_tls_reloads_total` | counter | `result` | Successful and rejected SIGHUP TLS identity reloads |
 | `masque_roster_reloads_total` | counter | `result` | Successful and rejected active client-roster reloads |

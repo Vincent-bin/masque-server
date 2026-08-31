@@ -349,6 +349,12 @@ impl ListenerMetrics {
         );
         render_value(
             out,
+            "masque_connections_active_max",
+            label,
+            self.sum(|shard| &shard.connections_active_max),
+        );
+        render_value(
+            out,
             "masque_connections_accepted_total",
             label,
             self.sum(|shard| &shard.connections_accepted),
@@ -424,6 +430,16 @@ impl ListenerMetrics {
                 "masque_tunnels_active{{{label},protocol=\"{protocol}\"}} {value}"
             )
             .unwrap();
+            let maximum = self
+                .shards
+                .iter()
+                .map(|shard| shard.tunnels_active_max[index].load(RELAXED))
+                .sum::<u64>();
+            writeln!(
+                out,
+                "masque_tunnels_active_max{{{label},protocol=\"{protocol}\"}} {maximum}"
+            )
+            .unwrap();
         }
         for (result, field) in [
             (
@@ -448,9 +464,21 @@ impl ListenerMetrics {
         );
         render_value(
             out,
+            "masque_auth_pending_max",
+            label,
+            self.sum(|shard| &shard.auth_pending_max),
+        );
+        render_value(
+            out,
             "masque_auth_running",
             label,
             self.sum(|shard| &shard.auth_running),
+        );
+        render_value(
+            out,
+            "masque_auth_running_max",
+            label,
+            self.sum(|shard| &shard.auth_running_max),
         );
         for (reason, field) in [
             (
@@ -487,6 +515,7 @@ pub(crate) struct ShardMetrics {
     quic_udp_gso_enabled: AtomicBool,
     quic_udp_gro_enabled: AtomicBool,
     connections_active: AtomicU64,
+    connections_active_max: AtomicU64,
     connections_accepted: AtomicU64,
     connections_rejected_limit: AtomicU64,
     connections_rejected_source_limit: AtomicU64,
@@ -502,11 +531,14 @@ pub(crate) struct ShardMetrics {
     tcp_relay_events: AtomicU64,
     tcp_relay_bytes: AtomicU64,
     tunnels_active: [AtomicU64; 3],
+    tunnels_active_max: [AtomicU64; 3],
     auth_success: AtomicU64,
     auth_failure: AtomicU64,
     auth_overloaded: AtomicU64,
     auth_pending: AtomicU64,
+    auth_pending_max: AtomicU64,
     auth_running: AtomicU64,
+    auth_running_max: AtomicU64,
     dropped_shard_queue: AtomicU64,
     dropped_datagram_queue: AtomicU64,
     dropped_tun_queue: AtomicU64,
@@ -522,6 +554,7 @@ impl ShardMetrics {
             quic_udp_gso_enabled: AtomicBool::new(udp_gso),
             quic_udp_gro_enabled: AtomicBool::new(udp_gro),
             connections_active: AtomicU64::new(0),
+            connections_active_max: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected_limit: AtomicU64::new(0),
             connections_rejected_source_limit: AtomicU64::new(0),
@@ -537,11 +570,14 @@ impl ShardMetrics {
             tcp_relay_events: AtomicU64::new(0),
             tcp_relay_bytes: AtomicU64::new(0),
             tunnels_active: std::array::from_fn(|_| AtomicU64::new(0)),
+            tunnels_active_max: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_success: AtomicU64::new(0),
             auth_failure: AtomicU64::new(0),
             auth_overloaded: AtomicU64::new(0),
             auth_pending: AtomicU64::new(0),
+            auth_pending_max: AtomicU64::new(0),
             auth_running: AtomicU64::new(0),
+            auth_running_max: AtomicU64::new(0),
             dropped_shard_queue: AtomicU64::new(0),
             dropped_datagram_queue: AtomicU64::new(0),
             dropped_tun_queue: AtomicU64::new(0),
@@ -582,7 +618,7 @@ impl ShardMetrics {
             return;
         }
         self.connections_accepted.fetch_add(1, RELAXED);
-        self.connections_active.fetch_add(1, RELAXED);
+        increment_with_high_water(&self.connections_active, &self.connections_active_max);
     }
 
     pub(crate) fn connection_closed(&self) {
@@ -652,12 +688,19 @@ impl ShardMetrics {
         if !self.enabled {
             return;
         }
-        for ((metric, old), new) in self.tunnels_active.iter().zip(previous).zip(current) {
+        for (((metric, maximum), old), new) in self
+            .tunnels_active
+            .iter()
+            .zip(&self.tunnels_active_max)
+            .zip(previous)
+            .zip(current)
+        {
             if new >= old {
                 metric.fetch_add((new - old) as u64, RELAXED);
             } else {
                 subtract(metric, (old - new) as u64);
             }
+            maximum.fetch_max(new as u64, RELAXED);
         }
     }
 
@@ -665,7 +708,10 @@ impl ShardMetrics {
     /// streams run as Tokio tasks rather than inside a shard-owned map.
     pub(crate) fn tunnel_opened(&self, protocol_index: usize) {
         if self.enabled {
-            self.tunnels_active[protocol_index].fetch_add(1, RELAXED);
+            increment_with_high_water(
+                &self.tunnels_active[protocol_index],
+                &self.tunnels_active_max[protocol_index],
+            );
         }
     }
 
@@ -746,10 +792,13 @@ impl GaugeGuard {
         let active = metrics.enabled;
         if active {
             match gauge {
-                Gauge::AuthPending => &metrics.auth_pending,
-                Gauge::AuthRunning => &metrics.auth_running,
+                Gauge::AuthPending => {
+                    increment_with_high_water(&metrics.auth_pending, &metrics.auth_pending_max)
+                }
+                Gauge::AuthRunning => {
+                    increment_with_high_water(&metrics.auth_running, &metrics.auth_running_max)
+                }
             }
-            .fetch_add(1, RELAXED);
         }
         Self {
             metrics,
@@ -778,6 +827,11 @@ fn subtract(metric: &AtomicU64, amount: u64) {
             Some(current.saturating_sub(amount))
         })
         .ok();
+}
+
+fn increment_with_high_water(current: &AtomicU64, maximum: &AtomicU64) {
+    let next = current.fetch_add(1, RELAXED).saturating_add(1);
+    maximum.fetch_max(next, RELAXED);
 }
 
 fn render_value(out: &mut String, name: &str, label: &str, value: u64) {
@@ -824,6 +878,11 @@ fn render_listener_headers(out: &mut String) {
         (
             "masque_connections_active",
             "Currently active HTTP transport connections.",
+            "gauge",
+        ),
+        (
+            "masque_connections_active_max",
+            "Largest active HTTP transport connection count since process start.",
             "gauge",
         ),
         (
@@ -892,6 +951,11 @@ fn render_listener_headers(out: &mut String) {
             "gauge",
         ),
         (
+            "masque_tunnels_active_max",
+            "Largest active CONNECT tunnel count by protocol since process start.",
+            "gauge",
+        ),
+        (
             "masque_auth_attempts_total",
             "Completed or load-shed authentication attempts.",
             "counter",
@@ -902,8 +966,18 @@ fn render_listener_headers(out: &mut String) {
             "gauge",
         ),
         (
+            "masque_auth_pending_max",
+            "Largest pending Basic authentication count since process start.",
+            "gauge",
+        ),
+        (
             "masque_auth_running",
             "Argon2 password verifications currently executing.",
+            "gauge",
+        ),
+        (
+            "masque_auth_running_max",
+            "Largest concurrent Argon2 verification count since process start.",
             "gauge",
         ),
         (
@@ -971,6 +1045,11 @@ mod tests {
                 "masque_connections_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 2"
             )
         );
+        assert!(
+            rendered.contains(
+                "masque_connections_active_max{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 2"
+            )
+        );
         assert!(rendered.contains(
             "masque_quic_receive_bytes_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 4800"
         ));
@@ -996,6 +1075,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "masque_tunnels_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",protocol=\"udp\"} 2"
+        ));
+        assert!(rendered.contains(
+            "masque_tunnels_active_max{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",protocol=\"udp\"} 2"
         ));
         assert!(rendered.contains(
             "masque_event_loop_lag_seconds{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",shard=\"0\"} 0.025000"
@@ -1032,6 +1114,8 @@ mod tests {
         }
         assert_eq!(listener.auth_pending.load(RELAXED), 0);
         assert_eq!(listener.auth_running.load(RELAXED), 0);
+        assert_eq!(listener.auth_pending_max.load(RELAXED), 1);
+        assert_eq!(listener.auth_running_max.load(RELAXED), 1);
     }
 
     #[test]

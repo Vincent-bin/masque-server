@@ -22,6 +22,8 @@
 | Client config | `cargo test --test client_config` | Surge output is importable, private, secret-aware, and never overwritten |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 | Parser fuzzing | `cargo +nightly fuzz run protocol_parsers` | Incremental capsule, datagram, varint, IP, and URI parser safety |
+| Dependency security | `cargo audit && cargo deny --workspace --locked check licenses sources bans` | RustSec, license, duplicate-version, and source policy |
+| Linux GNU ASan | Scheduled `linux-asan` job | Unsafe QUIC/target UDP FFI, 0-RTT ticket regression, and resource-pressure suite |
 
 ## Local tests
 
@@ -114,13 +116,21 @@ See [Performance](performance.md) for methodology and reporting requirements.
 ## Scheduled verification
 
 The weekly and manually dispatchable `Scheduled verification` workflow keeps
-the expensive checks off ordinary commits. It runs the Docker CONNECT-IP E2E,
-an HTTP/2 + HTTP/3 smoke test with QUIC Retry forced on, and a bounded parser
-fuzz session. A longer local parser run is:
+the expensive checks off ordinary commits. It runs dependency policy/security
+audits, Linux GNU ASan over the unsafe packet paths, an isolated resource
+pressure test, the real 0-RTT ticket regression, Docker CONNECT-IP E2E, an
+HTTP/2 + HTTP/3 smoke test with QUIC Retry forced on, and a bounded parser fuzz
+session. A longer local parser run is:
 
 ```sh
 cargo +nightly install cargo-fuzz --version 0.13.2 --locked
 cargo +nightly fuzz run protocol_parsers -- -max_total_time=3600
+```
+
+Run the Linux pressure suite without ASan with:
+
+```sh
+cargo test --test resource_exhaustion -- --ignored --nocapture
 ```
 
 ## Linux-specific checks

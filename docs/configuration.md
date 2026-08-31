@@ -88,10 +88,10 @@ max_tunnels_per_connection = 100
 | Key | Meaning |
 | --- | --- |
 | `idle_timeout_secs` | Inactive tunnel lifetime |
-| `max_connections` | Per-HTTP/3-shard or per-HTTP/2-listener connection cap |
-| `max_connections_per_ip` | Process-wide live H2 + H3 connections from one source IP |
+| `max_connections` | Per-HTTP/3-shard or per-HTTP/2-listener connection cap; `1..1000000` |
+| `max_connections_per_ip` | Process-wide live H2 + H3 connections from one source IP; `1..65536` |
 | `max_pending_auth_per_ip` | Process-wide running + queued Basic/Argon2 checks from one source; `1..256` |
-| `max_tunnels_per_connection` | CONNECT streams retained per connection |
+| `max_tunnels_per_connection` | CONNECT streams retained per connection; `1..4096` |
 
 This section contains process-wide connection limits only. Socket addresses and
 shard counts belong to [`[[listeners]]`](#listeners).
@@ -650,11 +650,11 @@ These values apply only to listeners with `transport = "http2"`:
 
 | Key | Meaning |
 | --- | --- |
-| `initial_stream_window` | Initial request-stream receive credit |
-| `initial_connection_window` | Initial aggregate receive credit per connection |
-| `max_concurrent_streams` | Concurrent request streams advertised per connection |
-| `max_header_list_size` | Maximum decoded request header list size |
-| `max_send_buffer_size` | Maximum response bytes buffered per stream by the H2 implementation |
+| `initial_stream_window` | Initial request-stream receive credit; `1..16777216` |
+| `initial_connection_window` | Initial aggregate receive credit per connection; `1..67108864` |
+| `max_concurrent_streams` | Concurrent request streams advertised per connection; `1..4096` |
+| `max_header_list_size` | Maximum decoded request header list size; `1..1048576` |
+| `max_send_buffer_size` | Maximum response bytes buffered per stream by the H2 implementation; `1..16777216` |
 | `data_frame_budget` | Connection-level allowance for queued small DATA-frame overhead; `1..16777216`. Packetized CONNECT-IP needs more than h2's generic HTTP default, but raising it increases the memory an abusive connection can consume. |
 | `max_datagram_size` | Maximum UDP payload or IP packet carried in one DATAGRAM capsule; `1..65527` |
 
@@ -689,6 +689,11 @@ Important relationships:
 
 - `initial_max_data` must not exceed `max_connection_window`.
 - `initial_max_stream_data` must not exceed `max_stream_window`.
+- `initial_max_streams_bidi` is limited to 4096.
+- `max_connection_window` is limited to 1 GiB and `max_stream_window` to
+  256 MiB.
+- Both `dgram_*_queue_len` values must be `1..4096`; queue depth is measured in
+  whole datagrams, so increasing it raises per-connection memory directly.
 - Path-MTU discovery cannot probe beyond `max_datagram_size`; raising only
   `discover_pmtu` has no benefit.
 - UDP GSO is opt-in because some virtual egress paths advertise it but drop

@@ -639,9 +639,12 @@ fn refuses_to_edit_a_file_another_edit_holds() {
         .truncate(false)
         .open(&lock_path)
         .unwrap();
-    // SAFETY: a descriptor this test owns, released when the file is dropped.
     assert_eq!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        unsafe {
+            // SAFETY: a descriptor this test owns, released when the file is
+            // dropped.
+            libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+        },
         0
     );
 

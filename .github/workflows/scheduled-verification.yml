@@ -16,6 +16,94 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  dependency-security:
+    name: Dependency vulnerabilities and policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - name: Restore security tool cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: security-tools-${{ runner.os }}-audit-0.22.2-deny-0.20.2
+
+      - name: Install pinned security tools
+        run: |
+          if ! cargo audit --version 2>/dev/null | grep -Fq '0.22.2'; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+          if ! cargo deny --version 2>/dev/null | grep -Fq '0.20.2'; then
+            cargo install cargo-deny --version 0.20.2 --locked
+          fi
+
+      - name: Audit RustSec advisories
+        run: cargo audit
+
+      - name: Enforce licenses and dependency sources
+        run: cargo deny --workspace --locked check licenses sources bans
+
+  linux-asan:
+    name: Linux GNU ASan and resource bounds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+      RUSTFLAGS: -Zsanitizer=address -Cforce-frame-pointers=yes
+      RUSTDOCFLAGS: -Zsanitizer=address -Cforce-frame-pointers=yes
+      MASQUE_RESOURCE_RSS_DELTA_MIB: "512"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install nightly Rust with instrumented standard library support
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake openssl
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: asan-${{ runner.os }}-nightly-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            asan-${{ runner.os }}-nightly-
+
+      - name: Exercise unsafe QUIC and target UDP packet paths
+        run: >-
+          cargo +nightly test -Zbuild-std
+          --target x86_64-unknown-linux-gnu --locked --lib net::
+
+      - name: Verify session tickets reject HTTP/3 Early Data
+        run: >-
+          cargo +nightly test -Zbuild-std
+          --target x86_64-unknown-linux-gnu --locked
+          --test client_cert_connect_ip
+          session_tickets_never_enable_zero_rtt_connect_requests
+
+      - name: Pressure authentication, streams, datagrams, and half-open peers
+        run: >-
+          cargo +nightly test -Zbuild-std
+          --target x86_64-unknown-linux-gnu --locked
+          --test resource_exhaustion -- --ignored --nocapture
+
   linux-network:
     name: Linux E2E and transport smoke
     runs-on: ubuntu-latest
