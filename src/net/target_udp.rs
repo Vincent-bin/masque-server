@@ -225,14 +225,11 @@ impl TargetRecvBatch {
 
 /// Read up to a batch of datagrams from a connected socket in one syscall.
 ///
-/// # Safety
-///
-/// `fd` must be a live, connected, nonblocking UDP socket.
+/// The caller should pass a connected, nonblocking UDP socket. An invalid or
+/// incompatible descriptor is reported by the kernel; all userspace pointers
+/// passed to it are constructed and retained inside this function.
 #[cfg(target_os = "linux")]
-pub unsafe fn recv_mmsg(
-    fd: std::os::fd::RawFd,
-    batch: &mut TargetRecvBatch,
-) -> std::io::Result<usize> {
+pub fn recv_mmsg(fd: std::os::fd::RawFd, batch: &mut TargetRecvBatch) -> std::io::Result<usize> {
     use std::os::raw::c_void;
 
     // Rebuilt per call because these hold raw pointers into `batch`.
@@ -285,6 +282,7 @@ unsafe fn raw_send_mmsg(
     headers: &mut [libc::mmsghdr; TARGET_BATCH_SIZE],
     count: usize,
 ) -> std::io::Result<usize> {
+    let count = count.min(TARGET_BATCH_SIZE);
     // SAFETY: The caller keeps every buffer referenced by `headers` alive for
     // this nonblocking call. Issued as a raw syscall because musl's `sendmmsg`
     // wrapper degrades into a loop of `sendmsg`.
@@ -305,7 +303,7 @@ unsafe fn raw_send_mmsg(
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn send_mmsg_plain(fd: std::os::fd::RawFd, payloads: &[Vec<u8>]) -> std::io::Result<usize> {
+fn send_mmsg_plain(fd: std::os::fd::RawFd, payloads: &[Vec<u8>]) -> std::io::Result<usize> {
     use std::os::raw::c_void;
 
     // Keep the disabled and small-datagram path equivalent to the original
@@ -315,7 +313,8 @@ unsafe fn send_mmsg_plain(fd: std::os::fd::RawFd, payloads: &[Vec<u8>]) -> std::
     // SAFETY: See above.
     let mut headers: [libc::mmsghdr; TARGET_BATCH_SIZE] = unsafe { std::mem::zeroed() };
 
-    for (index, payload) in payloads.iter().enumerate() {
+    let count = payloads.len().min(TARGET_BATCH_SIZE);
+    for (index, payload) in payloads.iter().take(count).enumerate() {
         iovecs[index] = libc::iovec {
             iov_base: payload.as_ptr().cast_mut().cast::<c_void>(),
             iov_len: payload.len(),
@@ -325,7 +324,7 @@ unsafe fn send_mmsg_plain(fd: std::os::fd::RawFd, payloads: &[Vec<u8>]) -> std::
     }
 
     // SAFETY: Every header points at the live iovec and payload storage above.
-    unsafe { raw_send_mmsg(fd, &mut headers, payloads.len()) }
+    unsafe { raw_send_mmsg(fd, &mut headers, count) }
 }
 
 /// Send a batch of datagrams on a connected socket in one syscall.
@@ -334,11 +333,11 @@ unsafe fn send_mmsg_plain(fd: std::os::fd::RawFd, payloads: &[Vec<u8>]) -> std::
 /// rest. With GSO enabled, several logical datagrams can be accepted as one
 /// kernel message.
 ///
-/// # Safety
-///
-/// `fd` must be a live, connected, nonblocking UDP socket.
+/// The caller should pass a connected, nonblocking UDP socket. An invalid or
+/// incompatible descriptor is reported by the kernel; all userspace pointers
+/// passed to it are constructed and retained inside this function.
 #[cfg(target_os = "linux")]
-pub unsafe fn send_mmsg(
+pub fn send_mmsg(
     fd: std::os::fd::RawFd,
     payloads: &[Vec<u8>],
     enable_gso: bool,
@@ -355,8 +354,7 @@ pub unsafe fn send_mmsg(
     // retain the exact low-overhead sendmmsg path for the whole batch; a later
     // large datagram can start a GSO batch on the next event-loop round.
     if !enable_gso || payloads[0].len() < UDP_MIN_GSO_SEGMENT_SIZE {
-        // SAFETY: This function carries the same live-socket contract.
-        return unsafe { send_mmsg_plain(fd, payloads) };
+        return send_mmsg_plain(fd, payloads);
     }
 
     let (groups, group_count) = plan_send(payloads, true);
@@ -521,8 +519,7 @@ mod tests {
         }
 
         let payloads = vec![vec![1; 1_200], vec![2; 1_200], vec![3; 600]];
-        // SAFETY: `sender` is live, connected, and nonblocking.
-        let sent = unsafe { send_mmsg(sender.as_raw_fd(), &payloads, true) }.unwrap();
+        let sent = send_mmsg(sender.as_raw_fd(), &payloads, true).unwrap();
         assert_eq!(sent, payloads.len());
 
         let expected = [(1_200, 1), (1_200, 2), (600, 3)];
@@ -551,8 +548,7 @@ mod tests {
         sender.set_nonblocking(true).unwrap();
 
         let payloads = vec![vec![1; 64], vec![2; 64], vec![3; 32]];
-        // SAFETY: `sender` is live, connected, and nonblocking.
-        let sent = unsafe { send_mmsg(sender.as_raw_fd(), &payloads, true) }.unwrap();
+        let sent = send_mmsg(sender.as_raw_fd(), &payloads, true).unwrap();
         assert_eq!(sent, payloads.len());
 
         let expected = [(64, 1), (64, 2), (32, 3)];
@@ -579,5 +575,16 @@ mod tests {
         batch.set_single(2_048);
         batch.truncated[0] = true;
         assert_eq!(batch.datagrams(1).count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn safe_batch_wrappers_reject_invalid_descriptors() {
+        let mut batch = TargetRecvBatch::new(1_350);
+        let receive_error = recv_mmsg(-1, &mut batch).unwrap_err();
+        assert_eq!(receive_error.raw_os_error(), Some(libc::EBADF));
+
+        let send_error = send_mmsg(-1, &[vec![0; 64]], false).unwrap_err();
+        assert_eq!(send_error.raw_os_error(), Some(libc::EBADF));
     }
 }

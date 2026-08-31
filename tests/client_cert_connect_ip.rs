@@ -222,6 +222,17 @@ impl Client {
     }
 
     fn connect_with(peer: SocketAddr, identity: Option<(&Path, &Path)>) -> anyhow::Result<Self> {
+        Self::connect_with_session(peer, identity, None, false)
+    }
+
+    /// Build a resuming client that is willing to send Early Data if the
+    /// server's ticket permits it. Production tickets must never do so.
+    fn connect_with_session(
+        peer: SocketAddr,
+        identity: Option<(&Path, &Path)>,
+        session: Option<&[u8]>,
+        enable_early_data: bool,
+    ) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -244,6 +255,9 @@ impl Client {
         config.set_initial_max_streams_bidi(16);
         config.set_initial_max_streams_uni(16);
         config.enable_dgram(true, 256, 256);
+        if enable_early_data {
+            config.enable_early_data();
+        }
 
         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut scid)
@@ -251,13 +265,18 @@ impl Client {
 
         // The SNI these clients send names the vendor's endpoint rather than
         // this server, which is exactly why they cannot verify the chain.
-        let quic = quiche::connect(
+        let mut quic = quiche::connect(
             Some("consumer-masque.cloudflareclient.com"),
             &quiche::ConnectionId::from_ref(&scid),
             local,
             peer,
             &mut config,
         )?;
+        if let Some(session) = session {
+            // This is still before the connection has emitted or received a
+            // packet, as required by quiche::Connection::set_session().
+            quic.set_session(session)?;
+        }
 
         Ok(Self {
             socket,
@@ -322,6 +341,19 @@ impl Client {
             }
         }
         anyhow::bail!("handshake timed out")
+    }
+
+    /// Receive the post-handshake session ticket and serialized QUIC transport
+    /// parameters needed to attempt a real resumed connection.
+    fn session(&mut self, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.drive()?;
+            if let Some(session) = self.quic.session() {
+                return Ok(session.to_vec());
+            }
+        }
+        anyhow::bail!("server did not issue a session ticket within {timeout:?}")
     }
 
     fn peer_certificate_der(&self) -> Vec<u8> {
@@ -1032,6 +1064,46 @@ fn quic_retry_always_completes_a_real_handshake() {
     let stream_id = client.send_connect_ip("connect-ip").unwrap();
     assert_eq!(
         client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+}
+
+/// A real ticket issued by the production TLS context must not allow the
+/// resuming client to construct HTTP/3 before the full handshake. Because
+/// CONNECT, CONNECT-UDP, and CONNECT-IP all enter through that same H3 layer,
+/// this prevents every tunnel kind from executing as replayable Early Data.
+#[test]
+fn session_tickets_never_enable_zero_rtt_connect_requests() {
+    let fixture = fixture("no-zero-rtt");
+    let identity = Some((fixture.client_cert.as_path(), fixture.client_key.as_path()));
+
+    let mut first = Client::connect_with_session(fixture.peer, identity, None, true).unwrap();
+    first.handshake(Duration::from_secs(5)).unwrap();
+    let session = first.session(Duration::from_secs(5)).unwrap();
+
+    let mut resumed =
+        Client::connect_with_session(fixture.peer, identity, Some(&session), true).unwrap();
+    // Emit the resumed Initial. If the ticket advertised 0-RTT, quiche would
+    // now report Early Data and permit H3 request headers to be serialized.
+    resumed.flush().unwrap();
+    assert!(
+        !resumed.quic.is_in_early_data(),
+        "the server's session ticket unexpectedly authorized Early Data"
+    );
+    assert!(
+        resumed.init_h3().is_err(),
+        "HTTP/3 became usable before the full handshake"
+    );
+
+    // Disabling Early Data must not disable ordinary session resumption or
+    // requests after the handshake.
+    resumed.handshake(Duration::from_secs(5)).unwrap();
+    resumed.init_h3().unwrap();
+    let stream_id = resumed.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        resumed
             .response_status(stream_id, Duration::from_secs(5))
             .unwrap(),
         200

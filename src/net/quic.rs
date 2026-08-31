@@ -132,11 +132,8 @@ impl RecvPacketBatch {
             return Err(io::Error::last_os_error());
         }
 
-        for (message, slot) in messages
-            .iter()
-            .zip(self.slots.iter_mut())
-            .take(result as usize)
-        {
+        let received = (result as usize).min(count);
+        for (message, slot) in messages.iter().zip(self.slots.iter_mut()).take(received) {
             if message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
                 continue;
             }
@@ -148,7 +145,7 @@ impl RecvPacketBatch {
                 .unwrap_or(slot.len);
         }
 
-        Ok(result as usize)
+        Ok(received)
     }
 }
 
@@ -600,10 +597,14 @@ fn gro_segment_size(header: &libc::msghdr) -> Option<usize> {
     // CMSG_FIRSTHDR validates that it contains at least a cmsghdr.
     unsafe {
         let control = libc::CMSG_FIRSTHDR(header);
+        let required = libc::CMSG_LEN(std::mem::size_of::<u16>() as _) as usize;
+        let control_len = header.msg_controllen as usize;
         if control.is_null()
+            || control_len < required
             || (*control).cmsg_level != libc::IPPROTO_UDP
             || (*control).cmsg_type != libc::UDP_GRO
-            || (*control).cmsg_len < libc::CMSG_LEN(std::mem::size_of::<u16>() as _) as _
+            || ((*control).cmsg_len as usize) < required
+            || ((*control).cmsg_len as usize) > control_len
         {
             return None;
         }
@@ -766,7 +767,7 @@ fn send_mmsg(
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(result as usize)
+        Ok((result as usize).min(count))
     }
 }
 
@@ -893,6 +894,44 @@ mod tests {
         // SAFETY: The argument is a small constant payload length.
         let required = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as _) as usize };
         assert!(std::mem::size_of::<ControlBuffer>() >= required);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gro_control_message_requires_a_bounded_u16_payload() {
+        use std::os::raw::c_void;
+
+        let mut control = ControlBuffer::default();
+        let control_header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        // SAFETY: `control` is aligned and large enough for this header and
+        // u16 payload, as checked by the preceding test.
+        unsafe {
+            (*control_header).cmsg_level = libc::IPPROTO_UDP;
+            (*control_header).cmsg_type = libc::UDP_GRO;
+            (*control_header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as _) as _;
+            libc::CMSG_DATA(control_header).cast::<u16>().write(1_200);
+        }
+
+        // SAFETY: Zero is a valid initial representation for msghdr; the
+        // control pointer and length are filled before inspection.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_control = control.as_mut_ptr().cast::<c_void>();
+        // SAFETY: The argument is a small constant payload length.
+        let required = unsafe { libc::CMSG_LEN(std::mem::size_of::<u16>() as _) as usize };
+        message.msg_controllen = required as _;
+        assert_eq!(gro_segment_size(&message), Some(1_200));
+
+        // A kernel- or ABI-supplied cmsg length may never authorize a read
+        // beyond the actual control buffer described by msghdr.
+        // SAFETY: Only the initialized cmsghdr field is changed.
+        unsafe { (*control_header).cmsg_len = (required + 1) as _ };
+        assert_eq!(gro_segment_size(&message), None);
+
+        // Restore the header, then truncate the outer buffer description.
+        // SAFETY: Only the initialized cmsghdr field is changed.
+        unsafe { (*control_header).cmsg_len = required as _ };
+        message.msg_controllen = (required - 1) as _;
+        assert_eq!(gro_segment_size(&message), None);
     }
 
     #[cfg(target_os = "linux")]

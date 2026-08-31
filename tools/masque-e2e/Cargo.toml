@@ -2,6 +2,14 @@
 name = "masque-e2e"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "End-to-end and benchmark client for masque-server development"
+license = "MIT"
+repository = "https://github.com/Vincent-bin/masque-server"
+publish = false
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "masque-e2e"

@@ -19,6 +19,21 @@ use tracing::warn;
 
 use crate::config::TlsSection;
 
+/// Disable TLS 1.3 Early Data on a server context, even if a future quiche
+/// default or refactor starts enabling it elsewhere.
+///
+/// MASQUE CONNECT requests create network side effects and are not replay
+/// safe. Session resumption remains enabled; only 0-RTT application data is
+/// refused, so every CONNECT waits for the peer's Finished message.
+pub(super) fn disable_early_data(builder: &mut SslContextBuilder) {
+    unsafe {
+        // SAFETY: `builder.as_ptr()` is the live, uniquely configured SSL_CTX
+        // owned by this builder. BoringSSL only flips a context boolean and
+        // neither retains the pointer nor transfers ownership.
+        boring_sys::SSL_CTX_set_early_data_enabled(builder.as_ptr(), 0);
+    }
+}
+
 /// One completely parsed and matched server certificate chain and private key.
 ///
 /// Keeping parsed BoringSSL objects rather than file paths is what makes a

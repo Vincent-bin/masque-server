@@ -93,6 +93,18 @@ connection IDs.
 Do not respond to overload by making queues arbitrarily deep; this can turn
 packet loss into seconds of latency and make memory exhaustion easier.
 
+Configuration validation also applies hard ceilings to attacker-controlled
+protocol credit: connection and tunnel counts, H2/H3 stream counts, receive
+windows, H2 header/send buffers, and both QUIC DATAGRAM queues. This prevents a
+mistyped deployment value from silently removing the runtime bounds.
+Process-lifetime `*_max` metrics make the actual connection, tunnel, and
+authentication high-water marks observable after a burst has ended.
+
+The scheduled Linux pressure test runs the daemon as a separate process and
+floods wrong passwords, half-open TLS sockets, excess streams, and DATAGRAM
+capsules. It checks authentication and tunnel high-water marks, CPU ticks,
+resident-memory growth, and `/proc/<pid>/fd` against the configured ceilings.
+
 `masque-server support-bundle` is deliberately a metadata-only diagnostic. It
 does not copy the configuration, logs, environment, usernames, password hashes,
 client labels or keys, certificate identities, target addresses, or traffic
@@ -121,6 +133,12 @@ Each successful reload advances the TLS session ID context. Session tickets
 from the previous identity or roster therefore cannot bypass certificate
 rotation or client revocation: BoringSSL falls back to a full handshake and
 issues tickets in the new context.
+
+TLS 1.3 Early Data is unconditionally disabled. CONNECT, CONNECT-UDP, and
+CONNECT-IP create externally visible network effects and are not replay-safe;
+they are accepted only after the peer's Finished message. Session resumption
+still works, but a ticket issued by this server never authorizes 0-RTT. The H3
+application gate independently rejects an Early Data state as defense in depth.
 
 The right server certificate depends on the authentication mode, because the
 two modes establish server identity in completely different ways.
@@ -197,11 +215,32 @@ than permission to install a broad ACCEPT or MASQUERADE rule automatically.
 
 ## Unsafe and syscall code
 
+The complete production unsafe inventory is intentionally small:
+
+| Module | Unsafe boundary | Invariant checked in review |
+| --- | --- | --- |
+| `src/net/quic.rs` | socket setup, `recvmmsg`/`sendmmsg`, sockaddr and ancillary-data layouts | Counts are clamped to fixed arrays; raw pointers refer to live per-call storage; address/control lengths are checked before typed reads |
+| `src/net/target_udp.rs` | `recvmmsg`/`sendmmsg` and UDP GSO ancillary data | Public batching wrappers are safe; only the private syscall receives raw interior pointers; payload and result counts are clamped |
+| `src/server/tls.rs` | two BoringSSL context/connection setters | Pointers come from live safe wrappers; BoringSSL copies bounded context bytes or changes one context flag without retaining ownership |
+| `src/config_edit.rs` | terminal attributes, ownership, and advisory file locks | Every descriptor is owned and live; initialized `termios` is restored by an RAII guard |
+
 Linux batching constructs `mmsghdr`, `iovec`, socket-address, and control
 message arrays that contain raw pointers. They are rebuilt per syscall, point
-only to live storage, are zero-initialized for ABI padding, and never escape
-the call. Any change to these layouts requires Linux musl and GNU tests plus
-boundary tests for control buffers and datagram truncation.
+only to live storage, and never escape the call. `unsafe_op_in_unsafe_fn` and
+Clippy's `undocumented_unsafe_blocks` are denied workspace-wide. The weekly
+Linux GNU ASan job directly exercises both packet modules; any layout change
+still requires GNU and musl tests plus control-buffer and truncation boundaries.
+The development-only E2E and probe tools use a few reviewed `setsockopt` and
+`if_nametoindex` calls; the same workspace lint policy applies to them.
+
+## Dependency security
+
+The weekly security workflow uses pinned `cargo-audit` and `cargo-deny`
+versions. Known RustSec vulnerabilities fail the audit, while informational
+warnings such as an unmaintained transitive crate remain visible. `deny.toml`
+restricts licenses and dependency registries/sources while reporting duplicate
+transitive versions. Workspace path dependencies are the sole wildcard
+exception because they are private code resolved from the same checkout.
 
 ## Reporting
 

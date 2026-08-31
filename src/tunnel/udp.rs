@@ -334,14 +334,11 @@ impl UdpTunnel {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            // SAFETY: The socket is live, connected, and nonblocking.
-            let sent = match unsafe {
-                target_udp::send_mmsg(
-                    self.send_socket.as_raw_fd(),
-                    &self.send_stage[..staged],
-                    self.udp_gso,
-                )
-            } {
+            let sent = match target_udp::send_mmsg(
+                self.send_socket.as_raw_fd(),
+                &self.send_stage[..staged],
+                self.udp_gso,
+            ) {
                 Ok(sent) => sent,
                 Err(error) if self.udp_gso && target_udp::is_udp_gso_error(&error) => {
                     self.udp_gso = false;
@@ -350,15 +347,11 @@ impl UdpTunnel {
                         %error,
                         "target UDP GSO unavailable, falling back to sendmmsg"
                     );
-                    // SAFETY: The socket is still live, connected, and
-                    // nonblocking; no message was accepted on the failed call.
-                    unsafe {
-                        target_udp::send_mmsg(
-                            self.send_socket.as_raw_fd(),
-                            &self.send_stage[..staged],
-                            false,
-                        )
-                    }?
+                    target_udp::send_mmsg(
+                        self.send_socket.as_raw_fd(),
+                        &self.send_stage[..staged],
+                        false,
+                    )?
                 }
                 Err(error) => return Err(error),
             };

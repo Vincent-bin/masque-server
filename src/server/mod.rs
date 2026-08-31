@@ -114,6 +114,23 @@ const MAX_PENDING_AUTH_GLOBAL: usize = 256;
 /// that is what `Shared::auth_permits` does.
 const MAX_PENDING_AUTH_PER_CONNECTION: usize = 16;
 
+/// Configuration ceilings that keep one hostile connection, or one mistaken
+/// configuration edit, from turning protocol credit into unbounded memory.
+/// Defaults remain far below these values; the ceilings leave room for large
+/// deployments while making the worst case auditable.
+const MAX_CONFIGURED_CONNECTIONS: usize = 1_000_000;
+const MAX_CONFIGURED_CONNECTIONS_PER_IP: usize = 65_536;
+const MAX_TUNNELS_PER_CONNECTION: usize = 4_096;
+const MAX_QUIC_STREAMS_BIDI: u64 = 4_096;
+const MAX_QUIC_DATAGRAM_QUEUE_LEN: usize = 4_096;
+const MAX_QUIC_CONNECTION_WINDOW: u64 = 1024 * 1024 * 1024;
+const MAX_QUIC_STREAM_WINDOW: u64 = 256 * 1024 * 1024;
+const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 4_096;
+const MAX_HTTP2_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+const MAX_HTTP2_CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+const MAX_HTTP2_HEADER_LIST_SIZE: u32 = 1024 * 1024;
+const MAX_HTTP2_SEND_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
 /// How many fresh kernel-selected ports to try when an ephemeral listener
 /// happens to overlap another listener.
 ///
@@ -516,11 +533,19 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
 
-    if config.server.max_connections == 0 {
-        anyhow::bail!("server.max_connections must be at least 1");
+    if !(1..=MAX_CONFIGURED_CONNECTIONS).contains(&config.server.max_connections) {
+        anyhow::bail!(
+            "server.max_connections ({}) must be between 1 and {}",
+            config.server.max_connections,
+            MAX_CONFIGURED_CONNECTIONS
+        );
     }
-    if config.server.max_connections_per_ip == 0 {
-        anyhow::bail!("server.max_connections_per_ip must be at least 1");
+    if !(1..=MAX_CONFIGURED_CONNECTIONS_PER_IP).contains(&config.server.max_connections_per_ip) {
+        anyhow::bail!(
+            "server.max_connections_per_ip ({}) must be between 1 and {}",
+            config.server.max_connections_per_ip,
+            MAX_CONFIGURED_CONNECTIONS_PER_IP
+        );
     }
     if !(1..=MAX_PENDING_AUTH_GLOBAL).contains(&config.server.max_pending_auth_per_ip) {
         anyhow::bail!(
@@ -529,8 +554,12 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
             MAX_PENDING_AUTH_GLOBAL
         );
     }
-    if config.server.max_tunnels_per_connection == 0 {
-        anyhow::bail!("server.max_tunnels_per_connection must be at least 1");
+    if !(1..=MAX_TUNNELS_PER_CONNECTION).contains(&config.server.max_tunnels_per_connection) {
+        anyhow::bail!(
+            "server.max_tunnels_per_connection ({}) must be between 1 and {}",
+            config.server.max_tunnels_per_connection,
+            MAX_TUNNELS_PER_CONNECTION
+        );
     }
     const MAX_TARGET_CONNECT_TIMEOUT_SECS: u64 = 300;
     if !(1..=MAX_TARGET_CONNECT_TIMEOUT_SECS).contains(&config.tcp_proxy.connect_timeout_secs) {
@@ -611,6 +640,37 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
             config.quic.initial_max_stream_data
         );
     }
+    if config.quic.max_connection_window > MAX_QUIC_CONNECTION_WINDOW {
+        anyhow::bail!(
+            "quic.max_connection_window ({}) must not exceed {} bytes",
+            config.quic.max_connection_window,
+            MAX_QUIC_CONNECTION_WINDOW
+        );
+    }
+    if config.quic.max_stream_window > MAX_QUIC_STREAM_WINDOW {
+        anyhow::bail!(
+            "quic.max_stream_window ({}) must not exceed {} bytes",
+            config.quic.max_stream_window,
+            MAX_QUIC_STREAM_WINDOW
+        );
+    }
+    if !(1..=MAX_QUIC_STREAMS_BIDI).contains(&config.quic.initial_max_streams_bidi) {
+        anyhow::bail!(
+            "quic.initial_max_streams_bidi ({}) must be between 1 and {}",
+            config.quic.initial_max_streams_bidi,
+            MAX_QUIC_STREAMS_BIDI
+        );
+    }
+    for (name, value) in [
+        ("dgram_recv_queue_len", config.quic.dgram_recv_queue_len),
+        ("dgram_send_queue_len", config.quic.dgram_send_queue_len),
+    ] {
+        if !(1..=MAX_QUIC_DATAGRAM_QUEUE_LEN).contains(&value) {
+            anyhow::bail!(
+                "quic.{name} ({value}) must be between 1 and {MAX_QUIC_DATAGRAM_QUEUE_LEN}"
+            );
+        }
+    }
 
     if !(quiche::MIN_CLIENT_INITIAL_LEN..=MAX_DATAGRAM_SIZE)
         .contains(&config.quic.max_datagram_size)
@@ -623,32 +683,37 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
         );
     }
 
-    const MAX_HTTP2_WINDOW: u32 = (1_u32 << 31) - 1;
-    if !(1..=MAX_HTTP2_WINDOW).contains(&config.http2.initial_stream_window) {
+    if !(1..=MAX_HTTP2_STREAM_WINDOW).contains(&config.http2.initial_stream_window) {
         anyhow::bail!(
-            "http2.initial_stream_window ({}) must be between 1 and {MAX_HTTP2_WINDOW}",
+            "http2.initial_stream_window ({}) must be between 1 and {MAX_HTTP2_STREAM_WINDOW}",
             config.http2.initial_stream_window
         );
     }
-    if !(1..=MAX_HTTP2_WINDOW).contains(&config.http2.initial_connection_window) {
+    if !(1..=MAX_HTTP2_CONNECTION_WINDOW).contains(&config.http2.initial_connection_window) {
         anyhow::bail!(
-            "http2.initial_connection_window ({}) must be between 1 and {MAX_HTTP2_WINDOW}",
+            "http2.initial_connection_window ({}) must be between 1 and {MAX_HTTP2_CONNECTION_WINDOW}",
             config.http2.initial_connection_window
         );
     }
-    if config.http2.max_concurrent_streams == 0 {
-        anyhow::bail!("http2.max_concurrent_streams must be at least 1");
+    if !(1..=MAX_HTTP2_CONCURRENT_STREAMS).contains(&config.http2.max_concurrent_streams) {
+        anyhow::bail!(
+            "http2.max_concurrent_streams ({}) must be between 1 and {}",
+            config.http2.max_concurrent_streams,
+            MAX_HTTP2_CONCURRENT_STREAMS
+        );
     }
-    if config.http2.max_header_list_size == 0 {
-        anyhow::bail!("http2.max_header_list_size must be at least 1");
+    if !(1..=MAX_HTTP2_HEADER_LIST_SIZE).contains(&config.http2.max_header_list_size) {
+        anyhow::bail!(
+            "http2.max_header_list_size ({}) must be between 1 and {}",
+            config.http2.max_header_list_size,
+            MAX_HTTP2_HEADER_LIST_SIZE
+        );
     }
-    if config.http2.max_send_buffer_size == 0
-        || config.http2.max_send_buffer_size > u32::MAX as usize
-    {
+    if !(1..=MAX_HTTP2_SEND_BUFFER_SIZE).contains(&config.http2.max_send_buffer_size) {
         anyhow::bail!(
             "http2.max_send_buffer_size ({}) must be between 1 and {}",
             config.http2.max_send_buffer_size,
-            u32::MAX
+            MAX_HTTP2_SEND_BUFFER_SIZE
         );
     }
     const MAX_HTTP2_DATA_FRAME_BUDGET: usize = 16 * 1024 * 1024;
@@ -1627,6 +1692,11 @@ fn build_quic_config(
     // the identity it already negotiated.
     let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
         .map_err(|e| anyhow::anyhow!("failed to create TLS context: {e}"))?;
+    // CONNECT, CONNECT-UDP, and CONNECT-IP all create externally observable
+    // side effects and therefore must never be accepted as replayable 0-RTT
+    // data. Keep resumption, but lock Early Data off explicitly rather than
+    // relying on quiche's current default.
+    tls::disable_early_data(&mut builder);
     tls::configure_dynamic_identity(&mut builder, tls_identity);
     if let Some(roster) = client_certs {
         // quiche's normal peer verification cannot express the self-signed,
@@ -1810,9 +1880,7 @@ async fn recv_target_batch(
 
         socket
             .async_io(Interest::READABLE, || {
-                // SAFETY: The socket is live, connected, and nonblocking for
-                // the duration of this readiness callback.
-                unsafe { target_udp::recv_mmsg(socket.as_raw_fd(), batch) }
+                target_udp::recv_mmsg(socket.as_raw_fd(), batch)
             })
             .await
     }
@@ -2841,8 +2909,10 @@ impl Shard {
             }
         }
 
-        // Upgrade to HTTP/3 once QUIC handshake completes.
-        if client.h3.is_none() && client.quic.is_established() {
+        // Upgrade only after the full handshake. The TLS context rejects
+        // Early Data; the second condition is defense in depth against a
+        // future TLS/configuration regression reaching this application gate.
+        if client.h3.is_none() && client.quic.is_established() && !client.quic.is_in_early_data() {
             match quiche::h3::Connection::with_transport(&mut client.quic, &self.h3_config) {
                 Ok(h3) => {
                     client.h3 = Some(h3);
@@ -4403,6 +4473,50 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("retry_token_ttl_secs"));
+    }
+
+    #[test]
+    fn attacker_controlled_protocol_credit_has_configuration_ceilings() {
+        let mut config = ServerConfig::default();
+        config.listeners[0].auth.enabled = false;
+        let error = |config: &ServerConfig| match super::validate_server_config(config) {
+            Ok(_) => panic!("oversized resource configuration must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        config.server.max_connections = super::MAX_CONFIGURED_CONNECTIONS + 1;
+        let message = error(&config);
+        assert!(message.contains("max_connections"), "{message}");
+        config.server.max_connections = 10_000;
+
+        config.server.max_tunnels_per_connection = super::MAX_TUNNELS_PER_CONNECTION + 1;
+        let message = error(&config);
+        assert!(message.contains("max_tunnels_per_connection"), "{message}");
+        config.server.max_tunnels_per_connection = 100;
+
+        config.quic.initial_max_streams_bidi = super::MAX_QUIC_STREAMS_BIDI + 1;
+        let message = error(&config);
+        assert!(message.contains("initial_max_streams_bidi"), "{message}");
+        config.quic.initial_max_streams_bidi = 128;
+
+        config.quic.dgram_recv_queue_len = super::MAX_QUIC_DATAGRAM_QUEUE_LEN + 1;
+        let message = error(&config);
+        assert!(message.contains("dgram_recv_queue_len"), "{message}");
+        config.quic.dgram_recv_queue_len = 2_048;
+
+        config.quic.max_connection_window = super::MAX_QUIC_CONNECTION_WINDOW + 1;
+        let message = error(&config);
+        assert!(message.contains("max_connection_window"), "{message}");
+        config.quic.max_connection_window = 24 * 1024 * 1024;
+
+        config.http2.max_concurrent_streams = super::MAX_HTTP2_CONCURRENT_STREAMS + 1;
+        let message = error(&config);
+        assert!(message.contains("max_concurrent_streams"), "{message}");
+        config.http2.max_concurrent_streams = 128;
+
+        config.http2.initial_connection_window = super::MAX_HTTP2_CONNECTION_WINDOW + 1;
+        let message = error(&config);
+        assert!(message.contains("initial_connection_window"), "{message}");
     }
 
     #[test]
