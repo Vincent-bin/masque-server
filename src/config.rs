@@ -121,6 +121,10 @@ pub struct AuthSection {
     /// Master switch. `false` disables authentication whatever `mode` says.
     pub enabled: bool,
     pub mode: AuthMode,
+    /// Hide Basic authentication failures behind the same empty `404` used
+    /// for unsupported HTTP requests instead of advertising a `407` challenge.
+    /// Clients must send `Proxy-Authorization` on their first CONNECT.
+    pub stealth: bool,
     /// Legacy single-user spelling retained so existing configurations keep
     /// working. New configurations should use repeated
     /// `[[listeners.auth.users]]` tables instead.
@@ -161,6 +165,7 @@ impl std::fmt::Debug for AuthSection {
         f.debug_struct("AuthSection")
             .field("enabled", &self.enabled)
             .field("mode", &self.mode)
+            .field("stealth", &self.stealth)
             .field("username", &self.username)
             .field(
                 "password_hash",
@@ -184,6 +189,11 @@ impl AuthSection {
     /// Whether a client certificate is required to complete the handshake.
     pub fn client_cert_enabled(&self) -> bool {
         self.enabled && self.mode == AuthMode::ClientCert
+    }
+
+    /// Whether failed Basic authorization should resemble an ordinary 404.
+    pub fn stealth_enabled(&self) -> bool {
+        self.basic_enabled() && self.stealth
     }
 }
 
@@ -437,6 +447,7 @@ impl Default for AuthSection {
             // credentials or explicitly opts out for a private test setup.
             enabled: true,
             mode: AuthMode::Basic,
+            stealth: false,
             username: String::new(),
             password_hash: String::new(),
             users: Vec::new(),

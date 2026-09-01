@@ -28,7 +28,7 @@ Proxy-Authorization: Basic BASE64(username:password)
 
 The server validates syntax, looks up the username in that listener's account
 set, and snapshots only the matching Argon2id hash before scheduling password
-verification. Missing or invalid credentials return:
+verification. Missing or invalid credentials normally return:
 
 ```text
 :status: 407
@@ -37,6 +37,11 @@ proxy-authenticate: Basic realm="masque", charset="UTF-8"
 
 Authentication is per request, so one authenticated tunnel does not authorize
 later streams that omit the header.
+
+When that listener sets `auth.stealth = true`, the failure response is instead
+an empty `404` without `proxy-authenticate`. Correct credentials must therefore
+arrive on the first CONNECT request. This changes only the unauthenticated
+response, not successful proxy protocol behavior.
 
 With a listener's `auth.mode = "client_cert"` there is no per-request step: the client is
 identified once, from its TLS client certificate, during the TLS handshake. An
@@ -117,8 +122,8 @@ head-of-line block unrelated IP packets after loss.
 | `200` | Tunnel established |
 | `400` | Malformed headers, authority, URI, datagram, or capsule |
 | `403` | Target rejected by policy or proxy type disabled |
-| `404` | Request is not a supported CONNECT endpoint |
-| `407` | Proxy credentials missing or invalid |
+| `404` | Unsupported CONNECT endpoint, or failed Basic authentication with `auth.stealth = true` |
+| `407` | Proxy credentials missing or invalid on a default Basic listener |
 | `429` / `503` | Per-connection or global setup capacity exhausted |
 | `502` | DNS, target socket, or upstream TCP setup failed |
 

@@ -56,12 +56,20 @@ pub(super) async fn authorize_request(
     let mut values = request.headers().get_all(PROXY_AUTHORIZATION).iter();
     let first = values.next().map(HeaderValue::as_bytes);
     if values.next().is_some() {
-        let _ = send_proxy_auth_required(respond);
+        let _ = send_auth_rejection(
+            respond,
+            context.stealth_auth,
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        );
         return Authorization::ResponseSent;
     }
     let (credential, password) = match auth.precheck(first) {
         AuthPrecheck::Rejected => {
-            let _ = send_proxy_auth_required(respond);
+            let _ = send_auth_rejection(
+                respond,
+                context.stealth_auth,
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            );
             return Authorization::ResponseSent;
         }
         AuthPrecheck::NeedsVerify {
@@ -73,7 +81,11 @@ pub(super) async fn authorize_request(
         Ok(slot) => slot,
         Err(_) => {
             context.metrics.record_auth_overloaded();
-            let _ = send_error(respond, StatusCode::SERVICE_UNAVAILABLE);
+            let _ = send_auth_rejection(
+                respond,
+                context.stealth_auth,
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             return Authorization::ResponseSent;
         }
     };
@@ -81,7 +93,11 @@ pub(super) async fn authorize_request(
         Some(slot) => slot,
         None => {
             context.metrics.record_auth_overloaded();
-            let _ = send_error(respond, StatusCode::SERVICE_UNAVAILABLE);
+            let _ = send_auth_rejection(
+                respond,
+                context.stealth_auth,
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             return Authorization::ResponseSent;
         }
     };
@@ -102,11 +118,19 @@ pub(super) async fn authorize_request(
     match authorized {
         AuthResult::Authorized => Authorization::Granted,
         AuthResult::Rejected => {
-            let _ = send_proxy_auth_required(respond);
+            let _ = send_auth_rejection(
+                respond,
+                context.stealth_auth,
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            );
             Authorization::ResponseSent
         }
         AuthResult::Overloaded => {
-            let _ = send_error(respond, StatusCode::SERVICE_UNAVAILABLE);
+            let _ = send_auth_rejection(
+                respond,
+                context.stealth_auth,
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             Authorization::ResponseSent
         }
     }
@@ -172,4 +196,18 @@ fn send_proxy_auth_required(respond: &mut SendResponse<Bytes>) -> Result<(), h2:
         .body(())
         .expect("static proxy-authenticate response is valid");
     respond.send_response(response, true).map(|_| ())
+}
+
+fn send_auth_rejection(
+    respond: &mut SendResponse<Bytes>,
+    stealth: bool,
+    fallback: StatusCode,
+) -> Result<(), h2::Error> {
+    if stealth {
+        send_error(respond, StatusCode::NOT_FOUND)
+    } else if fallback == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        send_proxy_auth_required(respond)
+    } else {
+        send_error(respond, fallback)
+    }
 }

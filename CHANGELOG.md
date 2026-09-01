@@ -7,6 +7,17 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.12.1 - 2026-09-01
+
+### Added
+
+- Basic listeners can opt into `auth.stealth = true`, making missing, malformed,
+  or invalid authorization and authentication overload look like an ordinary
+  empty `404` instead of exposing a `407` challenge or `503`. HTTP/2 and HTTP/3
+  share the behavior, while correct proactive credentials are unaffected.
+- `add-listener --stealth` and the installer's `MASQUE_BASIC_STEALTH=1` expose
+  the mode without hand-editing a generated configuration.
+
 ## 0.12.0 - 2026-09-01
 
 ### Added

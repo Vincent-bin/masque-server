@@ -563,21 +563,22 @@ impl Client {
         Ok(stream_id)
     }
 
-    /// Wait for the response status on `stream_id`.
-    fn response_status(&mut self, stream_id: u64, timeout: Duration) -> anyhow::Result<u16> {
+    /// Wait for the response headers on `stream_id`.
+    fn response_headers(
+        &mut self,
+        stream_id: u64,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             loop {
                 let h3 = self.h3.as_mut().unwrap();
                 match h3.poll(&mut self.quic) {
                     Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
-                        for header in &list {
-                            if header.name() == b":status" {
-                                let status = std::str::from_utf8(header.value())?;
-                                return Ok(status.parse()?);
-                            }
-                        }
-                        anyhow::bail!("response had no :status");
+                        return Ok(list
+                            .iter()
+                            .map(|header| (header.name().to_vec(), header.value().to_vec()))
+                            .collect());
                     }
                     Ok(_) => continue,
                     Err(quiche::h3::Error::Done) => break,
@@ -587,6 +588,17 @@ impl Client {
             self.drive()?;
         }
         anyhow::bail!("no response within {timeout:?}")
+    }
+
+    /// Wait for the response status on `stream_id`.
+    fn response_status(&mut self, stream_id: u64, timeout: Duration) -> anyhow::Result<u16> {
+        let headers = self.response_headers(stream_id, timeout)?;
+        let status = headers
+            .iter()
+            .find(|(name, _)| name == b":status")
+            .map(|(_, value)| value.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("response had no :status"))?;
+        Ok(std::str::from_utf8(status)?.parse()?)
     }
 
     /// Collect capsules from the response body until `wanted` of them arrive.
@@ -714,6 +726,10 @@ struct DualFixture {
 /// `auth.mode` fixes the TLS context when a socket is bound, so this is the
 /// only shape in which one process can serve both.
 fn dual_fixture(tag: &str) -> DualFixture {
+    dual_fixture_with_stealth(tag, false)
+}
+
+fn dual_fixture_with_stealth(tag: &str, stealth: bool) -> DualFixture {
     let dir = TempDir::new(tag);
 
     let server_key = p256_key();
@@ -750,6 +766,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
+                stealth,
                 username: BASIC_USERNAME.into(),
                 password_hash: masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap(),
                 users: Vec::new(),
@@ -762,6 +779,7 @@ fn dual_fixture(tag: &str) -> DualFixture {
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,
+                stealth: false,
                 username: String::new(),
                 password_hash: String::new(),
                 users: Vec::new(),
@@ -1391,6 +1409,61 @@ fn a_listener_enforces_only_its_own_authentication_mode() {
     assert!(
         client.wait_for_close(Duration::from_secs(5)),
         "Basic credentials must not open the certificate listener"
+    );
+}
+
+/// Surge sends Basic authorization proactively on every CONNECT, so hiding
+/// the challenge must preserve a successful first request while making all
+/// unauthenticated failures indistinguishable from the ordinary H3 404.
+#[test]
+fn stealth_basic_listener_hides_the_challenge_and_accepts_first_request_credentials() {
+    let fixture = dual_fixture_with_stealth("dual-stealth", true);
+    let mut client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+
+    let stream_id = client.send_connect_ip("connect-ip").unwrap();
+    let headers = client
+        .response_headers(stream_id, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| name == b":status")
+            .map(|(_, value)| value.as_slice()),
+        Some(b"404".as_slice())
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|(name, _)| name != b"proxy-authenticate"),
+        "a stealth response must not advertise Basic authentication"
+    );
+
+    let wrong = format!(
+        "Basic {}",
+        STANDARD.encode(format!("{BASIC_USERNAME}:wrong"))
+    );
+    let stream_id = client
+        .send_connect_ip_with_credentials("connect-ip", Some(&wrong))
+        .unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        404,
+        "wrong credentials must use the same camouflage response"
+    );
+
+    let stream_id = client
+        .send_connect_ip_with_credentials("connect-ip", Some(&fixture.credentials))
+        .unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200,
+        "correct credentials on the first request must still work"
     );
 }
 

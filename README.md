@@ -17,8 +17,8 @@ a staging environment.
 - HTTP/3 over UDP for performance, plus HTTP/2 Extended CONNECT and the
   Cloudflare/usque CONNECT-IP dialect over TCP/TLS as compatibility fallbacks
 - Multiple HTTP Basic accounts per listener with Argon2id password
-  verification, or TLS client-certificate authentication against a public-key
-  roster
+  verification and optional 404 response camouflage, or TLS client-certificate
+  authentication against a public-key roster
 - Multiple listeners in one process, each with its own Basic or client-certificate
   authentication mode while sharing proxy policies, client roster, and TUN state
 - CIDR allow and deny policies for TCP and UDP targets
@@ -76,6 +76,11 @@ identity remains active.
 
 Authentication is fail-closed. In `basic` mode the server refuses to start until
 at least one uniquely named account with a valid Argon2id hash is configured.
+Clients such as Surge send Basic authorization on their first CONNECT, so a
+Basic listener may set `stealth = true` to return an ordinary empty 404 instead
+of advertising a 407 challenge to unauthenticated probes. See
+[Authentication](docs/configuration.md#authentication) for the compatibility
+and security limits of this option.
 
 Alternatively, set `mode = "client_cert"` in `[listeners.auth]` to authenticate
 clients during the TLS handshake. Generate each client's P-256 key and
@@ -187,7 +192,8 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
 ```
 
 For a new configuration the installer prompts for `basic`, `client_cert`, or
-`dual` authentication and optional TLS file locations. Basic mode creates the
+`dual` authentication, optional Basic stealth mode, and optional TLS file
+locations. Basic mode creates the
 first account, generates a random password when none is supplied, and can write
 a ready-to-import Surge configuration while the plaintext is still available.
 Client-certificate mode enrolls the first

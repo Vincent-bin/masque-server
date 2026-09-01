@@ -167,6 +167,11 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
 
+        /// Hide missing or invalid Basic credentials behind an ordinary 404.
+        /// The client must send authorization on its first CONNECT request.
+        #[arg(long, conflicts_with = "disable_auth")]
+        stealth: bool,
+
         /// Emit a ready-to-import client configuration while the plaintext
         /// password is still available.
         #[arg(
@@ -574,6 +579,7 @@ async fn main() -> anyhow::Result<()> {
         client_name,
         client_out,
         disable_auth,
+        stealth,
         no_bind_check,
         dry_run,
         yes,
@@ -604,6 +610,7 @@ async fn main() -> anyhow::Result<()> {
                 password_stdin: *password_stdin,
                 client_output,
                 disable_auth: *disable_auth,
+                stealth: *stealth,
                 no_bind_check: *no_bind_check,
                 dry_run: *dry_run,
                 assume_yes: *yes,

@@ -45,6 +45,7 @@ pub(super) struct Http2Listener {
     config: Arc<ServerConfig>,
     shared: Arc<Shared>,
     auth: Option<Arc<SharedBasicAuthenticator>>,
+    stealth_auth: bool,
     client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
@@ -82,6 +83,7 @@ impl Http2Listener {
             .auth
             .client_cert_enabled()
             .then(|| Arc::clone(&shared.clients));
+        let stealth_auth = listener.auth.stealth_enabled();
 
         info!(addr = %listen_addr, transport = "http2", "listening");
         Ok(Self {
@@ -100,6 +102,7 @@ impl Http2Listener {
             config,
             shared,
             auth,
+            stealth_auth,
             client_certs,
             metrics,
         })
@@ -156,6 +159,7 @@ impl Http2Listener {
                         config: Arc::clone(&self.config),
                         shared: Arc::clone(&self.shared),
                         auth: self.auth.as_ref().map(Arc::clone),
+                        stealth_auth: self.stealth_auth,
                         client_certs: self.client_certs.as_ref().map(Arc::clone),
                         tcp_policy: self.tcp_policy.clone(),
                         udp_policy: self.udp_policy.clone(),
@@ -196,6 +200,7 @@ struct ConnectionContext {
     config: Arc<ServerConfig>,
     shared: Arc<Shared>,
     auth: Option<Arc<SharedBasicAuthenticator>>,
+    stealth_auth: bool,
     client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,

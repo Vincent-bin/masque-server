@@ -63,7 +63,13 @@ impl Shard {
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
                         if let Some(h3) = &mut client.h3 {
-                            Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                            Self::send_auth_rejection(
+                                h3,
+                                &mut client.quic,
+                                stream_id,
+                                self.stealth_auth,
+                                503,
+                            );
                         }
                     }
                     continue;
@@ -77,7 +83,13 @@ impl Shard {
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
                         if let Some(h3) = &mut client.h3 {
-                            Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                            Self::send_auth_rejection(
+                                h3,
+                                &mut client.quic,
+                                stream_id,
+                                self.stealth_auth,
+                                503,
+                            );
                         }
                     }
                     continue;
@@ -194,7 +206,7 @@ impl Shard {
 
             if !authorized {
                 warn!(stream_id, "proxy authentication failed");
-                Self::send_proxy_auth_required(h3, &mut client.quic, stream_id);
+                Self::send_auth_rejection(h3, &mut client.quic, stream_id, self.stealth_auth, 407);
                 return;
             }
 
@@ -207,6 +219,7 @@ impl Shard {
             let request_context = RequestContext {
                 config: &self.config,
                 auth: self.auth.as_deref(),
+                stealth_auth: self.stealth_auth,
             };
             Self::dispatch_connect(
                 h3,
