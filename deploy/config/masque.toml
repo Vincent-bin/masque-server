@@ -46,6 +46,10 @@ enabled = true
 # To serve both kinds of client, add the second listener shown at the end of
 # this file. Every listener has its own explicit authentication table.
 mode = "basic"
+# Optional response camouflage for clients such as Surge that send credentials
+# on their first CONNECT. Missing or invalid credentials receive the same empty
+# 404 as an unsupported request instead of a 407 challenge.
+stealth = false
 
 # Repeat this table for independent accounts on the same address and port.
 # Account edits can be made with add-user/set-password/remove-user and applied

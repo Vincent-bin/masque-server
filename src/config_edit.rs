@@ -71,6 +71,8 @@ pub struct AddListener {
     pub client_output: Option<BasicClientOutput>,
     /// Write `enabled = false`, for a listener on a trusted network.
     pub disable_auth: bool,
+    /// Hide failed Basic authentication behind an ordinary 404 response.
+    pub stealth: bool,
     /// Do not try to bind the new address before writing it.
     pub no_bind_check: bool,
     /// Print the block that would be appended and leave the file alone.
@@ -183,6 +185,12 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
             "Surge MASQUE client output requires an HTTP/3 listener"
         );
     }
+    if request.stealth {
+        ensure!(
+            !request.disable_auth && mode == AuthMode::Basic,
+            "--stealth applies only to an authenticated Basic listener"
+        );
+    }
 
     let shards = match (transport, request.shards) {
         (ListenerTransport::Http2, Some(1) | None) => 1,
@@ -199,6 +207,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         AuthSection {
             enabled: false,
             mode,
+            stealth: false,
             username: String::new(),
             password_hash: String::new(),
             users: Vec::new(),
@@ -208,6 +217,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
             AuthMode::ClientCert => AuthSection {
                 enabled: true,
                 mode,
+                stealth: false,
                 username: String::new(),
                 password_hash: String::new(),
                 users: Vec::new(),
@@ -228,6 +238,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
                 AuthSection {
                     enabled: true,
                     mode,
+                    stealth: request.stealth,
                     username: String::new(),
                     password_hash: String::new(),
                     users: vec![BasicUser {
@@ -908,6 +919,9 @@ pub fn listener_toml_block(listener: &ListenerSection) -> String {
     match listener.auth.mode {
         AuthMode::Basic => {
             block.push_str("mode = \"basic\"\n");
+            if listener.auth.stealth {
+                block.push_str("stealth = true\n");
+            }
             for (username, password_hash) in effective_basic_users(&listener.auth) {
                 block.push_str("\n[[listeners.auth.users]]\n");
                 block.push_str(&format!("username = {}\n", toml_string(username)));
@@ -1526,6 +1540,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,
+                stealth: false,
                 username: String::new(),
                 password_hash: String::new(),
                 users: Vec::new(),
@@ -1565,6 +1580,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
+                stealth: false,
                 username: String::new(),
                 password_hash: String::new(),
                 users: vec![BasicUser {
@@ -1597,6 +1613,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             auth: AuthSection {
                 enabled: false,
                 mode: AuthMode::Basic,
+                stealth: false,
                 username: String::new(),
                 password_hash: String::new(),
                 users: Vec::new(),

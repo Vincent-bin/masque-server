@@ -327,6 +327,7 @@ mod tests {
         let auth = BasicAuthenticator::from_section(&AuthSection {
             enabled: true,
             mode: AuthMode::Basic,
+            stealth: false,
             username: String::new(),
             password_hash: String::new(),
             users: vec![
@@ -354,6 +355,7 @@ mod tests {
         let duplicate = AuthSection {
             enabled: true,
             mode: AuthMode::Basic,
+            stealth: false,
             username: String::new(),
             password_hash: String::new(),
             users: vec![

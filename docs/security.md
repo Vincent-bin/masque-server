@@ -39,6 +39,17 @@ removed without changing every other client. Account edits become active on
 `SIGHUP`; existing tunnels remain, while later CONNECT requests use the new
 snapshot.
 
+A Basic listener may opt into `auth.stealth = true`. Missing, malformed,
+duplicated, unknown, or incorrect credentials then receive the same empty 404
+as an unsupported request instead of a 407 challenge. This removes an obvious
+HTTP authentication fingerprint and also hides authentication-overload status
+from an unauthenticated caller. It is response camouflage, not protocol
+obfuscation: QUIC/TLS handshakes, ALPN, packet sizes, timing, and the open port
+remain observable. The server deliberately keeps cheap malformed and unknown
+user rejection cheap instead of running dummy Argon2 work, so a determined
+observer may still distinguish timing classes. Clients must send credentials
+proactively; challenge-driven clients need the default `stealth = false`.
+
 With a listener's `auth.mode = "client_cert"` the cost profile is different: identity is
 established once during the handshake, by public key, so there is no per-request
 verification to bound and no password to brute-force. An unenrolled key is

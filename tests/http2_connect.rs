@@ -501,6 +501,80 @@ async fn basic_auth_challenges_missing_credentials_and_accepts_valid_credentials
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stealth_basic_auth_uses_404_and_accepts_proactive_credentials() {
+    let files = TestFiles::new();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        stream.write_all(&byte).await.unwrap();
+    });
+
+    let mut config = http2_config(&files);
+    config.listeners[0].auth.enabled = true;
+    config.listeners[0].auth.mode = AuthMode::Basic;
+    config.listeners[0].auth.stealth = true;
+    config.listeners[0].auth.users = vec![BasicUser {
+        username: "alice".into(),
+        password_hash: masque::auth::hash_password(b"alice-secret").unwrap(),
+    }];
+    let (server_addr, server_task) = spawn_http2_config(config).await;
+    let (mut client, driver) = connect_h2(server_addr).await;
+
+    let (response, _) = client
+        .send_request(connect_request(target_addr), true)
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.headers().get("proxy-authenticate").is_none());
+
+    client = client.ready().await.unwrap();
+    let mut request = connect_request(target_addr);
+    request.headers_mut().insert(
+        "proxy-authorization",
+        format!("Basic {}", STANDARD.encode("alice:wrong"))
+            .parse()
+            .unwrap(),
+    );
+    let (response, _) = client.send_request(request, true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.headers().get("proxy-authenticate").is_none());
+
+    client = client.ready().await.unwrap();
+    let mut request = connect_request(target_addr);
+    request.headers_mut().insert(
+        "proxy-authorization",
+        format!("Basic {}", STANDARD.encode("alice:alice-secret"))
+            .parse()
+            .unwrap(),
+    );
+    let (response, mut request_body) = client.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    request_body
+        .send_data(Bytes::from_static(b"s"), true)
+        .unwrap();
+    let mut response_body = response.into_body();
+    let echoed = tokio::time::timeout(Duration::from_secs(2), response_body.data())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed[..], b"s");
+    response_body
+        .flow_control()
+        .release_capacity(echoed.len())
+        .unwrap();
+
+    target_task.await.unwrap();
+    server_task.abort();
+    driver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_certificate_authenticates_http2_connection() {
     let files = TestFiles::new();
     let client_key = p256_key();

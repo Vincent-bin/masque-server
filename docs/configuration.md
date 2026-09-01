@@ -150,6 +150,7 @@ connect, and vice versa. To serve both kinds of client, define two listeners.
 | --- | --- |
 | `enabled` | Master switch. `false` disables authentication whatever `mode` says |
 | `mode` | `basic` (default) or `client_cert` |
+| `stealth` | `basic` only; use an empty `404` instead of a `407` challenge (default `false`) |
 | `[[listeners.auth.users]]` | `basic` only; one or more accounts on this socket |
 | `users[].username` | Unique Basic username on this listener |
 | `users[].password_hash` | Argon2id PHC string |
@@ -174,6 +175,8 @@ shards = 1
 [listeners.auth]
 enabled = true
 mode = "basic"
+# Compatible clients must send Proxy-Authorization on their first request.
+stealth = true
 
 [[listeners.auth.users]]
 username = "proxy-user"
@@ -192,8 +195,21 @@ printf '%s' 'a-strong-password' | masque-server hash-password
 ```
 
 Clients send `Proxy-Authorization: Basic BASE64(user:password)` on each
-request. Missing, malformed, duplicated, or wrong credentials receive
-`407 Proxy Authentication Required`.
+request. By default, missing, malformed, duplicated, or wrong credentials
+receive `407 Proxy Authentication Required`.
+
+With `stealth = true`, every such authentication failure instead receives the
+same empty `404` as an unsupported request, with no `Proxy-Authenticate`
+header. [Surge](https://manual.nssurge.com/policies/masque.html) sends Basic
+authorization proactively on each CONNECT and is compatible with this setting.
+A client that waits for a 407 challenge is not:
+it must remain on the default setting. Changing `stealth` requires a restart;
+account changes remain reloadable with `SIGHUP`.
+
+This option reduces the application-response fingerprint of an unauthenticated
+probe. It does not hide the listening QUIC/TLS service or imitate a real web
+site, and authentication timing is not deliberately equalized because doing so
+would turn malformed probes into Argon2 work.
 
 The server accepts at most 4,096 accounts on one listener and refuses to start
 if there are no users, usernames are duplicated, a username is empty or
@@ -564,6 +580,7 @@ add-listener options:
       --username <NAME>     Basic username
       --password-hash <PHC>  Argon2id hash, as printed by hash-password
       --password-stdin      Read the password from stdin and hash it here
+      --stealth            Return 404 instead of challenging failed Basic auth
       --emit-client surge   Emit the Basic credential in Surge syntax
       --client-endpoint <HOST:PORT>  Public endpoint written to that client config
       --client-name <NAME>  Optional Surge proxy name

@@ -184,6 +184,7 @@ DUAL_SURGE_CONFIG=$TEST_TMP/dual-surge.conf
 MASQUE_AUTH_MODE=dual \
     MASQUE_AUTH_USERNAME=proxy-user \
     MASQUE_AUTH_PASSWORD=a-strong-password \
+    MASQUE_BASIC_STEALTH=1 \
     MASQUE_LISTEN_PORT=8449 \
     MASQUE_CERT_LISTEN_PORT=8450 \
     MASQUE_CLIENT_NAME=laptop \
@@ -208,6 +209,8 @@ grep -q '^listen_addr = "0.0.0.0:8449"$' "$CONFIG_PATH" ||
     die "the Basic listener did not take MASQUE_LISTEN_PORT"
 grep -q '^listen_addr = "0.0.0.0:8450"$' "$CONFIG_PATH" ||
     die "the certificate listener did not take MASQUE_CERT_LISTEN_PORT"
+grep -q '^stealth = true$' "$CONFIG_PATH" ||
+    die "the Basic listener did not enable MASQUE_BASIC_STEALTH"
 # [server] contains only process-wide limits; listeners name every socket.
 grep -q '^\[server\]$' "$CONFIG_PATH" ||
     die "the [server] section disappeared from the dual configuration"

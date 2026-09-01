@@ -37,7 +37,8 @@ from `/dev/tty`. A new installation offers three modes:
 
 - `basic` creates the first account, generates a high-entropy password unless
   one is provided, prints the credentials once, and optionally writes a secret
-  Surge configuration while the plaintext is available;
+  Surge configuration while the plaintext is available; it also asks whether
+  to hide failed authentication behind an empty 404 (off by default);
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
   entry, writes the usque JSON to a new `0600` file, and prints the mihomo block;
 - `dual` does both, writing a
@@ -69,6 +70,7 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_AUTH_MODE` | `basic`, `client_cert`, or `dual` |
 | `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
+| `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |
 | `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables Surge configuration generation |
 | `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated Surge configuration |
 | `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret Surge output path; defaults to `/root/masque-surge.conf` when generation is enabled |

@@ -75,6 +75,7 @@ struct ListenerSummary {
     transport: &'static str,
     shards: usize,
     authentication: &'static str,
+    stealth: bool,
     basic_user_count: usize,
 }
 
@@ -194,6 +195,7 @@ pub fn collect(
                     transport: listener.transport.as_str(),
                     shards: listener.shards,
                     authentication: auth_label(&listener.auth),
+                    stealth: listener.auth.stealth_enabled(),
                     basic_user_count: basic_user_count(&listener.auth),
                 })
                 .collect(),
@@ -439,6 +441,7 @@ mod tests {
             assert!(!json.contains(secret), "bundle leaked {secret}");
         }
         assert!(json.contains("\"basic_user_count\": 1"));
+        assert!(json.contains("\"stealth\": false"));
         assert!(json.contains("\"registered_client_count\": 1"));
     }
 }

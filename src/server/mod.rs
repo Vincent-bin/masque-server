@@ -627,6 +627,9 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
     // the listener it came from or it cannot be found in a multi-listener file.
     for plan in &listeners {
         let addr = plan.listener.listen_addr;
+        if plan.listener.auth.stealth && !plan.listener.auth.basic_enabled() {
+            anyhow::bail!("listener {addr} auth.stealth requires enabled Basic authentication");
+        }
         if plan.listener.auth.basic_enabled() {
             BasicAuthenticator::from_section(&plan.listener.auth)
                 .with_context(|| format!("listener {addr}"))?;
@@ -833,6 +836,7 @@ fn config_reload_settings(
                 listen_addr: listener.listen_addr,
                 transport: listener.transport,
                 auth: ReloadAuthKind::from(&listener.auth),
+                stealth: listener.auth.stealth_enabled(),
             })
             .collect(),
     })
@@ -1533,10 +1537,12 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
         if startup.listen_addr != current.listen_addr
             || startup.transport != current.transport
             || startup.auth != current_auth
+            || startup.stealth != current.auth.stealth_enabled()
         {
             anyhow::bail!(
-                "refusing to reload listener {}: address, transport, order, or authentication \
-                 mode changed; restart the service to apply trust-boundary changes",
+                "refusing to reload listener {}: address, transport, order, authentication \
+                 mode, or stealth setting changed; restart the service to apply trust-boundary \
+                 changes",
                 index + 1
             );
         }
@@ -1992,6 +1998,7 @@ struct ReloadListener {
     listen_addr: SocketAddr,
     transport: ListenerTransport,
     auth: ReloadAuthKind,
+    stealth: bool,
 }
 
 /// State every shard shares.
@@ -2157,6 +2164,8 @@ struct Shard {
     /// key. The initial CID stays on the one-lookup hot path above.
     connection_id_aliases: FxHashMap<quiche::ConnectionId<'static>, quiche::ConnectionId<'static>>,
     auth: Option<Arc<SharedBasicAuthenticator>>,
+    /// Whether failed Basic authorization uses the ordinary empty 404.
+    stealth_auth: bool,
     /// Set when clients authenticate with a certificate instead of credentials.
     ///
     /// The TLS context already refuses unregistered keys, so this exists to
@@ -2258,6 +2267,7 @@ impl Shard {
         } else {
             None
         };
+        let stealth_auth = listener.auth.stealth_enabled();
 
         let quic_config = build_quic_config(
             &config,
@@ -2292,6 +2302,7 @@ impl Shard {
             connections: FxHashMap::default(),
             connection_id_aliases: FxHashMap::default(),
             auth,
+            stealth_auth,
             client_certs,
             tcp_policy,
             udp_policy,
@@ -3241,6 +3252,7 @@ impl Shard {
                         let request_context = RequestContext {
                             config: &self.config,
                             auth: self.auth.as_deref(),
+                            stealth_auth: self.stealth_auth,
                         };
                         if let Some(pending) = Self::handle_request(
                             h3,
@@ -3255,7 +3267,13 @@ impl Shard {
                                     stream_id,
                                     "too many CONNECT requests awaiting authorization"
                                 );
-                                Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                                Self::send_auth_rejection(
+                                    h3,
+                                    &mut client.quic,
+                                    stream_id,
+                                    self.stealth_auth,
+                                    503,
+                                );
                             } else {
                                 client.awaiting_auth.insert(stream_id, AwaitingAuth::new());
                                 pending_auth.push(pending);
@@ -4446,6 +4464,27 @@ impl Shard {
         }
     }
 
+    /// Reject a request whose Basic credentials have not been verified.
+    ///
+    /// A stealth listener deliberately emits the same empty 404 as an
+    /// unsupported request. Ordinary listeners retain the challenge or the
+    /// overload status supplied by the caller.
+    fn send_auth_rejection(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        stealth: bool,
+        fallback_status: u16,
+    ) {
+        if stealth {
+            Self::send_error_response(h3, quic, stream_id, 404);
+        } else if fallback_status == 407 {
+            Self::send_proxy_auth_required(h3, quic, stream_id);
+        } else {
+            Self::send_error_response(h3, quic, stream_id, fallback_status);
+        }
+    }
+
     /// Send an HTTP error response.
     fn send_error_response(
         h3: &mut quiche::h3::Connection,
@@ -4619,6 +4658,7 @@ mod tests {
             auth: AuthSection {
                 enabled: true,
                 mode,
+                stealth: false,
                 // Enough to satisfy `BasicAuthenticator`; the hash is only
                 // parsed when a request actually arrives.
                 username: "alice".into(),
@@ -4658,6 +4698,24 @@ mod tests {
         assert!(super::active_client_registry(&config, true).is_err());
     }
 
+    #[test]
+    fn stealth_auth_requires_an_enabled_basic_listener() {
+        let mut config = ServerConfig::default();
+        config.listeners[0].auth.enabled = false;
+        config.listeners[0].auth.stealth = true;
+
+        let error = match super::validate_server_config(&config) {
+            Ok(_) => panic!("stealth authentication was accepted without Basic auth"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("auth.stealth requires enabled Basic authentication"),
+            "unexpected diagnostic: {error:#}"
+        );
+    }
+
     /// The roster belongs to the server, so one certificate listener among
     /// several is enough to make it load — and to keep reload available.
     #[test]
@@ -4687,6 +4745,12 @@ mod tests {
         let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
         assert!(!reload.client_cert_enabled);
         assert_eq!(reload.tls, config.tls);
+        assert!(!reload.listeners[0].stealth);
+
+        config.listeners[0].auth.stealth = true;
+        let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
+        assert!(reload.listeners[0].stealth);
+        config.listeners[0].auth.stealth = false;
 
         config.listeners[0].auth.mode = AuthMode::ClientCert;
         config.ip_proxy.enabled = false;

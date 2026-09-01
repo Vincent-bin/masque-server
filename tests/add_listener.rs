@@ -288,6 +288,51 @@ fn adds_a_basic_listener_with_a_password_read_from_stdin() {
 }
 
 #[test]
+fn adds_a_stealth_basic_listener() {
+    let fixture = Fixture::new(false);
+    let output = fixture.user_command(
+        "add-listener",
+        &[
+            "--listen-addr",
+            "127.0.0.1:8466",
+            "--mode",
+            "basic",
+            "--username",
+            "phone",
+            "--password-stdin",
+            "--stealth",
+            "--no-bind-check",
+        ],
+        Some(b"listener-secret\n"),
+    );
+    assert!(
+        output.status.success(),
+        "add-listener failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.config().listeners[1].auth.stealth_enabled());
+    assert!(fixture.text().contains("stealth = true"));
+}
+
+#[test]
+fn refuses_stealth_without_basic_authentication() {
+    let fixture = Fixture::new(true);
+    let output = fixture.add_listener(&[
+        "--listen-addr",
+        "127.0.0.1:8467",
+        "--mode",
+        "client-cert",
+        "--stealth",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--stealth applies only to an authenticated Basic listener")
+    );
+    fixture.assert_unchanged();
+}
+
+#[test]
 fn adding_a_basic_listener_can_emit_its_private_surge_configuration() {
     let fixture = Fixture::new(false);
     let client_path = fixture._dir.path().join("new-listener.conf");
