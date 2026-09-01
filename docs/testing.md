@@ -155,8 +155,17 @@ truncated.
 
 `cargo test --test client_cert_connect_ip` covers the handshake, the
 `cf-connect-ip` request, pinned address assignment, reconnect overlap, datagram
-sizing, and rejection of unenrolled keys — all against a synthetic client that
-imitates this family. It runs anywhere.
+sizing, rejection of unenrolled keys, and a real QUIC source-port migration —
+all against a synthetic client that imitates this family. It runs anywhere.
+On Linux the same target also changes the peer IP, verifies migration cannot
+bypass `max_connections_per_ip`, proves long- and short-header CIDs select the
+intended SO_REUSEPORT socket, and confirms migrated connections do not enter
+the userspace cross-shard fallback.
+
+The general E2E client keeps an established CONNECT-UDP stream open while it
+replaces its UDP socket when `MASQUE_MIGRATION_CHECK=1`. Add
+`MASQUE_BENCH_MIGRATED=1` to its normal `MASQUE_BENCH=1` invocation to run the
+64-byte and 1200-byte measurements only after that path has validated.
 
 What it cannot cover is packet forwarding, because that needs a TUN device.
 Qualifying a real client therefore needs a Linux host with root. Two clients are

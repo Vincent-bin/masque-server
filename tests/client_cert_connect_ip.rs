@@ -11,6 +11,10 @@
 //! and 24 hours of validity; `:protocol: cf-connect-ip`; a hardcoded authority;
 //! and `:path: /`.
 
+#[cfg(target_os = "linux")]
+use std::io::{Read as _, Write as _};
+#[cfg(target_os = "linux")]
+use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -42,6 +46,8 @@ const CLIENT_IPV6: &str = "fd00:abcd::2";
 /// QUIC maps a TLS alert to `CRYPTO_ERROR` (0x100) plus the alert number.
 /// Alert 49 is `access_denied`.
 const ACCESS_DENIED_CRYPTO_ERROR: u64 = 0x100 + 49;
+#[cfg(target_os = "linux")]
+const MIGRATION_SOURCE_LIMIT_ERROR: u64 = 0x0101;
 
 /// The tunnel MTU these clients use, matching `ip_proxy.tun_mtu`.
 const TUN_MTU: usize = 1280;
@@ -173,6 +179,10 @@ fn server_config(
 /// server, so no parallel test can take it in between, and a caller cannot
 /// start talking to a socket that is not up yet.
 fn spawn_server(config: ServerConfig) -> Vec<SocketAddr> {
+    spawn_server_with_observability(config).0
+}
+
+fn spawn_server_with_observability(config: ServerConfig) -> (Vec<SocketAddr>, Option<SocketAddr>) {
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -184,7 +194,7 @@ fn spawn_server(config: ServerConfig) -> Vec<SocketAddr> {
                 Ok(mut server) => {
                     // A failed send means the test gave up; run anyway and let
                     // the detached thread die with the process.
-                    let _ = bound_tx.send(server.listen_addrs());
+                    let _ = bound_tx.send((server.listen_addrs(), server.observability_addr()));
                     let _ = server.run().await;
                 }
                 Err(e) => panic!("server failed to bind: {e:#}"),
@@ -195,6 +205,30 @@ fn spawn_server(config: ServerConfig) -> Vec<SocketAddr> {
     bound_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("server did not report its listen addresses")
+}
+
+#[cfg(target_os = "linux")]
+fn scrape_metrics(addr: SocketAddr) -> String {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+#[cfg(target_os = "linux")]
+fn metric_total(rendered: &str, name: &str) -> u64 {
+    rendered
+        .lines()
+        .filter(|line| line.starts_with(name))
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.parse::<u64>().ok())
+        .sum()
 }
 
 // ── Client ───────────────────────────────────────────────────────────
@@ -221,6 +255,16 @@ impl Client {
         Self::connect_with(peer, None)
     }
 
+    #[cfg(target_os = "linux")]
+    fn connect_from(
+        peer: SocketAddr,
+        cert: &Path,
+        key: &Path,
+        source_ip: std::net::IpAddr,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_session_from(peer, Some((cert, key)), None, false, source_ip)
+    }
+
     fn connect_with(peer: SocketAddr, identity: Option<(&Path, &Path)>) -> anyhow::Result<Self> {
         Self::connect_with_session(peer, identity, None, false)
     }
@@ -233,7 +277,23 @@ impl Client {
         session: Option<&[u8]>,
         enable_early_data: bool,
     ) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
+        Self::connect_with_session_from(
+            peer,
+            identity,
+            session,
+            enable_early_data,
+            "127.0.0.1".parse().unwrap(),
+        )
+    }
+
+    fn connect_with_session_from(
+        peer: SocketAddr,
+        identity: Option<(&Path, &Path)>,
+        session: Option<&[u8]>,
+        enable_early_data: bool,
+        source_ip: std::net::IpAddr,
+    ) -> anyhow::Result<Self> {
+        let socket = UdpSocket::bind(SocketAddr::new(source_ip, 0))?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let local = socket.local_addr()?;
@@ -254,6 +314,8 @@ impl Client {
         config.set_initial_max_stream_data_uni(262_144);
         config.set_initial_max_streams_bidi(16);
         config.set_initial_max_streams_uni(16);
+        config.set_active_connection_id_limit(2);
+        config.set_disable_active_migration(false);
         config.enable_dgram(true, 256, 256);
         if enable_early_data {
             config.enable_early_data();
@@ -327,6 +389,80 @@ impl Client {
         self.flush()?;
         self.recv_once()?;
         self.flush()
+    }
+
+    /// Give the server a spare destination CID before moving to another
+    /// socket. Active migration requires both endpoints to have supplied one.
+    fn publish_spare_connection_id(&mut self) -> anyhow::Result<()> {
+        while self.quic.scids_left() > 0 {
+            let mut random = [0u8; CLIENT_CONN_ID_LEN + 16];
+            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
+                .map_err(|_| anyhow::anyhow!("RNG failed"))?;
+            let id = quiche::ConnectionId::from_ref(&random[..CLIENT_CONN_ID_LEN]);
+            let reset_token = u128::from_be_bytes(
+                random[CLIENT_CONN_ID_LEN..]
+                    .try_into()
+                    .expect("reset token is 16 bytes"),
+            );
+            self.quic.new_scid(&id, reset_token, false)?;
+        }
+        self.flush()
+    }
+
+    /// Replace the connected UDP socket while retaining this QUIC and H3
+    /// connection, then wait for the replacement path to validate.
+    fn migrate_source(&mut self, timeout: Duration) -> anyhow::Result<(SocketAddr, SocketAddr)> {
+        self.migrate_source_from("127.0.0.1".parse().unwrap(), timeout)
+    }
+
+    fn migrate_source_from(
+        &mut self,
+        source_ip: std::net::IpAddr,
+        timeout: Duration,
+    ) -> anyhow::Result<(SocketAddr, SocketAddr)> {
+        self.publish_spare_connection_id()?;
+        let old_local = self.socket.local_addr()?;
+        let peer = self.socket.peer_addr()?;
+        let replacement = UdpSocket::bind(SocketAddr::new(source_ip, 0))?;
+        replacement.connect(peer)?;
+        replacement.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let new_local = replacement.local_addr()?;
+        anyhow::ensure!(
+            old_local != new_local,
+            "replacement socket reused the old address"
+        );
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.quic.migrate_source(new_local) {
+                Ok(_) => {
+                    // `migrate_source()` selects the new path. Explicitly
+                    // probe the server side and send a non-probing PING so the
+                    // server also observes peer migration and validates us.
+                    self.quic.probe_path(new_local, peer)?;
+                    self.quic.send_ack_eliciting()?;
+                    break;
+                }
+                Err(quiche::Error::OutOfIdentifiers) if Instant::now() < deadline => {
+                    // The server publishes its spare CID immediately after the
+                    // handshake; receive until that NEW_CONNECTION_ID arrives.
+                    self.drive()?;
+                }
+                Err(error) => anyhow::bail!("cannot start QUIC migration: {error}"),
+            }
+        }
+
+        self.socket = replacement;
+        while Instant::now() < deadline {
+            self.drive()?;
+            if self.quic.is_path_validated(new_local, peer) == Ok(true) {
+                return Ok((old_local, new_local));
+            }
+            if self.quic.is_closed() {
+                anyhow::bail!("connection closed during migration");
+            }
+        }
+        anyhow::bail!("replacement QUIC path did not validate within {timeout:?}")
     }
 
     fn handshake(&mut self, timeout: Duration) -> anyhow::Result<()> {
@@ -1349,6 +1485,210 @@ fn a_full_mtu_ip_packet_fits_in_one_datagram() {
         .dgram_send(&framed)
         .expect("a full-MTU packet must be sendable as one datagram");
     client.flush().unwrap();
+}
+
+/// Changing the client's UDP source port must preserve both the QUIC/H3
+/// connection and an already-open CONNECT stream. This is the common NAT
+/// rebinding form of connection migration and exercises the spare CID that the
+/// server publishes after the handshake.
+#[test]
+fn client_source_port_migrates_without_reconnecting() {
+    let fixture = fixture("migration");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let existing_stream = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(existing_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    let (old_local, new_local) = client.migrate_source(Duration::from_secs(5)).unwrap();
+    assert_eq!(old_local.ip(), new_local.ip());
+    assert_ne!(old_local.port(), new_local.port());
+
+    // Response-body state belonging to the pre-migration stream survives.
+    let capsules = client.capsules(existing_stream, 2, Duration::from_secs(5));
+    assert!(
+        capsules
+            .iter()
+            .any(|frame| matches!(frame, CapsuleFrame::AddressAssign(_))),
+        "the pre-migration CONNECT stream stopped making progress"
+    );
+
+    // A new stream on the same H3 connection works without another TLS or
+    // client-certificate handshake.
+    let later_stream = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(later_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert!(!client.quic.is_closed());
+}
+
+/// A validated address change, not only a NAT port remap, keeps the same
+/// authenticated HTTP/3 connection alive. The loopback /8 gives the test two
+/// routable local addresses without depending on an external interface.
+#[cfg(target_os = "linux")]
+#[test]
+fn client_source_ip_migrates_without_reconnecting() {
+    let fixture = fixture("migration-ip");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let first_stream = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(first_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    let (old_local, new_local) = client
+        .migrate_source_from("127.0.0.2".parse().unwrap(), Duration::from_secs(5))
+        .unwrap();
+    assert_ne!(old_local.ip(), new_local.ip());
+
+    let later_stream = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(later_stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert!(!client.quic.is_closed());
+}
+
+/// Linux steers every server-issued destination CID to its owning reuseport
+/// socket. Source-port migration must therefore stay on the connection's
+/// shard instead of paying the userspace cross-shard forwarding cost.
+#[cfg(target_os = "linux")]
+#[test]
+fn migrated_connections_stay_on_reuseport_owner() {
+    let dir = TempDir::new("migration-shards");
+    let server_key = p256_key();
+    let (server_cert, server_key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+    let mut config = server_config(
+        server_cert,
+        server_key_path,
+        ephemeral_addr(),
+        vec![ClientEntry {
+            name: "migrating-client".into(),
+            public_key: public_key_b64(&client_key),
+            ipv4: None,
+            ipv6: None,
+        }],
+    );
+    config.listeners[0].shards = 4;
+    config.observability.listen_addr = Some(ephemeral_addr());
+    let (listeners, observability) = spawn_server_with_observability(config);
+    assert_eq!(listeners.len(), 4);
+    let peer = listeners[0];
+    let observability = observability.expect("metrics listener must be bound");
+
+    for _ in 0..8 {
+        let mut client = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+        client.handshake(Duration::from_secs(5)).unwrap();
+        client.migrate_source(Duration::from_secs(5)).unwrap();
+        assert!(!client.quic.is_closed());
+    }
+
+    let metrics = scrape_metrics(observability);
+    assert!(
+        metrics.lines().any(|line| {
+            line.starts_with("masque_quic_path_events_total{")
+                && line.contains("event=\"peer_migrated\"")
+                && line
+                    .rsplit_once(' ')
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+                    .is_some_and(|value| value >= 8)
+        }),
+        "all eight migrations should be observable as completed peer migrations"
+    );
+    assert_eq!(
+        metric_total(&metrics, "masque_quic_cross_shard_forwarded_packets_total{"),
+        0,
+        "CID steering should keep migrated packets on their owning shard"
+    );
+}
+
+/// A validated path cannot use migration to bypass the live-connection cap of
+/// its new source. The old admission remains balanced and the already-admitted
+/// connection at the destination source is unaffected.
+#[cfg(target_os = "linux")]
+#[test]
+fn migration_to_a_full_source_is_closed() {
+    let dir = TempDir::new("migration-source-limit");
+    let server_key = p256_key();
+    let (server_cert, server_key_path) = write_pem(
+        dir.path(),
+        "server",
+        &server_key,
+        &self_signed(&server_key, Some("masque-server")),
+    );
+    let client_key = p256_key();
+    let (client_cert, client_key_path) = write_pem(
+        dir.path(),
+        "client",
+        &client_key,
+        &self_signed(&client_key, None),
+    );
+    let mut config = server_config(
+        server_cert,
+        server_key_path,
+        ephemeral_addr(),
+        vec![ClientEntry {
+            name: "limited-client".into(),
+            public_key: public_key_b64(&client_key),
+            ipv4: None,
+            ipv6: None,
+        }],
+    );
+    config.server.max_connections_per_ip = 1;
+    let peer = spawn_server(config)[0];
+
+    let occupied_source = "127.0.0.2".parse().unwrap();
+    let mut occupied =
+        Client::connect_from(peer, &client_cert, &client_key_path, occupied_source).unwrap();
+    occupied.handshake(Duration::from_secs(5)).unwrap();
+
+    let mut migrating = Client::connect(peer, &client_cert, &client_key_path).unwrap();
+    migrating.handshake(Duration::from_secs(5)).unwrap();
+    let _ = migrating.migrate_source_from(occupied_source, Duration::from_secs(2));
+    assert!(
+        migrating.wait_for_close(Duration::from_secs(5)),
+        "migration into a full source budget remained open"
+    );
+    assert_eq!(
+        migrating
+            .quic
+            .peer_error()
+            .map(|error| (error.is_app, error.error_code)),
+        Some((true, MIGRATION_SOURCE_LIMIT_ERROR))
+    );
+
+    occupied.drive().unwrap();
+    assert!(!occupied.quic.is_closed());
 }
 
 /// A network change often makes the replacement QUIC connection arrive before

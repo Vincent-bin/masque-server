@@ -119,8 +119,16 @@ pub struct ClientConnection {
     /// The deadline this connection currently holds in the server's timer
     /// queue, used to tell a live wakeup from one a later deadline superseded.
     pub(crate) scheduled_deadline: Option<std::time::Instant>,
-    /// Releases this source's process-wide connection admission on drop.
-    _source_admission: SourceAdmission,
+    /// Tracks the currently validated peer in the process-wide source budget
+    /// and releases it on drop.
+    source_admission: SourceAdmission,
+    /// Server-issued wire connection IDs that currently route to this
+    /// connection. The initial entry is also the shard's stable internal map
+    /// key; later IDs let a peer move paths without reusing a linkable CID.
+    server_connection_ids: Vec<quiche::ConnectionId<'static>>,
+    /// The stable map key cannot be removed when the peer retires its wire CID,
+    /// so remember whether it is still valid for packet demultiplexing.
+    primary_connection_id_active: bool,
     metrics: Arc<ShardMetrics>,
     published_tunnels: [usize; 3],
 }
@@ -131,6 +139,7 @@ impl ClientConnection {
         index: u64,
         metrics: Arc<ShardMetrics>,
         source_admission: SourceAdmission,
+        initial_connection_id: quiche::ConnectionId<'static>,
     ) -> Self {
         metrics.connection_opened();
         Self {
@@ -146,14 +155,48 @@ impl ClientConnection {
             identity: None,
             deferred_send: DeferredSend::default(),
             scheduled_deadline: None,
-            _source_admission: source_admission,
+            source_admission,
+            server_connection_ids: vec![initial_connection_id],
+            primary_connection_id_active: true,
             metrics,
             published_tunnels: [0; 3],
         }
     }
 
     pub(crate) fn source_ip(&self) -> std::net::IpAddr {
-        self._source_admission.source()
+        self.source_admission.source()
+    }
+
+    /// Transfer this connection's source budget after QUIC validates a new
+    /// peer path. A failed transfer leaves the old admission in place.
+    pub(crate) fn rebind_source_ip(&mut self, source: std::net::IpAddr) -> bool {
+        self.source_admission.try_rebind(source)
+    }
+
+    pub(crate) fn publish_connection_id(&mut self, id: quiche::ConnectionId<'static>) {
+        debug_assert!(!self.server_connection_ids.contains(&id));
+        self.server_connection_ids.push(id);
+    }
+
+    pub(crate) fn retire_connection_id(&mut self, id: &quiche::ConnectionId<'_>) {
+        if self.primary_connection_id_active
+            && self
+                .server_connection_ids
+                .first()
+                .is_some_and(|primary| primary.as_ref() == id.as_ref())
+        {
+            self.primary_connection_id_active = false;
+        }
+        self.server_connection_ids
+            .retain(|published| published.as_ref() != id.as_ref());
+    }
+
+    pub(crate) fn connection_ids(&self) -> &[quiche::ConnectionId<'static>] {
+        &self.server_connection_ids
+    }
+
+    pub(crate) fn primary_connection_id_active(&self) -> bool {
+        self.primary_connection_id_active
     }
 
     /// The next instant this connection needs the event loop's attention:

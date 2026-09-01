@@ -179,6 +179,16 @@ Use `MASQUE_BENCH_QUIC_GSO=0|1` for the outer QUIC socket and
 updates during an A/B run; the default `0` measures the uninstrumented packet
 path.
 
+For HTTP/3 migration A/B testing, run the same UDP command once normally and
+once with `MASQUE_BENCH_MIGRATED=1`. The latter replaces the client's UDP
+socket after CONNECT-UDP setup, waits for the new path to validate, and labels
+machine-readable results as `path=masque_migrated`. Compare medians from at
+least three alternating runs; the unchanged-path run detects ordinary hot-path
+regressions, while the migrated run verifies Linux CID-based SO_REUSEPORT
+steering keeps the steady-state path on its original shard. A non-zero
+`masque_quic_cross_shard_forwarded_packets_total` identifies use of the bounded
+userspace fallback.
+
 CONNECT-TCP alternates a direct origin download with each proxy sample by
 default, then prints the median throughput and proxy/direct ratio. Set
 `MASQUE_TCP_DIRECT_BASELINE=0` only when the benchmark host intentionally

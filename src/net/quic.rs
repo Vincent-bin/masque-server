@@ -268,6 +268,68 @@ pub(crate) struct QuicUdpSocket {
     socket: UdpSocket,
     udp_gso: bool,
     udp_gro: bool,
+    reuseport_cid_steering: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn bpf_statement(code: u32, value: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k: value,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bpf_jump(code: u32, value: u32, jump_true: u8, jump_false: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code: code as u16,
+        jt: jump_true,
+        jf: jump_false,
+        k: value,
+    }
+}
+
+/// Route a QUIC packet to the socket index encoded in the first byte of its
+/// destination CID. The UDP reuseport hook sees transport payload bytes:
+/// short-header DCIDs start at byte 1, while long-header DCIDs start at byte 6.
+#[cfg(target_os = "linux")]
+fn attach_reuseport_cid_selector(fd: std::os::fd::RawFd, shards: usize) -> io::Result<()> {
+    debug_assert!(shards > 1 && shards <= u8::MAX as usize);
+
+    let mut filter = [
+        // A = first QUIC header byte.
+        bpf_statement(libc::BPF_LD | libc::BPF_B | libc::BPF_ABS, 0),
+        // Header Form is the high bit. Long headers load byte 6; short
+        // headers skip to byte 1.
+        bpf_jump(libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K, 0x80, 0, 2),
+        bpf_statement(libc::BPF_LD | libc::BPF_B | libc::BPF_ABS, 6),
+        bpf_jump(libc::BPF_JMP | libc::BPF_JA, 1, 0, 0),
+        bpf_statement(libc::BPF_LD | libc::BPF_B | libc::BPF_ABS, 1),
+        bpf_statement(libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K, shards as u32),
+        bpf_statement(libc::BPF_RET | libc::BPF_A, 0),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+
+    // SAFETY: `program` points to a live, verifier-safe classic BPF program
+    // for the duration of setsockopt, and `fd` is a live reuseport UDP socket.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_REUSEPORT_CBPF,
+            (&program as *const libc::sock_fprog).cast(),
+            std::mem::size_of_val(&program) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Bind a UDP socket, optionally with `SO_REUSEPORT` so several sockets can
@@ -277,7 +339,7 @@ pub(crate) struct QuicUdpSocket {
 /// The option has to be set between `socket()` and `bind()`, which
 /// `UdpSocket::bind` does not expose, so this goes through the raw syscalls.
 #[cfg(target_os = "linux")]
-fn bind_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+fn bind_reuseport(addr: SocketAddr, shards: usize) -> io::Result<(std::net::UdpSocket, bool)> {
     use std::os::fd::FromRawFd;
 
     let domain = match addr {
@@ -332,26 +394,35 @@ fn bind_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(socket)
+    let cid_steering = match attach_reuseport_cid_selector(fd, shards) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, shards, "QUIC CID reuseport steering unavailable; using cross-shard fallback");
+            false
+        }
+    };
+
+    Ok((socket, cid_steering))
 }
 
 impl QuicUdpSocket {
     /// Bind one socket for a server shard.
     ///
-    /// With `reuseport`, several shards bind the same address and the kernel
-    /// hashes each 4-tuple to one of them, so a client's packets consistently
-    /// reach the same shard until it migrates.
+    /// With more than one `reuseport_shards`, several sockets bind the same
+    /// address. Linux steers QUIC packets by the shard byte encoded in the
+    /// destination CID, so a changed four-tuple still reaches its owner.
     pub(crate) async fn bind_shared(
         addr: SocketAddr,
         max_segment_size: usize,
         enable_gso: bool,
         enable_gro: bool,
-        reuseport: bool,
+        reuseport_shards: usize,
     ) -> io::Result<Self> {
-        let socket = if reuseport {
+        let (socket, reuseport_cid_steering) = if reuseport_shards > 1 {
             #[cfg(target_os = "linux")]
             {
-                UdpSocket::from_std(bind_reuseport(addr)?)?
+                let (socket, cid_steering) = bind_reuseport(addr, reuseport_shards)?;
+                (UdpSocket::from_std(socket)?, cid_steering)
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -361,7 +432,7 @@ impl QuicUdpSocket {
                 ));
             }
         } else {
-            UdpSocket::bind(addr).await?
+            (UdpSocket::bind(addr).await?, false)
         };
 
         #[cfg(target_os = "linux")]
@@ -385,6 +456,7 @@ impl QuicUdpSocket {
             socket,
             udp_gso,
             udp_gro,
+            reuseport_cid_steering,
         })
     }
 
@@ -398,6 +470,10 @@ impl QuicUdpSocket {
 
     pub(crate) fn udp_gro_enabled(&self) -> bool {
         self.udp_gro
+    }
+
+    pub(crate) fn reuseport_cid_steering_enabled(&self) -> bool {
+        self.reuseport_cid_steering
     }
 
     #[cfg(target_os = "linux")]
@@ -958,7 +1034,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
         let mut sender =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, 1)
                 .await
                 .unwrap();
 
@@ -983,7 +1059,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
         let mut sender =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, false)
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, 1)
                 .await
                 .unwrap();
 
@@ -1016,17 +1092,17 @@ mod tests {
         assert!(seen.into_iter().all(|received| received));
     }
 
-    /// Connection sharding is only worth anything if the kernel actually
-    /// spreads distinct 4-tuples across the sockets sharing the port. If this
-    /// fails, every shard but one would sit idle.
+    /// Established packets must follow their encoded CID shard after their
+    /// four-tuple changes. Cover both QUIC header forms because handshake
+    /// packets use the long offset before 1-RTT switches to the short one.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn reuseport_spreads_source_ports_across_sockets() {
+    async fn reuseport_routes_long_and_short_headers_by_destination_cid() {
         const SHARDS: usize = 4;
-        const SENDERS: usize = 64;
+        const PACKETS_PER_HEADER: usize = 8;
 
         let first =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, true)
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, SHARDS)
                 .await
                 .unwrap();
         let target = first.local_addr().unwrap();
@@ -1034,55 +1110,72 @@ mod tests {
         let mut shards = vec![first];
         for _ in 1..SHARDS {
             shards.push(
-                QuicUdpSocket::bind_shared(target, 1350, false, false, true)
+                QuicUdpSocket::bind_shared(target, 1350, false, false, SHARDS)
                     .await
                     .unwrap(),
             );
         }
+        assert!(
+            shards
+                .iter()
+                .all(QuicUdpSocket::reuseport_cid_steering_enabled)
+        );
 
-        // Each sender gets its own ephemeral port, so each is a distinct
-        // 4-tuple for the kernel to hash.
-        for _ in 0..SENDERS {
-            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            sender.send_to(b"shard probe", target).await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for shard in 0..SHARDS {
+            for sequence in 0..PACKETS_PER_HEADER {
+                let mut short = [0u8; 16];
+                short[0] = 0x40;
+                short[1] = shard as u8;
+                short[2] = sequence as u8;
+                sender.send_to(&short, target).await.unwrap();
+
+                let mut long = [0u8; 16];
+                long[0] = 0xc0;
+                long[6] = shard as u8;
+                long[7] = sequence as u8;
+                sender.send_to(&long, target).await.unwrap();
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let mut used = 0;
         let mut delivered = 0;
-        for shard in &shards {
-            let mut batch = RecvPacketBatch::new(SENDERS);
-            match tokio::time::timeout(
+        for (expected_shard, shard) in shards.iter().enumerate() {
+            let mut batch = RecvPacketBatch::new(PACKETS_PER_HEADER * 2);
+            let received = tokio::time::timeout(
                 std::time::Duration::from_millis(200),
                 shard.recv_batch(&mut batch),
             )
             .await
-            {
-                Ok(Ok(received)) if received > 0 => {
-                    used += 1;
-                    batch.for_each_packet_mut(received, |_, _| delivered += 1);
-                }
-                _ => {}
-            }
+            .unwrap()
+            .unwrap();
+            let mut shard_delivered = 0;
+            batch.for_each_packet_mut(received, |packet, _| {
+                let encoded_shard = if packet[0] & 0x80 == 0 {
+                    packet[1]
+                } else {
+                    packet[6]
+                };
+                assert_eq!(encoded_shard as usize, expected_shard);
+                shard_delivered += 1;
+            });
+            assert_eq!(shard_delivered, PACKETS_PER_HEADER * 2);
+            delivered += shard_delivered;
         }
 
-        assert_eq!(delivered, SENDERS, "every datagram should reach some shard");
-        assert!(
-            used > 1,
-            "expected the kernel to use more than one of {SHARDS} shards, used {used}"
-        );
+        assert_eq!(delivered, SHARDS * PACKETS_PER_HEADER * 2);
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn recvmmsg_and_gro_restore_logical_packets() {
         let receiver =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, 1)
                 .await
                 .unwrap();
         let target = receiver.local_addr().unwrap();
         let mut sender =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, false)
+            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, 1)
                 .await
                 .unwrap();
 

@@ -84,6 +84,18 @@ binds the source IP and listener but not the source port, so normal NAT remaps
 do not break it. Use `retry_mode = "always"` where spoofed floods are a primary
 risk; it costs one extra handshake round trip.
 
+An established HTTP/3 connection may move to a new peer IP or UDP port. quiche
+does not report the migration until PATH_CHALLENGE/PATH_RESPONSE proves return
+routability. Only then does the server atomically transfer the connection's
+per-source admission guard; if the new source is already at its limit, the
+connection closes and the original counter remains balanced. Each connection
+advertises only one spare CID and retains only a bounded path-challenge queue,
+so source-port churn cannot create unbounded routing or validation state.
+Multi-shard Linux listeners reserve one of the 16 CID bytes for kernel socket
+selection; the other 15 bytes remain keyed or randomly generated, retaining
+120 bits of unpredictability. Failure to attach the selector changes only
+performance: the bounded userspace ownership map still routes valid packets.
+
 The optional operational endpoint has no authentication and therefore accepts
 only loopback addresses. It must stay host-local: use a local collector or a
 secure tunnel instead of forwarding `/metrics` to a public interface. Metric
