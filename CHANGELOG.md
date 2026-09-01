@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.12.2 - 2026-09-01
+
 ### Added
 
 - HTTP/3 listeners may override the global `quic.max_datagram_size`, allowing a
