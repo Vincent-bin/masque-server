@@ -63,6 +63,7 @@ pub struct AddListener {
     pub transport: Option<ListenerTransport>,
     pub mode: Option<AuthMode>,
     pub shards: Option<usize>,
+    pub max_datagram_size: Option<usize>,
     pub username: Option<String>,
     pub password_hash: Option<String>,
     /// Read the password from standard input and hash it.
@@ -201,6 +202,12 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         (ListenerTransport::Http3, None) if interactive => prompt_shards()?,
         (ListenerTransport::Http3, None) => 1,
     };
+    if transport == ListenerTransport::Http2 && request.max_datagram_size.is_some() {
+        bail!(
+            "--max-datagram-size applies only to an HTTP/3 listener; use \
+             [http2].max_datagram_size for HTTP/2"
+        );
+    }
 
     let mut resolved_password: Option<ResolvedUserPassword> = None;
     let auth = if request.disable_auth {
@@ -254,6 +261,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         listen_addr,
         transport,
         shards,
+        max_datagram_size: request.max_datagram_size,
         auth,
     };
 
@@ -907,6 +915,9 @@ pub fn listener_toml_block(listener: &ListenerSection) -> String {
         toml_string(listener.transport.as_str())
     ));
     block.push_str(&format!("shards = {}\n", listener.shards));
+    if let Some(max_datagram_size) = listener.max_datagram_size {
+        block.push_str(&format!("max_datagram_size = {max_datagram_size}\n"));
+    }
     block.push_str("\n[listeners.auth]\n");
 
     if !listener.auth.enabled {
@@ -1537,6 +1548,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             listen_addr: format!("0.0.0.0:{port}").parse().unwrap(),
             transport: config::ListenerTransport::Http3,
             shards: 1,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,
@@ -1559,6 +1571,17 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
         assert!(listener_toml_block(&listener).contains("transport = \"http3\""));
     }
 
+    #[test]
+    fn listener_block_preserves_an_http3_datagram_size_override() {
+        let mut listener = client_cert_listener(4443);
+        listener.max_datagram_size = Some(1200);
+        let block = listener_toml_block(&listener);
+        assert!(block.contains("max_datagram_size = 1200"));
+
+        let parsed = config::parse_toml(&append_block(BASIC_CONFIG, &block)).unwrap();
+        assert_eq!(parsed.listeners[1], listener);
+    }
+
     /// The edit is textual, so the comments an operator relies on must survive
     /// it. That is the whole reason the file is not re-serialised.
     #[test]
@@ -1577,6 +1600,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             listen_addr: "127.0.0.1:8443".parse().unwrap(),
             transport: config::ListenerTransport::Http3,
             shards: 2,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
@@ -1610,6 +1634,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             listen_addr: "127.0.0.1:8443".parse().unwrap(),
             transport: config::ListenerTransport::Http3,
             shards: 1,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: false,
                 mode: AuthMode::Basic,

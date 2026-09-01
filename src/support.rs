@@ -15,7 +15,7 @@ use anyhow::Context as _;
 use boring::x509::X509;
 use serde::Serialize;
 
-use crate::config::{ResolvedListener, ServerConfig};
+use crate::config::{ListenerTransport, ResolvedListener, ServerConfig};
 use crate::host;
 
 #[derive(Debug, Serialize)]
@@ -74,6 +74,7 @@ struct ListenerSummary {
     listen_addr: String,
     transport: &'static str,
     shards: usize,
+    max_datagram_size: Option<usize>,
     authentication: &'static str,
     stealth: bool,
     basic_user_count: usize,
@@ -194,6 +195,9 @@ pub fn collect(
                     listen_addr: listener.listen_addr.to_string(),
                     transport: listener.transport.as_str(),
                     shards: listener.shards,
+                    max_datagram_size: (listener.transport == ListenerTransport::Http3).then(
+                        || listener.effective_quic_max_datagram_size(config.quic.max_datagram_size),
+                    ),
                     authentication: auth_label(&listener.auth),
                     stealth: listener.auth.stealth_enabled(),
                     basic_user_count: basic_user_count(&listener.auth),
@@ -422,6 +426,7 @@ mod tests {
             listen_addr: config.listeners[0].listen_addr,
             transport: ListenerTransport::Http3,
             shards: 1,
+            max_datagram_size: None,
             auth: config.listeners[0].auth.clone(),
         }];
 

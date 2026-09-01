@@ -215,6 +215,12 @@ pub struct ListenerSection {
     /// one per available core and is accepted only for a single listener.
     #[serde(default = "default_listener_shards")]
     pub shards: usize,
+    /// Optional HTTP/3 packet-size ceiling for this listener. When absent,
+    /// `quic.max_datagram_size` remains the process-wide default. A listener
+    /// override lets a relay/low-MTU endpoint use 1200 without penalising
+    /// ordinary single-hop listeners.
+    #[serde(default)]
+    pub max_datagram_size: Option<usize>,
     /// Authentication for this listener. Required so a socket's trust boundary
     /// is never inherited from a distant part of the file.
     pub auth: AuthSection,
@@ -230,7 +236,14 @@ pub struct ResolvedListener {
     pub listen_addr: SocketAddr,
     pub transport: ListenerTransport,
     pub shards: usize,
+    pub max_datagram_size: Option<usize>,
     pub auth: AuthSection,
+}
+
+impl ResolvedListener {
+    pub fn effective_quic_max_datagram_size(&self, default: usize) -> usize {
+        self.max_datagram_size.unwrap_or(default)
+    }
 }
 
 /// One pre-registered client.
@@ -410,6 +423,7 @@ impl Default for ServerConfig {
                 listen_addr: "0.0.0.0:443".parse().unwrap(),
                 transport: ListenerTransport::Http3,
                 shards: default_listener_shards(),
+                max_datagram_size: None,
                 auth: AuthSection::default(),
             }],
         }
@@ -821,6 +835,34 @@ mode = "client_cert"
         assert_eq!(cfg.listeners[1].shards, 2);
         assert!(cfg.listeners[1].auth.client_cert_enabled());
         assert!(!cfg.listeners[1].auth.basic_enabled());
+    }
+
+    #[test]
+    fn http3_listener_can_override_the_global_datagram_size() {
+        let cfg = parse_toml(
+            r#"
+[quic]
+max_datagram_size = 1350
+
+[[listeners]]
+listen_addr = "0.0.0.0:8443"
+max_datagram_size = 1200
+
+[listeners.auth]
+enabled = false
+
+[[listeners]]
+listen_addr = "0.0.0.0:8444"
+
+[listeners.auth]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.quic.max_datagram_size, 1350);
+        assert_eq!(cfg.listeners[0].max_datagram_size, Some(1200));
+        assert_eq!(cfg.listeners[1].max_datagram_size, None);
     }
 
     #[test]

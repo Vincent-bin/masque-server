@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -21,6 +22,109 @@ use crate::policy::TargetPolicy;
 use crate::uri::UdpTarget;
 
 use super::target::{TargetSetupFailure, resolve_allowed};
+
+/// Early client DATAGRAMs retained while authorization or target setup is in
+/// flight. Surge sends its first packet immediately after the CONNECT headers,
+/// before it has received the successful response, so dropping these packets
+/// makes an otherwise valid CONNECT-UDP tunnel look dead.
+///
+/// The bounds are deliberately small and local to one stream. Basic-auth
+/// requests can enter this state before their password has been verified, so
+/// this storage must never scale with an attacker-controlled datagram burst.
+const MAX_EARLY_DATAGRAMS_PER_TUNNEL: usize = 8;
+const MAX_EARLY_DATAGRAM_BYTES_PER_TUNNEL: usize = 64 * 1024;
+const MAX_EARLY_DATAGRAM_BYTES_PER_CONNECTION: usize = 64 * 1024;
+
+/// Shared allocation budget for every early-DATAGRAM queue on one QUIC
+/// connection. Keeping the counter beside the retained bytes makes stream
+/// reset, authentication failure, and connection teardown release capacity
+/// automatically without scanning all pending tunnels.
+#[derive(Clone, Default)]
+pub(crate) struct EarlyUdpBudget {
+    bytes: Arc<AtomicUsize>,
+}
+
+impl EarlyUdpBudget {
+    fn try_reserve(&self, bytes: usize) -> bool {
+        self.bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= MAX_EARLY_DATAGRAM_BYTES_PER_CONNECTION)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let previous = self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+        debug_assert!(previous >= bytes, "early UDP budget underflow");
+    }
+}
+
+pub(crate) struct EarlyUdpDatagrams {
+    payloads: Vec<Vec<u8>>,
+    bytes: usize,
+    budget: EarlyUdpBudget,
+}
+
+impl EarlyUdpDatagrams {
+    pub(crate) fn new(budget: EarlyUdpBudget) -> Self {
+        Self {
+            payloads: Vec::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    /// Retain one payload if both this stream and its connection still have
+    /// capacity. The shared budget makes this O(1), including when a client
+    /// has many CONNECT requests in flight.
+    pub(crate) fn push(&mut self, payload: &[u8]) -> bool {
+        if self.payloads.len() >= MAX_EARLY_DATAGRAMS_PER_TUNNEL
+            || self.bytes.saturating_add(payload.len()) > MAX_EARLY_DATAGRAM_BYTES_PER_TUNNEL
+            || !self.budget.try_reserve(payload.len())
+        {
+            return false;
+        }
+
+        self.payloads.push(payload.to_vec());
+        self.bytes += payload.len();
+        true
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.payloads.len()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn into_payloads(mut self) -> Vec<Vec<u8>> {
+        self.release_budget();
+        std::mem::take(&mut self.payloads)
+    }
+
+    fn release_budget(&mut self) {
+        self.budget.release(self.bytes);
+        self.bytes = 0;
+    }
+}
+
+impl Default for EarlyUdpDatagrams {
+    fn default() -> Self {
+        Self::new(EarlyUdpBudget::default())
+    }
+}
+
+impl Drop for EarlyUdpDatagrams {
+    fn drop(&mut self) {
+        self.release_budget();
+    }
+}
 
 /// A connected target socket prepared off the HTTP/3 event loop.
 pub(crate) struct ConnectedUdpTarget {
@@ -61,14 +165,31 @@ pub(crate) struct PendingUdpTunnel {
     header: crate::datagram::DatagramHeader,
     started_at: Instant,
     setup_task: Option<JoinHandle<()>>,
+    early_datagrams: EarlyUdpDatagrams,
 }
 
 impl PendingUdpTunnel {
-    pub(crate) fn new(header: crate::datagram::DatagramHeader) -> Self {
+    pub(crate) fn new(
+        header: crate::datagram::DatagramHeader,
+        early_udp_budget: EarlyUdpBudget,
+    ) -> Self {
         Self {
             header,
             started_at: Instant::now(),
             setup_task: None,
+            early_datagrams: EarlyUdpDatagrams::new(early_udp_budget),
+        }
+    }
+
+    pub(crate) fn with_early_datagrams(
+        header: crate::datagram::DatagramHeader,
+        early_datagrams: EarlyUdpDatagrams,
+    ) -> Self {
+        Self {
+            header,
+            started_at: Instant::now(),
+            setup_task: None,
+            early_datagrams,
         }
     }
 
@@ -79,6 +200,14 @@ impl PendingUdpTunnel {
 
     pub(crate) fn header(&self) -> crate::datagram::DatagramHeader {
         self.header
+    }
+
+    pub(crate) fn buffer_early_datagram(&mut self, payload: &[u8]) -> bool {
+        self.early_datagrams.push(payload)
+    }
+
+    pub(crate) fn take_early_datagrams(&mut self) -> EarlyUdpDatagrams {
+        std::mem::take(&mut self.early_datagrams)
     }
 
     pub(crate) fn is_idle(&self, timeout: Duration) -> bool {
@@ -460,12 +589,48 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let mut pending = PendingUdpTunnel::new(crate::datagram::DatagramHeader::new(0).unwrap());
+        let mut pending = PendingUdpTunnel::new(
+            crate::datagram::DatagramHeader::new(0).unwrap(),
+            EarlyUdpBudget::default(),
+        );
         pending.start_setup(task);
         drop(pending);
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn early_udp_datagrams_are_bounded_and_keep_order() {
+        let mut datagrams = EarlyUdpDatagrams::default();
+        for value in 0..MAX_EARLY_DATAGRAMS_PER_TUNNEL {
+            assert!(datagrams.push(&[value as u8]));
+        }
+        assert!(!datagrams.push(b"too many"));
+        assert_eq!(datagrams.len(), MAX_EARLY_DATAGRAMS_PER_TUNNEL);
+        assert_eq!(datagrams.bytes(), MAX_EARLY_DATAGRAMS_PER_TUNNEL);
+        assert_eq!(
+            datagrams.into_payloads(),
+            (0..MAX_EARLY_DATAGRAMS_PER_TUNNEL)
+                .map(|value| vec![value as u8])
+                .collect::<Vec<_>>()
+        );
+
+        let mut bytes = EarlyUdpDatagrams::default();
+        assert!(!bytes.push(&vec![0; MAX_EARLY_DATAGRAM_BYTES_PER_TUNNEL + 1]));
+        assert_eq!(bytes.len(), 0);
+    }
+
+    #[test]
+    fn early_udp_budget_is_shared_and_released_on_drop() {
+        let budget = EarlyUdpBudget::default();
+        let mut first = EarlyUdpDatagrams::new(budget.clone());
+        let mut second = EarlyUdpDatagrams::new(budget);
+
+        assert!(first.push(&vec![0; 40 * 1024]));
+        assert!(!second.push(&vec![0; 32 * 1024]));
+        drop(first);
+        assert!(second.push(&vec![0; 32 * 1024]));
     }
 
     #[tokio::test]

@@ -96,6 +96,7 @@ Important settings:
 | Setting | Effect |
 | --- | --- |
 | `listeners[].shards` | Aggregate multi-connection CPU parallelism for that listener |
+| `listeners[].max_datagram_size` | Optional HTTP/3 packet ceiling for a low-MTU or nested listener; otherwise inherits `quic.max_datagram_size` |
 | `http2.initial_*_window` | HTTP/2 initial bandwidth-delay credit |
 | `http2.max_concurrent_streams` | HTTP/2 per-connection stream concurrency |
 | `http2.max_send_buffer_size` | HTTP/2 buffered response bound per stream |

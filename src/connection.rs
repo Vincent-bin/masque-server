@@ -9,21 +9,33 @@ use crate::fxhash::FxHashMap;
 use crate::metrics::ShardMetrics;
 use crate::tunnel::ip::IpTunnel;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
-use crate::tunnel::udp::{PendingUdpTunnel, UdpTunnel};
+use crate::tunnel::udp::{EarlyUdpBudget, EarlyUdpDatagrams, PendingUdpTunnel, UdpTunnel};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EarlyUdpDatagramResult {
+    Buffered,
+    CapacityExceeded,
+    UnknownTunnel,
+}
 
 /// One CONNECT stream waiting for its credentials to be verified.
 pub(crate) struct AwaitingAuth {
     pub(crate) client_finished: bool,
     cancelled: Arc<AtomicBool>,
     task: Option<tokio::task::AbortHandle>,
+    /// Present only for CONNECT-UDP. TCP request bodies remain in quiche under
+    /// stream flow control, while UDP DATAGRAM frames have already left
+    /// quiche's bounded receive queue by the time this state sees them.
+    early_udp_datagrams: Option<EarlyUdpDatagrams>,
 }
 
 impl AwaitingAuth {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(connect_udp: bool, early_udp_budget: EarlyUdpBudget) -> Self {
         Self {
             client_finished: false,
             cancelled: Arc::new(AtomicBool::new(false)),
             task: None,
+            early_udp_datagrams: connect_udp.then(|| EarlyUdpDatagrams::new(early_udp_budget)),
         }
     }
 
@@ -37,6 +49,20 @@ impl AwaitingAuth {
         if let Some(previous) = self.task.replace(task) {
             previous.abort();
         }
+    }
+
+    fn buffer_early_udp_datagram(&mut self, payload: &[u8]) -> Option<bool> {
+        self.early_udp_datagrams
+            .as_mut()
+            .map(|datagrams| datagrams.push(payload))
+    }
+
+    fn accepts_early_udp_datagrams(&self) -> bool {
+        self.early_udp_datagrams.is_some()
+    }
+
+    pub(crate) fn take_early_udp_datagrams(&mut self) -> Option<EarlyUdpDatagrams> {
+        self.early_udp_datagrams.take()
     }
 }
 
@@ -104,6 +130,10 @@ pub struct ClientConnection {
     /// quiche, so an unauthenticated caller cannot make the server buffer
     /// anything; stream flow control bounds them until the tunnel exists.
     pub(crate) awaiting_auth: FxHashMap<u64, AwaitingAuth>,
+    /// One constant-time memory budget shared by every early CONNECT-UDP
+    /// queue on this connection. Queue ownership carries the reservation
+    /// through authentication and target setup.
+    early_udp_budget: EarlyUdpBudget,
     /// Dense index for this connection, used as the `conn_id` in
     /// `TunnelOwner` and to address the connection from background tasks.
     pub index: u64,
@@ -151,6 +181,7 @@ impl ClientConnection {
             udp_tunnels: FxHashMap::default(),
             ip_tunnels: FxHashMap::default(),
             awaiting_auth: FxHashMap::default(),
+            early_udp_budget: EarlyUdpBudget::default(),
             index,
             identity: None,
             deferred_send: DeferredSend::default(),
@@ -165,6 +196,10 @@ impl ClientConnection {
 
     pub(crate) fn source_ip(&self) -> std::net::IpAddr {
         self.source_admission.source()
+    }
+
+    pub(crate) fn early_udp_budget(&self) -> EarlyUdpBudget {
+        self.early_udp_budget.clone()
     }
 
     /// Transfer this connection's source budget after QUIC validates a new
@@ -197,6 +232,47 @@ impl ClientConnection {
 
     pub(crate) fn primary_connection_id_active(&self) -> bool {
         self.primary_connection_id_active
+    }
+
+    /// Buffer a context-zero DATAGRAM for a CONNECT-UDP stream that exists but
+    /// cannot relay yet. This covers both Basic verification and asynchronous
+    /// DNS/socket setup without adding storage to the active-tunnel hot path.
+    pub(crate) fn buffer_early_udp_datagram(
+        &mut self,
+        stream_id: u64,
+        payload: &[u8],
+    ) -> EarlyUdpDatagramResult {
+        let pending_setup = self.pending_udp_tunnels.contains_key(&stream_id);
+        let pending_auth = self
+            .awaiting_auth
+            .get(&stream_id)
+            .is_some_and(AwaitingAuth::accepts_early_udp_datagrams);
+        if !pending_setup && !pending_auth {
+            // Keep unknown-stream floods on the same constant-time path they
+            // had before early buffering was added. Summing the connection's
+            // bounded queues is necessary only for a stream we may retain.
+            return EarlyUdpDatagramResult::UnknownTunnel;
+        }
+
+        if let Some(tunnel) = self.pending_udp_tunnels.get_mut(&stream_id) {
+            return if tunnel.buffer_early_datagram(payload) {
+                EarlyUdpDatagramResult::Buffered
+            } else {
+                EarlyUdpDatagramResult::CapacityExceeded
+            };
+        }
+
+        if let Some(awaiting) = self.awaiting_auth.get_mut(&stream_id)
+            && let Some(buffered) = awaiting.buffer_early_udp_datagram(payload)
+        {
+            return if buffered {
+                EarlyUdpDatagramResult::Buffered
+            } else {
+                EarlyUdpDatagramResult::CapacityExceeded
+            };
+        }
+
+        EarlyUdpDatagramResult::UnknownTunnel
     }
 
     /// The next instant this connection needs the event loop's attention:
@@ -285,7 +361,7 @@ mod tests {
             let _slot = slot;
             std::future::pending::<()>().await;
         });
-        let mut awaiting = AwaitingAuth::new();
+        let mut awaiting = AwaitingAuth::new(false, EarlyUdpBudget::default());
         let cancelled = awaiting.cancellation_flag();
         awaiting.set_task(task.abort_handle());
 
@@ -297,5 +373,16 @@ mod tests {
             .expect_err("dropping auth state must abort its task");
         assert!(error.is_cancelled());
         assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn only_udp_auth_state_accepts_early_datagrams() {
+        let mut tcp = AwaitingAuth::new(false, EarlyUdpBudget::default());
+        assert_eq!(tcp.buffer_early_udp_datagram(b"ignored"), None);
+
+        let mut udp = AwaitingAuth::new(true, EarlyUdpBudget::default());
+        assert_eq!(udp.buffer_early_udp_datagram(b"first"), Some(true));
+        let buffered = udp.take_early_udp_datagrams().unwrap();
+        assert_eq!(buffered.into_payloads(), vec![b"first".to_vec()]);
     }
 }

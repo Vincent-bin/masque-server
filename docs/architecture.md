@@ -170,11 +170,12 @@ connection.
 
 `[[listeners]]` runs one or more listeners in one process. Startup resolves each
 entry into a small listener plan containing its transport, address, shard count,
-and authentication. Every worker references the same process-wide
+optional QUIC packet ceiling, and authentication. Every worker references the same process-wide
 `ServerConfig`, so proxy policies, TLS tuning, and limits are shared rather than
 copied. Each listener owns one authentication snapshot shared by its shards and
-established HTTP/2 connections. QUIC tuning applies only to HTTP/3,
-and HTTP/2 flow-control tuning applies only to HTTP/2. The authentication mode
+established HTTP/2 connections. QUIC tuning applies only to HTTP/3; its
+`max_datagram_size` default may be overridden by one listener. HTTP/2
+flow-control tuning applies only to HTTP/2. The authentication mode
 decides which TLS context is built, and that policy is fixed when the socket
 binds. A process-wide TLS identity snapshot is selected once per new handshake;
 `SIGHUP` validates and atomically replaces it and every active authentication

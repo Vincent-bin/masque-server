@@ -384,14 +384,16 @@ mode = "client_cert"
 | `listen_addr` | Required; there is no default, so a typo cannot silently land on someone else's port |
 | `transport` | `http3` (default) binds UDP/QUIC; `http2` binds TCP/TLS |
 | `shards` | HTTP/3 event loops; defaults to `1`. HTTP/2 must use exactly `1` |
+| `max_datagram_size` | Optional HTTP/3 packet ceiling; inherits `quic.max_datagram_size` when absent and is rejected on HTTP/2 |
 | `[listeners.auth]` | Required; authentication is always explicit per socket |
 
-Everything else stays server-wide: TLS, HTTP/2 and QUIC settings, TCP/UDP target
-policies, connection limits, one `[[clients]]` roster, one TUN device, one
-CONNECT-IP address pool, and one routing table. That is the reason to run two
-listeners in one process rather than two processes — two processes would need
-two TUN devices and two address pools, and overlapping pools hand the same
-tunnel address to two clients.
+Apart from that one QUIC packet-size override, everything else stays
+server-wide: TLS, HTTP/2 and QUIC settings, TCP/UDP target policies, connection
+limits, one `[[clients]]` roster, one TUN device, one CONNECT-IP address pool,
+and one routing table. That is the reason to run two listeners in one process
+rather than two processes — two processes would need two TUN devices and two
+address pools, and overlapping pools hand the same tunnel address to two
+clients.
 
 Use one HTTP/3 shard until a benchmark shows one event loop is CPU-bound.
 Memory and the effective connection capacity increase with the shard count.
@@ -440,7 +442,7 @@ the server will actually run rather than the ones written down
 
 ```
 configuration is compatible with masque-server 0.8.0: /etc/masque/masque.toml
-listener 0.0.0.0:443 transport=http3 auth=basic shards=1
+listener 0.0.0.0:443 transport=http3 auth=basic shards=1 max_datagram_size=1350
 listener 0.0.0.0:4443 transport=http2 auth=client_cert shards=1
 ```
 
@@ -577,6 +579,7 @@ add-listener options:
       --transport <TRANSPORT>  http3 | http2 [scripted default: http3]
       --mode <MODE>         basic | client-cert
       --shards <N>          Event loops for this listener [default: 1]
+      --max-datagram-size <BYTES>  Override the HTTP/3 QUIC packet ceiling
       --username <NAME>     Basic username
       --password-hash <PHC>  Argon2id hash, as printed by hash-password
       --password-stdin      Read the password from stdin and hash it here
@@ -594,7 +597,8 @@ add-listener options:
 Combinations that would be ignored are refused rather than dropped:
 `--username`, `--password-hash`, and `--password-stdin` apply to `--mode basic`
 only, and `--disable-auth` cannot be combined with `--mode`, since a listener
-that demands nothing has no mode to record.
+that demands nothing has no mode to record. `--max-datagram-size` applies only
+to HTTP/3; HTTP/2 uses `[http2].max_datagram_size`.
 
 The four client-output options have the same safety and file format described
 under [Basic account management](#basic-account-management). They apply only to
@@ -713,6 +717,22 @@ Important relationships:
   whole datagrams, so increasing it raises per-connection memory directly.
 - Path-MTU discovery cannot probe beyond `max_datagram_size`; raising only
   `discover_pmtu` has no benefit.
+- `quic.max_datagram_size` remains the default for every HTTP/3 listener. An
+  individual listener may override it in its own block:
+
+  ```toml
+  [[listeners]]
+  listen_addr = "[::]:9449"
+  transport = "http3"
+  max_datagram_size = 1200
+  ```
+
+  The override must be `1200..65535`, is rejected on HTTP/2, and needs a
+  restart. Keep ordinary direct listeners at the 1350 default; 1200 is useful
+  for a low-MTU path or an inner QUIC connection carried through another
+  MASQUE hop. A 1200-byte listener cannot carry the default 1280-byte
+  CONNECT-IP packets; reserve it for CONNECT-UDP/TCP traffic, or lower
+  `ip_proxy.tun_mtu` consistently on both ends before using CONNECT-IP there.
 - UDP GSO is opt-in because some virtual egress paths advertise it but drop
   super-packets. Enable it only after an external-path A/B test.
 - Supported congestion controllers are `cubic`, `reno`, and `bbr2`. CUBIC is

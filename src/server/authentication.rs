@@ -198,11 +198,12 @@ impl Shard {
                 return;
             };
 
-            let Some(awaiting) = client.awaiting_auth.remove(&stream_id) else {
+            let Some(mut awaiting) = client.awaiting_auth.remove(&stream_id) else {
                 // The stream was reset while the hash was running.
                 return;
             };
             let client_finished = awaiting.client_finished;
+            let early_udp_datagrams = awaiting.take_early_udp_datagrams();
 
             if !authorized {
                 warn!(stream_id, "proxy authentication failed");
@@ -258,7 +259,10 @@ impl Shard {
                 debug_assert_eq!(*pending_stream, stream_id);
                 client.pending_udp_tunnels.insert(
                     stream_id,
-                    crate::tunnel::udp::PendingUdpTunnel::new(*header),
+                    crate::tunnel::udp::PendingUdpTunnel::with_early_datagrams(
+                        *header,
+                        early_udp_datagrams.unwrap_or_default(),
+                    ),
                 );
             }
         }

@@ -763,6 +763,7 @@ fn dual_fixture_with_stealth(tag: &str, stealth: bool) -> DualFixture {
             listen_addr: ephemeral_addr(),
             transport: ListenerTransport::Http3,
             shards: 1,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
@@ -776,6 +777,7 @@ fn dual_fixture_with_stealth(tag: &str, stealth: bool) -> DualFixture {
             listen_addr: ephemeral_addr(),
             transport: ListenerTransport::Http3,
             shards: 1,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,

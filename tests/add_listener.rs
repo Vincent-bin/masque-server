@@ -238,6 +238,50 @@ fn adds_a_certificate_listener_beside_a_basic_one() {
 }
 
 #[test]
+fn adds_an_http3_listener_with_its_own_datagram_size() {
+    let fixture = Fixture::new(true);
+    let output = fixture.add_listener(&[
+        "--listen-addr",
+        "127.0.0.1:8468",
+        "--mode",
+        "client-cert",
+        "--max-datagram-size",
+        "1200",
+        "--no-bind-check",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "add-listener failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.config().listeners[1].max_datagram_size, Some(1200));
+    assert!(fixture.text().contains("max_datagram_size = 1200"));
+}
+
+#[test]
+fn refuses_a_quic_datagram_size_on_an_http2_listener() {
+    let fixture = Fixture::new(true);
+    let output = fixture.add_listener(&[
+        "--transport",
+        "http2",
+        "--listen-addr",
+        "127.0.0.1:8469",
+        "--mode",
+        "client-cert",
+        "--max-datagram-size",
+        "1200",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--max-datagram-size applies only to an HTTP/3 listener")
+    );
+    fixture.assert_unchanged();
+}
+
+#[test]
 fn adds_a_basic_listener_with_a_password_read_from_stdin() {
     let fixture = Fixture::new(false);
     let mut child = Command::new(env!("CARGO_BIN_EXE_masque-server"))

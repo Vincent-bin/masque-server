@@ -1650,20 +1650,22 @@ fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()>
     let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
 
     let headers = connect_udp_headers(server_addr, echo_host, echo_port)?;
-    let stream_id = client.send_request(&headers, false)?;
-
-    let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
-    if status != 200 {
-        bail!("expected 200, got {status}");
-    }
-
-    // Give the server a moment to set up the UDP tunnel socket.
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Send a datagram through the tunnel and verify echo.
     let payload = b"hello masque e2e";
+    let stream_id = client.send_request(&headers, false)?;
+    // Surge sends its probe immediately after the request rather than waiting
+    // for the 200. Flush it as a separate flight so it reaches the server while
+    // Argon2 and target setup are still pending.
     client.send_dgram(stream_id, payload)?;
 
+    let (response_stream_id, status) = client.poll_response(Duration::from_secs(5))?;
+    if response_stream_id != stream_id || status != 200 {
+        bail!(
+            "expected stream {stream_id} status 200, got stream {response_stream_id} status {status}"
+        );
+    }
+
+    // The packet sent before the response must have survived Basic password
+    // verification plus asynchronous DNS/socket setup.
     let dgram = client.recv_dgram(Duration::from_secs(5))?;
     if dgram.payload != payload {
         bail!(

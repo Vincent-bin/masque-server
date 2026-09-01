@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- HTTP/3 listeners may override the global `quic.max_datagram_size`, allowing a
+  1200-byte low-MTU or nested-relay endpoint to coexist with 1350-byte direct
+  listeners. `add-listener --max-datagram-size` writes the same setting.
+
+### Fixed
+
+- CONNECT-UDP retains a small, bounded set of client DATAGRAMs that arrive
+  while Basic authentication or asynchronous target setup is still pending.
+  Clients such as Surge may therefore send their first UDP packet immediately
+  after the CONNECT headers without losing it before the server returns 200.
+
 ## 0.12.1 - 2026-09-01
 
 ### Added
