@@ -906,6 +906,7 @@ fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
             listen_addr: ephemeral_addr(),
             transport: ListenerTransport::Http3,
             shards: 2,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: false,
                 ..Default::default()
@@ -915,6 +916,7 @@ fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
             listen_addr: ephemeral_addr(),
             transport: ListenerTransport::Http3,
             shards: 2,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: false,
                 ..Default::default()
