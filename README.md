@@ -24,9 +24,11 @@ a staging environment.
 - CIDR allow and deny policies for TCP and UDP targets
 - Adaptive QUIC Retry plus process-wide per-source connection and Basic-auth
   admission limits
+- QUIC NAT rebinding and validated client-address migration without dropping
+  established HTTP/3 tunnels
 - Bounded queues and backpressure across authentication and tunnel I/O
 - Linux `recvmmsg`/`sendmmsg`, UDP GRO, optional UDP GSO, and TUN offload
-- Multi-core sharding with `SO_REUSEPORT`
+- Multi-core sharding with Linux `SO_REUSEPORT` CID steering
 - Optional loopback health/readiness endpoints and low-overhead Prometheus
   metrics, with packaged static alert rules and a Grafana dashboard JSON
 - Optional JSON logs plus native systemd readiness and shard-liveness watchdog

@@ -139,11 +139,30 @@ listener's UDP address using `SO_REUSEPORT`. The kernel normally keeps a client
 4-tuple on one of them. An HTTP/2 listener must use `shards = 1`; its one TCP
 accept loop dispatches connections across the Tokio runtime instead.
 
-QUIC permits address migration, so a packet can arrive on a shard that does
-not own its connection. A shared connection-ID registry identifies the owner,
-and the receiving shard forwards the packet through a bounded channel. TUN
-input uses the same ownership model. This keeps connection state single-owner
-without dropping legitimate migration traffic.
+QUIC permits address migration, so its UDP four-tuple is not a stable shard
+key. On a multi-shard Linux listener, the server reserves the first byte of its
+16-byte CIDs for the listener-local socket index and attaches a classic
+reuseport BPF selector. Both long- and short-header packets then return directly
+to the connection-owning socket after migration; the remaining 120 random bits
+keep CIDs impractical to predict.
+
+A shared connection-ID registry remains the correctness fallback when kernel
+steering is unavailable or a packet reaches the wrong shard. The receiving
+shard forwards that receive round through a bounded channel. The channel is
+admission-controlled by packet count rather than batch count, so coalescing
+wakeups does not enlarge its worst-case memory. TUN input uses the same
+ownership model. Connection state therefore stays single-owner without making
+migration depend on a particular Linux kernel capability.
+
+After the handshake, the server advertises one spare connection ID. A client
+can therefore move to a replacement source address without reusing the CID
+visible on the old path. Every active server CID maps to the same shard-owned
+connection; retired IDs are removed and replenished. quiche validates a new
+path with PATH_CHALLENGE/PATH_RESPONSE before the server transfers its
+per-source admission guard or reports `PeerMigrated`. A source at its configured
+connection limit cannot receive a migrated connection. Migration is an HTTP/3
+capability on one listener endpoint; HTTP/2 remains tied to its TCP connection,
+and switching server listeners creates a new connection.
 
 One HTTP/3 connection still uses one shard. Sharding improves aggregate
 throughput across multiple connections; it cannot parallelize a single QUIC

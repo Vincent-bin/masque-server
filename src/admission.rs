@@ -60,6 +60,44 @@ impl SourceAdmission {
     pub(crate) fn source(&self) -> IpAddr {
         self.source
     }
+
+    /// Move a live admission to a newly validated source address.
+    ///
+    /// QUIC can keep one transport connection alive while its peer address
+    /// changes. Updating both counters under the same lock prevents a
+    /// migration from temporarily escaping the per-source bound, and leaves
+    /// the original admission untouched when the destination source is full.
+    pub(crate) fn try_rebind(&mut self, source: IpAddr) -> bool {
+        let source = canonical_ip(source);
+        if source == self.source {
+            return true;
+        }
+
+        let mut counts = self
+            .inner
+            .counts
+            .lock()
+            .expect("source admissions poisoned");
+        if !counts.get(&self.source).is_some_and(|count| *count > 0) {
+            debug_assert!(false, "live source admission has no counter");
+            return false;
+        }
+        if counts.get(&source).copied().unwrap_or_default() >= self.inner.max_per_ip {
+            return false;
+        }
+
+        *counts.entry(source).or_default() += 1;
+        let previous = counts
+            .get_mut(&self.source)
+            .expect("live source admission checked above");
+        *previous -= 1;
+        let remove_previous = *previous == 0;
+        if remove_previous {
+            counts.remove(&self.source);
+        }
+        self.source = source;
+        true
+    }
 }
 
 impl Drop for SourceAdmission {
@@ -119,5 +157,36 @@ mod tests {
         let _first = limiter.try_acquire("192.0.2.1".parse().unwrap()).unwrap();
         let mapped = "::ffff:192.0.2.1".parse::<IpAddr>().unwrap();
         assert!(limiter.try_acquire(mapped).is_none());
+    }
+
+    #[test]
+    fn live_admission_rebinds_atomically() {
+        let limiter = SourceAdmissionLimiter::new(1);
+        let mut admission = limiter.try_acquire("192.0.2.1".parse().unwrap()).unwrap();
+
+        assert!(admission.try_rebind("192.0.2.2".parse().unwrap()));
+        assert_eq!(admission.source(), "192.0.2.2".parse::<IpAddr>().unwrap());
+        assert!(limiter.try_acquire("192.0.2.1".parse().unwrap()).is_some());
+        assert!(limiter.try_acquire("192.0.2.2".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn rejected_rebind_keeps_the_original_admission() {
+        let limiter = SourceAdmissionLimiter::new(1);
+        let mut admission = limiter.try_acquire("192.0.2.1".parse().unwrap()).unwrap();
+        let _occupied = limiter.try_acquire("192.0.2.2".parse().unwrap()).unwrap();
+
+        assert!(!admission.try_rebind("192.0.2.2".parse().unwrap()));
+        assert_eq!(admission.source(), "192.0.2.1".parse::<IpAddr>().unwrap());
+        assert!(limiter.try_acquire("192.0.2.1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn rebind_canonicalizes_ipv4_mapped_ipv6() {
+        let limiter = SourceAdmissionLimiter::new(1);
+        let mut admission = limiter.try_acquire("192.0.2.1".parse().unwrap()).unwrap();
+
+        assert!(admission.try_rebind("::ffff:192.0.2.1".parse().unwrap()));
+        assert_eq!(admission.source(), "192.0.2.1".parse::<IpAddr>().unwrap());
     }
 }

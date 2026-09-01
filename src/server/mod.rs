@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use std::sync::{Mutex, RwLock};
 
 use anyhow::Context as _;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -96,6 +96,18 @@ const MAX_SHARDS: usize = 32;
 
 /// Queue depth for packets handed between shards.
 const SHARD_FORWARD_QUEUE_CAPACITY: usize = 1024;
+
+/// Keep one active and one spare connection ID. Sequential migrations can
+/// replenish the spare after retirement without letting CID routing state
+/// grow with attacker-controlled path churn.
+const ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
+
+/// Bound unacknowledged PATH_CHALLENGEs retained by quiche per connection.
+const PATH_CHALLENGE_RECV_QUEUE_LEN: usize = 3;
+
+/// Private application error used when an otherwise valid peer migration
+/// would exceed the process-wide connection cap for its new source address.
+const MIGRATION_SOURCE_LIMIT_ERROR: u64 = 0x0101;
 
 /// Queue depth for completed credential verifications.
 const AUTH_RESULT_QUEUE_CAPACITY: usize = 256;
@@ -830,14 +842,14 @@ fn config_reload_settings(
 async fn open_quic_socket(
     config: &ServerConfig,
     listen_addr: SocketAddr,
-    reuseport: bool,
+    reuseport_shards: usize,
 ) -> anyhow::Result<QuicUdpSocket> {
     QuicUdpSocket::bind_shared(
         listen_addr,
         config.quic.max_datagram_size,
         config.quic.enable_udp_gso,
         config.quic.enable_udp_gro,
-        reuseport,
+        reuseport_shards,
     )
     .await
     .with_context(|| format!("failed to bind listener {listen_addr}"))
@@ -852,11 +864,11 @@ async fn open_quic_socket(
 async fn bind_first_listener_socket(
     config: &ServerConfig,
     requested: SocketAddr,
-    reuseport: bool,
+    reuseport_shards: usize,
     unavailable: &[SocketAddr],
 ) -> anyhow::Result<(QuicUdpSocket, SocketAddr)> {
     for attempt in 1..=MAX_EPHEMERAL_BIND_ATTEMPTS {
-        let socket = open_quic_socket(config, requested, reuseport).await?;
+        let socket = open_quic_socket(config, requested, reuseport_shards).await?;
         let bound = socket.local_addr()?;
 
         if requested.port() != 0 {
@@ -944,12 +956,14 @@ impl Server {
         // know which listener that owner belongs to.
         let mut forward_tx = Vec::with_capacity(total_shards);
         let mut forward_rx = Vec::with_capacity(total_shards);
+        let mut forward_slots = Vec::with_capacity(total_shards);
         let mut tun_tx = Vec::with_capacity(total_shards);
         let mut tun_rx = Vec::with_capacity(total_shards);
         for _ in 0..total_shards {
             let (tx, rx) = mpsc::channel(SHARD_FORWARD_QUEUE_CAPACITY);
             forward_tx.push(tx);
             forward_rx.push(rx);
+            forward_slots.push(Arc::new(Semaphore::new(SHARD_FORWARD_QUEUE_CAPACITY)));
             let (tx, rx) = mpsc::channel(SHARD_FORWARD_QUEUE_CAPACITY);
             tun_tx.push(tx);
             tun_rx.push(rx);
@@ -979,6 +993,7 @@ impl Server {
             ),
             tun,
             forward_tx,
+            forward_slots,
             tun_tx,
             auth_permits: Arc::new(Semaphore::new(auth_concurrency(basic_shards))),
             auth_queue_slots: Arc::new(Semaphore::new(MAX_PENDING_AUTH_GLOBAL)),
@@ -1030,18 +1045,13 @@ impl Server {
                 continue;
             }
 
-            // SO_REUSEPORT is what lets one listener's shards share an address.
-            // A single-shard listener must not set it, or a later listener that
-            // was misconfigured onto the same address could join its group.
-            let reuseport = plan.listener.shards > 1;
-
             // Bind `:0` only once, then use the assigned address for every
             // remaining shard. Asking the kernel for `:0` independently would
             // split one logical listener across unrelated ports.
             let (first_socket, bound_addr) = bind_first_listener_socket(
                 &config,
                 plan.listener.listen_addr,
-                reuseport,
+                plan.listener.shards,
                 &unavailable_http3_addrs,
             )
             .await?;
@@ -1067,6 +1077,7 @@ impl Server {
                 .expect("one inbox pair was created per planned shard");
             shards.push(Shard::from_socket(
                 shards.len(),
+                0,
                 Arc::clone(&shared),
                 Arc::clone(&config),
                 plan.listener.clone(),
@@ -1077,18 +1088,19 @@ impl Server {
                 tun_rx,
             )?);
 
-            for shard_metrics in listener_metrics.iter().skip(1) {
+            for (listener_shard_index, shard_metrics) in listener_metrics.iter().enumerate().skip(1)
+            {
                 let (forward_rx, tun_rx) = inboxes
                     .next()
                     .expect("one inbox pair was created per planned shard");
                 shards.push(
                     Shard::bind(
                         shards.len(),
+                        listener_shard_index,
                         Arc::clone(&shared),
                         Arc::clone(&config),
                         plan.listener.clone(),
                         listener_auth.as_ref().map(Arc::clone),
-                        reuseport,
                         Arc::clone(shard_metrics),
                         forward_rx,
                         tun_rx,
@@ -1733,6 +1745,14 @@ fn build_quic_config(
     quic_config.set_initial_max_streams_uni(100);
     quic_config.set_max_connection_window(config.quic.max_connection_window);
     quic_config.set_max_stream_window(config.quic.max_stream_window);
+    // Keep peer-address migration an explicit, tested part of the transport
+    // contract rather than inheriting whatever a future quiche default does.
+    // One spare CID is enough for a client to validate a replacement path;
+    // retired IDs are replenished while the connection is alive.
+    quic_config.set_disable_active_migration(false);
+    quic_config.set_active_connection_id_limit(ACTIVE_CONNECTION_ID_LIMIT);
+    quic_config.set_disable_dcid_reuse(false);
+    quic_config.set_path_challenge_recv_max_queue_len(PATH_CHALLENGE_RECV_QUEUE_LEN);
     quic_config.enable_pacing(true);
     quic_config.discover_pmtu(config.quic.discover_pmtu);
 
@@ -1898,6 +1918,39 @@ struct ForwardedPacket {
     from: SocketAddr,
 }
 
+/// A receive batch handed to the shard that owns its connection IDs.
+///
+/// `_slots` accounts every packet rather than every channel item, preserving
+/// the original queue's memory bound after packets are coalesced into batches.
+struct ForwardedPacketBatch {
+    packets: Vec<ForwardedPacket>,
+    bytes: usize,
+    _slots: OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct PendingForwardBatch {
+    packets: Vec<ForwardedPacket>,
+    bytes: usize,
+}
+
+impl PendingForwardBatch {
+    fn push(&mut self, packet: &[u8], from: SocketAddr) {
+        self.bytes += packet.len();
+        self.packets.push(ForwardedPacket {
+            data: packet.to_vec(),
+            from,
+        });
+    }
+}
+
+struct PacketOutput<'a> {
+    stateless: &'a mut [u8],
+    stateless_batch: &'a mut SendPacketBatch,
+    stateless_retries: &'a mut usize,
+    forward_batches: &'a mut [PendingForwardBatch],
+}
+
 /// Immutable facts that govern SIGHUP reloads.
 struct ConfigReload {
     path: std::path::PathBuf,
@@ -1945,8 +1998,8 @@ struct ReloadListener {
 ///
 /// None of it is on the per-packet path: the pool and routing table are touched
 /// only when a CONNECT-IP tunnel opens or closes or when a TUN packet needs an
-/// owner, and the ownership maps only when a connection is created, destroyed,
-/// or has migrated to a different shard's socket.
+/// owner, and the ownership maps only when a connection is created or
+/// destroyed, or one of its connection IDs is published or retired.
 struct Shared {
     address_pool: Mutex<AddressPool>,
     routing_table: RwLock<RoutingTable>,
@@ -1983,7 +2036,10 @@ struct Shared {
     /// Shared TUN device for CONNECT-IP tunnels (None if IP proxy disabled).
     tun: Option<TunManager>,
     /// Inbox per shard for packets forwarded after a migration.
-    forward_tx: Vec<mpsc::Sender<ForwardedPacket>>,
+    forward_tx: Vec<mpsc::Sender<ForwardedPacketBatch>>,
+    /// Packet-count permits for each forward inbox. Batching changes the
+    /// number of channel items but must not increase queued packet memory.
+    forward_slots: Vec<Arc<Semaphore>>,
     /// Inbox per shard for TUN packets belonging to its connections.
     tun_tx: Vec<mpsc::Sender<Vec<u8>>>,
     /// Bounds how many password verifications run at once.
@@ -2022,14 +2078,25 @@ struct Shared {
 }
 
 impl Shared {
-    fn record_shard_queue_drop(&self, shard: usize) {
+    fn record_shard_queue_drop(&self, shard: usize, packets: usize) {
         if let Some(metrics) = self
             .shard_metrics
             .read()
             .expect("shard metrics list poisoned")
             .get(shard)
         {
-            metrics.record_shard_queue_drop();
+            metrics.record_shard_queue_drop(packets);
+        }
+    }
+
+    fn record_cross_shard_forward(&self, shard: usize, packets: usize, bytes: usize) {
+        if let Some(metrics) = self
+            .shard_metrics
+            .read()
+            .expect("shard metrics list poisoned")
+            .get(shard)
+        {
+            metrics.record_cross_shard_forward(packets, bytes);
         }
     }
 
@@ -2076,6 +2143,9 @@ impl Shared {
 /// One shard: an independent event loop over its own share of connections.
 struct Shard {
     index: usize,
+    /// Listener-local socket index encoded into server CIDs on a reuseport
+    /// listener. `None` keeps all 128 CID bits random for a single shard.
+    reuseport_index: Option<u8>,
     shared: Arc<Shared>,
     /// Counters owned by this shard and aggregated per listener while scraping.
     metrics: Arc<ShardMetrics>,
@@ -2083,6 +2153,9 @@ struct Shard {
     quic_config: quiche::Config,
     h3_config: quiche::h3::Config,
     connections: FxHashMap<quiche::ConnectionId<'static>, ClientConnection>,
+    /// Additional server-issued CIDs mapped back to the stable connection-map
+    /// key. The initial CID stays on the one-lookup hot path above.
+    connection_id_aliases: FxHashMap<quiche::ConnectionId<'static>, quiche::ConnectionId<'static>>,
     auth: Option<Arc<SharedBasicAuthenticator>>,
     /// Set when clients authenticate with a certificate instead of credentials.
     ///
@@ -2101,7 +2174,7 @@ struct Shard {
     udp_setup_rx: mpsc::Receiver<UdpSetupResult>,
     tcp_event_tx: mpsc::Sender<TcpRelayEvent>,
     tcp_event_rx: mpsc::Receiver<TcpRelayEvent>,
-    forward_rx: mpsc::Receiver<ForwardedPacket>,
+    forward_rx: mpsc::Receiver<ForwardedPacketBatch>,
     tun_rx: mpsc::Receiver<Vec<u8>>,
     auth_tx: mpsc::Sender<AuthOutcome>,
     auth_rx: mpsc::Receiver<AuthOutcome>,
@@ -2116,18 +2189,27 @@ impl Shard {
     #[allow(clippy::too_many_arguments)]
     async fn bind(
         index: usize,
+        listener_shard_index: usize,
         shared: Arc<Shared>,
         config: Arc<ServerConfig>,
         listener: ResolvedListener,
         auth: Option<Arc<SharedBasicAuthenticator>>,
-        reuseport: bool,
         metrics: Arc<ShardMetrics>,
-        forward_rx: mpsc::Receiver<ForwardedPacket>,
+        forward_rx: mpsc::Receiver<ForwardedPacketBatch>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
-        let socket = open_quic_socket(&config, listener.listen_addr, reuseport).await?;
+        let socket = open_quic_socket(&config, listener.listen_addr, listener.shards).await?;
         Self::from_socket(
-            index, shared, config, listener, auth, socket, metrics, forward_rx, tun_rx,
+            index,
+            listener_shard_index,
+            shared,
+            config,
+            listener,
+            auth,
+            socket,
+            metrics,
+            forward_rx,
+            tun_rx,
         )
     }
 
@@ -2139,22 +2221,35 @@ impl Shard {
     #[allow(clippy::too_many_arguments)]
     fn from_socket(
         index: usize,
+        listener_shard_index: usize,
         shared: Arc<Shared>,
         config: Arc<ServerConfig>,
         listener: ResolvedListener,
         auth: Option<Arc<SharedBasicAuthenticator>>,
         socket: QuicUdpSocket,
         metrics: Arc<ShardMetrics>,
-        forward_rx: mpsc::Receiver<ForwardedPacket>,
+        forward_rx: mpsc::Receiver<ForwardedPacketBatch>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            listener_shard_index < listener.shards,
+            "listener shard index {listener_shard_index} is outside {} shards",
+            listener.shards
+        );
+        let reuseport_index = if listener.shards > 1 {
+            Some(u8::try_from(listener_shard_index).context("listener shard index exceeds u8")?)
+        } else {
+            None
+        };
         let bound_addr = socket.local_addr()?;
         metrics.set_udp_offload_state(socket.udp_gso_enabled(), socket.udp_gro_enabled());
         info!(
             shard = index,
+            listener_shard = listener_shard_index,
             addr = %bound_addr,
             udp_gso = socket.udp_gso_enabled(),
             udp_gro = socket.udp_gro_enabled(),
+            reuseport_cid_steering = socket.reuseport_cid_steering_enabled(),
             "listening"
         );
 
@@ -2188,12 +2283,14 @@ impl Shard {
 
         Ok(Self {
             index,
+            reuseport_index,
             shared,
             metrics,
             socket,
             quic_config,
             h3_config,
             connections: FxHashMap::default(),
+            connection_id_aliases: FxHashMap::default(),
             auth,
             client_certs,
             tcp_policy,
@@ -2225,6 +2322,9 @@ impl Shard {
         let mut send_batch = SendPacketBatch::new();
         let mut stateless_out = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut stateless_batch = SendPacketBatch::new();
+        let mut forward_batches: Vec<PendingForwardBatch> = (0..self.shared.forward_tx.len())
+            .map(|_| PendingForwardBatch::default())
+            .collect();
         // One shard reads the shared TUN device and hands each packet to the
         // connection that owns its address. Shard 0 is an arbitrary but stable
         // choice; nothing here depends on which listener that shard serves.
@@ -2253,6 +2353,10 @@ impl Shard {
             self.dirty.end_round();
             serviced.clear();
             stateless_batch.clear();
+            for batch in &mut forward_batches {
+                debug_assert!(batch.packets.is_empty());
+                debug_assert_eq!(batch.bytes, 0);
+            }
             let mut stateless_retries = 0usize;
 
             // Wake for the earliest connection deadline rather than scanning
@@ -2277,7 +2381,7 @@ impl Shard {
                 TcpRelay(Option<TcpRelayEvent>),
                 TunPacket(std::io::Result<usize>),
                 /// A QUIC packet another shard received for one of ours.
-                Forwarded(Option<ForwardedPacket>),
+                Forwarded(Option<ForwardedPacketBatch>),
                 /// A TUN packet another shard read for one of our tunnels.
                 TunInbound(Option<Vec<u8>>),
                 /// Credentials finished verifying off the event loop.
@@ -2352,26 +2456,37 @@ impl Shard {
                 Event::PacketBatch(Ok(received)) => {
                     let mut packet_count = 0usize;
                     let mut byte_count = 0usize;
+                    let mut packet_output = PacketOutput {
+                        stateless: &mut stateless_out,
+                        stateless_batch: &mut stateless_batch,
+                        stateless_retries: &mut stateless_retries,
+                        forward_batches: &mut forward_batches,
+                    };
                     recv_batch.for_each_packet_mut(received, |packet, from| {
                         packet_count += 1;
                         byte_count += packet.len();
                         if !shutting_down {
-                            self.handle_packet(
-                                packet,
-                                from,
-                                local_addr,
-                                &mut stateless_out,
-                                &mut stateless_batch,
-                                &mut stateless_retries,
-                            );
+                            self.handle_packet(packet, from, local_addr, &mut packet_output);
                             return;
                         }
 
                         // During shutdown, still feed packets to quiche so it
                         // can send CONNECTION_CLOSE frames.
-                        if let Ok(hdr) = quiche::Header::from_slice(packet, CONN_ID_LEN)
-                            && let Some(client) = self.connections.get_mut(&hdr.dcid)
-                        {
+                        if let Ok(hdr) = quiche::Header::from_slice(packet, CONN_ID_LEN) {
+                            let key = if let Some((id, client)) =
+                                self.connections.get_key_value(&hdr.dcid)
+                                && client.primary_connection_id_active()
+                            {
+                                Some(id.clone())
+                            } else {
+                                self.connection_id_aliases.get(&hdr.dcid).cloned()
+                            };
+                            let Some(key) = key else {
+                                return;
+                            };
+                            let Some(client) = self.connections.get_mut(&key) else {
+                                return;
+                            };
                             let recv_info = quiche::RecvInfo {
                                 from,
                                 to: local_addr,
@@ -2413,15 +2528,29 @@ impl Shard {
                 Event::TunPacket(Err(e)) => {
                     error!(%e, "TUN recv error");
                 }
-                Event::Forwarded(Some(mut packet)) => {
-                    self.handle_packet(
-                        &mut packet.data,
-                        packet.from,
-                        local_addr,
-                        &mut stateless_out,
-                        &mut stateless_batch,
-                        &mut stateless_retries,
+                Event::Forwarded(Some(mut batch)) => {
+                    debug_assert_eq!(
+                        batch.bytes,
+                        batch
+                            .packets
+                            .iter()
+                            .map(|packet| packet.data.len())
+                            .sum::<usize>()
                     );
+                    let mut packet_output = PacketOutput {
+                        stateless: &mut stateless_out,
+                        stateless_batch: &mut stateless_batch,
+                        stateless_retries: &mut stateless_retries,
+                        forward_batches: &mut forward_batches,
+                    };
+                    for packet in &mut batch.packets {
+                        self.handle_packet(
+                            &mut packet.data,
+                            packet.from,
+                            local_addr,
+                            &mut packet_output,
+                        );
+                    }
                 }
                 Event::Forwarded(None) => {}
                 Event::TunInbound(Some(packet)) => {
@@ -2434,6 +2563,8 @@ impl Shard {
                 Event::AuthDone(None) => {}
                 Event::Timeout => {}
             }
+
+            self.flush_forward_batches(&mut forward_batches);
 
             if !stateless_batch.is_empty() {
                 let udp_gso_before_send = self.socket.udp_gso_enabled();
@@ -2537,11 +2668,16 @@ impl Shard {
                             );
                     }
                     self.conn_by_index.remove(&client.index);
-                    self.shared
+                    let mut cid_routes = self
+                        .shared
                         .cid_shard
                         .write()
-                        .expect("cid ownership poisoned")
-                        .remove(&id);
+                        .expect("cid ownership poisoned");
+                    for connection_id in client.connection_ids() {
+                        cid_routes.remove(connection_id);
+                        self.connection_id_aliases.remove(connection_id);
+                    }
+                    drop(cid_routes);
                     self.shared
                         .index_shard
                         .write()
@@ -2629,19 +2765,168 @@ impl Shard {
         destination: &quiche::ConnectionId<'_>,
     ) -> quiche::ConnectionId<'static> {
         let signed = ring::hmac::sign(&self.shared.conn_id_key, destination);
-        quiche::ConnectionId::from_vec(signed.as_ref()[..CONN_ID_LEN].to_vec())
+        let mut id = signed.as_ref()[..CONN_ID_LEN].to_vec();
+        if let Some(index) = self.reuseport_index {
+            id[0] = index;
+        }
+        quiche::ConnectionId::from_vec(id)
     }
 
-    fn forward_packet(&self, shard: usize, packet: &[u8], from: SocketAddr) {
-        let forwarded = ForwardedPacket {
-            data: packet.to_vec(),
-            from,
-        };
-        // Dropping under pressure is what the network would have done; QUIC
-        // retransmits without making this unbounded cross-shard state.
-        if self.shared.forward_tx[shard].try_send(forwarded).is_err() {
-            self.shared.record_shard_queue_drop(shard);
-            debug!(shard, "shard forward queue full, dropping packet");
+    /// Apply edge-triggered path notifications after a successful receive.
+    /// `PeerMigrated` is emitted by quiche only after PATH_RESPONSE validated
+    /// the replacement path, so it is the first safe point to move IP-based
+    /// resource accounting.
+    fn handle_path_events(metrics: &ShardMetrics, client: &mut ClientConnection) -> bool {
+        while let Some(event) = client.quic.path_event_next() {
+            metrics.record_quic_path_event(&event);
+            match event {
+                quiche::PathEvent::PeerMigrated(_local, peer) => {
+                    if !client.rebind_source_ip(peer.ip()) {
+                        metrics.record_quic_migration_source_limit();
+                        warn!(
+                            connection_index = client.index,
+                            "closing migrated connection at source connection limit"
+                        );
+                        let _ = client.quic.close(
+                            true,
+                            MIGRATION_SOURCE_LIMIT_ERROR,
+                            b"migration source limit",
+                        );
+                        return false;
+                    }
+                    info!(connection_index = client.index, "QUIC peer path migrated");
+                }
+                quiche::PathEvent::FailedValidation(..) => {
+                    debug!(
+                        connection_index = client.index,
+                        "QUIC peer path validation failed"
+                    );
+                }
+                quiche::PathEvent::ReusedSourceConnectionId(..) => {
+                    debug!(
+                        connection_index = client.index,
+                        "peer reused a source connection ID on another path"
+                    );
+                }
+                quiche::PathEvent::New(..)
+                | quiche::PathEvent::Validated(..)
+                | quiche::PathEvent::Closed(..) => {}
+            }
+        }
+        true
+    }
+
+    /// Remove retired server CIDs and keep one spare available for a client
+    /// that wants to migrate without reusing the ID visible on its old path.
+    fn sync_connection_ids(
+        shared: &Shared,
+        shard: usize,
+        reuseport_index: Option<u8>,
+        aliases: &mut FxHashMap<quiche::ConnectionId<'static>, quiche::ConnectionId<'static>>,
+        primary: &quiche::ConnectionId<'static>,
+        client: &mut ClientConnection,
+    ) {
+        let mut retired = Vec::new();
+        while let Some(id) = client.quic.retired_scid_next() {
+            retired.push(id);
+        }
+        if !retired.is_empty() {
+            let mut routes = shared.cid_shard.write().expect("cid ownership poisoned");
+            for id in retired {
+                routes.remove(&id);
+                aliases.remove(&id);
+                client.retire_connection_id(&id);
+            }
+        }
+
+        if !client.quic.is_established() {
+            return;
+        }
+
+        while client.quic.scids_left() > 0 {
+            let mut random = [0u8; CONN_ID_LEN + 16];
+            if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
+                .is_err()
+            {
+                warn!(
+                    connection_index = client.index,
+                    "cannot generate spare QUIC connection ID"
+                );
+                return;
+            }
+            if let Some(index) = reuseport_index {
+                random[0] = index;
+            }
+            let id = quiche::ConnectionId::from_vec(random[..CONN_ID_LEN].to_vec());
+            let reset_token = u128::from_be_bytes(
+                random[CONN_ID_LEN..]
+                    .try_into()
+                    .expect("reset token has a fixed 16-byte slice"),
+            );
+
+            let mut routes = shared.cid_shard.write().expect("cid ownership poisoned");
+            if routes.contains_key(&id) {
+                continue;
+            }
+            if let Err(error) = client.quic.new_scid(&id, reset_token, false) {
+                debug!(
+                    connection_index = client.index,
+                    %error,
+                    "cannot publish spare QUIC connection ID"
+                );
+                return;
+            }
+            routes.insert(id.clone(), shard);
+            drop(routes);
+            aliases.insert(id.clone(), primary.clone());
+            client.publish_connection_id(id);
+        }
+    }
+
+    fn queue_forward_packet(
+        &self,
+        shard: usize,
+        packet: &[u8],
+        from: SocketAddr,
+        batches: &mut [PendingForwardBatch],
+    ) {
+        if let Some(batch) = batches.get_mut(shard) {
+            batch.push(packet, from);
+        }
+    }
+
+    /// Publish at most one channel item per destination shard for this receive
+    /// round while preserving the original packet-count queue bound.
+    fn flush_forward_batches(&self, batches: &mut [PendingForwardBatch]) {
+        for (shard, pending) in batches.iter_mut().enumerate() {
+            if pending.packets.is_empty() {
+                continue;
+            }
+
+            let packets = pending.packets.len();
+            let bytes = pending.bytes;
+            let slots = Arc::clone(&self.shared.forward_slots[shard]);
+            let Ok(slots) = slots.try_acquire_many_owned(packets as u32) else {
+                pending.packets.clear();
+                pending.bytes = 0;
+                self.shared.record_shard_queue_drop(shard, packets);
+                debug!(shard, packets, "shard forward queue full, dropping batch");
+                continue;
+            };
+
+            let batch = ForwardedPacketBatch {
+                packets: std::mem::take(&mut pending.packets),
+                bytes,
+                _slots: slots,
+            };
+            pending.bytes = 0;
+            if self.shared.forward_tx[shard].try_send(batch).is_err() {
+                self.shared.record_shard_queue_drop(shard, packets);
+                debug!(shard, packets, "shard forward inbox full, dropping batch");
+                continue;
+            }
+            self.shared
+                .record_cross_shard_forward(shard, packets, bytes);
         }
     }
 
@@ -2670,9 +2955,7 @@ impl Shard {
         buf: &mut [u8],
         from: SocketAddr,
         local: SocketAddr,
-        stateless_out: &mut [u8],
-        stateless_batch: &mut SendPacketBatch,
-        stateless_retries: &mut usize,
+        output: &mut PacketOutput<'_>,
     ) {
         let hdr = match quiche::Header::from_slice(buf, CONN_ID_LEN) {
             Ok(v) => v,
@@ -2685,7 +2968,11 @@ impl Shard {
         // Established packets carry the server-issued CID and take this fast
         // path without hashing. If migration made the packet land on another
         // SO_REUSEPORT shard, the shared ownership map names the right inbox.
-        let key = if let Some((conn_id, _)) = self.connections.get_key_value(&hdr.dcid) {
+        let key = if let Some((conn_id, client)) = self.connections.get_key_value(&hdr.dcid)
+            && client.primary_connection_id_active()
+        {
+            conn_id.clone()
+        } else if let Some(conn_id) = self.connection_id_aliases.get(&hdr.dcid) {
             conn_id.clone()
         } else {
             let direct_owner = self
@@ -2697,9 +2984,9 @@ impl Shard {
                 .copied();
             if let Some(owner) = direct_owner {
                 if owner != self.index {
-                    self.forward_packet(owner, buf, from);
+                    self.queue_forward_packet(owner, buf, from, output.forward_batches);
                 } else {
-                    debug!("connection ownership published without local state");
+                    debug!("connection ownership published without local state or CID alias");
                 }
                 return;
             }
@@ -2718,12 +3005,12 @@ impl Shard {
             }
 
             if !quiche::version_is_supported(hdr.version) {
-                match quiche::negotiate_version(&hdr.scid, &hdr.dcid, stateless_out) {
+                match quiche::negotiate_version(&hdr.scid, &hdr.dcid, output.stateless) {
                     Ok(written) => self.queue_stateless_packet(
-                        &stateless_out[..written],
+                        &output.stateless[..written],
                         local,
                         from,
-                        stateless_batch,
+                        output.stateless_batch,
                     ),
                     Err(error) => debug!(%error, "failed to build QUIC version negotiation"),
                 }
@@ -2746,7 +3033,7 @@ impl Shard {
                     .copied();
                 if let Some(owner) = derived_owner {
                     if owner != self.index {
-                        self.forward_packet(owner, buf, from);
+                        self.queue_forward_packet(owner, buf, from, output.forward_batches);
                     } else {
                         debug!("derived connection ownership published without local state");
                     }
@@ -2768,16 +3055,16 @@ impl Shard {
                         &derived,
                         &retry_token,
                         hdr.version,
-                        stateless_out,
+                        output.stateless,
                     ) {
                         Ok(written) => {
                             self.queue_stateless_packet(
-                                &stateless_out[..written],
+                                &output.stateless[..written],
                                 local,
                                 from,
-                                stateless_batch,
+                                output.stateless_batch,
                             );
-                            *stateless_retries += 1;
+                            *output.stateless_retries += 1;
                         }
                         Err(error) => debug!(%error, "failed to build QUIC Retry"),
                     }
@@ -2853,6 +3140,7 @@ impl Shard {
                     conn_idx,
                     Arc::clone(&self.metrics),
                     source_admission,
+                    scid.clone(),
                 );
                 self.connections.insert(scid.clone(), client);
                 scid
@@ -2873,6 +3161,18 @@ impl Shard {
             debug!(%e, "quiche recv error");
             return;
         }
+
+        if !Self::handle_path_events(&self.metrics, client) {
+            return;
+        }
+        Self::sync_connection_ids(
+            &self.shared,
+            self.index,
+            self.reuseport_index,
+            &mut self.connection_id_aliases,
+            &key,
+            client,
+        );
 
         // Resolve the client's certificate to a roster entry once, at the
         // handshake boundary. The TLS callback has already refused unknown

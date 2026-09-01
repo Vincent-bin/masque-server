@@ -245,6 +245,17 @@ case "$BENCH_MODE" in
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
             target/release/masque-e2e
+
+            if [ "$transport" = http3 ]; then
+                MASQUE_MIGRATION_CHECK=1 \
+                MASQUE_BENCH_TRANSPORT=http3 \
+                MASQUE_SERVER_ADDR=127.0.0.1:4433 \
+                ECHO_SERVER_ADDR=127.0.0.1:9999 \
+                MASQUE_USERNAME=test \
+                MASQUE_PASSWORD=test-password \
+                RUST_LOG=warn \
+                target/release/masque-e2e
+            fi
         done
         ;;
 esac

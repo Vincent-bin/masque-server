@@ -386,6 +386,46 @@ impl ListenerMetrics {
             )
             .unwrap();
         }
+        for (event, field) in [
+            (
+                "new",
+                (|shard: &ShardMetrics| &shard.quic_path_new) as fn(&ShardMetrics) -> &AtomicU64,
+            ),
+            ("validated", |shard| &shard.quic_path_validated),
+            ("failed_validation", |shard| {
+                &shard.quic_path_failed_validation
+            }),
+            ("closed", |shard| &shard.quic_path_closed),
+            ("reused_source_cid", |shard| {
+                &shard.quic_path_reused_source_cid
+            }),
+            ("peer_migrated", |shard| &shard.quic_path_peer_migrated),
+        ] {
+            writeln!(
+                out,
+                "masque_quic_path_events_total{{{label},event=\"{event}\"}} {}",
+                self.sum(field)
+            )
+            .unwrap();
+        }
+        writeln!(
+            out,
+            "masque_quic_path_migrations_rejected_total{{{label},reason=\"source_limit\"}} {}",
+            self.sum(|shard| &shard.quic_migration_source_limit)
+        )
+        .unwrap();
+        render_value(
+            out,
+            "masque_quic_cross_shard_forwarded_packets_total",
+            label,
+            self.sum(|shard| &shard.quic_cross_shard_forwarded_packets),
+        );
+        render_value(
+            out,
+            "masque_quic_cross_shard_forwarded_bytes_total",
+            label,
+            self.sum(|shard| &shard.quic_cross_shard_forwarded_bytes),
+        );
         for (name, field) in [
             (
                 "masque_quic_receive_batches_total",
@@ -521,6 +561,15 @@ pub(crate) struct ShardMetrics {
     connections_rejected_source_limit: AtomicU64,
     quic_retries_sent: AtomicU64,
     quic_retries_invalid: AtomicU64,
+    quic_path_new: AtomicU64,
+    quic_path_validated: AtomicU64,
+    quic_path_failed_validation: AtomicU64,
+    quic_path_closed: AtomicU64,
+    quic_path_reused_source_cid: AtomicU64,
+    quic_path_peer_migrated: AtomicU64,
+    quic_migration_source_limit: AtomicU64,
+    quic_cross_shard_forwarded_packets: AtomicU64,
+    quic_cross_shard_forwarded_bytes: AtomicU64,
     quic_receive_batches: AtomicU64,
     quic_receive_packets: AtomicU64,
     quic_receive_bytes: AtomicU64,
@@ -560,6 +609,15 @@ impl ShardMetrics {
             connections_rejected_source_limit: AtomicU64::new(0),
             quic_retries_sent: AtomicU64::new(0),
             quic_retries_invalid: AtomicU64::new(0),
+            quic_path_new: AtomicU64::new(0),
+            quic_path_validated: AtomicU64::new(0),
+            quic_path_failed_validation: AtomicU64::new(0),
+            quic_path_closed: AtomicU64::new(0),
+            quic_path_reused_source_cid: AtomicU64::new(0),
+            quic_path_peer_migrated: AtomicU64::new(0),
+            quic_migration_source_limit: AtomicU64::new(0),
+            quic_cross_shard_forwarded_packets: AtomicU64::new(0),
+            quic_cross_shard_forwarded_bytes: AtomicU64::new(0),
             quic_receive_batches: AtomicU64::new(0),
             quic_receive_packets: AtomicU64::new(0),
             quic_receive_bytes: AtomicU64::new(0),
@@ -652,6 +710,37 @@ impl ShardMetrics {
         if self.enabled {
             self.quic_retries_invalid.fetch_add(1, RELAXED);
         }
+    }
+
+    pub(crate) fn record_quic_path_event(&self, event: &quiche::PathEvent) {
+        if !self.enabled {
+            return;
+        }
+        let counter = match event {
+            quiche::PathEvent::New(..) => &self.quic_path_new,
+            quiche::PathEvent::Validated(..) => &self.quic_path_validated,
+            quiche::PathEvent::FailedValidation(..) => &self.quic_path_failed_validation,
+            quiche::PathEvent::Closed(..) => &self.quic_path_closed,
+            quiche::PathEvent::ReusedSourceConnectionId(..) => &self.quic_path_reused_source_cid,
+            quiche::PathEvent::PeerMigrated(..) => &self.quic_path_peer_migrated,
+        };
+        counter.fetch_add(1, RELAXED);
+    }
+
+    pub(crate) fn record_quic_migration_source_limit(&self) {
+        if self.enabled {
+            self.quic_migration_source_limit.fetch_add(1, RELAXED);
+        }
+    }
+
+    pub(crate) fn record_cross_shard_forward(&self, packets: usize, bytes: usize) {
+        if !self.enabled || packets == 0 {
+            return;
+        }
+        self.quic_cross_shard_forwarded_packets
+            .fetch_add(packets as u64, RELAXED);
+        self.quic_cross_shard_forwarded_bytes
+            .fetch_add(bytes as u64, RELAXED);
     }
 
     #[inline]
@@ -750,11 +839,11 @@ impl ShardMetrics {
         GaugeGuard::new(Arc::clone(self), Gauge::AuthRunning)
     }
 
-    pub(crate) fn record_shard_queue_drop(&self) {
-        if !self.enabled {
+    pub(crate) fn record_shard_queue_drop(&self, packets: usize) {
+        if !self.enabled || packets == 0 {
             return;
         }
-        self.dropped_shard_queue.fetch_add(1, RELAXED);
+        self.dropped_shard_queue.fetch_add(packets as u64, RELAXED);
     }
 
     pub(crate) fn record_datagram_queue_drop(&self, packets: usize) {
@@ -901,6 +990,26 @@ fn render_listener_headers(out: &mut String) {
             "counter",
         ),
         (
+            "masque_quic_path_events_total",
+            "QUIC peer-path discovery, validation, and migration events.",
+            "counter",
+        ),
+        (
+            "masque_quic_path_migrations_rejected_total",
+            "Validated QUIC peer migrations rejected by a resource bound.",
+            "counter",
+        ),
+        (
+            "masque_quic_cross_shard_forwarded_packets_total",
+            "QUIC packets forwarded to the shard that owns their connection ID.",
+            "counter",
+        ),
+        (
+            "masque_quic_cross_shard_forwarded_bytes_total",
+            "QUIC bytes forwarded to the shard that owns their connection ID.",
+            "counter",
+        ),
+        (
             "masque_quic_receive_batches_total",
             "Kernel receive batches containing QUIC packets.",
             "counter",
@@ -1026,6 +1135,17 @@ mod tests {
         listener.connection_rejected_source_limit();
         listener.record_quic_retries_sent(2);
         listener.record_quic_retry_invalid();
+        listener.record_quic_path_event(&quiche::PathEvent::New(
+            "127.0.0.1:8449".parse().unwrap(),
+            "192.0.2.1:50000".parse().unwrap(),
+        ));
+        listener.record_quic_path_event(&quiche::PathEvent::PeerMigrated(
+            "127.0.0.1:8449".parse().unwrap(),
+            "192.0.2.2:50001".parse().unwrap(),
+        ));
+        listener.record_quic_migration_source_limit();
+        listener.record_cross_shard_forward(3, 3600);
+        listener.record_shard_queue_drop(2);
         listener.record_tcp_relay_batch(4, 256 * 1024);
         listener.update_tunnels([0, 0, 0], [1, 2, 1]);
         listener.record_auth_success();
@@ -1072,6 +1192,21 @@ mod tests {
         ));
         assert!(rendered.contains(
             "masque_quic_retries_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",result=\"invalid\"} 1"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_path_events_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",event=\"peer_migrated\"} 1"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_path_migrations_rejected_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",reason=\"source_limit\"} 1"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_cross_shard_forwarded_packets_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 3"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_cross_shard_forwarded_bytes_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\"} 3600"
+        ));
+        assert!(rendered.contains(
+            "masque_packets_dropped_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",reason=\"shard_queue\"} 2"
         ));
         assert!(rendered.contains(
             "masque_tunnels_active{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",protocol=\"udp\"} 2"

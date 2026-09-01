@@ -7,6 +7,29 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.12.0 - 2026-09-01
+
+### Added
+
+- HTTP/3 connections survive validated client source-address and NAT port
+  migration. Each connection maintains one bounded spare CID, retires its CID
+  routes with quiche, transfers per-source admission only after PATH_RESPONSE,
+  and exports low-cardinality path and cross-shard forwarding metrics.
+- The E2E client verifies an established CONNECT-UDP tunnel across a real UDP
+  socket replacement. Linux coverage also verifies CID-based SO_REUSEPORT
+  steering and checks that migration cannot bypass per-source connection caps;
+  `MASQUE_BENCH_MIGRATED=1` measures the post-migration steady state.
+
+### Changed
+
+- Wrong-shard QUIC packets from one kernel receive round are forwarded as a
+  batch while a packet-count semaphore preserves the previous bounded-memory
+  limit.
+- Multi-shard Linux listeners encode a listener-local socket index in one byte
+  of each server CID and attach a classic reuseport BPF selector. Migrated
+  packets therefore stay on their connection-owning shard; the bounded shared
+  registry remains as a compatibility fallback when steering is unavailable.
+
 ## 0.11.0 - 2026-09-01
 
 ### Added

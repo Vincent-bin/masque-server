@@ -320,6 +320,8 @@ impl Client {
         config.set_max_stream_window(16_777_216);
         config.set_initial_max_streams_bidi(128);
         config.set_initial_max_streams_uni(100);
+        config.set_active_connection_id_limit(2);
+        config.set_disable_active_migration(false);
         config.enable_pacing(true);
         config.enable_dgram(true, 1000, 1000);
 
@@ -395,6 +397,72 @@ impl Client {
         self.recv_once()?;
         self.flush()?;
         Ok(())
+    }
+
+    fn publish_spare_connection_id(&mut self) -> Result<()> {
+        while self.quic.scids_left() > 0 {
+            let mut random = [0u8; quiche::MAX_CONN_ID_LEN + 16];
+            ring::rand::SystemRandom::new()
+                .fill(&mut random)
+                .map_err(|_| anyhow::anyhow!("RNG failed"))?;
+            let id = quiche::ConnectionId::from_ref(&random[..quiche::MAX_CONN_ID_LEN]);
+            let reset_token = u128::from_be_bytes(
+                random[quiche::MAX_CONN_ID_LEN..]
+                    .try_into()
+                    .expect("reset token is 16 bytes"),
+            );
+            self.quic.new_scid(&id, reset_token, false)?;
+        }
+        self.flush()
+    }
+
+    /// Change the UDP source port while preserving the QUIC and H3 state.
+    fn migrate_source(&mut self, timeout: Duration) -> Result<(SocketAddr, SocketAddr)> {
+        self.publish_spare_connection_id()?;
+        let old_local = self.local;
+        let bind_addr = if old_local.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+        let replacement = UdpSocket::bind(bind_addr)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        tune_udp_receive_buffer(&replacement);
+        #[cfg(target_os = "macos")]
+        bind_udp_socket_to_requested_interface(&replacement)?;
+        replacement.connect(self.peer)?;
+        let new_local = replacement.local_addr()?;
+        if new_local == old_local {
+            bail!("replacement UDP socket reused {old_local}");
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.quic.migrate_source(new_local) {
+                Ok(_) => {
+                    self.quic.probe_path(new_local, self.peer)?;
+                    self.quic.send_ack_eliciting()?;
+                    break;
+                }
+                Err(quiche::Error::OutOfIdentifiers) if Instant::now() < deadline => {
+                    self.drive()?;
+                }
+                Err(error) => bail!("cannot start QUIC migration: {error}"),
+            }
+        }
+
+        self.socket = replacement;
+        self.local = new_local;
+        while Instant::now() < deadline {
+            self.drive()?;
+            if self.quic.is_path_validated(new_local, self.peer) == Ok(true) {
+                return Ok((old_local, new_local));
+            }
+            if self.quic.is_closed() {
+                bail!("QUIC connection closed during migration");
+            }
+        }
+        bail!("replacement QUIC path did not validate within {timeout:?}")
     }
 
     /// Complete the QUIC handshake.
@@ -1609,6 +1677,25 @@ fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()>
     Ok(())
 }
 
+fn test_quic_migration(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
+    let before = b"before QUIC migration";
+    client.send_dgram(stream_id, before)?;
+    if client.recv_dgram(Duration::from_secs(5))?.payload != before {
+        bail!("pre-migration CONNECT-UDP payload mismatch");
+    }
+
+    let (old_local, new_local) = client.migrate_source(Duration::from_secs(5))?;
+
+    let after = b"after QUIC migration";
+    client.send_dgram(stream_id, after)?;
+    if client.recv_dgram(Duration::from_secs(5))?.payload != after {
+        bail!("post-migration CONNECT-UDP payload mismatch");
+    }
+    info!(%old_local, %new_local, "CONNECT-UDP survived QUIC source migration");
+    Ok(())
+}
+
 fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
@@ -1934,7 +2021,7 @@ fn print_udp_result(
     let rx_pps = received as f64 / seconds;
     let goodput_gbps = received as f64 * payload_size as f64 * 8.0 / seconds / 1e9;
     let response_shortfall_pct = sent.saturating_sub(received) as f64 * 100.0 / sent.max(1) as f64;
-    let relay_gbps = if path == "masque" {
+    let relay_gbps = if path.starts_with("masque") {
         Some(goodput_gbps * 2.0)
     } else {
         None
@@ -2007,9 +2094,22 @@ fn benchmark_direct_udp(
 
 fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfig) -> Result<()> {
     println!("MASQUE CONNECT-UDP (transport=http3):");
+    let migrate_before_measurement = std::env::var_os("MASQUE_BENCH_MIGRATED").is_some();
+    let result_path = if migrate_before_measurement {
+        "masque_migrated"
+    } else {
+        "masque"
+    };
     let setup_started = Instant::now();
     let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
     let setup = setup_started.elapsed();
+    let migration = if migrate_before_measurement {
+        let started = Instant::now();
+        client.migrate_source(Duration::from_secs(5))?;
+        Some(started.elapsed())
+    } else {
+        None
+    };
 
     let latency_payload = vec![0x3c; 64];
     let mut latencies = Vec::with_capacity(config.latency_samples);
@@ -2025,8 +2125,11 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
     latencies.sort_by(f64::total_cmp);
     let percentile = |p: f64| percentile_nearest_rank(&latencies, p).unwrap();
     println!(
-        "  setup {:.3} ms; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
+        "  setup {:.3} ms{}; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
         setup.as_secs_f64() * 1e3,
+        migration
+            .map(|elapsed| format!("; migration {:.3} ms", elapsed.as_secs_f64() * 1e3))
+            .unwrap_or_default(),
         config.latency_samples,
         percentile(0.50),
         percentile(0.95),
@@ -2037,6 +2140,9 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
 
     for payload_size in [64, 1_200] {
         let (mut client, stream_id) = connect_udp_tunnel(server_addr, echo_addr)?;
+        if migrate_before_measurement {
+            client.migrate_source(Duration::from_secs(5))?;
+        }
         let (sent, received, expired) = client.run_echo_throughput(
             stream_id,
             payload_size,
@@ -2046,7 +2152,7 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
         )?;
         print_udp_result(
             "http3",
-            "masque",
+            result_path,
             payload_size,
             config.duration,
             sent,
@@ -2449,6 +2555,19 @@ fn main() {
         return;
     }
 
+    if std::env::var_os("MASQUE_MIGRATION_CHECK").is_some() {
+        if transport == BenchTransport::Http2 {
+            error!("QUIC migration is available only on HTTP/3 listeners");
+            std::process::exit(2);
+        }
+        if let Err(error) = test_quic_migration(&server_addr, &echo_addr) {
+            error!(%error, "QUIC migration check failed");
+            std::process::exit(1);
+        }
+        info!("QUIC migration check passed");
+        return;
+    }
+
     if std::env::var_os("MASQUE_LOAD").is_some() {
         if transport == BenchTransport::Http2 {
             error!("HTTP/2 multi-connection load mode is not implemented; use tcp or udp mode");
@@ -2503,6 +2622,7 @@ fn main() {
         ),
         ("proxy_auth_required", test_proxy_auth_required),
         ("connect_udp_happy_path", test_connect_udp_happy_path),
+        ("quic_migration", test_quic_migration),
         ("connect_udp_policy_deny", test_connect_udp_policy_deny),
         ("connect_udp_bad_uri", test_connect_udp_bad_uri),
         ("non_connect_404", test_non_connect_404),
