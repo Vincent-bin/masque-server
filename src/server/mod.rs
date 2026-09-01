@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use self::authentication::AuthOutcome;
-use self::request::{PendingAuth, PendingConnectSetups, RequestContext};
+use self::request::{ConnectRequest, PendingAuth, PendingConnectSetups, RequestContext};
 use crate::address_pool::{AddressPool, PoolError};
 use crate::admission::SourceAdmissionLimiter;
 use crate::auth::{BasicAuthenticator, SharedBasicAuthenticator};
@@ -31,7 +31,7 @@ use crate::client_identity::{
     ClientIdentity, ClientRegistry, SharedRoster, configure_client_cert_verification,
 };
 use crate::config::{AuthSection, ListenerTransport, ResolvedListener, ServerConfig, TlsSection};
-use crate::connection::{AwaitingAuth, ClientConnection};
+use crate::connection::{AwaitingAuth, ClientConnection, EarlyUdpDatagramResult};
 use crate::datagram;
 use crate::fxhash::FxHashMap;
 use crate::ip_packet;
@@ -481,6 +481,7 @@ fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<ListenerPlan>> {
                 listen_addr: listener.listen_addr,
                 transport: listener.transport,
                 shards,
+                max_datagram_size: listener.max_datagram_size,
                 auth: listener.auth.clone(),
             },
         });
@@ -697,6 +698,26 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
             MAX_DATAGRAM_SIZE
         );
     }
+    for plan in &listeners {
+        let Some(max_datagram_size) = plan.listener.max_datagram_size else {
+            continue;
+        };
+        if plan.listener.transport != ListenerTransport::Http3 {
+            anyhow::bail!(
+                "listener {} max_datagram_size is an HTTP/3-only override; use \
+                 http2.max_datagram_size for an HTTP/2 listener",
+                plan.listener.listen_addr
+            );
+        }
+        if !(quiche::MIN_CLIENT_INITIAL_LEN..=MAX_DATAGRAM_SIZE).contains(&max_datagram_size) {
+            anyhow::bail!(
+                "listener {} max_datagram_size ({max_datagram_size}) must be between {} and {} bytes",
+                plan.listener.listen_addr,
+                quiche::MIN_CLIENT_INITIAL_LEN,
+                MAX_DATAGRAM_SIZE
+            );
+        }
+    }
 
     if !(1..=MAX_HTTP2_STREAM_WINDOW).contains(&config.http2.initial_stream_window) {
         anyhow::bail!(
@@ -789,8 +810,14 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<ValidatedServ
             .then(|| Arc::new(SharedRoster::new(clients.clone())));
         match plan.listener.transport {
             ListenerTransport::Http3 => {
-                build_quic_config(config, client_certs, Arc::clone(&tls))
-                    .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
+                build_quic_config(
+                    config,
+                    plan.listener
+                        .effective_quic_max_datagram_size(config.quic.max_datagram_size),
+                    client_certs,
+                    Arc::clone(&tls),
+                )
+                .with_context(|| format!("listener {}", plan.listener.listen_addr))?;
             }
             ListenerTransport::Http2 => {
                 http2::build_acceptor(client_certs, Arc::clone(&tls))
@@ -847,10 +874,11 @@ async fn open_quic_socket(
     config: &ServerConfig,
     listen_addr: SocketAddr,
     reuseport_shards: usize,
+    max_datagram_size: usize,
 ) -> anyhow::Result<QuicUdpSocket> {
     QuicUdpSocket::bind_shared(
         listen_addr,
-        config.quic.max_datagram_size,
+        max_datagram_size,
         config.quic.enable_udp_gso,
         config.quic.enable_udp_gro,
         reuseport_shards,
@@ -869,10 +897,12 @@ async fn bind_first_listener_socket(
     config: &ServerConfig,
     requested: SocketAddr,
     reuseport_shards: usize,
+    max_datagram_size: usize,
     unavailable: &[SocketAddr],
 ) -> anyhow::Result<(QuicUdpSocket, SocketAddr)> {
     for attempt in 1..=MAX_EPHEMERAL_BIND_ATTEMPTS {
-        let socket = open_quic_socket(config, requested, reuseport_shards).await?;
+        let socket =
+            open_quic_socket(config, requested, reuseport_shards, max_datagram_size).await?;
         let bound = socket.local_addr()?;
 
         if requested.port() != 0 {
@@ -1056,6 +1086,8 @@ impl Server {
                 &config,
                 plan.listener.listen_addr,
                 plan.listener.shards,
+                plan.listener
+                    .effective_quic_max_datagram_size(config.quic.max_datagram_size),
                 &unavailable_http3_addrs,
             )
             .await?;
@@ -1701,6 +1733,7 @@ fn encode_ip_setup_capsules(addresses: &[IpAddr]) -> Vec<u8> {
 /// live shards.
 fn build_quic_config(
     config: &ServerConfig,
+    max_datagram_size: usize,
     client_certs: Option<Arc<SharedRoster>>,
     tls_identity: Arc<tls::SharedTlsIdentity>,
 ) -> anyhow::Result<quiche::Config> {
@@ -1741,8 +1774,8 @@ fn build_quic_config(
 
     // Transport parameters.
     quic_config.set_max_idle_timeout(idle_timeout_ms);
-    quic_config.set_max_recv_udp_payload_size(config.quic.max_datagram_size);
-    quic_config.set_max_send_udp_payload_size(config.quic.max_datagram_size);
+    quic_config.set_max_recv_udp_payload_size(max_datagram_size);
+    quic_config.set_max_send_udp_payload_size(max_datagram_size);
     quic_config.set_initial_max_data(config.quic.initial_max_data);
     quic_config.set_initial_max_stream_data_bidi_local(config.quic.initial_max_stream_data);
     quic_config.set_initial_max_stream_data_bidi_remote(config.quic.initial_max_stream_data);
@@ -2174,6 +2207,10 @@ struct Shard {
     client_certs: Option<Arc<SharedRoster>>,
     tcp_policy: TargetPolicy,
     udp_policy: TargetPolicy,
+    /// Effective QUIC packet ceiling for this listener. This is copied out of
+    /// the resolved listener so the datagram hot path does not repeatedly
+    /// consult an optional override.
+    max_datagram_size: usize,
     config: Arc<ServerConfig>,
     /// Reverse index for routing TUN packets without scanning every connection.
     conn_by_index: FxHashMap<u64, quiche::ConnectionId<'static>>,
@@ -2207,7 +2244,15 @@ impl Shard {
         forward_rx: mpsc::Receiver<ForwardedPacketBatch>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<Self> {
-        let socket = open_quic_socket(&config, listener.listen_addr, listener.shards).await?;
+        let max_datagram_size =
+            listener.effective_quic_max_datagram_size(config.quic.max_datagram_size);
+        let socket = open_quic_socket(
+            &config,
+            listener.listen_addr,
+            listener.shards,
+            max_datagram_size,
+        )
+        .await?;
         Self::from_socket(
             index,
             listener_shard_index,
@@ -2251,6 +2296,8 @@ impl Shard {
             None
         };
         let bound_addr = socket.local_addr()?;
+        let max_datagram_size =
+            listener.effective_quic_max_datagram_size(config.quic.max_datagram_size);
         metrics.set_udp_offload_state(socket.udp_gso_enabled(), socket.udp_gro_enabled());
         info!(
             shard = index,
@@ -2258,6 +2305,7 @@ impl Shard {
             addr = %bound_addr,
             udp_gso = socket.udp_gso_enabled(),
             udp_gro = socket.udp_gro_enabled(),
+            max_datagram_size,
             reuseport_cid_steering = socket.reuseport_cid_steering_enabled(),
             "listening"
         );
@@ -2271,6 +2319,7 @@ impl Shard {
 
         let quic_config = build_quic_config(
             &config,
+            max_datagram_size,
             client_certs.as_ref().map(Arc::clone),
             Arc::clone(&shared.tls),
         )?;
@@ -2306,6 +2355,7 @@ impl Shard {
             client_certs,
             tcp_policy,
             udp_policy,
+            max_datagram_size,
             config,
             conn_by_index: FxHashMap::default(),
             udp_response_tx,
@@ -3241,6 +3291,7 @@ impl Shard {
         let mut closed_ip_streams: Vec<u64> = Vec::new();
         let mut failed_tcp_streams: Vec<u64> = Vec::new();
         let mut pending_auth: Vec<PendingAuth> = Vec::new();
+        let early_udp_budget = client.early_udp_budget();
 
         // Process HTTP/3 events.
         if let Some(h3) = &mut client.h3 {
@@ -3275,7 +3326,12 @@ impl Shard {
                                     503,
                                 );
                             } else {
-                                client.awaiting_auth.insert(stream_id, AwaitingAuth::new());
+                                let connect_udp =
+                                    matches!(&pending.request, ConnectRequest::Udp { .. });
+                                client.awaiting_auth.insert(
+                                    stream_id,
+                                    AwaitingAuth::new(connect_udp, early_udp_budget.clone()),
+                                );
                                 pending_auth.push(pending);
                             }
                         }
@@ -3291,9 +3347,10 @@ impl Shard {
                             let (pending_stream, _, header) =
                                 pending_setups.udp.last().expect("one UDP setup added");
                             debug_assert_eq!(*pending_stream, stream_id);
-                            client
-                                .pending_udp_tunnels
-                                .insert(stream_id, PendingUdpTunnel::new(*header));
+                            client.pending_udp_tunnels.insert(
+                                stream_id,
+                                PendingUdpTunnel::new(*header, early_udp_budget.clone()),
+                            );
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -3437,11 +3494,7 @@ impl Shard {
         // so matching that effective QUIC limit keeps target responses intact
         // without allowing a bad configuration to allocate unbounded buffers
         // per tunnel.
-        let target_datagram_size = self
-            .config
-            .quic
-            .max_datagram_size
-            .clamp(1, MAX_DATAGRAM_SIZE);
+        let target_datagram_size = self.max_datagram_size.clamp(1, MAX_DATAGRAM_SIZE);
         let enable_target_udp_gso = self.config.udp_proxy.enable_udp_gso;
         for (stream_id, target, _header) in pending_udp_setups {
             if !client.pending_udp_tunnels.contains_key(&stream_id) {
@@ -3694,11 +3747,12 @@ impl Shard {
         let Some(client) = self.connections.get_mut(&conn_id) else {
             return;
         };
-        let Some(pending) = client.pending_udp_tunnels.remove(&stream_id) else {
+        let Some(mut pending) = client.pending_udp_tunnels.remove(&stream_id) else {
             // The stream or connection disappeared while DNS was in flight.
             return;
         };
         let header = pending.header();
+        let early_datagrams = pending.take_early_datagrams();
         drop(pending);
         self.dirty.mark(connection_index);
 
@@ -3733,11 +3787,7 @@ impl Shard {
         let (send_socket, socket, target_addr, target_udp_gso) = prepared.into_http3();
         let recv_socket = Arc::clone(&socket);
         let response_tx = self.udp_response_tx.clone();
-        let target_datagram_size = self
-            .config
-            .quic
-            .max_datagram_size
-            .clamp(1, MAX_DATAGRAM_SIZE);
+        let target_datagram_size = self.max_datagram_size.clamp(1, MAX_DATAGRAM_SIZE);
         let recv_task = tokio::spawn(async move {
             // One `recvmmsg` per readiness instead of a `recvfrom` per
             // datagram, and one channel send per batch.
@@ -3771,7 +3821,7 @@ impl Shard {
                 }
             }
         });
-        let tunnel = UdpTunnel::from_socket(
+        let mut tunnel = UdpTunnel::from_socket(
             stream_id,
             target_addr,
             send_socket,
@@ -3779,6 +3829,28 @@ impl Shard {
             recv_task,
             target_udp_gso,
         );
+        let early_datagram_count = early_datagrams.len();
+        let early_datagram_bytes = early_datagrams.bytes();
+        if early_datagram_count > 0 {
+            for payload in early_datagrams.into_payloads() {
+                if tunnel.stage_to_target(&payload)
+                    && let Err(error) = tunnel.flush_to_target()
+                {
+                    debug!(stream_id, %error, "failed to flush early UDP datagrams");
+                }
+            }
+            if tunnel.has_staged()
+                && let Err(error) = tunnel.flush_to_target()
+            {
+                debug!(stream_id, %error, "failed to flush early UDP datagrams");
+            }
+            debug!(
+                stream_id,
+                datagrams = early_datagram_count,
+                bytes = early_datagram_bytes,
+                "relayed buffered early UDP datagrams"
+            );
+        }
         info!(
             stream_id,
             target = %target_addr,
@@ -4149,6 +4221,26 @@ impl Shard {
                         tun_send.push(dgram.payload);
                     }
                     continue;
+                }
+
+                match client.buffer_early_udp_datagram(dgram.stream_id, dgram.payload) {
+                    EarlyUdpDatagramResult::Buffered => {
+                        debug!(
+                            stream_id = dgram.stream_id,
+                            bytes = dgram.payload.len(),
+                            "buffered early UDP datagram"
+                        );
+                        continue;
+                    }
+                    EarlyUdpDatagramResult::CapacityExceeded => {
+                        debug!(
+                            stream_id = dgram.stream_id,
+                            bytes = dgram.payload.len(),
+                            "early UDP datagram buffer full, dropping packet"
+                        );
+                        continue;
+                    }
+                    EarlyUdpDatagramResult::UnknownTunnel => {}
                 }
 
                 debug!(stream_id = dgram.stream_id, "datagram for unknown tunnel");
@@ -4655,6 +4747,7 @@ mod tests {
             listen_addr: addr.parse().unwrap(),
             transport: ListenerTransport::Http3,
             shards: 1,
+            max_datagram_size: None,
             auth: AuthSection {
                 enabled: true,
                 mode,
@@ -4923,6 +5016,55 @@ mod tests {
             plans[1].listener.listen_addr,
             "127.0.0.1:8444".parse::<std::net::SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn listener_datagram_size_overrides_only_its_http3_socket() {
+        let mut relay = listener("127.0.0.1:8443", AuthMode::Basic);
+        relay.max_datagram_size = Some(1200);
+        let direct = listener("127.0.0.1:8444", AuthMode::Basic);
+        let config = config_with(vec![relay, direct]);
+
+        let plans = super::plan_listeners(&config).unwrap();
+        assert_eq!(
+            plans[0]
+                .listener
+                .effective_quic_max_datagram_size(config.quic.max_datagram_size),
+            1200
+        );
+        assert_eq!(
+            plans[1]
+                .listener
+                .effective_quic_max_datagram_size(config.quic.max_datagram_size),
+            1350
+        );
+    }
+
+    #[test]
+    fn listener_datagram_size_is_bounded_and_http3_only() {
+        for invalid in [
+            quiche::MIN_CLIENT_INITIAL_LEN - 1,
+            super::MAX_DATAGRAM_SIZE + 1,
+        ] {
+            let mut http3 = listener("127.0.0.1:8443", AuthMode::Basic);
+            http3.auth.enabled = false;
+            http3.max_datagram_size = Some(invalid);
+            let error = match super::validate_server_config(&config_with(vec![http3])) {
+                Ok(_) => panic!("invalid listener datagram size was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("max_datagram_size"), "{error}");
+        }
+
+        let mut http2 = listener("127.0.0.1:8443", AuthMode::Basic);
+        http2.auth.enabled = false;
+        http2.transport = ListenerTransport::Http2;
+        http2.max_datagram_size = Some(1200);
+        let error = match super::validate_server_config(&config_with(vec![http2])) {
+            Ok(_) => panic!("HTTP/2 listener accepted a QUIC-only override"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("HTTP/3-only"), "{error}");
     }
 
     /// Not just a bind failure: a multi-shard listener uses SO_REUSEPORT, so a

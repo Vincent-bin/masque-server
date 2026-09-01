@@ -155,6 +155,12 @@ enum Command {
         #[arg(long)]
         shards: Option<usize>,
 
+        /// Override quic.max_datagram_size for this HTTP/3 listener. Use 1200
+        /// for a low-MTU or nested relay endpoint while leaving direct
+        /// listeners on the global default.
+        #[arg(long)]
+        max_datagram_size: Option<usize>,
+
         /// Basic username.
         #[arg(long)]
         username: Option<String>,
@@ -571,6 +577,7 @@ async fn main() -> anyhow::Result<()> {
         transport,
         mode,
         shards,
+        max_datagram_size,
         username,
         password_hash,
         password_stdin,
@@ -605,6 +612,7 @@ async fn main() -> anyhow::Result<()> {
                 transport: transport.map(Into::into),
                 mode: mode.map(Into::into),
                 shards: *shards,
+                max_datagram_size: *max_datagram_size,
                 username: username.clone(),
                 password_hash: password_hash.clone(),
                 password_stdin: *password_stdin,
@@ -763,13 +771,24 @@ async fn main() -> anyhow::Result<()> {
         // shard count is the resolved one — `shards = 0` means one per core and
         // a large value is capped, neither of which the file shows.
         for listener in listeners {
-            println!(
-                "listener {} transport={} auth={} shards={}",
-                listener.listen_addr,
-                listener.transport.as_str(),
-                auth_label(&listener.auth),
-                listener.shards
-            );
+            if listener.transport == masque::config::ListenerTransport::Http3 {
+                println!(
+                    "listener {} transport={} auth={} shards={} max_datagram_size={}",
+                    listener.listen_addr,
+                    listener.transport.as_str(),
+                    auth_label(&listener.auth),
+                    listener.shards,
+                    listener.effective_quic_max_datagram_size(cfg.quic.max_datagram_size)
+                );
+            } else {
+                println!(
+                    "listener {} transport={} auth={} shards={}",
+                    listener.listen_addr,
+                    listener.transport.as_str(),
+                    auth_label(&listener.auth),
+                    listener.shards
+                );
+            }
         }
         if let Some(addr) = cfg.observability.listen_addr {
             println!("observability {addr} health=/healthz ready=/readyz metrics=/metrics");

@@ -326,7 +326,7 @@ that, and all three were hit while qualifying this feature:
 | In-tunnel traffic works, egress does not | The host's forwarding path, not the server. See [Egress testing needs an uncontended host](#egress-testing-needs-an-uncontended-host). |
 | Egress ICMP works but TCP hangs | Almost always a transparent proxy on the server host that exempts ICMP from its policy routing. Check `ip rule show`. |
 | Server logs `spoofed source address, dropping` | The client's interface address disagrees with its pinned address. Re-enroll so both sides match. |
-| Small packets work, bulk transfers stall | The framed MTU exceeds the selected transport's datagram budget. Raise `quic.max_datagram_size` for HTTP/3 or `http2.max_datagram_size` for HTTP/2, or lower the client's MTU; keep the client at 1280 unless both ends were changed together. |
+| Small packets work, bulk transfers stall | The framed MTU exceeds the selected transport's datagram budget. Raise `quic.max_datagram_size` (or that HTTP/3 listener's `max_datagram_size`) for HTTP/3, raise `http2.max_datagram_size` for HTTP/2, or lower the client's MTU; keep the client at 1280 unless both ends were changed together. |
 | Tunnel drops roughly every 30s | `server.idle_timeout_secs` is at or below the client's keepalive period. |
 
 ## Release checklist

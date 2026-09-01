@@ -41,6 +41,7 @@ a staging environment.
   CONNECT-TCP, CONNECT-UDP, and optional CONNECT-IP over HTTP/3 or HTTP/2
 - Credential-safe client configuration generation and a redacted JSON support
   bundle for reproducible troubleshooting
+- Per-listener QUIC packet ceilings for mixed direct and low-MTU relay endpoints
 - Static Linux x86_64 and ARM64 release archives with a systemd installer
 
 ## Quick start

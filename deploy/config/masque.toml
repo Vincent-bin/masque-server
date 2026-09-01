@@ -33,6 +33,11 @@ transport = "http3"
 # is what lets a CPU-bound server use more than one core. 0 = one per core for a
 # single listener. Linux only; measure before raising it.
 shards = 1
+# Optional HTTP/3-only override. Leave absent to inherit the 1350-byte [quic]
+# default; use 1200 for a listener dedicated to a verified low-MTU or nested
+# MASQUE path. It cannot carry the default 1280-byte CONNECT-IP packets, so use
+# it for CONNECT-UDP/TCP or lower ip_proxy.tun_mtu consistently on both ends.
+# max_datagram_size = 1200
 
 [listeners.auth]
 enabled = true
