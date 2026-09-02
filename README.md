@@ -46,6 +46,11 @@ a staging environment.
   keep the Entry at 1350 and use a dedicated 1200-byte Exit listener for the
   nested QUIC connection
 - Static Linux x86_64 and ARM64 release archives with a systemd installer
+- Standalone Linux and macOS x86_64/ARM64 probe archives with automatic,
+  SHA-256-verified installation
+- Optional guarded fleet operations CLI and repo-scoped AI Skill for status,
+  secret-isolated empty-host bootstrap, canary rollout, external verification,
+  and recorded rollback
 
 ## Quick start
 
@@ -168,6 +173,14 @@ HTTP/3 first and falls back to HTTP/2, then establishes a real upstream TCP
 CONNECT and performs a DNS-over-UDP round trip through the proxy:
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-probe.sh | sh
+```
+
+The installer detects Linux/macOS and x86_64/ARM64, verifies the selected
+release archive's SHA-256, and installs to `~/.local/bin` for an unprivileged
+user or `/usr/local/bin` for root. Then run:
+
+```sh
 printf '%s' 'a-strong-password' | masque-probe proxy.example.com:8449 \
   --username phone --password-stdin
 masque-probe proxy.example.com:4443 --client-config laptop.json --connect-ip
@@ -223,8 +236,9 @@ variables, certificate requirements, and installing a specific release.
 ## Install a downloaded release on Linux
 
 Release archives contain `masque-server`, `masque-probe`, an example
-configuration, a hardened systemd unit, Prometheus rules, a Grafana dashboard,
-and an installer. Replace `ARCH` with `x86_64` or `aarch64`:
+configuration, a restricted maintenance entrypoint, a hardened systemd unit,
+Prometheus rules, a Grafana dashboard, and an installer. Replace `ARCH` with
+`x86_64` or `aarch64`:
 
 ```sh
 tar xzf masque-vVERSION-linux-ARCH.tar.gz
@@ -250,6 +264,7 @@ upgrades, and diagnostics.
 | [Architecture](docs/architecture.md) | Runtime components, data flow, sharding, and resource bounds |
 | [Configuration](docs/configuration.md) | TOML sections, authentication, policy, and tuning |
 | [Deployment](docs/deployment.md) | Linux installation, systemd, certificates, and upgrades |
+| [Operations](docs/operations.md) | Secret-isolated bootstrap, fleet rollout, rollback, and optional AI Skill |
 | [Protocols](docs/protocols.md) | Supported RFCs and CONNECT request behavior |
 | [Performance](docs/performance.md) | Benchmark methodology and Linux fast paths |
 | [Observability](docs/observability.md) | Health/readiness, metrics, alerts, dashboard, and structured logs |
@@ -272,6 +287,7 @@ fuzz/                   Scheduled libFuzzer targets for public protocol parsers
 deploy/                 Example config, installer, systemd unit, and monitoring assets
 docs/                   Operator and contributor documentation
 scripts/                Test, benchmark, certificate, and packaging helpers
+.agents/skills/          Optional repository-scoped agent runbooks
 .github/workflows/      CI and release automation
 ```
 

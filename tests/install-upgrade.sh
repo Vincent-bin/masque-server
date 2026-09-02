@@ -25,12 +25,16 @@ CANDIDATE_PROBE=${MASQUE_TEST_PACKAGE_PROBE:-}
 
 BIN_PATH=/usr/local/bin/masque-server
 PROBE_PATH=/usr/local/bin/masque-probe
+MAINTENANCE_PATH=/usr/local/sbin/masque-maintain
+LIBEXEC_DIR=/usr/local/libexec/masque-server
+BOOTSTRAP_PATH=$LIBEXEC_DIR/install-latest.sh
 CONFIG_PATH=/etc/masque/masque.toml
 UNIT_PATH=/etc/systemd/system/masque.service
 MONITORING_DIR=/usr/local/share/masque-server/monitoring
 PROMETHEUS_RULES_PATH=$MONITORING_DIR/prometheus-rules.yml
 GRAFANA_DASHBOARD_PATH=$MONITORING_DIR/grafana-dashboard.json
-for protected_path in "$BIN_PATH" "$PROBE_PATH" "$CONFIG_PATH" "$UNIT_PATH" \
+for protected_path in "$BIN_PATH" "$PROBE_PATH" "$MAINTENANCE_PATH" \
+    "$BOOTSTRAP_PATH" "$CONFIG_PATH" "$UNIT_PATH" \
     "$PROMETHEUS_RULES_PATH" "$GRAFANA_DASHBOARD_PATH"; do
     [ ! -e "$protected_path" ] || die "runner is not clean: $protected_path already exists"
 done
@@ -44,6 +48,8 @@ cleanup() {
     rm -f -- \
         "$BIN_PATH" \
         "$PROBE_PATH" \
+        "$MAINTENANCE_PATH" \
+        "$BOOTSTRAP_PATH" \
         "$CONFIG_PATH" \
         /etc/masque/.masque.toml.lock \
         "$UNIT_PATH" \
@@ -52,6 +58,7 @@ cleanup() {
         /etc/masque/certs/server.crt \
         /etc/masque/certs/server.key
     rmdir /etc/masque/certs /etc/masque >/dev/null 2>&1
+    rmdir "$LIBEXEC_DIR" /usr/local/libexec >/dev/null 2>&1
     rmdir "$MONITORING_DIR" /usr/local/share/masque-server >/dev/null 2>&1
     rm -rf -- "$TEST_TMP"
     exit "$cleanup_status"
@@ -62,11 +69,13 @@ trap 'exit 1' HUP INT TERM
 PACKAGE_DIR=$TEST_TMP/package
 MOCK_BIN=$TEST_TMP/mock-bin
 MOCK_STATE=$TEST_TMP/restart-count
-install -d "$PACKAGE_DIR/bin" "$PACKAGE_DIR/config" "$PACKAGE_DIR/monitoring" \
-    "$PACKAGE_DIR/systemd" "$MOCK_BIN"
+install -d "$PACKAGE_DIR/bin" "$PACKAGE_DIR/config" "$PACKAGE_DIR/maintenance" \
+    "$PACKAGE_DIR/monitoring" "$PACKAGE_DIR/systemd" "$MOCK_BIN"
 install -m 0755 "$CANDIDATE" "$PACKAGE_DIR/bin/masque-server"
 install -m 0755 "$CANDIDATE_PROBE" "$PACKAGE_DIR/bin/masque-probe"
 install -m 0755 deploy/install.sh "$PACKAGE_DIR/install.sh"
+install -m 0755 deploy/masque-maintain "$PACKAGE_DIR/maintenance/masque-maintain"
+install -m 0755 install-latest.sh "$PACKAGE_DIR/maintenance/install-latest.sh"
 install -m 0644 deploy/config/masque.toml "$PACKAGE_DIR/config/masque.toml"
 install -m 0644 deploy/systemd/masque.service "$PACKAGE_DIR/systemd/masque.service"
 install -m 0644 deploy/monitoring/prometheus-rules.yml \
@@ -149,6 +158,10 @@ EOF
 echo old-masque-probe
 EOF
     chmod 0755 "$PROBE_PATH"
+    install -d /usr/local/sbin "$LIBEXEC_DIR"
+    printf '%s\n' '#!/bin/sh' 'echo old-masque-maintain' >"$MAINTENANCE_PATH"
+    printf '%s\n' '#!/bin/sh' 'echo old-install-latest' >"$BOOTSTRAP_PATH"
+    chmod 0755 "$MAINTENANCE_PATH" "$BOOTSTRAP_PATH"
     printf '%s\n' 'old systemd unit' >"$UNIT_PATH"
     chmod 0644 "$UNIT_PATH"
     install -d "$MONITORING_DIR"
@@ -225,6 +238,20 @@ grep -q '^dual-proxy = masque, proxy.example, 8449, username=proxy-user, passwor
 [ "$(stat -c '%a' "$DUAL_SURGE_CONFIG")" = 600 ] ||
     die "the generated Surge configuration is not mode 0600"
 [ -x "$PROBE_PATH" ] || die "the diagnostic probe was not installed"
+[ -x "$MAINTENANCE_PATH" ] || die "the maintenance helper was not installed"
+[ -x "$BOOTSTRAP_PATH" ] || die "the pinned bootstrap was not installed"
+"$MAINTENANCE_PATH" status >"$TEST_TMP/maintenance-status.log" ||
+    die "the installed maintenance helper could not inspect the server"
+grep -q '^masque_ops_status=1$' "$TEST_TMP/maintenance-status.log" ||
+    die "the maintenance helper did not emit its stable status schema"
+grep -q '^config_check=ok$' "$TEST_TMP/maintenance-status.log" ||
+    die "the maintenance helper did not validate the active configuration"
+for invalid_version in not-a-version v1.2.3-01 v1.2.3-a..b; do
+    if "$MAINTENANCE_PATH" upgrade "$invalid_version" \
+        >"$TEST_TMP/maintenance-invalid.log" 2>&1; then
+        die "the maintenance helper accepted invalid release version $invalid_version"
+    fi
+done
 
 # The server itself must agree about what those listeners are.
 "$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/dual-check.log" 2>&1 ||
@@ -279,11 +306,33 @@ grep -q 'add-listener' "$TEST_TMP/dual-upgrade.log" ||
 
 rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
 
+# Automation can provision a fresh host without putting credentials or the
+# rendered configuration into captured logs.
+MASQUE_AUTH_MODE=basic \
+    MASQUE_AUTH_USERNAME=private-automation-user \
+    MASQUE_AUTH_PASSWORD=private-automation-password \
+    MASQUE_PRINT_SECRETS=0 \
+    MASQUE_START_SERVICE=0 \
+    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/suppressed-fresh.log" 2>&1 ||
+    die "fresh secret-suppressed installation failed"
+grep -q 'Credential and generated configuration output was suppressed' \
+    "$TEST_TMP/suppressed-fresh.log" ||
+    die "fresh automation did not report suppressed output"
+! grep -q 'private-automation-user' "$TEST_TMP/suppressed-fresh.log" ||
+    die "fresh automation printed its Basic username"
+! grep -q 'private-automation-password' "$TEST_TMP/suppressed-fresh.log" ||
+    die "fresh automation printed its Basic password"
+! grep -q 'Effective server configuration' "$TEST_TMP/suppressed-fresh.log" ||
+    die "fresh automation printed its rendered configuration"
+rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
+
 # An incompatible existing configuration must fail before replacement.
 write_old_installation
 write_config not-a-controller
 old_binary_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
 old_probe_sha=$(sha256sum "$PROBE_PATH" | awk '{print $1}')
+old_maintenance_sha=$(sha256sum "$MAINTENANCE_PATH" | awk '{print $1}')
+old_bootstrap_sha=$(sha256sum "$BOOTSTRAP_PATH" | awk '{print $1}')
 old_unit_sha=$(sha256sum "$UNIT_PATH" | awk '{print $1}')
 old_rules_sha=$(sha256sum "$PROMETHEUS_RULES_PATH" | awk '{print $1}')
 old_dashboard_sha=$(sha256sum "$GRAFANA_DASHBOARD_PATH" | awk '{print $1}')
@@ -293,6 +342,8 @@ if MASQUE_START_SERVICE=0 "$PACKAGE_DIR/install.sh" >"$TEST_TMP/preflight.log" 2
 fi
 assert_sha_unchanged "$BIN_PATH" "$old_binary_sha"
 assert_sha_unchanged "$PROBE_PATH" "$old_probe_sha"
+assert_sha_unchanged "$MAINTENANCE_PATH" "$old_maintenance_sha"
+assert_sha_unchanged "$BOOTSTRAP_PATH" "$old_bootstrap_sha"
 assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
 assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
 assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
@@ -309,8 +360,12 @@ assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
 assert_upgrade_output_is_summary_only "$TEST_TMP/staged.log"
 candidate_sha=$(sha256sum "$CANDIDATE" | awk '{print $1}')
 candidate_probe_sha=$(sha256sum "$CANDIDATE_PROBE" | awk '{print $1}')
+candidate_maintenance_sha=$(sha256sum deploy/masque-maintain | awk '{print $1}')
+candidate_bootstrap_sha=$(sha256sum install-latest.sh | awk '{print $1}')
 assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
 assert_sha_unchanged "$PROBE_PATH" "$candidate_probe_sha"
+assert_sha_unchanged "$MAINTENANCE_PATH" "$candidate_maintenance_sha"
+assert_sha_unchanged "$BOOTSTRAP_PATH" "$candidate_bootstrap_sha"
 
 # A successful activation restarts once and preserves operator-managed files.
 write_old_installation
@@ -321,6 +376,8 @@ MOCK_ACTIVE=1 MOCK_ENABLED=1 MASQUE_START_SERVICE=1 \
     die "successful activation did not restart the service exactly once"
 assert_sha_unchanged "$BIN_PATH" "$candidate_sha"
 assert_sha_unchanged "$PROBE_PATH" "$candidate_probe_sha"
+assert_sha_unchanged "$MAINTENANCE_PATH" "$candidate_maintenance_sha"
+assert_sha_unchanged "$BOOTSTRAP_PATH" "$candidate_bootstrap_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
 assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
 assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
@@ -332,6 +389,8 @@ grep -q 'Service:        started or restarted' "$TEST_TMP/activated.log" ||
 write_old_installation
 old_binary_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
 old_probe_sha=$(sha256sum "$PROBE_PATH" | awk '{print $1}')
+old_maintenance_sha=$(sha256sum "$MAINTENANCE_PATH" | awk '{print $1}')
+old_bootstrap_sha=$(sha256sum "$BOOTSTRAP_PATH" | awk '{print $1}')
 old_unit_sha=$(sha256sum "$UNIT_PATH" | awk '{print $1}')
 old_rules_sha=$(sha256sum "$PROMETHEUS_RULES_PATH" | awk '{print $1}')
 old_dashboard_sha=$(sha256sum "$GRAFANA_DASHBOARD_PATH" | awk '{print $1}')
@@ -343,13 +402,15 @@ if MOCK_ACTIVE=1 MOCK_ENABLED=1 MOCK_FAIL_FIRST_RESTART=1 \
 fi
 assert_sha_unchanged "$BIN_PATH" "$old_binary_sha"
 assert_sha_unchanged "$PROBE_PATH" "$old_probe_sha"
+assert_sha_unchanged "$MAINTENANCE_PATH" "$old_maintenance_sha"
+assert_sha_unchanged "$BOOTSTRAP_PATH" "$old_bootstrap_sha"
 assert_sha_unchanged "$UNIT_PATH" "$old_unit_sha"
 assert_sha_unchanged "$PROMETHEUS_RULES_PATH" "$old_rules_sha"
 assert_sha_unchanged "$GRAFANA_DASHBOARD_PATH" "$old_dashboard_sha"
 assert_sha_unchanged "$CONFIG_PATH" "$valid_config_sha"
 assert_sha_unchanged /etc/masque/certs/server.crt "$tls_cert_sha"
 assert_sha_unchanged /etc/masque/certs/server.key "$tls_key_sha"
-grep -q 'Previous binaries, systemd unit, monitoring assets, and service state restored' \
+grep -q 'Previous release-managed files and service state restored' \
     "$TEST_TMP/rollback.log" || die "rollback confirmation was not printed"
 
 echo "installer upgrade preflight, preservation, and rollback passed"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "MASQUE Operations"
+  short_description: "Safely inspect, deploy, and roll back MASQUE fleets"
+  default_prompt: "Use $masque-ops to inspect my fleet and prepare a safe upgrade plan."

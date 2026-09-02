@@ -59,12 +59,17 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          sh -n install-latest.sh deploy/install.sh \
+          sh -n install-latest.sh install-probe.sh deploy/install.sh deploy/masque-maintain \
             scripts/validate-release.sh tests/install-upgrade.sh \
-            tests/release-metadata.sh tests/systemd-shutdown.sh
+            tests/install-probe.sh tests/release-metadata.sh tests/systemd-shutdown.sh
+          sh tests/install-probe.sh
           sh tests/release-metadata.sh
-          shellcheck install-latest.sh deploy/install.sh scripts/*.sh \
+          shellcheck install-latest.sh install-probe.sh deploy/install.sh \
+            deploy/masque-maintain scripts/*.sh \
             tests/*.sh tests/e2e/*.sh
+
+      - name: Test fleet operations CLI
+        run: python3 -m unittest -v tests/test_masque_ops.py
 
   msrv:
     name: Check MSRV (1.88.0)
@@ -201,11 +206,16 @@ jobs:
           ARCH: ${{ matrix.arch }}
           USE_ZIGBUILD: "1"
           VERSION: ci-${{ github.sha }}
-        run: scripts/package-linux.sh
+        run: |
+          scripts/package-linux.sh
+          SKIP_BUILD=1 scripts/package-probe.sh
 
       - name: Inspect archive
         run: |
           tar tzf "dist/masque-vci-${GITHUB_SHA}-linux-${{ matrix.arch }}.tar.gz"
+          tar tzf "dist/masque-probe-vci-${GITHUB_SHA}-linux-${{ matrix.arch }}.tar.gz"
           cd dist
           sha256sum --check \
             "masque-vci-${GITHUB_SHA}-linux-${{ matrix.arch }}.tar.gz.sha256"
+          sha256sum --check \
+            "masque-probe-vci-${GITHUB_SHA}-linux-${{ matrix.arch }}.tar.gz.sha256"

@@ -50,10 +50,12 @@ fn monitoring_assets_reference_exported_metric_names() {
 }
 
 #[test]
-fn release_packager_includes_both_monitoring_assets() {
+fn release_packager_includes_operational_assets() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = std::fs::read_to_string(root.join("scripts/package-linux.sh")).unwrap();
     assert!(script.contains("monitoring/prometheus-rules.yml"));
     assert!(script.contains("monitoring/grafana-dashboard.json"));
     assert!(script.contains("bin/masque-probe"));
+    assert!(script.contains("maintenance/masque-maintain"));
+    assert!(script.contains("maintenance/install-latest.sh"));
 }

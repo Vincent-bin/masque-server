@@ -7,6 +7,22 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- A guarded fleet operations CLI and repo-scoped AI Skill provide read-only
+  status and diagnostics, exact-release planning, externally verified canary
+  rollout, and recorded rollback. Release packages include a root-owned,
+  command-limited maintenance entrypoint and verified bootstrap copy so a
+  dedicated SSH account does not need arbitrary root shell access.
+- Standalone `masque-probe` archives are released for Linux and macOS on
+  x86_64 and ARM64. The probe installer detects the local platform and
+  architecture and verifies the downloaded archive against its SHA-256.
+- Fleet operations can preflight and install a pinned release on an empty Linux
+  host from a private bootstrap profile. The deterministic CLI—not the AI
+  agent—reads SSH and credential files, sends Basic secrets only through SSH
+  standard input, suppresses installer secret output, and streams generated
+  client credentials directly into local mode-`0600` files.
+
 ## 0.12.2 - 2026-09-01
 
 ### Added

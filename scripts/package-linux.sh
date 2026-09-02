@@ -52,6 +52,7 @@ fi
 install -d \
     "$STAGING_ROOT/$ARCHIVE_NAME/bin" \
     "$STAGING_ROOT/$ARCHIVE_NAME/config" \
+    "$STAGING_ROOT/$ARCHIVE_NAME/maintenance" \
     "$STAGING_ROOT/$ARCHIVE_NAME/monitoring" \
     "$STAGING_ROOT/$ARCHIVE_NAME/systemd"
 install -m 0755 "target/$TARGET/release/masque-server" \
@@ -59,6 +60,10 @@ install -m 0755 "target/$TARGET/release/masque-server" \
 install -m 0755 "target/$TARGET/release/masque-probe" \
     "$STAGING_ROOT/$ARCHIVE_NAME/bin/masque-probe"
 install -m 0755 deploy/install.sh "$STAGING_ROOT/$ARCHIVE_NAME/install.sh"
+install -m 0755 deploy/masque-maintain \
+    "$STAGING_ROOT/$ARCHIVE_NAME/maintenance/masque-maintain"
+install -m 0755 install-latest.sh \
+    "$STAGING_ROOT/$ARCHIVE_NAME/maintenance/install-latest.sh"
 install -m 0644 deploy/config/masque.toml "$STAGING_ROOT/$ARCHIVE_NAME/config/masque.toml"
 install -m 0644 deploy/systemd/masque.service \
     "$STAGING_ROOT/$ARCHIVE_NAME/systemd/masque.service"
