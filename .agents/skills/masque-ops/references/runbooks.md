@@ -1,9 +1,11 @@
 # Fleet operation runbooks
 
-Set the private inventory path once for the examples:
+Resolve `OPS_CLI` to `scripts/masque-ops.py` inside the directory containing
+this Skill, then set the private inventory path once for the examples:
 
 ```sh
 inventory="$HOME/.config/masque-server/fleet.toml"
+OPS_CLI="/absolute/path/to/masque-ops/scripts/masque-ops.py"
 ```
 
 Place global options before the subcommand. Add `--json` when machine-readable
@@ -14,10 +16,10 @@ output is useful.
 These commands are read-only:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" validate
-scripts/masque-ops.py --inventory "$inventory" status
-scripts/masque-ops.py --inventory "$inventory" diagnose edge-a --journal-lines 100
-scripts/masque-ops.py --inventory "$inventory" plan --version vX.Y.Z
+"$OPS_CLI" --inventory "$inventory" validate
+"$OPS_CLI" --inventory "$inventory" status
+"$OPS_CLI" --inventory "$inventory" diagnose edge-a --journal-lines 100
+"$OPS_CLI" --inventory "$inventory" plan --version vX.Y.Z
 ```
 
 Diagnostics are bounded and filter authentication material, but journals can
@@ -28,7 +30,7 @@ still contain client or destination metadata. Review them before sharing.
 Run and inspect `plan` first, then execute only after explicit authorization:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" \
+"$OPS_CLI" --inventory "$inventory" \
   deploy edge-a --version vX.Y.Z --apply
 ```
 
@@ -36,7 +38,7 @@ For a pre-operations release that does not yet contain `masque-maintain`, use
 the one-time root-only bootstrap after the operator approves it:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" \
+"$OPS_CLI" --inventory "$inventory" \
   deploy edge-a --version vX.Y.Z --bootstrap --apply
 ```
 
@@ -55,16 +57,16 @@ an AI session. Validate it, inspect the empty host, and run the bootstrap
 preflight without mutation:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" validate
-scripts/masque-ops.py --inventory "$inventory" status edge-new
-scripts/masque-ops.py --inventory "$inventory" \
+"$OPS_CLI" --inventory "$inventory" validate
+"$OPS_CLI" --inventory "$inventory" status edge-new
+"$OPS_CLI" --inventory "$inventory" \
   bootstrap edge-new --version vX.Y.Z
 ```
 
 After the operator explicitly authorizes the fresh installation:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" \
+"$OPS_CLI" --inventory "$inventory" \
   bootstrap edge-new --version vX.Y.Z --apply
 ```
 
@@ -84,7 +86,7 @@ upgraded and externally probed before the remaining hosts are changed, one at a
 time:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" \
+"$OPS_CLI" --inventory "$inventory" \
   rollout --version vX.Y.Z --apply
 ```
 
@@ -98,7 +100,7 @@ The local mode-`0600` state file records the previous version after each
 successful deployment. Restore it with:
 
 ```sh
-scripts/masque-ops.py --inventory "$inventory" rollback edge-a --apply
+"$OPS_CLI" --inventory "$inventory" rollback edge-a --apply
 ```
 
 Do not edit the state file to force a rollback. If state and the running

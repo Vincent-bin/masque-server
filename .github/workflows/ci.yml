@@ -59,12 +59,15 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          sh -n install-latest.sh install-probe.sh deploy/install.sh deploy/masque-maintain \
+          sh -n install-latest.sh install-ops.sh install-probe.sh \
+            deploy/install.sh deploy/masque-maintain \
             scripts/validate-release.sh tests/install-upgrade.sh \
-            tests/install-probe.sh tests/release-metadata.sh tests/systemd-shutdown.sh
+            tests/install-ops.sh tests/install-probe.sh tests/release-metadata.sh \
+            tests/systemd-shutdown.sh
+          sh tests/install-ops.sh
           sh tests/install-probe.sh
           sh tests/release-metadata.sh
-          shellcheck install-latest.sh install-probe.sh deploy/install.sh \
+          shellcheck install-latest.sh install-ops.sh install-probe.sh deploy/install.sh \
             deploy/masque-maintain scripts/*.sh \
             tests/*.sh tests/e2e/*.sh
 

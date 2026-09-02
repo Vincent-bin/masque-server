@@ -1,11 +1,12 @@
 # Private fleet inventory
 
-The operations CLI requires Python 3.11 or newer. Copy
-`deploy/config/fleet.example.toml` to a location outside the repository:
+The operations CLI requires Python 3.11 or newer. Resolve paths relative to the
+Skill directory and copy `assets/fleet.example.toml` to the private inventory
+location:
 
 ```sh
 install -d -m 0700 ~/.config/masque-server ~/.config/masque-server/secrets
-install -m 0600 deploy/config/fleet.example.toml \
+install -m 0600 assets/fleet.example.toml \
   ~/.config/masque-server/fleet.toml
 ```
 
@@ -60,7 +61,7 @@ writable by the deployment user.
 
 For the initial transition from a release without the helper, temporarily use
 an explicit root inventory entry and the CLI's `deploy --bootstrap` flag. This
-one-time path sends the repository's audited installer over SSH; subsequent
+one-time path sends the Skill's bundled, audited installer over SSH; subsequent
 operations should use the dedicated account and omit `--bootstrap`.
 
 For a truly unconfigured host, add a private `[hosts.bootstrap]` table and use
@@ -71,7 +72,7 @@ are not accepted. Basic mode reads an existing mode-`0600` password file or
 creates it before connecting; certificate mode retrieves the generated client
 configuration directly into a new mode-`0600` file. If the probe uses those
 credentials, its paths must match the bootstrap paths exactly. See
-`deploy/config/fleet.example.toml` for all fields.
+`assets/fleet.example.toml` for all fields.
 
 ## External probes
 
