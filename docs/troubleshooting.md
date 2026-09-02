@@ -7,9 +7,16 @@ without changing it.
 
 ## Client-side connectivity probe
 
-Release archives install `/usr/local/bin/masque-probe` beside the server. Copy
-that binary to the affected Linux client if necessary, and run it from the same
-network and interface as the application that fails.
+Install the standalone probe on a Linux or macOS x86_64/ARM64 client; the
+installer selects the local architecture and verifies the release SHA-256:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-probe.sh | sh
+```
+
+Linux server archives also install `/usr/local/bin/masque-probe` beside the
+service. Run it from the same network and interface as the application that
+fails.
 
 For Basic authentication, pass the password on stdin so it never appears in
 the process list:

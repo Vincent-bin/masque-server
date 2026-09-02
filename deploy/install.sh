@@ -9,8 +9,13 @@ fi
 PACKAGE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 CANDIDATE_BIN=$PACKAGE_DIR/bin/masque-server
 CANDIDATE_PROBE=$PACKAGE_DIR/bin/masque-probe
+CANDIDATE_MAINTENANCE=$PACKAGE_DIR/maintenance/masque-maintain
+CANDIDATE_BOOTSTRAP=$PACKAGE_DIR/maintenance/install-latest.sh
 BIN_PATH=/usr/local/bin/masque-server
 PROBE_PATH=/usr/local/bin/masque-probe
+MAINTENANCE_PATH=/usr/local/sbin/masque-maintain
+LIBEXEC_DIR=/usr/local/libexec/masque-server
+BOOTSTRAP_PATH=$LIBEXEC_DIR/install-latest.sh
 CONFIG_PATH=/etc/masque/masque.toml
 TLS_CERT_PATH=/etc/masque/certs/server.crt
 TLS_KEY_PATH=/etc/masque/certs/server.key
@@ -36,6 +41,8 @@ BASIC_CLIENT_CONFIG_OUT=
 BASIC_CLIENT_CONFIG_CREATED=0
 BINARY_INSTALL_TMP=
 PROBE_INSTALL_TMP=
+MAINTENANCE_INSTALL_TMP=
+BOOTSTRAP_INSTALL_TMP=
 UNIT_INSTALL_TMP=
 PROMETHEUS_RULES_INSTALL_TMP=
 GRAFANA_DASHBOARD_INSTALL_TMP=
@@ -43,6 +50,8 @@ UPGRADE_BACKUP_DIR=
 ROLLBACK_PENDING=0
 HAD_BINARY=0
 HAD_PROBE=0
+HAD_MAINTENANCE=0
+HAD_BOOTSTRAP=0
 HAD_UNIT=0
 HAD_PROMETHEUS_RULES=0
 HAD_GRAFANA_DASHBOARD=0
@@ -51,6 +60,7 @@ WAS_SERVICE_ENABLED=0
 SERVICE_RESULT="enabled, not started"
 RUN_HOST_DIAGNOSTICS=1
 HOST_DIAGNOSTICS_RESULT="not run"
+PRINT_SECRETS=1
 
 cleanup() {
     cleanup_status=$?
@@ -66,6 +76,8 @@ cleanup() {
     [ -z "$CLIENT_BLOCK_TMP" ] || rm -f -- "$CLIENT_BLOCK_TMP"
     [ -z "$BINARY_INSTALL_TMP" ] || rm -f -- "$BINARY_INSTALL_TMP"
     [ -z "$PROBE_INSTALL_TMP" ] || rm -f -- "$PROBE_INSTALL_TMP"
+    [ -z "$MAINTENANCE_INSTALL_TMP" ] || rm -f -- "$MAINTENANCE_INSTALL_TMP"
+    [ -z "$BOOTSTRAP_INSTALL_TMP" ] || rm -f -- "$BOOTSTRAP_INSTALL_TMP"
     [ -z "$UNIT_INSTALL_TMP" ] || rm -f -- "$UNIT_INSTALL_TMP"
     [ -z "$PROMETHEUS_RULES_INSTALL_TMP" ] || rm -f -- "$PROMETHEUS_RULES_INSTALL_TMP"
     [ -z "$GRAFANA_DASHBOARD_INSTALL_TMP" ] || rm -f -- "$GRAFANA_DASHBOARD_INSTALL_TMP"
@@ -103,6 +115,26 @@ rollback_installation() {
         fi
     elif ! rm -f -- "$PROBE_PATH"; then
         echo "error: could not remove the newly installed $PROBE_PATH" >&2
+        rollback_ok=0
+    fi
+
+    if [ "$HAD_MAINTENANCE" -eq 1 ]; then
+        if ! cp -p -- "$UPGRADE_BACKUP_DIR/masque-maintain" "$MAINTENANCE_PATH"; then
+            echo "error: could not restore $MAINTENANCE_PATH" >&2
+            rollback_ok=0
+        fi
+    elif ! rm -f -- "$MAINTENANCE_PATH"; then
+        echo "error: could not remove the newly installed $MAINTENANCE_PATH" >&2
+        rollback_ok=0
+    fi
+
+    if [ "$HAD_BOOTSTRAP" -eq 1 ]; then
+        if ! cp -p -- "$UPGRADE_BACKUP_DIR/install-latest.sh" "$BOOTSTRAP_PATH"; then
+            echo "error: could not restore $BOOTSTRAP_PATH" >&2
+            rollback_ok=0
+        fi
+    elif ! rm -f -- "$BOOTSTRAP_PATH"; then
+        echo "error: could not remove the newly installed $BOOTSTRAP_PATH" >&2
         rollback_ok=0
     fi
 
@@ -163,7 +195,7 @@ rollback_installation() {
 
     ROLLBACK_PENDING=0
     if [ "$rollback_ok" -eq 1 ]; then
-        echo "Previous binaries, systemd unit, monitoring assets, and service state restored." >&2
+        echo "Previous release-managed files and service state restored." >&2
     else
         echo "error: rollback was incomplete; inspect the paths and service above" >&2
     fi
@@ -209,6 +241,20 @@ parse_host_diagnostics_requested() {
             ;;
         *)
             die "MASQUE_RUN_HOST_DIAGNOSTICS must be 0 or 1"
+            ;;
+    esac
+}
+
+parse_secret_output_requested() {
+    case "${MASQUE_PRINT_SECRETS:-1}" in
+        1|true|yes)
+            PRINT_SECRETS=1
+            ;;
+        0|false|no)
+            PRINT_SECRETS=0
+            ;;
+        *)
+            die "MASQUE_PRINT_SECRETS must be 0 or 1"
             ;;
     esac
 }
@@ -373,7 +419,10 @@ generate_basic_client_config() {
         basic_client_endpoint=$(prompt_value \
             "Public Basic endpoint (host:port; leave empty to skip)" "")
     fi
-    [ -n "$basic_client_endpoint" ] || return
+    # Skipping this optional artifact is a successful fresh installation.
+    # A bare `return` here would preserve the failed `[ -n ... ]` status and,
+    # under `set -e`, terminate unattended installs without an error message.
+    [ -n "$basic_client_endpoint" ] || return 0
 
     BASIC_CLIENT_CONFIG_OUT=${MASQUE_BASIC_CLIENT_CONFIG_OUT:-}
     if [ -z "$BASIC_CLIENT_CONFIG_OUT" ]; then
@@ -681,6 +730,14 @@ snapshot_installed_files() {
         cp -p -- "$PROBE_PATH" "$UPGRADE_BACKUP_DIR/masque-probe"
         HAD_PROBE=1
     fi
+    if [ -e "$MAINTENANCE_PATH" ]; then
+        cp -p -- "$MAINTENANCE_PATH" "$UPGRADE_BACKUP_DIR/masque-maintain"
+        HAD_MAINTENANCE=1
+    fi
+    if [ -e "$BOOTSTRAP_PATH" ]; then
+        cp -p -- "$BOOTSTRAP_PATH" "$UPGRADE_BACKUP_DIR/install-latest.sh"
+        HAD_BOOTSTRAP=1
+    fi
     if [ -e "$UNIT_PATH" ]; then
         cp -p -- "$UNIT_PATH" "$UPGRADE_BACKUP_DIR/masque.service"
         HAD_UNIT=1
@@ -704,11 +761,15 @@ snapshot_installed_files() {
 install_program_and_unit() {
     BINARY_INSTALL_TMP=$(mktemp /usr/local/bin/.masque-server.install.XXXXXX)
     PROBE_INSTALL_TMP=$(mktemp /usr/local/bin/.masque-probe.install.XXXXXX)
+    MAINTENANCE_INSTALL_TMP=$(mktemp /usr/local/sbin/.masque-maintain.install.XXXXXX)
+    BOOTSTRAP_INSTALL_TMP=$(mktemp "$LIBEXEC_DIR/.install-latest.install.XXXXXX")
     UNIT_INSTALL_TMP=$(mktemp /etc/systemd/system/.masque.service.install.XXXXXX)
     PROMETHEUS_RULES_INSTALL_TMP=$(mktemp "$MONITORING_DIR/.prometheus-rules.install.XXXXXX")
     GRAFANA_DASHBOARD_INSTALL_TMP=$(mktemp "$MONITORING_DIR/.grafana-dashboard.install.XXXXXX")
     install -m 0755 "$CANDIDATE_BIN" "$BINARY_INSTALL_TMP"
     install -m 0755 "$CANDIDATE_PROBE" "$PROBE_INSTALL_TMP"
+    install -m 0755 "$CANDIDATE_MAINTENANCE" "$MAINTENANCE_INSTALL_TMP"
+    install -m 0755 "$CANDIDATE_BOOTSTRAP" "$BOOTSTRAP_INSTALL_TMP"
     install -m 0644 "$PACKAGE_DIR/systemd/masque.service" "$UNIT_INSTALL_TMP"
     install -m 0644 "$PACKAGE_DIR/monitoring/prometheus-rules.yml" \
         "$PROMETHEUS_RULES_INSTALL_TMP"
@@ -722,6 +783,10 @@ install_program_and_unit() {
     BINARY_INSTALL_TMP=
     mv -f -- "$PROBE_INSTALL_TMP" "$PROBE_PATH"
     PROBE_INSTALL_TMP=
+    mv -f -- "$MAINTENANCE_INSTALL_TMP" "$MAINTENANCE_PATH"
+    MAINTENANCE_INSTALL_TMP=
+    mv -f -- "$BOOTSTRAP_INSTALL_TMP" "$BOOTSTRAP_PATH"
+    BOOTSTRAP_INSTALL_TMP=
     mv -f -- "$UNIT_INSTALL_TMP" "$UNIT_PATH"
     UNIT_INSTALL_TMP=
     mv -f -- "$PROMETHEUS_RULES_INSTALL_TMP" "$PROMETHEUS_RULES_PATH"
@@ -769,6 +834,12 @@ run_host_diagnostics() {
 
 [ -x "$CANDIDATE_BIN" ] || die "release package is missing executable $CANDIDATE_BIN"
 [ -x "$CANDIDATE_PROBE" ] || die "release package is missing executable $CANDIDATE_PROBE"
+[ -x "$CANDIDATE_MAINTENANCE" ] ||
+    die "release package is missing executable $CANDIDATE_MAINTENANCE"
+[ -x "$CANDIDATE_BOOTSTRAP" ] ||
+    die "release package is missing executable $CANDIDATE_BOOTSTRAP"
+sh -n "$CANDIDATE_MAINTENANCE" || die "packaged maintenance helper has invalid shell syntax"
+sh -n "$CANDIDATE_BOOTSTRAP" || die "packaged bootstrap has invalid shell syntax"
 if ! CANDIDATE_VERSION_OUTPUT=$("$CANDIDATE_BIN" --version); then
     die "the packaged server binary cannot run on this host"
 fi
@@ -784,6 +855,7 @@ fi
     "packaged binary versions differ: server $CANDIDATE_VERSION, probe $CANDIDATE_PROBE_VERSION"
 parse_start_requested
 parse_host_diagnostics_requested
+parse_secret_output_requested
 
 if [ -e "$CONFIG_PATH" ]; then
     check_config_compatibility "$CONFIG_PATH"
@@ -802,8 +874,9 @@ if ! id masque >/dev/null 2>&1; then
         --create-home --shell /usr/sbin/nologin masque
 fi
 
-install -d -m 0755 /usr/local/bin /etc/masque /etc/systemd/system \
-    /usr/local/share/masque-server "$MONITORING_DIR"
+install -d -m 0755 /usr/local/bin /usr/local/sbin "$LIBEXEC_DIR" \
+    /etc/masque /etc/systemd/system /usr/local/share/masque-server \
+    "$MONITORING_DIR"
 install -d -o root -g masque -m 0750 /etc/masque/certs
 
 if [ "$FRESH_CONFIG" -eq 1 ]; then
@@ -841,6 +914,7 @@ echo "MASQUE installation result"
 echo "  Version:        $("$BIN_PATH" --version)"
 echo "  Binary:         $BIN_PATH"
 echo "  Probe:          $PROBE_PATH"
+echo "  Maintenance:    $MAINTENANCE_PATH"
 echo "  Configuration:  $CONFIG_PATH"
 echo "  Authentication: $AUTH_MODE"
 echo "  Service:        $SERVICE_RESULT"
@@ -861,7 +935,7 @@ fi
 # CONFIG_CHANGED first: only a freshly rendered configuration has credentials to
 # print, and on an upgrade AUTH_MODE is a summary of what was found rather than
 # one of the modes this installer writes.
-if [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
+if [ "$PRINT_SECRETS" -eq 1 ] && [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     echo
     echo "Basic client credentials:"
     echo "  Stealth mode: $BASIC_STEALTH"
@@ -877,14 +951,17 @@ if [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     fi
 fi
 
-if [ "$CONFIG_CHANGED" -eq 1 ]; then
+if [ "$PRINT_SECRETS" -eq 0 ] && [ "$CONFIG_CHANGED" -eq 1 ]; then
+    echo
+    echo "Credential and generated configuration output was suppressed."
+elif [ "$CONFIG_CHANGED" -eq 1 ]; then
     print_redacted_config
 else
     echo
     echo "Existing configuration was preserved and is not printed during upgrades."
 fi
 
-if [ -n "$ENROLL_OUTPUT" ]; then
+if [ "$PRINT_SECRETS" -eq 1 ] && [ -n "$ENROLL_OUTPUT" ]; then
     echo
     echo "Client-certificate enrollment result"
     echo "  Secret usque JSON: $CLIENT_CONFIG_OUT"

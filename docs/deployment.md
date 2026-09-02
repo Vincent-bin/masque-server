@@ -9,6 +9,8 @@ GitHub Actions builds static `x86_64-unknown-linux-musl` and
 bin/masque-server
 bin/masque-probe
 config/masque.toml
+maintenance/masque-maintain
+maintenance/install-latest.sh
 monitoring/prometheus-rules.yml
 monitoring/grafana-dashboard.json
 systemd/masque.service
@@ -21,6 +23,10 @@ Verify the archive before extraction:
 ```sh
 sha256sum --check masque-vVERSION-linux-ARCH.tar.gz.sha256
 ```
+
+Releases also publish standalone `masque-probe` archives for Linux and macOS,
+on both x86_64 and ARM64. `install-probe.sh` detects the local pair and verifies
+the archive SHA-256 before installing it.
 
 ## One-command install
 
@@ -83,6 +89,7 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_CLIENT_CONFIG_OUT` | Absolute secret JSON output path; defaults to `/root/masque-client.json` |
 | `MASQUE_START_SERVICE` | `1` to start/restart, `0` to stage only; bootstrap default is `1` |
 | `MASQUE_RUN_HOST_DIAGNOSTICS` | `1` to run the read-only CONNECT-IP host check after installation (default), `0` to skip |
+| `MASQUE_PRINT_SECRETS` | `0` suppresses credentials, client private keys, and the rendered fresh configuration for automation; default `1` |
 
 For example, a non-interactive client-certificate installation is:
 
@@ -111,12 +118,16 @@ The same one-command installer is safe to reuse for later releases. If the
 configuration already exists, the downloaded candidate runs `check-config`
 against it before any installed file is replaced. A failed check leaves the
 server/probe binaries, systemd unit, monitoring assets, configuration, TLS
-files, and running service untouched. On success, both binaries, the packaged systemd unit, Prometheus
+files, and running service untouched. On success, both binaries, the restricted
+maintenance helper, its pinned bootstrap, the packaged systemd unit, Prometheus
 rules, and Grafana dashboard are upgraded; the TOML and every TLS path it
 references remain unchanged. If the requested service restart then fails, the
 installer restores the previous release-managed files, enabled state, and
 active state. Upgrade output reports the resolved listener and authentication
 summary but does not print the existing configuration contents.
+
+For guarded multi-host planning, canary rollout, external protocol checks, and
+recorded rollback, see [AI-assisted fleet operations](operations.md).
 
 ## Install a downloaded archive
 

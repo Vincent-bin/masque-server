@@ -1,0 +1,130 @@
+#!/usr/bin/env sh
+set -eu
+
+# This root-owned entrypoint is intentionally narrow enough to grant through a
+# dedicated sudoers rule. It never edits the server configuration, TLS files,
+# routing, firewall, or NAT.
+REPOSITORY=Vincent-bin/masque-server
+BOOTSTRAP=/usr/local/libexec/masque-server/install-latest.sh
+BIN=/usr/local/bin/masque-server
+CONFIG=/etc/masque/masque.toml
+CERT=/etc/masque/certs/server.crt
+SERVICE=masque.service
+LOCK=/run/lock/masque-maintain.lock
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "masque-maintain must run as root"
+}
+
+status() {
+    version=$("$BIN" --version 2>/dev/null | sed -n '1p' || true)
+    arch=$(uname -m 2>/dev/null || true)
+    active=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+    enabled=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
+    config_exists=no
+    config_check=missing
+    config_sha256=
+    if [ -f "$CONFIG" ]; then
+        config_exists=yes
+        if "$BIN" --config "$CONFIG" check-config >/dev/null 2>&1; then
+            config_check=ok
+        else
+            config_check=failed
+        fi
+        config_sha256=$(sha256sum "$CONFIG" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    fi
+    cert_not_after=$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null |
+        sed -n 's/^notAfter=//p' || true)
+    disk_available_kb=$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $4 }')
+    disk_used_percent=$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $5 }')
+
+    printf '%s\n' \
+        'masque_ops_status=1' \
+        "version=$version" \
+        "arch=$arch" \
+        "service_active=$active" \
+        "service_enabled=$enabled" \
+        "config_exists=$config_exists" \
+        "config_check=$config_check" \
+        "config_sha256=$config_sha256" \
+        "cert_not_after=$cert_not_after" \
+        "disk_available_kb=$disk_available_kb" \
+        "disk_used_percent=$disk_used_percent"
+}
+
+diagnose() {
+    lines=${1:-100}
+    case "$lines" in
+        ''|*[!0-9]*) die "diagnostic line count must be an integer" ;;
+    esac
+    if [ "$lines" -lt 1 ] || [ "$lines" -gt 500 ]; then
+        die "diagnostic line count must be between 1 and 500"
+    fi
+
+    echo '== version =='
+    "$BIN" --version 2>&1 || true
+    echo '== service =='
+    systemctl status "$SERVICE" --no-pager -l 2>&1 || true
+    echo '== configuration check =='
+    "$BIN" --config "$CONFIG" check-config 2>&1 || true
+    echo '== host prerequisites =='
+    "$BIN" --config "$CONFIG" doctor 2>&1 || true
+    echo '== certificate expiry =='
+    openssl x509 -in "$CERT" -noout -enddate 2>&1 || true
+    echo '== root filesystem =='
+    df -h / 2>&1 || true
+    echo '== listening sockets =='
+    ss -H -lntu 2>&1 || true
+    echo '== recent warning journal =='
+    journalctl -u "$SERVICE" -p warning -n "$lines" --no-pager 2>&1 || true
+}
+
+validate_version() {
+    version=$1
+    printf '%s\n' "$version" |
+        grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$' ||
+        die "invalid release version: $version"
+}
+
+upgrade() {
+    version=$1
+    validate_version "$version"
+    [ -x "$BOOTSTRAP" ] || die "installed bootstrap is missing: $BOOTSTRAP"
+    command -v flock >/dev/null 2>&1 || die "required command not found: flock"
+    install -d -m 0755 /run/lock
+    exec 9>"$LOCK"
+    flock -n 9 || die "another MASQUE maintenance operation is running"
+
+    MASQUE_VERSION=$version
+    MASQUE_GITHUB_REPOSITORY=$REPOSITORY
+    MASQUE_START_SERVICE=1
+    MASQUE_RUN_HOST_DIAGNOSTICS=0
+    export MASQUE_VERSION MASQUE_GITHUB_REPOSITORY MASQUE_START_SERVICE
+    export MASQUE_RUN_HOST_DIAGNOSTICS
+    "$BOOTSTRAP"
+}
+
+require_root
+command=${1:-}
+case "$command" in
+    status)
+        [ "$#" -eq 1 ] || die "usage: masque-maintain status"
+        status
+        ;;
+    diagnose)
+        [ "$#" -le 2 ] || die "usage: masque-maintain diagnose [LINES]"
+        diagnose "${2:-100}"
+        ;;
+    upgrade)
+        [ "$#" -eq 2 ] || die "usage: masque-maintain upgrade vVERSION"
+        upgrade "$2"
+        ;;
+    *)
+        die "usage: masque-maintain status | diagnose [LINES] | upgrade vVERSION"
+        ;;
+esac

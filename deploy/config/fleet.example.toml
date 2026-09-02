@@ -1,0 +1,73 @@
+# Copy this file outside the repository, normally to
+# ~/.config/masque-server/fleet.toml, replace every example value, and chmod
+# the file and each referenced private file to 0600.
+schema_version = 1
+repository = "Vincent-bin/masque-server"
+state_path = "~/.local/state/masque-server/ops-state.json"
+probe_binary = "masque-probe"
+
+[defaults]
+user = "masque-deploy"
+port = 22
+identity_file = "~/.ssh/id_ed25519_masque"
+known_hosts_file = "~/.ssh/known_hosts"
+sudo = true
+connect_timeout_secs = 10
+command_timeout_secs = 60
+deploy_timeout_secs = 900
+
+# Exactly one selected host should normally be the rollout canary. The address
+# is used only for SSH and is never written to the operations state or audit.
+[[hosts]]
+name = "edge-a"
+address = "203.0.113.10"
+canary = true
+# A truly empty server is bootstrapped through an explicit root entry. After
+# the first install, replace this with the restricted masque-deploy account and
+# remove the bootstrap table.
+user = "root"
+sudo = false
+
+[hosts.bootstrap]
+auth_mode = "basic"
+listen_port = 8449
+tls_cert_path = "/root/.acme.sh/proxy-a.example.com_ecc/fullchain.cer"
+tls_key_path = "/root/.acme.sh/proxy-a.example.com_ecc/proxy-a.example.com.key"
+basic_username = "probe-user"
+basic_stealth = true
+basic_password_file = "secrets/edge-a.password"
+basic_client_endpoint = "proxy-a.example.com:8449"
+basic_client_name = "edge-a"
+basic_client_config = "secrets/edge-a.surge.conf"
+# For auth_mode = "client_cert" or "dual":
+# client_name = "laptop"
+# client_endpoint = "proxy-a.example.com:4443"
+# client_ipv4 = "10.89.0.2"       # use "none" to omit one family
+# client_ipv6 = "fd00:abcd::2"
+# client_config = "secrets/edge-a-client.json"
+# For auth_mode = "dual" only:
+# cert_listen_port = 4443
+
+# This optional probe runs on the administration machine after installation.
+# Password contents are read directly by masque-probe, never by masque-ops and
+# never from a command-line argument.
+[hosts.probe]
+endpoint = "proxy-a.example.com:8449"
+transport = "http3"
+username = "probe-user"
+password_file = "secrets/edge-a.password"
+timeout_secs = 8
+
+[[hosts]]
+name = "edge-b"
+address = "2001:db8::20"
+port = 2222
+
+# A certificate-authenticated probe references the enrollment JSON without
+# copying its private key into this inventory.
+[hosts.probe]
+endpoint = "proxy-b.example.com:4443"
+transport = "http3"
+client_config = "secrets/edge-b-client.json"
+connect_ip = true
+timeout_secs = 10

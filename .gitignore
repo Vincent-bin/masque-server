@@ -1,6 +1,12 @@
 /target
 /dist
 certs/
+# Operations inventory and state belong outside the repository. These names
+# are ignored as a last line of defense if an operator copies them here.
+fleet.toml
+ops-state.json
+ops-audit.jsonl
 /fuzz/artifacts
 /fuzz/corpus
 /fuzz/target
+__pycache__/
