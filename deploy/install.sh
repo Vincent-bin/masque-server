@@ -419,7 +419,10 @@ generate_basic_client_config() {
         basic_client_endpoint=$(prompt_value \
             "Public Basic endpoint (host:port; leave empty to skip)" "")
     fi
-    [ -n "$basic_client_endpoint" ] || return
+    # Skipping this optional artifact is a successful fresh installation.
+    # A bare `return` here would preserve the failed `[ -n ... ]` status and,
+    # under `set -e`, terminate unattended installs without an error message.
+    [ -n "$basic_client_endpoint" ] || return 0
 
     BASIC_CLIENT_CONFIG_OUT=${MASQUE_BASIC_CLIENT_CONFIG_OUT:-}
     if [ -z "$BASIC_CLIENT_CONFIG_OUT" ]; then
