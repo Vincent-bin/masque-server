@@ -48,45 +48,52 @@ a staging environment.
 - Static Linux x86_64 and ARM64 release archives with a systemd installer
 - Standalone Linux and macOS x86_64/ARM64 probe archives with automatic,
   SHA-256-verified installation
-- Optional guarded fleet operations CLI and repo-scoped AI Skill for status,
+- Optional guarded fleet operations CLI and installable AI Skill for status,
   secret-isolated empty-host bootstrap, canary rollout, external verification,
   and recorded rollback
 
 ## AI-assisted operations with the `masque-ops` Skill
 
-The repository ships a Codex-compatible operations Skill alongside the
-deterministic CLI it controls. There is nothing to install on a proxy server:
-clone the repository on the administration machine, start Codex from its root,
-and the repo-scoped Skill is discovered automatically:
+Install the Codex-compatible Skill, its deterministic CLI, inventory example,
+and the release-matched `masque-probe` on a Linux or macOS administration
+machine with one command:
 
 ```sh
-git clone https://github.com/Vincent-bin/masque-server.git
-cd masque-server
-codex
+curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-ops.sh | sh
 ```
 
-Then invoke it explicitly in Codex:
+The installer requires Python 3.11 or newer and OpenSSH. It detects the latest
+stable Release, verifies both downloaded archives against their published
+SHA-256 files, installs the Skill at `~/.agents/skills/masque-ops`, and exposes
+the CLI as `~/.local/bin/masque-ops` for an unprivileged user. Run the same
+command to upgrade; private inventory, state, and credentials are preserved.
+Set `MASQUE_VERSION=vX.Y.Z` to pin an exact Release, or
+`MASQUE_OPS_INSTALL_PROBE=0` to omit the optional probe.
+
+Restart Codex after installation so it discovers the Skill, then invoke it
+explicitly:
 
 ```text
 $masque-ops validate the fleet and inspect its current status
 ```
 
-To make the Skill available outside this checkout, ask Codex's built-in
-installer to install it directly from the repository:
+As an alternative, Codex's built-in installer can install the self-contained
+Skill directly from the repository. This does not create the shell command or
+install the probe:
 
 ```text
 $skill-installer install the masque-ops skill from https://github.com/Vincent-bin/masque-server/tree/main/.agents/skills/masque-ops
 ```
 
-Copy [`deploy/config/fleet.example.toml`](deploy/config/fleet.example.toml) to
-the private inventory location, replace its documentation values, and keep it
-mode `0600`. The AI passes only that path and host aliases to
-[`scripts/masque-ops.py`](scripts/masque-ops.py); the CLI—not the AI—reads the
-inventory, SSH identity, passwords, or generated client credentials. It can
-inspect an existing fleet or bootstrap an explicitly configured empty Linux
-host. Start with a read-only request, review the plan, and authorize `--apply`
-separately. See [AI-assisted fleet operations](docs/operations.md) for setup,
-bootstrap, rollout, and rollback instructions.
+Copy `~/.config/masque-server/fleet.example.toml` to `fleet.toml`, replace its
+documentation values, and keep it mode `0600`. The AI passes only that path and
+host aliases to the CLI; the CLI—not the AI—reads the inventory, SSH identity,
+passwords, or generated client credentials. It can inspect an existing fleet
+or bootstrap an explicitly configured empty Linux host. Start with a read-only
+request, review the plan, and authorize `--apply` separately. A repository
+checkout remains supported through [`scripts/masque-ops.py`](scripts/masque-ops.py).
+See [AI-assisted fleet operations](docs/operations.md) for setup, bootstrap,
+rollout, and rollback instructions.
 
 ## Quick start
 
@@ -323,7 +330,7 @@ fuzz/                   Scheduled libFuzzer targets for public protocol parsers
 deploy/                 Example config, installer, systemd unit, and monitoring assets
 docs/                   Operator and contributor documentation
 scripts/                Test, benchmark, certificate, and packaging helpers
-.agents/skills/          Optional repository-scoped agent runbooks
+.agents/skills/          Installable and repository-scoped agent runbooks
 .github/workflows/      CI and release automation
 ```
 

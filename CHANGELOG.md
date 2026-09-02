@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.13.0 - 2026-09-02
+
 ### Added
 
 - A guarded fleet operations CLI and repo-scoped AI Skill provide read-only
@@ -22,6 +24,11 @@ pre-1.0.
   agent—reads SSH and credential files, sends Basic secrets only through SSH
   standard input, suppresses installer secret output, and streams generated
   client credentials directly into local mode-`0600` files.
+- A platform-independent, checksummed `masque-ops` Release archive and
+  one-command installer place the self-contained Skill, CLI, inventory example,
+  and release-matched probe on a Linux or macOS administration machine. Running
+  the installer again upgrades those tools without touching private inventory,
+  state, or credentials.
 
 ## 0.12.2 - 2026-09-01
 

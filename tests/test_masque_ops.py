@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = ROOT / "scripts" / "masque-ops.py"
+SKILL_ROOT = ROOT / ".agents" / "skills" / "masque-ops"
+SCRIPT = SKILL_ROOT / "scripts" / "masque-ops.py"
+REPOSITORY_LAUNCHER = ROOT / "scripts" / "masque-ops.py"
 SPEC = importlib.util.spec_from_file_location("masque_ops", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 ops = importlib.util.module_from_spec(SPEC)
@@ -528,6 +530,43 @@ class OperationTests(unittest.TestCase):
 
 
 class SecurityTests(unittest.TestCase):
+    def test_skill_is_self_contained_and_versioned(self) -> None:
+        self.assertEqual((SKILL_ROOT / "VERSION").read_text().strip(), "0.13.0")
+        self.assertEqual(
+            (SKILL_ROOT / "scripts/install-latest.sh").read_bytes(),
+            (ROOT / "install-latest.sh").read_bytes(),
+        )
+        self.assertEqual(
+            (SKILL_ROOT / "scripts/install-probe.sh").read_bytes(),
+            (ROOT / "install-probe.sh").read_bytes(),
+        )
+        self.assertEqual(
+            (SKILL_ROOT / "assets/fleet.example.toml").read_bytes(),
+            (ROOT / "deploy/config/fleet.example.toml").read_bytes(),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            isolated = Path(temporary) / "masque-ops"
+            shutil.copytree(SKILL_ROOT, isolated)
+            completed = subprocess.run(
+                [str(isolated / "scripts/masque-ops.py"), "--version"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "masque-ops 0.13.0")
+
+    def test_repository_launcher_uses_the_bundled_cli(self) -> None:
+        completed = subprocess.run(
+            [str(REPOSITORY_LAUNCHER), "--version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "masque-ops 0.13.0")
+
     @unittest.skipUnless(shutil.which("sh"), "POSIX shell is required")
     def test_embedded_remote_scripts_have_valid_shell_syntax(self) -> None:
         for name in (
