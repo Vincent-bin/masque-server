@@ -62,8 +62,9 @@ diagnose() {
     case "$lines" in
         ''|*[!0-9]*) die "diagnostic line count must be an integer" ;;
     esac
-    [ "$lines" -ge 1 ] && [ "$lines" -le 500 ] ||
+    if [ "$lines" -lt 1 ] || [ "$lines" -gt 500 ]; then
         die "diagnostic line count must be between 1 and 500"
+    fi
 
     echo '== version =='
     "$BIN" --version 2>&1 || true

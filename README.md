@@ -52,6 +52,42 @@ a staging environment.
   secret-isolated empty-host bootstrap, canary rollout, external verification,
   and recorded rollback
 
+## AI-assisted operations with the `masque-ops` Skill
+
+The repository ships a Codex-compatible operations Skill alongside the
+deterministic CLI it controls. There is nothing to install on a proxy server:
+clone the repository on the administration machine, start Codex from its root,
+and the repo-scoped Skill is discovered automatically:
+
+```sh
+git clone https://github.com/Vincent-bin/masque-server.git
+cd masque-server
+codex
+```
+
+Then invoke it explicitly in Codex:
+
+```text
+$masque-ops validate the fleet and inspect its current status
+```
+
+To make the Skill available outside this checkout, ask Codex's built-in
+installer to install it directly from the repository:
+
+```text
+$skill-installer install the masque-ops skill from https://github.com/Vincent-bin/masque-server/tree/main/.agents/skills/masque-ops
+```
+
+Copy [`deploy/config/fleet.example.toml`](deploy/config/fleet.example.toml) to
+the private inventory location, replace its documentation values, and keep it
+mode `0600`. The AI passes only that path and host aliases to
+[`scripts/masque-ops.py`](scripts/masque-ops.py); the CLI—not the AI—reads the
+inventory, SSH identity, passwords, or generated client credentials. It can
+inspect an existing fleet or bootstrap an explicitly configured empty Linux
+host. Start with a read-only request, review the plan, and authorize `--apply`
+separately. See [AI-assisted fleet operations](docs/operations.md) for setup,
+bootstrap, rollout, and rollback instructions.
+
 ## Quick start
 
 Build the server:

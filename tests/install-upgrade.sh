@@ -313,8 +313,15 @@ MASQUE_AUTH_MODE=basic \
     MASQUE_AUTH_PASSWORD=private-automation-password \
     MASQUE_PRINT_SECRETS=0 \
     MASQUE_START_SERVICE=0 \
-    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/suppressed-fresh.log" 2>&1 ||
+    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/suppressed-fresh.log" 2>&1 || {
+    # The values above are fixed test fixtures, but still redact them so a
+    # regression cannot teach CI logs to expose the corresponding real fields.
+    sed \
+        -e 's/private-automation-user/<redacted-user>/g' \
+        -e 's/private-automation-password/<redacted-password>/g' \
+        "$TEST_TMP/suppressed-fresh.log" >&2
     die "fresh secret-suppressed installation failed"
+}
 grep -q 'Credential and generated configuration output was suppressed' \
     "$TEST_TMP/suppressed-fresh.log" ||
     die "fresh automation did not report suppressed output"
