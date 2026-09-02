@@ -42,6 +42,9 @@ a staging environment.
 - Credential-safe client configuration generation and a redacted JSON support
   bundle for reproducible troubleshooting
 - Per-listener QUIC packet ceilings for mixed direct and low-MTU relay endpoints
+- Documented [client-driven two-hop sizing](docs/configuration.md#client-driven-two-hop-masque):
+  keep the Entry at 1350 and use a dedicated 1200-byte Exit listener for the
+  nested QUIC connection
 - Static Linux x86_64 and ARM64 release archives with a systemd installer
 
 ## Quick start

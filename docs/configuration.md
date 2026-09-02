@@ -751,6 +751,79 @@ Important relationships:
 Queue depths trade memory and latency for burst tolerance. QUIC DATAGRAM frames
 are not retransmitted; a full queue drops traffic.
 
+### Client-driven two-hop MASQUE
+
+A client such as [Surge](https://manual.nssurge.com/policies/parameters.html#underlying-proxy)
+can establish an Exit MASQUE connection through an Entry MASQUE policy
+(`underlying-proxy`). This is a nested client connection, not a server-to-server
+option: the Entry needs only an ordinary HTTP/3 listener, while the client dials
+another HTTP/3 listener on the Exit through a CONNECT-UDP tunnel.
+
+The two QUIC layers must not use the same 1350-byte packet ceiling. A complete
+inner 1350-byte QUIC packet, plus the outer HTTP Datagram and QUIC framing,
+does not fit in a 1350-byte outer packet. TCP may appear to work while UDP
+tests time out or larger transfers stall. Use these values:
+
+| Role | Listener use | `max_datagram_size` |
+| --- | --- | --- |
+| Entry | Outer MASQUE connection from the client | `1350` (the default) |
+| Exit | Direct client connections | `1350` (the default) |
+| Exit | Inner MASQUE connection carried through Entry | `1200` |
+
+Prefer a dedicated Exit port for the nested path. The relevant part of the
+Exit configuration is:
+
+```toml
+# Direct clients retain the normal packet ceiling.
+[[listeners]]
+listen_addr = "[::]:8449"
+transport = "http3"
+shards = 1
+
+[listeners.auth]
+enabled = true
+mode = "basic"
+
+[[listeners.auth.users]]
+username = "exit-direct"
+password_hash = "$argon2id$..."
+
+# The client reaches this listener through its Entry proxy.
+[[listeners]]
+listen_addr = "[::]:8450"
+transport = "http3"
+shards = 1
+max_datagram_size = 1200
+
+[listeners.auth]
+enabled = true
+mode = "basic"
+
+[[listeners.auth.users]]
+username = "exit-relay"
+password_hash = "$argon2id$..."
+
+[quic]
+max_datagram_size = 1350
+```
+
+Replace the abbreviated hashes with values produced by `hash-password`, allow
+UDP port 8450 from the Entry's egress address on the Exit host, and point the
+client's Exit policy at that port. Account for both address families if the
+Exit hostname has A and AAAA records. The Entry configuration does not need a
+`1200` override. If an Exit is used only through an Entry, its sole listener
+may use `1200` instead of adding a second port.
+
+`max_datagram_size` is a QUIC UDP-packet ceiling, not an operating-system
+interface MTU. The listener setting constrains both directions of the inner
+QUIC connection through transport negotiation; no MASQUE MTU option is needed
+in Surge. Do not expect `discover_pmtu` to remove the encapsulation overhead.
+
+The 1200-byte listener is suitable for CONNECT and CONNECT-UDP. It cannot carry
+the default 1280-byte CONNECT-IP packets. Keep CONNECT-IP on a normal listener,
+or lower `ip_proxy.tun_mtu` consistently on the server and client and validate
+full-size packets before using CONNECT-IP through two hops.
+
 ## TCP policy
 
 ```toml

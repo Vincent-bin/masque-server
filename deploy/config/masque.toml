@@ -34,9 +34,11 @@ transport = "http3"
 # single listener. Linux only; measure before raising it.
 shards = 1
 # Optional HTTP/3-only override. Leave absent to inherit the 1350-byte [quic]
-# default; use 1200 for a listener dedicated to a verified low-MTU or nested
-# MASQUE path. It cannot carry the default 1280-byte CONNECT-IP packets, so use
-# it for CONNECT-UDP/TCP or lower ip_proxy.tun_mtu consistently on both ends.
+# default. For a client-driven two-hop chain, keep 1350 on the Entry and set
+# 1200 on a dedicated Exit listener reached through the Entry; this leaves the
+# Exit's direct listener at 1350. A 1200 listener cannot carry the default
+# 1280-byte CONNECT-IP packets, so use it for CONNECT-UDP/TCP or lower
+# ip_proxy.tun_mtu consistently on both ends. See docs/configuration.md.
 # max_datagram_size = 1200
 
 [listeners.auth]
