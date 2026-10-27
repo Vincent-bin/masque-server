@@ -16,6 +16,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::policy::TargetPolicy;
 use crate::uri::TcpTarget;
 
+use super::resolver::TargetResolver;
 use super::target::resolve_allowed;
 
 pub use super::target::TargetSetupFailure as TcpSetupFailure;
@@ -386,16 +387,17 @@ impl Drop for TcpTunnel {
     }
 }
 
-pub fn spawn_tcp_connect(
+pub(crate) fn spawn_tcp_connect(
     connection_index: u64,
     stream_id: u64,
     target: TcpTarget,
     policy: TargetPolicy,
     timeout: Duration,
     event_tx: mpsc::Sender<TcpRelayEvent>,
+    resolver: TargetResolver,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let result = resolve_and_connect(target, &policy, timeout).await;
+        let result = resolve_and_connect(target, &policy, timeout, &resolver).await;
         let _ = event_tx
             .send(TcpRelayEvent::ConnectResult {
                 connection_index,
@@ -410,9 +412,10 @@ pub(crate) async fn resolve_and_connect(
     target: TcpTarget,
     policy: &TargetPolicy,
     timeout: Duration,
+    resolver: &TargetResolver,
 ) -> Result<(TcpStream, SocketAddr), TcpSetupFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let resolved = resolve_allowed(&target.host, target.port, policy, deadline).await?;
+    let resolved = resolve_allowed(&target.host, target.port, policy, deadline, resolver).await?;
     let connected =
         tokio::time::timeout_at(deadline, happy_eyeballs_connect(resolved.into_addresses()))
             .await

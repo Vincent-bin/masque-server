@@ -696,6 +696,66 @@ async fn connect_udp_relays_datagram_capsules_over_http2() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http2() {
+    let files = TestFiles::new();
+    let tcp_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = http2_config(&files);
+    config.tcp_proxy.allow_targets = vec!["0.0.0.0/0".into(), "::/0".into()];
+    config.tcp_proxy.deny_targets = vec!["127.0.0.0/8".into()];
+    config.udp_proxy.allow_targets = config.tcp_proxy.allow_targets.clone();
+    config.udp_proxy.deny_targets = config.tcp_proxy.deny_targets.clone();
+    let (server_addr, server_task) = spawn_http2_config(config).await;
+    let (mut client, driver) = connect_h2(server_addr).await;
+
+    for host in ["127.0.0.1", "::ffff:127.0.0.1"] {
+        let target = std::net::SocketAddr::new(
+            host.parse().unwrap(),
+            tcp_target.local_addr().unwrap().port(),
+        );
+        let (response, _request_body) =
+            client.send_request(connect_request(target), false).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "TCP {host}"
+        );
+
+        let uri = format!(
+            "https://localhost/.well-known/masque/udp/{}/{}/",
+            host.replace(':', "%3A"),
+            udp_target.local_addr().unwrap().port()
+        );
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri(uri)
+            .header("capsule-protocol", "?1")
+            .body(())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from_static("connect-udp"));
+        let (response, _request_body) = client.send_request(request, false).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "UDP {host}"
+        );
+    }
+
+    server_task.abort();
+    driver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_ip_assigns_addresses_and_routes_over_http2_capsules() {
     let files = TestFiles::new();
     let mut config = http2_config(&files);

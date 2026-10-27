@@ -32,6 +32,24 @@ work that has not started and discards results for work already running.
 Each Basic listener is also limited to 4,096 configured accounts; adding
 accounts does not enlarge any Argon2 concurrency or queue limit.
 
+After a successful verification, that listener's account retains one
+HMAC-SHA256 password tag under a freshly generated, account-specific random
+key for five minutes. Requests still parse and check their own credentials;
+the cache is neither a connection-wide authorization flag nor a stored
+plaintext password. Hits do not extend the expiry. Reloading creates new
+credential objects and keys, invalidating every cached result for future
+requests even when an account's PHC hash is unchanged. In-memory tags and
+their keys are sensitive: Argon2 remains the at-rest password protection,
+not protection against disclosure of the live cache and its key together.
+
+Identical cold checks share one in-flight result. Followers retain bounded
+request admission slots but use no Argon2 CPU permit or blocking thread.
+Failures are shared only with existing followers, never cached for later
+requests. Cancelling a leader before work begins lets a follower replace it;
+already-running work retains its permits until completion. Warm cache hits
+bypass expensive-verification admission, while wrong passwords still use the
+same per-source, connection, and global safeguards.
+
 Give each client or operator a distinct account with a unique, high-entropy
 password. Basic credentials are protected by TLS in transit but are reusable
 bearer secrets at the HTTP layer. A compromised account can then be rotated or
@@ -77,7 +95,18 @@ rather than looking the name up again. This closes the policy/connect gap an
 attacker-controlled short-TTL name could otherwise use for DNS rebinding.
 Mixed allowed and denied answers fail closed.
 
+IPv4-mapped IPv6 targets (for example `::ffff:127.0.0.1`) are checked as their
+IPv4 address, so IPv6 allow rules cannot bypass IPv4 deny rules. Explicit
+mapped CIDRs within `::ffff:0:0/96` are translated to equivalent IPv4 CIDRs;
+native and mapped spellings therefore share the same allow/deny decision.
+
 Disable TCP, UDP, or IP proxy sections that are not required.
+
+Target DNS calls share 128 permits across all listeners and eight per
+connection. These cover queued and running blocking calls: cancellation or a
+setup timeout does not release a permit until `getaddrinfo` actually ends.
+Waiting for a permit is included in the setup timeout and can return `504`.
+Numeric target addresses bypass DNS work and its permits.
 
 ## Resource safety
 

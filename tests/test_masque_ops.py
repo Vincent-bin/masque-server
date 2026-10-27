@@ -531,7 +531,7 @@ class OperationTests(unittest.TestCase):
 
 class SecurityTests(unittest.TestCase):
     def test_skill_is_self_contained_and_versioned(self) -> None:
-        self.assertEqual((SKILL_ROOT / "VERSION").read_text().strip(), "0.13.0")
+        self.assertEqual((SKILL_ROOT / "VERSION").read_text().strip(), "0.14.0")
         self.assertEqual(
             (SKILL_ROOT / "scripts/install-latest.sh").read_bytes(),
             (ROOT / "install-latest.sh").read_bytes(),
@@ -555,7 +555,7 @@ class SecurityTests(unittest.TestCase):
                 check=False,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "masque-ops 0.13.0")
+        self.assertEqual(completed.stdout.strip(), "masque-ops 0.14.0")
 
     def test_repository_launcher_uses_the_bundled_cli(self) -> None:
         completed = subprocess.run(
@@ -565,7 +565,7 @@ class SecurityTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "masque-ops 0.13.0")
+        self.assertEqual(completed.stdout.strip(), "masque-ops 0.14.0")
 
     @unittest.skipUnless(shutil.which("sh"), "POSIX shell is required")
     def test_embedded_remote_scripts_have_valid_shell_syntax(self) -> None:

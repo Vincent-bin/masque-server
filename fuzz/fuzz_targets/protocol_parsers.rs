@@ -5,7 +5,10 @@ use masque::capsule::decoder::CapsuleDecoder;
 
 fuzz_target!(|data: &[u8]| {
     let _ = masque::varint::decode(data);
-    let _ = masque::datagram::decode_ref(data);
+    if let Ok(datagram) = masque::datagram::decode_ref(data) {
+        assert!(datagram.stream_id <= masque::varint::MAX_VALUE);
+        assert!(datagram.stream_id.is_multiple_of(4));
+    }
     let _ = masque::ip_packet::parse(data);
     let _ = masque::ip_packet::src_addr(data);
     let _ = masque::ip_packet::dst_addr(data);
@@ -20,6 +23,11 @@ fuzz_target!(|data: &[u8]| {
         if capsules.decode(chunk).is_err() {
             break;
         }
+    }
+
+    let mut datagrams = masque::capsule::datagram::DatagramCapsules::new(64 * 1024);
+    for chunk in data.chunks(chunk_size) {
+        if datagrams.decode(chunk).is_err() { break; }
     }
 
     if let Ok(text) = std::str::from_utf8(data) {

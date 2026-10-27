@@ -10,7 +10,7 @@ undocumented_unsafe_blocks = "deny"
 
 [package]
 name = "masque-server"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.88"
 description = "High-performance MASQUE proxy for CONNECT, CONNECT-UDP, and CONNECT-IP over HTTP/2 and HTTP/3"
@@ -55,7 +55,7 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-boring = "4.19"
 toml = "1.1"
 toml_edit = "0.25"

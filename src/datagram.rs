@@ -8,13 +8,23 @@
 
 use crate::varint;
 
+/// RFC 9297 Section 2.1: QUIC stream IDs have at most 62 bits.
+pub const MAX_QUARTER_STREAM_ID: u64 = (1 << 60) - 1;
+
+/// HTTP/3 application error for a missing or out-of-range Quarter Stream ID.
+pub const H3_DATAGRAM_ERROR: u64 = 0x33;
+
 /// Error from datagram parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatagramError {
-    /// Buffer too short to decode the framing header.
+    /// Buffer too short to decode the Context ID.
     TooShort,
+    /// Buffer too short to decode the Quarter Stream ID.
+    MissingQuarterStreamId,
+    /// The Quarter Stream ID exceeds the legal 60-bit range.
+    InvalidQuarterStreamId(u64),
     /// The stream ID is not a valid client-initiated bidirectional stream
-    /// (must be divisible by 4).
+    /// (must be divisible by 4 and fit in 62 bits).
     InvalidStreamId(u64),
 }
 
@@ -22,6 +32,12 @@ impl std::fmt::Display for DatagramError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DatagramError::TooShort => write!(f, "datagram too short"),
+            DatagramError::MissingQuarterStreamId => {
+                write!(f, "datagram has no complete quarter stream id")
+            }
+            DatagramError::InvalidQuarterStreamId(id) => {
+                write!(f, "quarter stream id exceeds the legal maximum: {id}")
+            }
             DatagramError::InvalidStreamId(id) => {
                 write!(f, "invalid stream id for datagram: {id}")
             }
@@ -30,6 +46,17 @@ impl std::fmt::Display for DatagramError {
 }
 
 impl std::error::Error for DatagramError {}
+
+impl DatagramError {
+    /// RFC 9297 Section 2.1 requires a connection error for QSID failures.
+    /// A malformed Context ID is a separate, tunnel-specific payload error.
+    pub fn is_connection_error(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingQuarterStreamId | Self::InvalidQuarterStreamId(_)
+        )
+    }
+}
 
 /// A parsed HTTP Datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +79,10 @@ pub struct HttpDatagramRef<'a> {
 
 /// Decode an HTTP Datagram without allocating or copying its payload.
 pub fn decode_ref(buf: &[u8]) -> Result<HttpDatagramRef<'_>, DatagramError> {
-    let (qsid, qlen) = varint::decode(buf).map_err(|_| DatagramError::TooShort)?;
+    let (qsid, qlen) = varint::decode(buf).map_err(|_| DatagramError::MissingQuarterStreamId)?;
+    if qsid > MAX_QUARTER_STREAM_ID {
+        return Err(DatagramError::InvalidQuarterStreamId(qsid));
+    }
     let (context_id, clen) = varint::decode(&buf[qlen..]).map_err(|_| DatagramError::TooShort)?;
 
     Ok(HttpDatagramRef {
@@ -75,7 +105,7 @@ pub fn decode(buf: &[u8]) -> Result<HttpDatagram, DatagramError> {
 
 /// Encode an HTTP Datagram into a QUIC DATAGRAM frame payload.
 pub fn encode(dgram: &HttpDatagram) -> Result<Vec<u8>, DatagramError> {
-    if !dgram.stream_id.is_multiple_of(4) {
+    if !dgram.stream_id.is_multiple_of(4) || dgram.stream_id > varint::MAX_VALUE {
         return Err(DatagramError::InvalidStreamId(dgram.stream_id));
     }
 
@@ -110,7 +140,7 @@ impl DatagramHeader {
     /// Build the header for `stream_id`, which must be a client-initiated
     /// bidirectional stream.
     pub fn new(stream_id: u64) -> Result<Self, DatagramError> {
-        if !stream_id.is_multiple_of(4) {
+        if !stream_id.is_multiple_of(4) || stream_id > varint::MAX_VALUE {
             return Err(DatagramError::InvalidStreamId(stream_id));
         }
 
@@ -228,13 +258,76 @@ mod tests {
 
     #[test]
     fn decode_too_short_no_qsid() {
-        assert_eq!(decode(&[]), Err(DatagramError::TooShort));
+        for wire in [&[][..], &[0x40], &[0x80, 0, 0], &[0xc0, 0, 0, 0, 0, 0, 0]] {
+            let error = decode_ref(wire).unwrap_err();
+            assert_eq!(error, DatagramError::MissingQuarterStreamId);
+            assert!(error.is_connection_error());
+        }
     }
 
     #[test]
     fn decode_too_short_no_context_id() {
         // qsid only, no context_id
         assert_eq!(decode(&[0x00]), Err(DatagramError::TooShort));
+        assert!(!decode_ref(&[0, 0x40]).unwrap_err().is_connection_error());
+    }
+
+    #[test]
+    fn quarter_stream_id_bounds_are_enforced_before_context_decoding() {
+        for qsid in [MAX_QUARTER_STREAM_ID + 1, varint::MAX_VALUE] {
+            let mut wire = Vec::new();
+            varint::encode_to_vec(qsid, &mut wire).unwrap();
+            // Even with the context absent, the QSID violation takes precedence.
+            for context in [None, Some(0)] {
+                if let Some(context) = context {
+                    wire.push(context);
+                }
+                let error = decode_ref(&wire).unwrap_err();
+                assert_eq!(error, DatagramError::InvalidQuarterStreamId(qsid));
+                assert!(error.is_connection_error());
+                assert_eq!(decode(&wire).unwrap_err(), error);
+            }
+        }
+    }
+
+    #[test]
+    fn largest_legal_request_stream_roundtrips() {
+        let stream_id = MAX_QUARTER_STREAM_ID * 4;
+        let wire = encode_payload(stream_id, b"boundary").unwrap();
+        let decoded = decode_ref(&wire).unwrap();
+        assert_eq!(decoded.stream_id, stream_id);
+        assert_eq!(decoded.payload, b"boundary");
+        assert_eq!(
+            encode(&HttpDatagram {
+                stream_id,
+                context_id: 0,
+                payload: b"boundary".to_vec()
+            })
+            .unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn encoders_reject_stream_ids_above_the_quic_limit() {
+        for stream_id in [1 << 62, u64::MAX - 3] {
+            assert_eq!(
+                DatagramHeader::new(stream_id),
+                Err(DatagramError::InvalidStreamId(stream_id))
+            );
+            assert_eq!(
+                encode_payload(stream_id, b"invalid"),
+                Err(DatagramError::InvalidStreamId(stream_id))
+            );
+            assert_eq!(
+                encode(&HttpDatagram {
+                    stream_id,
+                    context_id: 0,
+                    payload: Vec::new()
+                }),
+                Err(DatagramError::InvalidStreamId(stream_id))
+            );
+        }
     }
 
     // ── Encode tests ──────────────────────────────────────────────────

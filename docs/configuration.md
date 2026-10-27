@@ -736,8 +736,9 @@ Important relationships:
 - UDP GSO is opt-in because some virtual egress paths advertise it but drop
   super-packets. Enable it only after an external-path A/B test.
 - Supported congestion controllers are `cubic`, `reno`, and `bbr2`. CUBIC is
-  the current default because the server's deferred-send behavior penalizes
-  BBR2's fine-grained pacing.
+  the current default. Paced output uses bounded packet groups; compare
+  controllers on the deployment's actual RTT and loss profile before changing
+  this setting.
 - `retry_mode = "adaptive"` accepts tokenless Initial packets below
   `retry_connection_threshold`, avoiding an extra low-load round trip. At or
   above the per-shard threshold, the server sends a stateless, authenticated

@@ -78,6 +78,21 @@ On HTTP/3, each HTTP Datagram starts with the request stream's Quarter Stream
 ID followed by Context ID `0` and the UDP payload. QUIC does not retransmit a
 lost datagram.
 
+A missing, truncated, or out-of-range Quarter Stream ID closes the HTTP/3
+connection with `H3_DATAGRAM_ERROR` (`0x33`); the maximum QSID is `2^60 - 1`.
+An unknown or truncated Context ID and a legal QSID with no owning tunnel are
+dropped without closing the connection.
+
+HTTP/3 request DATA streams also accept DATAGRAM capsules, decoded across frame
+boundaries. Replies use QUIC DATAGRAM only after the peer has advertised support;
+otherwise they use DATAGRAM capsules on the response stream. This applies to
+both CONNECT-UDP and CONNECT-IP. Unknown capsule values are streamed past
+without buffering. Oversized DATAGRAM declarations or a truncated capsule at
+end-of-stream reset the affected stream with `H3_MESSAGE_ERROR`. A packet too
+large for native QUIC DATAGRAM is dropped rather than moved onto the reliable
+capsule path. UDP capsule payloads support up to 65,527 bytes; IP capsules obey
+the configured TUN MTU.
+
 HTTP/2 has no native HTTP Datagram frame. The client must negotiate Capsule
 Protocol with `Capsule-Protocol: ?1`; each request and response DATA stream then
 carries RFC 9297 DATAGRAM capsules whose value is Context ID `0` followed by

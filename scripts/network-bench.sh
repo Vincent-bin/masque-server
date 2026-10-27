@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 cd "$(dirname "$0")/.."
 
 BENCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/masque-network-bench.XXXXXX")"
+BIN_DIR="${MASQUE_BENCH_BIN_DIR:-target/release}"
+RESULTS_DIR="${MASQUE_BENCH_RESULTS_DIR:-}"
+PERF_BIN="${MASQUE_BENCH_PERF_BIN:-perf}"
+PERF_PID=""
 SERVER_PID=""
 ECHO_PID=""
 HTTP_PID=""
@@ -14,9 +19,14 @@ BENCH_MODE="${MASQUE_BENCH_MODE:-all}"
 BENCH_SHARDS="${MASQUE_BENCH_SHARDS:-1}"
 BENCH_TRANSPORT="${MASQUE_BENCH_TRANSPORT:-http3}"
 BENCH_QUIC_RETRY="${MASQUE_BENCH_QUIC_RETRY:-adaptive}"
+BENCH_CC="${MASQUE_BENCH_CC:-cubic}"
 LOAD_CONNS="${MASQUE_LOAD_CONNS:-}"
 
 cleanup() {
+    if [ -n "$PERF_PID" ]; then
+        kill -INT "$PERF_PID" 2>/dev/null || true
+        wait "$PERF_PID" 2>/dev/null || true
+    fi
     if [ -n "$SERVER_PID" ]; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
@@ -29,9 +39,19 @@ cleanup() {
         kill "$HTTP_PID" 2>/dev/null || true
         wait "$HTTP_PID" 2>/dev/null || true
     fi
+    if [ -n "$RESULTS_DIR" ]; then
+        mkdir -p "$RESULTS_DIR"
+        for artifact in server.log echo.log http.log perf.data perf.log; do
+            if [ -f "$BENCH_DIR/$artifact" ]; then
+                cp "$BENCH_DIR/$artifact" "$RESULTS_DIR/$artifact"
+            fi
+        done
+    fi
     rm -rf -- "$BENCH_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 case "$BENCH_MODE" in
     all|smoke|tcp|udp|load) ;;
@@ -63,6 +83,11 @@ if [ "$BENCH_MODE" = load ] && [ "$BENCH_TRANSPORT" != http3 ]; then
     echo "MASQUE_BENCH_MODE=load currently requires MASQUE_BENCH_TRANSPORT=http3" >&2
     exit 2
 fi
+
+case "$BENCH_CC" in
+    cubic|reno|bbr2) ;;
+    *) echo "MASQUE_BENCH_CC must be cubic, reno, or bbr2" >&2; exit 2 ;;
+esac
 
 case "$BENCH_SHARDS" in
     ''|*[!0-9]*)
@@ -111,6 +136,19 @@ case "$TCP_DIRECT_BASELINE" in
         ;;
 esac
 
+case "${MASQUE_BENCH_PERF:-0}" in
+    0|1) ;;
+    *) echo "MASQUE_BENCH_PERF must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${MASQUE_LOAD_WARM_AUTH:-1}" in
+    0|1) ;;
+    *) echo "MASQUE_LOAD_WARM_AUTH must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${MASQUE_BENCH_PERF:-0}" = 1 ]; then
+    command -v "$PERF_BIN" >/dev/null || { echo "perf is required for sampling" >&2; exit 2; }
+    [ -n "$RESULTS_DIR" ] || { echo "MASQUE_BENCH_RESULTS_DIR is required for sampling" >&2; exit 2; }
+fi
+
 bash scripts/gen-certs.sh "$BENCH_DIR/certs"
 
 cat >"$BENCH_DIR/masque.toml" <<EOF
@@ -122,6 +160,7 @@ cert_path = "$BENCH_DIR/certs/server.crt"
 key_path = "$BENCH_DIR/certs/server.key"
 
 [quic]
+cc_algorithm = "$BENCH_CC"
 max_datagram_size = 1350
 enable_dgram = true
 enable_udp_gso = $QUIC_GSO_TOML
@@ -194,7 +233,14 @@ EOF
         ;;
 esac
 
-cargo build --workspace --release
+if [ -z "${MASQUE_BENCH_BIN_DIR:-}" ]; then
+    cargo build --workspace --release
+fi
+for binary in masque-server masque-e2e; do
+    [ -x "$BIN_DIR/$binary" ] || { echo "missing executable: $BIN_DIR/$binary" >&2; exit 2; }
+done
+printf 'BENCH_CONFIG transport=%s cc=%s shards=%s quic_gso=%s target_gso=%s load_warm_auth=%s\n' \
+    "$BENCH_TRANSPORT" "$BENCH_CC" "$BENCH_SHARDS" "$QUIC_GSO_TOML" "$TARGET_GSO_TOML" "${MASQUE_LOAD_WARM_AUTH:-1}"
 
 case "$BENCH_MODE" in
     all|tcp)
@@ -209,14 +255,19 @@ case "$BENCH_MODE" in
     all|smoke|udp|load)
         MASQUE_ECHO_SERVER_ADDR=127.0.0.1:9999 \
         RUST_LOG=warn \
-        target/release/masque-e2e >"$BENCH_DIR/echo.log" 2>&1 &
+        "$BIN_DIR/masque-e2e" >"$BENCH_DIR/echo.log" 2>&1 &
         ECHO_PID=$!
         ;;
 esac
 
-RUST_LOG=warn target/release/masque-server --config "$BENCH_DIR/masque.toml" \
+RUST_LOG=warn "$BIN_DIR/masque-server" --config "$BENCH_DIR/masque.toml" \
     >"$BENCH_DIR/server.log" 2>&1 &
 SERVER_PID=$!
+if [ "${MASQUE_BENCH_PERF:-0}" = 1 ]; then
+    "$PERF_BIN" record --event cpu-clock:u -F 99 --call-graph dwarf,8192 \
+        -p "$SERVER_PID" -o "$BENCH_DIR/perf.data" >"$BENCH_DIR/perf.log" 2>&1 &
+    PERF_PID=$!
+fi
 
 case "$BENCH_MODE" in
     all|smoke)
@@ -226,7 +277,7 @@ case "$BENCH_MODE" in
             MASQUE_SERVER_ADDR=127.0.0.1:4433 \
             ECHO_SERVER_ADDR=127.0.0.1:9999 \
             RUST_LOG=warn \
-            target/release/masque-e2e
+            "$BIN_DIR/masque-e2e"
 
             MASQUE_TCP_CHECK=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
@@ -235,7 +286,7 @@ case "$BENCH_MODE" in
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
-            target/release/masque-e2e
+            "$BIN_DIR/masque-e2e"
 
             MASQUE_UDP_CHECK=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
@@ -244,7 +295,7 @@ case "$BENCH_MODE" in
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
-            target/release/masque-e2e
+            "$BIN_DIR/masque-e2e"
 
             if [ "$transport" = http3 ]; then
                 MASQUE_MIGRATION_CHECK=1 \
@@ -254,7 +305,7 @@ case "$BENCH_MODE" in
                 MASQUE_USERNAME=test \
                 MASQUE_PASSWORD=test-password \
                 RUST_LOG=warn \
-                target/release/masque-e2e
+                "$BIN_DIR/masque-e2e"
             fi
         done
         ;;
@@ -272,7 +323,7 @@ case "$BENCH_MODE" in
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
-            target/release/masque-e2e
+            "$BIN_DIR/masque-e2e"
         done
         ;;
 esac
@@ -287,7 +338,7 @@ case "$BENCH_MODE" in
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
-            target/release/masque-e2e
+            "$BIN_DIR/masque-e2e"
         done
         ;;
 esac
@@ -295,6 +346,12 @@ esac
 if [ "$BENCH_MODE" = load ] || {
     [ "$BENCH_MODE" = all ] && [ -n "$LOAD_CONNS" ] && [ "$LOAD_CONNS" != 0 ]
 }; then
+    if [ "${MASQUE_LOAD_WARM_AUTH:-1}" = 1 ]; then
+        MASQUE_UDP_CHECK=1 MASQUE_BENCH_TRANSPORT=http3 \
+        MASQUE_SERVER_ADDR=127.0.0.1:4433 ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        MASQUE_USERNAME=test MASQUE_PASSWORD=test-password RUST_LOG=warn \
+        "$BIN_DIR/masque-e2e"
+    fi
     MASQUE_LOAD=1 \
     MASQUE_LOAD_CONNS="${LOAD_CONNS:-32}" \
     MASQUE_BENCH_TRANSPORT=http3 \
@@ -303,5 +360,11 @@ if [ "$BENCH_MODE" = load ] || {
     MASQUE_USERNAME=test \
     MASQUE_PASSWORD=test-password \
     RUST_LOG=warn \
-    target/release/masque-e2e
+    "$BIN_DIR/masque-e2e"
+fi
+
+if [ -n "$PERF_PID" ] && ! kill -0 "$PERF_PID" 2>/dev/null; then
+    cat "$BENCH_DIR/perf.log" >&2
+    echo "perf sampling failed" >&2
+    exit 1
 fi

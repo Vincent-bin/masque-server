@@ -29,6 +29,10 @@ impl TargetPolicy {
     /// 2. If `addr` matches any allow entry → allowed.
     /// 3. Otherwise → denied (default-deny).
     pub fn is_allowed(&self, addr: IpAddr) -> bool {
+        // The kernel reaches the same IPv4 target for a mapped IPv6 address.
+        // Judge both spellings against the IPv4 rules, before an IPv6 wildcard
+        // can bypass a deny such as 127.0.0.0/8 or 169.254.0.0/16.
+        let addr = addr.to_canonical();
         // Deny takes precedence
         for net in &self.deny {
             if net.contains(&addr) {
@@ -65,6 +69,19 @@ fn parse_cidrs(strings: &[String]) -> Vec<IpNet> {
                 tracing::warn!(cidr = %s, "invalid CIDR in policy, skipping");
                 None
             })
+        })
+        .map(|net| {
+            // Preserve explicitly configured mapped CIDRs as aliases of their
+            // IPv4 equivalents. Only prefixes wholly inside ::ffff:0:0/96
+            // qualify; a broader IPv6 network stays an IPv6 network.
+            if let IpNet::V6(v6) = net
+                && v6.prefix_len() >= 96
+                && let Some(v4) = v6.network().to_ipv4_mapped()
+            {
+                return IpNet::new(IpAddr::V4(v4), v6.prefix_len() - 96)
+                    .expect("a mapped IPv6 prefix translates to a valid IPv4 prefix");
+            }
+            net
         })
         .collect()
 }
@@ -152,6 +169,56 @@ mod tests {
         // IPv4 address should not be allowed by ::/0
         let p = policy(&["::/0"], &[]);
         assert!(!p.is_allowed(Ipv4Addr::new(8, 8, 8, 8).into()));
+    }
+
+    #[test]
+    fn mapped_ipv6_cannot_bypass_ipv4_target_denials() {
+        let p = policy(
+            &["0.0.0.0/0", "::/0"],
+            &[
+                "127.0.0.0/8",
+                "10.0.0.0/8",
+                "169.254.0.0/16",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+            ],
+        );
+        for addr in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(10, 1, 2, 3),
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+        ] {
+            assert!(!p.is_allowed(addr.into()), "{addr}");
+            assert!(!p.is_allowed(addr.to_ipv6_mapped().into()), "mapped {addr}");
+        }
+    }
+
+    #[test]
+    fn mapped_ipv6_uses_ipv4_allow_rules() {
+        let mapped = "::ffff:192.0.2.10".parse().unwrap();
+        assert!(policy(&["192.0.2.0/24"], &[]).is_allowed(mapped));
+        assert!(!policy(&["::/0"], &[]).is_allowed(mapped));
+        assert!(!policy(&[], &[]).is_allowed(mapped));
+    }
+
+    #[test]
+    fn explicitly_mapped_cidrs_apply_to_both_target_spellings() {
+        for allow in ["::ffff:192.0.2.10/120", "192.0.2.0/24"] {
+            for deny in ["::ffff:192.0.2.10/128", "192.0.2.10/32"] {
+                let p = policy(&[allow], &[deny]);
+                for spelling in ["192.0.2.10", "::ffff:192.0.2.10"] {
+                    assert!(!p.is_allowed(spelling.parse().unwrap()), "{allow}, {deny}");
+                }
+                for spelling in ["192.0.2.11", "::ffff:192.0.2.11"] {
+                    assert!(p.is_allowed(spelling.parse().unwrap()), "{allow}, {deny}");
+                }
+            }
+        }
+        let p = policy(&["::ffff:0:0/96"], &[]);
+        assert!(p.is_allowed("192.0.2.10".parse().unwrap()));
+        assert!(!p.is_allowed("2001:db8::1".parse().unwrap()));
     }
 
     // ── any_allowed / all_allowed ─────────────────────────────────────

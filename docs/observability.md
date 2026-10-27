@@ -118,6 +118,9 @@ All metric names start with `masque_`.
 | `masque_tunnels_active` | gauge | `listener`, `transport`, `auth`, `protocol` | Live `tcp`, `udp`, or `ip` tunnels |
 | `masque_tunnels_active_max` | gauge | `listener`, `transport`, `auth`, `protocol` | Largest live tunnel count since process start |
 | `masque_auth_attempts_total` | counter | `listener`, `transport`, `auth`, `result` | Successful, failed, or load-shed verification |
+| `masque_auth_cache_hits_total` | counter | `listener`, `transport`, `auth` | Requests accepted using a current successful-password cache entry |
+| `masque_auth_coalesced_total` | counter | `listener`, `transport`, `auth` | Requests joining identical in-flight password work |
+| `masque_auth_argon2_total` | counter | `listener`, `transport`, `auth` | Expensive password verification calls actually started |
 | `masque_auth_pending` | gauge | `listener`, `transport`, `auth` | Admitted Basic checks not yet completed |
 | `masque_auth_pending_max` | gauge | `listener`, `transport`, `auth` | Largest pending Basic-check count since process start |
 | `masque_auth_running` | gauge | `listener`, `transport`, `auth` | Argon2 jobs currently executing |

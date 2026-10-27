@@ -7,6 +7,7 @@
 //     Value  (Length bytes),
 //   }
 
+pub mod datagram;
 pub mod decoder;
 pub mod encoder;
 

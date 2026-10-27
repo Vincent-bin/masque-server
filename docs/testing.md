@@ -26,7 +26,32 @@
 | Dependency security | `cargo audit && cargo deny --workspace --locked check licenses sources bans` | RustSec, license, duplicate-version, and source policy |
 | Linux GNU ASan | Scheduled `linux-asan` job | Unsafe QUIC/target UDP FFI, 0-RTT ticket regression, and resource-pressure suite |
 
+## Release verification and promotion
+
+Before tagging, validate the new version with `scripts/validate-release.sh`
+and run both the ordinary CI and manually dispatched scheduled verification
+on the candidate commit. The latter explicitly runs the otherwise ignored
+Linux resource-pressure test, ASan, Docker TUN forwarding, and parser fuzzing.
+An already cross-compiled pressure test can use
+`MASQUE_RESOURCE_SERVER_BIN=/absolute/path/to/masque-server` to launch the
+matching server executable after transfer to a disposable Linux environment.
+
+The release workflow publishes every tag as a GitHub prerelease initially,
+including tags without a SemVer prerelease suffix. Automatic installers stay
+on the previous stable release while the exact, checksummed candidate is
+verified through the operations CLI on one host. Verify the external probe,
+configuration preservation, bounded resources, and rollback before promotion.
+For a stable tag such as `v0.14.0`, promote those same artifacts only after
+verification with `gh release edit v0.14.0 --prerelease=false --latest`.
+SemVer prerelease tags must retain their prerelease status.
+
 ## Local tests
+
+The HTTP/3 protocol tests include early fragmented UDP capsules through Basic
+authentication, 4 KiB echoes over a 64-byte initial response window, partial
+response cancellation, CONNECT-IP setup capsules, and malformed-capsule stream
+isolation. Resolver tests hold real blocking work across cancellation to verify
+that both global and per-connection permits remain charged until it finishes.
 
 ```sh
 cargo fmt --all --check

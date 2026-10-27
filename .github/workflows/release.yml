@@ -218,9 +218,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          release_flags=()
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            release_flags+=(--prerelease)
-          fi
+          # Keep /releases/latest on the previous stable version until an
+          # operator verifies the exact candidate on a canary and promotes it.
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag --generate-notes "${release_flags[@]}"
+            --verify-tag --generate-notes --prerelease --latest=false
