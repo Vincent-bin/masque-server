@@ -30,6 +30,7 @@ pub(super) async fn serve(
         target,
         &context.tcp_policy,
         Duration::from_secs(context.config.tcp_proxy.connect_timeout_secs),
+        &context.resolver,
     )
     .await
     {

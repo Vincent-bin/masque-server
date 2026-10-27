@@ -1,7 +1,7 @@
 //! HTTP/2 connection identity and per-request Basic authentication.
 
 use std::future::poll_fn;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use bytes::Bytes;
 use h2::server::SendResponse;
@@ -64,6 +64,11 @@ pub(super) async fn authorize_request(
         return Authorization::ResponseSent;
     }
     let (credential, password) = match auth.precheck(first) {
+        AuthPrecheck::Authenticated => {
+            context.metrics.record_auth_cache_hit();
+            context.metrics.record_auth_success();
+            return Authorization::Granted;
+        }
         AuthPrecheck::Rejected => {
             let _ = send_auth_rejection(
                 respond,
@@ -158,31 +163,18 @@ async fn verify_password(
             return AuthResult::Overloaded;
         }
     };
-    let pending = metrics.auth_pending_guard();
-    let permit = match permits.acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => return AuthResult::Rejected,
-    };
-    drop(pending);
-    let running = metrics.auth_running_guard();
-    let completion_metrics = Arc::clone(&metrics);
-    match tokio::task::spawn_blocking(move || {
-        let _source_slot = source_slot;
-        let _queue_slot = queue_slot;
-        let _permit = permit;
-        let _running = running;
-        let authorized = credential.verify(&password);
-        if authorized {
-            completion_metrics.record_auth_success();
-        } else {
-            completion_metrics.record_auth_failure();
-        }
-        authorized
-    })
+    match super::super::authentication::verify_basic_password(
+        credential,
+        password,
+        permits,
+        metrics,
+        (_connection_slot, source_slot, queue_slot),
+        Arc::new(AtomicBool::new(false)),
+    )
     .await
     {
-        Ok(true) => AuthResult::Authorized,
-        Ok(false) | Err(_) => AuthResult::Rejected,
+        Some(true) => AuthResult::Authorized,
+        Some(false) | None => AuthResult::Rejected,
     }
 }
 

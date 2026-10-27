@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::admission::SourceAdmission;
 use crate::client_identity::ClientIdentity;
 use crate::fxhash::FxHashMap;
+use crate::fxhash::FxHashSet;
 use crate::metrics::ShardMetrics;
 use crate::tunnel::ip::IpTunnel;
+use crate::tunnel::resolver::TargetResolver;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpTunnel};
 use crate::tunnel::udp::{EarlyUdpBudget, EarlyUdpDatagrams, PendingUdpTunnel, UdpTunnel};
 
@@ -75,43 +77,104 @@ impl Drop for AwaitingAuth {
     }
 }
 
-/// One serialized QUIC packet waiting for its pacing deadline. The backing
-/// allocation is retained and reused so pacing does not add a packet-sized
-/// allocation to the hot path.
+/// Serialized packets retained until quiche's pacing deadlines. A bounded
+/// 100 microsecond group amortizes timer wakeups; no packet is released early.
 #[derive(Default)]
 pub(crate) struct DeferredSend {
-    packet: Vec<u8>,
-    info: Option<quiche::SendInfo>,
+    packets: std::collections::VecDeque<(Vec<u8>, quiche::SendInfo)>,
+    spare: Vec<Vec<u8>>,
+    bytes: usize,
+    spare_bytes: usize,
 }
+
+const MAX_DEFERRED_PACKETS: usize = 64;
+const MAX_DEFERRED_BYTES: usize = 128 * 1024;
+const PACING_GROUP: std::time::Duration = std::time::Duration::from_micros(100);
 
 impl DeferredSend {
     pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
-        self.info.map(|info| info.at)
+        let first = self.packets.front()?.1.at;
+        // A packet beyond this horizon is retained for the next group.
+        self.packets
+            .iter()
+            .take_while(|(_, info)| info.at <= first + PACING_GROUP)
+            .map(|(_, info)| info.at)
+            .max()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    pub(crate) fn has_capacity(&self, max_packet_size: usize) -> bool {
+        self.packets.len() < MAX_DEFERRED_PACKETS
+            && self.bytes.saturating_add(max_packet_size) <= MAX_DEFERRED_BYTES
+    }
+
+    pub(crate) fn can_prefetch(&self) -> bool {
+        match (self.packets.front(), self.packets.back()) {
+            (Some((_, first)), Some((_, last))) => last.at <= first.at + PACING_GROUP,
+            _ => true,
+        }
     }
 
     pub(crate) fn schedule(&mut self, packet: &[u8], info: quiche::SendInfo) {
-        debug_assert!(self.info.is_none());
-        self.packet.clear();
-        self.packet.extend_from_slice(packet);
-        self.info = Some(info);
+        debug_assert!(self.has_capacity(packet.len()));
+        let mut buffer = self.spare.pop().unwrap_or_default();
+        self.spare_bytes -= buffer.capacity();
+        // Avoid retaining a large packet buffer for a run of small packets.
+        if buffer.capacity() < packet.len()
+            || buffer.capacity() > packet.len().saturating_mul(2).max(2048)
+        {
+            buffer = Vec::with_capacity(packet.len());
+        }
+        buffer.clear();
+        buffer.extend_from_slice(packet);
+        self.bytes += packet.len();
+        self.packets.push_back((buffer, info));
     }
 
     pub(crate) fn take_if_due(
         &mut self,
         now: std::time::Instant,
-    ) -> Option<(&[u8], quiche::SendInfo)> {
-        let info = self.info?;
-        if info.at > now {
+    ) -> Option<(Vec<u8>, quiche::SendInfo)> {
+        if self.packets.front()?.1.at > now {
             return None;
         }
+        let packet = self.packets.pop_front()?;
+        self.bytes -= packet.0.len();
+        Some(packet)
+    }
 
-        self.info = None;
-        Some((&self.packet, info))
+    pub(crate) fn recycle(&mut self, mut packet: Vec<u8>) {
+        if self.spare.len() < MAX_DEFERRED_PACKETS
+            && self.spare_bytes + packet.capacity() <= MAX_DEFERRED_BYTES
+        {
+            packet.clear();
+            self.spare_bytes += packet.capacity();
+            self.spare.push(packet);
+        }
+    }
+
+    pub(crate) fn discard(&mut self) {
+        while let Some((packet, _)) = self.packets.pop_front() {
+            self.bytes -= packet.len();
+            self.recycle(packet);
+        }
     }
 }
 
 /// State for a single client connection.
 pub struct ClientConnection {
+    pub(crate) capsule_streams: FxHashMap<u64, crate::server::capsules::CapsuleStream>,
+    pub(crate) capsule_readable: FxHashSet<u64>,
+    pub(crate) capsule_writable: FxHashSet<u64>,
+    pub(crate) finished_capsules: Vec<u64>,
+    pub(crate) capsule_send_bytes: usize,
+    pub(crate) capsule_send_packets: usize,
+    pub(crate) received_capsules: std::collections::VecDeque<Vec<u8>>,
+    pub(crate) received_capsule_bytes: usize,
+    pub(crate) resolver: TargetResolver,
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
     /// Standard CONNECT tunnels waiting for a target TCP connection.
@@ -144,7 +207,7 @@ pub struct ClientConnection {
     /// life of the connection, so re-parsing the certificate per request would
     /// be wasted work.
     pub(crate) identity: Option<Arc<ClientIdentity>>,
-    /// Packet already emitted by quiche but held until `SendInfo::at`.
+    /// Bounded packet groups emitted by quiche and held until `SendInfo::at`.
     pub(crate) deferred_send: DeferredSend,
     /// The deadline this connection currently holds in the server's timer
     /// queue, used to tell a live wakeup from one a later deadline superseded.
@@ -170,9 +233,19 @@ impl ClientConnection {
         metrics: Arc<ShardMetrics>,
         source_admission: SourceAdmission,
         initial_connection_id: quiche::ConnectionId<'static>,
+        resolver: TargetResolver,
     ) -> Self {
         metrics.connection_opened();
         Self {
+            resolver,
+            capsule_streams: FxHashMap::default(),
+            capsule_readable: FxHashSet::default(),
+            capsule_writable: FxHashSet::default(),
+            finished_capsules: Vec::new(),
+            capsule_send_bytes: 0,
+            capsule_send_packets: 0,
+            received_capsules: std::collections::VecDeque::new(),
+            received_capsule_bytes: 0,
             quic,
             h3: None,
             pending_tcp_tunnels: FxHashMap::default(),
@@ -346,11 +419,55 @@ mod tests {
             .take_if_due(now + Duration::from_millis(10))
             .unwrap();
         assert_eq!(packet, b"first");
+        deferred.recycle(packet);
         assert_eq!(deferred.deadline(), None);
 
         deferred.schedule(b"second", send_info(now));
         let (packet, _) = deferred.take_if_due(now).unwrap();
         assert_eq!(packet, b"second");
+    }
+
+    #[test]
+    fn deferred_send_groups_packets_without_releasing_them_early() {
+        let now = Instant::now();
+        let mut deferred = DeferredSend::default();
+        for micros in [10, 50, 100, 150] {
+            deferred.schedule(
+                &[micros as u8],
+                send_info(now + Duration::from_micros(micros)),
+            );
+        }
+        assert!(!deferred.can_prefetch());
+        assert_eq!(deferred.deadline(), Some(now + Duration::from_micros(100)));
+        assert!(deferred.take_if_due(now).is_none());
+        let group_deadline = deferred.deadline().unwrap();
+        for expected in [10, 50, 100] {
+            let (packet, info) = deferred.take_if_due(group_deadline).unwrap();
+            assert_eq!(packet, [expected]);
+            assert!(info.at <= group_deadline);
+            deferred.recycle(packet);
+        }
+        assert!(deferred.take_if_due(group_deadline).is_none());
+        assert_eq!(deferred.deadline(), Some(now + Duration::from_micros(150)));
+        deferred.discard();
+        assert_eq!(deferred.deadline(), None);
+        assert_eq!(deferred.bytes, 0);
+    }
+
+    #[test]
+    fn deferred_send_has_packet_and_byte_bounds() {
+        let now = Instant::now();
+        let mut deferred = DeferredSend::default();
+        for _ in 0..super::MAX_DEFERRED_PACKETS {
+            assert!(deferred.has_capacity(1));
+            deferred.schedule(&[0], send_info(now));
+        }
+        assert!(!deferred.has_capacity(1));
+        deferred.discard();
+        deferred.schedule(&vec![0; super::MAX_DEFERRED_BYTES], send_info(now));
+        assert!(!deferred.has_capacity(1));
+        deferred.discard();
+        assert!(deferred.spare_bytes <= super::MAX_DEFERRED_BYTES);
     }
 
     #[tokio::test]

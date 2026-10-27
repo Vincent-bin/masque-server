@@ -93,6 +93,7 @@ pub(super) fn classify_connect_request(
 
 /// Shared request dependencies passed together to keep dispatch APIs focused.
 pub(super) struct RequestContext<'a> {
+    pub(super) metrics: &'a crate::metrics::ShardMetrics,
     pub(super) config: &'a ServerConfig,
     pub(super) auth: Option<&'a SharedBasicAuthenticator>,
     pub(super) stealth_auth: bool,
@@ -160,6 +161,12 @@ impl Shard {
                 return None;
             }
             match auth.precheck(proxy_authorization) {
+                AuthPrecheck::Authenticated => {
+                    context.metrics.record_auth_cache_hit();
+                    context.metrics.record_auth_success();
+                    Self::dispatch_connect(h3, quic, stream_id, &request, context, pending);
+                    return None;
+                }
                 AuthPrecheck::Rejected => {
                     warn!(stream_id, "proxy authentication failed");
                     Self::send_auth_rejection(h3, quic, stream_id, context.stealth_auth, 407);

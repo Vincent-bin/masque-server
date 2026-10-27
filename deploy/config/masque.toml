@@ -109,10 +109,8 @@ enable_dgram = true
 enable_udp_gso = false
 enable_udp_gro = true
 
-# Congestion control. "bbr2" is available but currently much slower here: the
-# server holds back a single paced packet per connection, so BBR2's per-packet
-# pacing caps it at one packet per event-loop wakeup. Measured on loopback
-# CONNECT-UDP at 1200B: cubic 127k pkt/s at 75us p50 RTT, bbr2 34k at 1228us.
+# Congestion control: "cubic", "reno", or "bbr2". Paced packets are grouped
+# under bounded deadlines; compare throughput, latency, and loss on your path.
 cc_algorithm = "cubic"
 initial_congestion_window_packets = 32
 

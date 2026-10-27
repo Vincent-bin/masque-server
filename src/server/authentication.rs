@@ -1,11 +1,13 @@
 //! Bounded asynchronous credential verification and request resumption.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{info, warn};
 
+use crate::auth::{BasicCredential, PasswordVerification};
 use crate::connection::AwaitingAuth;
+use crate::metrics::ShardMetrics;
 use crate::tunnel::tcp::PendingTcpTunnel;
 
 use super::Shard;
@@ -18,6 +20,78 @@ pub(super) struct AuthOutcome {
     stream_id: u64,
     request: ConnectRequest,
     authorized: bool,
+}
+
+/// One bounded cold request, shared by H2 and H3. Followers hold admission
+/// slots but never a CPU permit or blocking thread. Once work starts, its
+/// admission guards live until Argon2 actually finishes, even after a reset.
+pub(super) async fn verify_basic_password(
+    credential: Arc<BasicCredential>,
+    password: zeroize::Zeroizing<Vec<u8>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<ShardMetrics>,
+    held: impl Send + 'static,
+    cancelled: Arc<AtomicBool>,
+) -> Option<bool> {
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _cancellation = CancelOnDrop(Arc::clone(&cancelled));
+    let pending = metrics.auth_pending_guard();
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let result = match credential.begin_verification(&password) {
+            PasswordVerification::Cached => {
+                metrics.record_auth_cache_hit();
+                Some(true)
+            }
+            PasswordVerification::Follower(waiter) => {
+                metrics.record_auth_coalesced();
+                waiter.wait().await
+            }
+            PasswordVerification::Leader(leader) => {
+                let permit = permits.acquire_owned().await.ok()?;
+                let running = metrics.auth_running_guard();
+                let failure_metrics = Arc::clone(&metrics);
+                return match tokio::task::spawn_blocking(move || {
+                    let (_held, _pending, _running, _permit) = (held, pending, running, permit);
+                    if cancelled.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    metrics.record_auth_argon2();
+                    let authorized = leader.verify(&password);
+                    record_result(&metrics, authorized);
+                    Some(authorized)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        failure_metrics.record_auth_failure();
+                        Some(false)
+                    }
+                };
+            }
+        };
+        if let Some(authorized) = result {
+            record_result(&metrics, authorized);
+            return Some(authorized);
+        }
+        // A cancelled leader never leaves its followers waiting forever.
+    }
+}
+
+fn record_result(metrics: &ShardMetrics, authorized: bool) {
+    if authorized {
+        metrics.record_auth_success();
+    } else {
+        metrics.record_auth_failure();
+    }
 }
 
 impl Shard {
@@ -95,8 +169,6 @@ impl Shard {
                     continue;
                 }
             };
-            let pending_gauge = self.metrics.auth_pending_guard();
-
             let auth_tx = self.auth_tx.clone();
             let permits = Arc::clone(&self.shared.auth_permits);
             let metrics = Arc::clone(&self.metrics);
@@ -108,45 +180,18 @@ impl Shard {
             } = request;
 
             let task = tokio::spawn(async move {
-                let _pending_gauge = pending_gauge;
-                // Admission above bounds waiting tasks; this second permit
-                // bounds the Argon2 CPU and memory actually running at once.
-                let Ok(permit) = permits.acquire_owned().await else {
+                let Some(authorized) = verify_basic_password(
+                    credential,
+                    password,
+                    permits,
+                    metrics,
+                    (source_slot, queue_slot),
+                    cancelled,
+                )
+                .await
+                else {
                     return;
                 };
-                let running_gauge = metrics.auth_running_guard();
-
-                let verified = tokio::task::spawn_blocking(move || {
-                    let _source_slot = source_slot;
-                    let _queue_slot = queue_slot;
-                    let _running_gauge = running_gauge;
-                    // Aborting an async task cannot stop spawn_blocking after
-                    // it begins. This check prevents queued blocking work from
-                    // starting Argon2 after its stream has disappeared.
-                    if cancelled.load(Ordering::Acquire) {
-                        drop(permit);
-                        return None;
-                    }
-                    let authorized = credential.verify(&password);
-                    drop(permit);
-                    Some(authorized)
-                })
-                .await;
-
-                let authorized = match verified {
-                    Ok(Some(authorized)) => authorized,
-                    Ok(None) => return,
-                    Err(_) => false,
-                };
-                // Count completed verification even when the stream or
-                // connection disappeared while Argon2 was running. Otherwise
-                // disconnecting after each bad password would hide abusive
-                // work from the authentication metrics.
-                if authorized {
-                    metrics.record_auth_success();
-                } else {
-                    metrics.record_auth_failure();
-                }
                 let _ = auth_tx
                     .send(AuthOutcome {
                         connection_index: conn_idx,
@@ -218,6 +263,7 @@ impl Shard {
             }
 
             let request_context = RequestContext {
+                metrics: &self.metrics,
                 config: &self.config,
                 auth: self.auth.as_deref(),
                 stealth_auth: self.stealth_auth,
@@ -268,5 +314,129 @@ impl Shard {
         }
 
         self.apply_connect_setups(connection_index, pending_setups);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AuthPrecheck, BasicAuthenticator};
+    use crate::metrics::Metrics;
+    use base64::Engine as _;
+    use std::time::Duration;
+
+    fn credential() -> Arc<BasicCredential> {
+        let auth = BasicAuthenticator::new("test", "$argon2id$v=19$m=19456,t=2,p=1$1xNVXhqKU7jJ6cqTBJKphQ$GXXAINVTW1qhloFtN1IR8lSr7pI7QEY79fq4K6d8scQ").unwrap();
+        let header = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("test:test-password")
+        );
+        let AuthPrecheck::NeedsVerify { credential, .. } = auth.precheck(Some(header.as_bytes()))
+        else {
+            panic!("cold credentials");
+        };
+        credential
+    }
+
+    fn counter(metrics: &Metrics, name: &str) -> u64 {
+        metrics
+            .render()
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .unwrap()
+            .rsplit_once(' ')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap()
+    }
+
+    async fn wait_for(metrics: &Metrics, name: &str, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counter(metrics, name) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn identical_requests_share_one_argon2_call_before_cpu_admission() {
+        let registry = Metrics::new(true);
+        let metrics = registry
+            .register_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                "http3",
+                "basic",
+                1,
+                false,
+                false,
+            )
+            .remove(0);
+        let credential = credential();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            tasks.push(tokio::spawn(verify_basic_password(
+                Arc::clone(&credential),
+                zeroize::Zeroizing::new(b"test-password".to_vec()),
+                Arc::clone(&permits),
+                Arc::clone(&metrics),
+                (),
+                Arc::new(AtomicBool::new(false)),
+            )));
+        }
+        wait_for(&registry, "masque_auth_coalesced_total", 31).await;
+        assert_eq!(counter(&registry, "masque_auth_argon2_total"), 0);
+        permits.add_permits(1);
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), Some(true));
+        }
+        assert_eq!(counter(&registry, "masque_auth_argon2_total"), 1);
+        assert_eq!(counter(&registry, "masque_auth_pending"), 0);
+        assert_eq!(counter(&registry, "masque_auth_running_max"), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_leader_does_not_cancel_other_requests() {
+        let registry = Metrics::new(true);
+        let metrics = registry
+            .register_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                "http2",
+                "basic",
+                1,
+                false,
+                false,
+            )
+            .remove(0);
+        let credential = credential();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let start = || {
+            tokio::spawn(verify_basic_password(
+                Arc::clone(&credential),
+                zeroize::Zeroizing::new(b"test-password".to_vec()),
+                Arc::clone(&permits),
+                Arc::clone(&metrics),
+                (),
+                Arc::new(AtomicBool::new(false)),
+            ))
+        };
+        let leader = start();
+        wait_for(&registry, "masque_auth_pending", 1).await;
+        let follower = start();
+        wait_for(&registry, "masque_auth_coalesced_total", 1).await;
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        permits.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), follower)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(counter(&registry, "masque_auth_argon2_total"), 1);
     }
 }

@@ -1,7 +1,8 @@
 //! HTTP proxy authentication helpers.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -14,6 +15,10 @@ use zeroize::Zeroizing;
 use crate::config::AuthSection;
 
 const MAX_AUTHORIZATION_LEN: usize = 8 * 1024;
+const SUCCESS_CACHE_TTL: Duration = Duration::from_secs(300);
+// The server admits at most 256 cold requests process-wide. Keep an explicit
+// local bound too, including callers outside the server scheduler.
+const MAX_IN_FLIGHT_PASSWORDS: usize = 256;
 
 /// Maximum number of independently revocable credentials on one listener.
 pub(crate) const MAX_BASIC_USERS_PER_LISTENER: usize = 4096;
@@ -27,6 +32,92 @@ pub(crate) struct BasicAuthenticator {
 /// so a concurrent SIGHUP cannot pair its password with a different hash.
 pub(crate) struct BasicCredential {
     password_hash: String,
+    cache_key: ring::hmac::Key,
+    verification: Mutex<VerificationState>,
+}
+
+#[derive(Default)]
+struct VerificationState {
+    success: Option<([u8; 32], Instant)>,
+    in_flight: HashMap<[u8; 32], Weak<PasswordFlight>>,
+}
+
+struct PasswordFlight {
+    result: tokio::sync::watch::Sender<FlightResult>,
+}
+
+#[derive(Clone, Copy)]
+enum FlightResult {
+    Pending,
+    Complete(bool),
+    Abandoned,
+}
+
+pub(crate) enum PasswordVerification {
+    Cached,
+    Leader(PasswordLeader),
+    Follower(PasswordWaiter),
+}
+
+pub(crate) struct PasswordLeader {
+    credential: Arc<BasicCredential>,
+    digest: [u8; 32],
+    flight: Arc<PasswordFlight>,
+    completed: bool,
+}
+
+pub(crate) struct PasswordWaiter {
+    // Keep the registration alive until all followers consume its result.
+    _flight: Arc<PasswordFlight>,
+    result: tokio::sync::watch::Receiver<FlightResult>,
+}
+
+impl PasswordWaiter {
+    /// None asks the caller to elect another leader after cancellation.
+    pub(crate) async fn wait(mut self) -> Option<bool> {
+        loop {
+            match *self.result.borrow_and_update() {
+                FlightResult::Complete(result) => return Some(result),
+                FlightResult::Abandoned => return None,
+                FlightResult::Pending => {}
+            }
+            if self.result.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
+impl PasswordLeader {
+    pub(crate) fn verify(mut self, password: &[u8]) -> bool {
+        let authorized = self.credential.verify(password);
+        self.completed = true;
+        self.flight
+            .result
+            .send_replace(FlightResult::Complete(authorized));
+        authorized
+    }
+}
+
+impl Drop for PasswordLeader {
+    fn drop(&mut self) {
+        // Remove only this registration: a later leader must never be erased.
+        let mut state = self
+            .credential
+            .verification
+            .lock()
+            .expect("auth cache poisoned");
+        if state
+            .in_flight
+            .get(&self.digest)
+            .is_some_and(|flight| Weak::ptr_eq(flight, &Arc::downgrade(&self.flight)))
+        {
+            state.in_flight.remove(&self.digest);
+        }
+        if !self.completed {
+            self.flight.result.send_replace(FlightResult::Abandoned);
+        }
+    }
 }
 
 /// Reloadable authentication state shared by every shard and established
@@ -95,8 +186,15 @@ impl BasicAuthenticator {
                 bail!("Basic user {username:?} password_hash must use Argon2id");
             }
 
+            let cache_key = ring::hmac::Key::generate(
+                ring::hmac::HMAC_SHA256,
+                &ring::rand::SystemRandom::new(),
+            )
+            .map_err(|_| anyhow::anyhow!("failed to generate authentication cache key"))?;
             let credential = Arc::new(BasicCredential {
                 password_hash: password_hash.to_owned(),
+                cache_key,
+                verification: Mutex::new(VerificationState::default()),
             });
             if users
                 .insert(username.as_bytes().to_vec(), credential)
@@ -119,6 +217,7 @@ impl BasicAuthenticator {
     #[cfg(test)]
     pub(crate) fn authenticate(&self, value: Option<&[u8]>) -> bool {
         match self.precheck(value) {
+            AuthPrecheck::Authenticated => true,
             AuthPrecheck::Rejected => false,
             AuthPrecheck::NeedsVerify {
                 credential,
@@ -167,6 +266,10 @@ impl BasicAuthenticator {
             return AuthPrecheck::Rejected;
         };
 
+        if credential.cached(password) {
+            return AuthPrecheck::Authenticated;
+        }
+
         AuthPrecheck::NeedsVerify {
             credential: Arc::clone(credential),
             password: Zeroizing::new(password.to_vec()),
@@ -179,6 +282,51 @@ impl BasicAuthenticator {
 }
 
 impl BasicCredential {
+    fn cached(&self, password: &[u8]) -> bool {
+        let state = self.verification.lock().expect("auth cache poisoned");
+        state.success.as_ref().is_some_and(|(digest, expires)| {
+            Instant::now() < *expires
+                && ring::hmac::verify(&self.cache_key, password, digest).is_ok()
+        })
+    }
+
+    /// Join identical work before taking a CPU permit or blocking-pool thread.
+    /// Only successful results persist; every new wrong-password attempt still
+    /// passes through bounded expensive verification.
+    pub(crate) fn begin_verification(self: &Arc<Self>, password: &[u8]) -> PasswordVerification {
+        let digest: [u8; 32] = ring::hmac::sign(&self.cache_key, password)
+            .as_ref()
+            .try_into()
+            .expect("SHA256 tag length");
+        let mut state = self.verification.lock().expect("auth cache poisoned");
+        if state.success.as_ref().is_some_and(|(tag, expires)| {
+            Instant::now() < *expires && ring::hmac::verify(&self.cache_key, password, tag).is_ok()
+        }) {
+            return PasswordVerification::Cached;
+        }
+        state
+            .in_flight
+            .retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = state.in_flight.get(&digest).and_then(Weak::upgrade) {
+            let result = flight.result.subscribe();
+            return PasswordVerification::Follower(PasswordWaiter {
+                _flight: flight,
+                result,
+            });
+        }
+        let (result, _) = tokio::sync::watch::channel(FlightResult::Pending);
+        let flight = Arc::new(PasswordFlight { result });
+        if state.in_flight.len() < MAX_IN_FLIGHT_PASSWORDS {
+            state.in_flight.insert(digest, Arc::downgrade(&flight));
+        }
+        PasswordVerification::Leader(PasswordLeader {
+            credential: Arc::clone(self),
+            digest,
+            flight,
+            completed: false,
+        })
+    }
+
     /// Verify a prechecked password against the configured hash.
     ///
     /// Argon2id is memory-hard by design — tens of milliseconds and ~19 MiB
@@ -188,7 +336,18 @@ impl BasicCredential {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
-        Argon2::default().verify_password(password, &parsed).is_ok()
+        let authorized = Argon2::default().verify_password(password, &parsed).is_ok();
+        if authorized {
+            let digest = ring::hmac::sign(&self.cache_key, password)
+                .as_ref()
+                .try_into()
+                .expect("SHA256 tag length");
+            self.verification
+                .lock()
+                .expect("auth cache poisoned")
+                .success = Some((digest, Instant::now() + SUCCESS_CACHE_TTL));
+        }
+        authorized
     }
 }
 
@@ -215,6 +374,8 @@ impl SharedBasicAuthenticator {
 
 /// Result of the cheap half of authentication.
 pub(crate) enum AuthPrecheck {
+    /// The current credential snapshot has recently verified this password.
+    Authenticated,
     /// Rejected without hashing.
     Rejected,
     /// Well formed and the username matches; the password still needs the
@@ -283,6 +444,7 @@ mod tests {
 
     fn authenticate_shared(auth: &SharedBasicAuthenticator, value: &[u8]) -> bool {
         match auth.precheck(Some(value)) {
+            AuthPrecheck::Authenticated => true,
             AuthPrecheck::Rejected => false,
             AuthPrecheck::NeedsVerify {
                 credential,
@@ -295,6 +457,102 @@ mod tests {
     fn accepts_valid_basic_credentials() {
         let auth = BasicAuthenticator::new(USERNAME, password_hash()).unwrap();
         assert!(auth.authenticate(Some(&authorization(USERNAME, PASSWORD))));
+    }
+
+    #[test]
+    fn successful_cache_checks_each_password_and_expires_without_sliding() {
+        let auth = BasicAuthenticator::new(USERNAME, password_hash()).unwrap();
+        let good = authorization(USERNAME, PASSWORD);
+        assert!(auth.authenticate(Some(&good)));
+        assert!(matches!(
+            auth.precheck(Some(&good)),
+            AuthPrecheck::Authenticated
+        ));
+        assert!(matches!(auth.precheck(None), AuthPrecheck::Rejected));
+        assert!(matches!(
+            auth.precheck(Some(&authorization("unknown", PASSWORD))),
+            AuthPrecheck::Rejected
+        ));
+        assert!(!auth.authenticate(Some(&authorization(USERNAME, "wrong"))));
+        let credential = &auth.users[USERNAME.as_bytes()];
+        credential
+            .verification
+            .lock()
+            .unwrap()
+            .success
+            .as_mut()
+            .unwrap()
+            .1 = Instant::now();
+        assert!(matches!(
+            auth.precheck(Some(&good)),
+            AuthPrecheck::NeedsVerify { .. }
+        ));
+        let other = BasicAuthenticator::new(USERNAME, password_hash()).unwrap();
+        assert!(matches!(
+            other.precheck(Some(&good)),
+            AuthPrecheck::NeedsVerify { .. }
+        ));
+    }
+
+    #[test]
+    fn reload_discards_warm_cache_even_with_identical_phc_hash() {
+        let shared = SharedBasicAuthenticator::new(
+            BasicAuthenticator::new(USERNAME, password_hash()).unwrap(),
+        );
+        let good = authorization(USERNAME, PASSWORD);
+        assert!(authenticate_shared(&shared, &good));
+        assert!(matches!(
+            shared.precheck(Some(&good)),
+            AuthPrecheck::Authenticated
+        ));
+        shared.replace(BasicAuthenticator::new(USERNAME, password_hash()).unwrap());
+        assert!(matches!(
+            shared.precheck(Some(&good)),
+            AuthPrecheck::NeedsVerify { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn identical_verifications_share_results_and_cancelled_leaders_can_be_replaced() {
+        let auth = BasicAuthenticator::new(USERNAME, password_hash()).unwrap();
+        let credential = &auth.users[USERNAME.as_bytes()];
+        let PasswordVerification::Leader(leader) = credential.begin_verification(b"wrong") else {
+            panic!("first call must lead");
+        };
+        let PasswordVerification::Follower(waiter) = credential.begin_verification(b"wrong") else {
+            panic!("identical call must join");
+        };
+        let PasswordVerification::Leader(different) =
+            credential.begin_verification(PASSWORD.as_bytes())
+        else {
+            panic!("different passwords must not share results");
+        };
+        assert!(!leader.verify(b"wrong"));
+        assert_eq!(waiter.wait().await, Some(false));
+        assert!(
+            matches!(
+                credential.begin_verification(b"wrong"),
+                PasswordVerification::Leader(_)
+            ),
+            "failures are not cached"
+        );
+        let PasswordVerification::Follower(cancelled_waiter) =
+            credential.begin_verification(PASSWORD.as_bytes())
+        else {
+            panic!("must join the live leader");
+        };
+        drop(different);
+        assert_eq!(cancelled_waiter.wait().await, None);
+        let PasswordVerification::Leader(replacement) =
+            credential.begin_verification(PASSWORD.as_bytes())
+        else {
+            panic!("cancelled flight must be replaceable");
+        };
+        assert!(replacement.verify(PASSWORD.as_bytes()));
+        assert!(matches!(
+            credential.begin_verification(PASSWORD.as_bytes()),
+            PasswordVerification::Cached
+        ));
     }
 
     #[test]

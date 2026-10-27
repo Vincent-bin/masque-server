@@ -480,14 +480,8 @@ impl Default for QuicSection {
             // opt-in until an operator has verified the actual egress path.
             enable_udp_gso: false,
             enable_udp_gro: true,
-            // CUBIC, despite BBR2 looking like the better fit for a proxy.
-            // `DeferredSend` holds back a single serialized packet per
-            // connection, so a pacer that spaces every packet individually —
-            // which BBR2 does and quiche's CUBIC pacing largely does not —
-            // caps the server at one packet per event-loop wakeup. Measured on
-            // loopback CONNECT-UDP at 1200B: CUBIC 127k pkt/s at 75us p50 RTT,
-            // BBR2 34k pkt/s at 1228us. Revisit once a pacing-blocked
-            // connection can hold a burst rather than one packet.
+            // CUBIC is the established default. The bounded pacing queue also
+            // supports BBR2; select controllers from actual path measurements.
             cc_algorithm: "cubic".into(),
             initial_congestion_window_packets: 32,
             initial_max_data: 16 * 1024 * 1024,

@@ -47,6 +47,15 @@ segments; `sendmmsg` submits multiple messages in one kernel entry.
 The batch is constrained by quiche's `send_quantum()` and pacing metadata.
 Batching never sends a packet before the time supplied by quiche.
 
+Paced output retains at most 64 packets and 128 KiB of payload per connection.
+Packets within a 100-microsecond pacing group share a wakeup at the latest
+deadline in that group, so earlier packets may wait up to 100 microseconds but
+none is sent early. An extra packet beyond the group is retained for its next
+deadline. The queue reuses packet buffers under a separate 128 KiB spare-buffer
+budget and is discarded when a connection closes. This lets per-packet pacers
+such as BBR2 prepare a bounded burst instead of serializing only one packet per
+timer wakeup. CUBIC remains the default controller.
+
 ### Target UDP sockets
 
 Client bursts are staged per tunnel during one shard iteration and submitted
@@ -149,6 +158,11 @@ runs HTTP/3 first, then HTTP/2. It requires an explicit non-zero HTTP/3 shard
 count. Multi-connection `load` mode remains HTTP/3-only until its native-thread
 packet engine has an equivalent asynchronous HTTP/2 implementation.
 
+`MASQUE_BENCH_CC=cubic|reno|bbr2` selects the server's QUIC congestion
+controller for a benchmark; the default is `cubic`. Alternate controllers over
+at least three runs with the same payload, window, duration, and expiry. Inspect
+goodput, RTT, response shortfall, and the direct baseline together.
+
 UDP runs emit one `UDP_RESULT` record per payload and path. TCP runs include a
 `transport` field in every `TCP_DOWNLOAD_RESULT` and `TCP_DOWNLOAD_SUMMARY`, so
 automation does not have to infer which listener produced a number from output
@@ -202,6 +216,27 @@ external-path test can qualify a deployment. Keep GSO disabled when external
 throughput is flat, regresses, or varies too much to separate from the direct
 baseline.
 
+`scripts/gso-bench.sh` runs three rounds of all four combinations: both off,
+QUIC only, target only, and both on. It reverses the case order on alternating
+rounds, builds once, and retains each case's output and server log. Set
+`MASQUE_GSO_ROUNDS=1..9` and `MASQUE_GSO_RESULTS_DIR` to change repetition and
+output location. `MASQUE_BENCH_MODE=tcp` measures TCP instead of the default
+UDP workload; target UDP GSO has no effect on that workload.
+
+Both scripts accept `MASQUE_BENCH_BIN_DIR` to use prebuilt executables without
+running Cargo. `MASQUE_BENCH_RESULTS_DIR` retains logs from an individual
+network-bench run. Load mode warms authentication with one successful UDP
+request by default so it measures established-connection traffic. Set
+`MASQUE_LOAD_WARM_AUTH=0` for a cold authentication burst; requests beyond
+`server.max_pending_auth_per_ip` may then correctly receive 503. Label cold
+and warm measurements separately.
+
+Use `masque_auth_cache_hits_total`, `masque_auth_coalesced_total`, and
+`masque_auth_argon2_total` to distinguish accepted requests from actual hash
+work. The first request for an account or after a reload/expiry remains cold.
+TCP download samples on the same listener therefore include a cold first
+CONNECT followed by warm CONNECTs; report these setup times separately.
+
 The expiry interval must exceed network RTT plus expected queueing. Otherwise
 the load generator spends its window on requests it has already classified as
 expired and the result measures the benchmark harness rather than the server.
@@ -232,6 +267,15 @@ The musl binary should show `sendmmsg` and `recvmmsg` on active UDP paths.
 Tracing perturbs performance; use it to verify behavior, then benchmark again
 without tracing. For CPU attribution, prefer `perf record` or a sampled flame
 graph over conclusions drawn from aggregate process CPU alone.
+
+On Linux, `MASQUE_BENCH_PERF=1` attaches `perf record` to only the temporary
+benchmark server, with user-space CPU-clock samples and DWARF call graphs.
+Set `MASQUE_BENCH_RESULTS_DIR` to retain `perf.data` and `perf.log`, and use
+`MASQUE_BENCH_PERF_BIN` for a non-default perf path. Sampling failures make
+the benchmark fail. Use a release build with symbols (for example
+`CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none`), a longer
+TCP workload, and `perf report --stdio --no-children` to inspect self cost.
+Do not mix sampled and unsampled throughput results.
 
 ## Reporting results
 

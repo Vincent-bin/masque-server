@@ -7,6 +7,42 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.0 - 2026-10-27
+
+### Added
+
+- Basic authentication retains a bounded five-minute successful-password
+  cache per listener/account and coalesces identical in-flight checks for
+  both HTTP/2 and HTTP/3. Every request still checks its credentials; reloads
+  invalidate the cache and cold-request resource limits remain in force.
+- Authentication metrics distinguish cache hits, coalesced requests, and
+  actual Argon2 calls. GSO benchmark tooling isolates both egress switches,
+  supports prebuilt binaries, and can collect temporary-server perf samples.
+- Target DNS work has a shared 128-job limit and an eight-job limit per
+  HTTP/2 or HTTP/3 connection. Cancelled and timed-out lookups keep their
+  permits until the actual blocking resolver call ends.
+- HTTP/3 CONNECT-UDP and CONNECT-IP accept incremental DATAGRAM capsules and
+  send capsule replies when native QUIC DATAGRAM is unavailable. Unknown
+  capsule values are skipped without buffering; response bytes and packet
+  counts are bounded across partial writes.
+- The network benchmark accepts `MASQUE_BENCH_CC=cubic|reno|bbr2` for
+  comparable congestion-controller runs.
+
+### Fixed
+
+- Require Tokio 1.53.3 or newer to resolve the AsyncFd I/O-safety advisory
+  RUSTSEC-2026-0386.
+- Paced QUIC output buffers bounded groups of packets and coalesces deadlines
+  within 100 microseconds, avoiding a single serialized packet per timer
+  wakeup while respecting every packet's release time.
+- Target CIDR policy treats IPv4-mapped IPv6 addresses and explicit mapped
+  CIDRs as their IPv4 equivalents, preventing an IPv6 allow rule from bypassing
+  IPv4 loopback, private-network, or metadata-address denials.
+- HTTP/3 rejects missing, truncated, and out-of-range HTTP Datagram Quarter
+  Stream IDs with `H3_DATAGRAM_ERROR`. Datagram encoders also reject stream IDs
+  beyond QUIC's 62-bit limit; unknown or truncated Context IDs remain packet
+  drops and do not close the connection.
+
 ## 0.13.0 - 2026-09-02
 
 ### Added

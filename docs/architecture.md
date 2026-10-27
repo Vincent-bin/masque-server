@@ -91,6 +91,8 @@ bounded drain begins. The packaged watchdog uses the same liveness decision.
 | `src/tunnel/tcp.rs` | TCP connection setup and bounded bidirectional relay |
 | `src/tunnel/udp.rs` | Per-target CONNECT-UDP state and send staging |
 | `src/tunnel/ip.rs` | CONNECT-IP assignment and activity state |
+| `src/tunnel/resolver.rs` | Shared and per-connection system DNS budgets |
+| `src/server/capsules.rs` | Bounded HTTP/3 DATAGRAM capsule input/output |
 | `src/capsule/` | Capsule Protocol encoding and incremental decoding |
 | `src/datagram.rs` | HTTP Datagram framing and Context ID handling |
 | `src/scheduler.rs` | Dirty-connection and deadline scheduling |
@@ -122,6 +124,11 @@ polled by a coarse periodic timer, so idle-to-active traffic does not inherit a
 timer-sized latency penalty.
 
 Hostname resolution and target socket creation never run on an HTTP/3 shard.
+System lookups have a shared 128-job budget across HTTP/2 and HTTP/3 and an
+eight-job budget per connection, shared by TCP and UDP. Both queued and running
+blocking calls consume permits until the actual resolver call ends, including
+after request cancellation. Waiting for capacity uses the target setup deadline;
+IP literals bypass the resolver entirely.
 CONNECT-UDP keeps a cancellable pending entry while an asynchronous task
 resolves one address snapshot, validates it, and opens the socket. The shard
 sends `200` only after that task succeeds. HTTP/2 uses the same resolver and
@@ -204,14 +211,20 @@ Credential processing is split into two stages:
 
 1. The owning HTTP/2 task or HTTP/3 shard synchronously validates the request
    shape, Basic scheme, encoded length, and username lookup, then retains the
-   selected account's immutable hash snapshot.
-2. Argon2id verification runs on Tokio's blocking pool under shared permits.
+   selected account's immutable hash snapshot. A matching unexpired successful
+   password tag accepts the request without scheduling slow work.
+2. Cold requests reserve bounded admission slots. Identical passwords for the
+   same account/snapshot share one in-flight result; only their leader acquires
+   a CPU permit and runs Argon2id on Tokio's blocking pool. A cancelled queued
+   leader is replaceable. Success retains one keyed tag for five minutes,
+   with no sliding expiry; reload creates fresh snapshots and cache keys.
 
 The queue has a global bound as well as a per-connection bound. A request must
 reserve a global slot before a task is spawned. Reset streams and closed
 connections abort waiting tasks and mark running work cancelled; an Argon2
 invocation already executing cannot be interrupted, but concurrency remains
-bounded and its result is discarded.
+bounded. Its result can still satisfy other waiting requests and populate
+that snapshot's cache, while the cancelled request's response is discarded.
 
 Only a compact pending request is retained while authentication completes.
 Target resolution, sockets, TUN addresses, and tunnel buffers are allocated
@@ -238,6 +251,16 @@ Receive buffers are sized from the configured maximum QUIC datagram size plus
 one sentinel byte. Linux also checks `MSG_TRUNC`; the sentinel makes oversized
 datagrams detectable on platforms that do not expose truncation flags through
 the portable socket API.
+
+When QUIC DATAGRAM is unavailable, HTTP/3 sends responses as DATAGRAM capsules.
+That receive task uses one 65,528-byte buffer and queues one packet per channel
+item, allowing large UDP payloads without multiplying the buffer by the native
+Linux batch size. Capsule input uses the same target forwarding and IP source
+checks as native datagrams. Unknown capsule values are skipped incrementally.
+Capsule response queues allow 64 items / 256 KiB per stream and 256 items /
+1 MiB per connection. A partial write retains its full memory charge until the
+buffer is released. Capsule input staging is capped at 64 packets / 256 KiB per
+connection. Full data queues drop UDP/IP packets.
 
 ### CONNECT-IP
 

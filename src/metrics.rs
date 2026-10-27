@@ -371,6 +371,16 @@ impl ListenerMetrics {
             self.sum(|shard| &shard.connections_rejected_source_limit)
         )
         .unwrap();
+        for (name, field) in [
+            (
+                "masque_auth_cache_hits_total",
+                (|shard: &ShardMetrics| &shard.auth_cache_hits) as fn(&ShardMetrics) -> &AtomicU64,
+            ),
+            ("masque_auth_coalesced_total", |shard| &shard.auth_coalesced),
+            ("masque_auth_argon2_total", |shard| &shard.auth_argon2),
+        ] {
+            render_value(out, name, label, self.sum(field));
+        }
         for (result, field) in [
             (
                 "sent",
@@ -581,6 +591,9 @@ pub(crate) struct ShardMetrics {
     tcp_relay_bytes: AtomicU64,
     tunnels_active: [AtomicU64; 3],
     tunnels_active_max: [AtomicU64; 3],
+    auth_cache_hits: AtomicU64,
+    auth_coalesced: AtomicU64,
+    auth_argon2: AtomicU64,
     auth_success: AtomicU64,
     auth_failure: AtomicU64,
     auth_overloaded: AtomicU64,
@@ -629,6 +642,9 @@ impl ShardMetrics {
             tcp_relay_bytes: AtomicU64::new(0),
             tunnels_active: std::array::from_fn(|_| AtomicU64::new(0)),
             tunnels_active_max: std::array::from_fn(|_| AtomicU64::new(0)),
+            auth_cache_hits: AtomicU64::new(0),
+            auth_coalesced: AtomicU64::new(0),
+            auth_argon2: AtomicU64::new(0),
             auth_success: AtomicU64::new(0),
             auth_failure: AtomicU64::new(0),
             auth_overloaded: AtomicU64::new(0),
@@ -807,6 +823,24 @@ impl ShardMetrics {
     pub(crate) fn tunnel_closed(&self, protocol_index: usize) {
         if self.enabled {
             subtract(&self.tunnels_active[protocol_index], 1);
+        }
+    }
+
+    pub(crate) fn record_auth_cache_hit(&self) {
+        if self.enabled {
+            self.auth_cache_hits.fetch_add(1, RELAXED);
+        }
+    }
+
+    pub(crate) fn record_auth_coalesced(&self) {
+        if self.enabled {
+            self.auth_coalesced.fetch_add(1, RELAXED);
+        }
+    }
+
+    pub(crate) fn record_auth_argon2(&self) {
+        if self.enabled {
+            self.auth_argon2.fetch_add(1, RELAXED);
         }
     }
 
@@ -1067,6 +1101,21 @@ fn render_listener_headers(out: &mut String) {
         (
             "masque_auth_attempts_total",
             "Completed or load-shed authentication attempts.",
+            "counter",
+        ),
+        (
+            "masque_auth_cache_hits_total",
+            "Basic requests accepted using a current successful password cache entry.",
+            "counter",
+        ),
+        (
+            "masque_auth_coalesced_total",
+            "Basic requests joining an identical in-flight password verification.",
+            "counter",
+        ),
+        (
+            "masque_auth_argon2_total",
+            "Argon2 password verification calls actually started.",
             "counter",
         ),
         (

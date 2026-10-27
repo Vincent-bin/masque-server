@@ -21,6 +21,7 @@ use crate::net::target_udp::TARGET_BATCH_SIZE;
 use crate::policy::TargetPolicy;
 use crate::uri::UdpTarget;
 
+use super::resolver::TargetResolver;
 use super::target::{TargetSetupFailure, resolve_allowed};
 
 /// Early client DATAGRAMs retained while authorization or target setup is in
@@ -232,9 +233,10 @@ pub(crate) async fn connect_udp_target(
     timeout: Duration,
     enable_udp_gso: bool,
     max_datagram_size: usize,
+    resolver: &TargetResolver,
 ) -> Result<ConnectedUdpTarget, TargetSetupFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let resolved = resolve_allowed(&target.host, target.port, policy, deadline).await?;
+    let resolved = resolve_allowed(&target.host, target.port, policy, deadline, resolver).await?;
     let mut last_error = None;
 
     for target_addr in resolved.into_addresses() {
@@ -300,10 +302,18 @@ pub(crate) fn spawn_udp_setup(
     enable_udp_gso: bool,
     max_datagram_size: usize,
     result_tx: mpsc::Sender<UdpSetupResult>,
+    resolver: TargetResolver,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let result =
-            connect_udp_target(target, &policy, timeout, enable_udp_gso, max_datagram_size).await;
+        let result = connect_udp_target(
+            target,
+            &policy,
+            timeout,
+            enable_udp_gso,
+            max_datagram_size,
+            &resolver,
+        )
+        .await;
         let _ = result_tx
             .send(UdpSetupResult {
                 connection_index,
@@ -556,6 +566,7 @@ mod tests {
             Duration::from_secs(1),
             false,
             1350,
+            &super::super::resolver::ResolverBudget::default().connection(),
         )
         .await
         .unwrap();

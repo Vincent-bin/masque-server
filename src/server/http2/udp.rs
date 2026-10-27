@@ -36,6 +36,7 @@ pub(super) async fn serve(
         Duration::from_secs(context.config.udp_proxy.connect_timeout_secs),
         false,
         max_payload,
+        &context.resolver,
     )
     .await
     {

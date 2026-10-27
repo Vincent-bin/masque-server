@@ -1006,6 +1006,9 @@ fn connect_echo_socket(echo_addr: &str) -> Result<UdpSocket> {
         "[::]:0"
     };
     let socket = UdpSocket::bind(bind_addr)?;
+    // Keep the direct baseline on the same underlay as the QUIC client.
+    #[cfg(target_os = "macos")]
+    bind_udp_socket_to_requested_interface(&socket)?;
     socket.connect(peer)?;
     Ok(socket)
 }

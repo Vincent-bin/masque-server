@@ -32,6 +32,7 @@ use crate::client_identity::{SharedRoster, configure_client_cert_verification};
 use crate::config::{ResolvedListener, ServerConfig};
 use crate::metrics::{Metrics, ShardMetrics};
 use crate::policy::TargetPolicy;
+use crate::tunnel::resolver::TargetResolver;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -155,6 +156,7 @@ impl Http2Listener {
                     };
 
                     let context = ConnectionContext {
+                        resolver: self.shared.resolver.connection(),
                         acceptor: Arc::clone(&self.acceptor),
                         config: Arc::clone(&self.config),
                         shared: Arc::clone(&self.shared),
@@ -196,6 +198,7 @@ impl Http2Listener {
 
 #[derive(Clone)]
 struct ConnectionContext {
+    resolver: TargetResolver,
     acceptor: Arc<SslAcceptor>,
     config: Arc<ServerConfig>,
     shared: Arc<Shared>,

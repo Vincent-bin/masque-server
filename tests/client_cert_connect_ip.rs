@@ -293,6 +293,26 @@ impl Client {
         enable_early_data: bool,
         source_ip: std::net::IpAddr,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_transport(
+            peer,
+            identity,
+            session,
+            enable_early_data,
+            source_ip,
+            true,
+            262_144,
+        )
+    }
+
+    fn connect_with_transport(
+        peer: SocketAddr,
+        identity: Option<(&Path, &Path)>,
+        session: Option<&[u8]>,
+        enable_early_data: bool,
+        source_ip: std::net::IpAddr,
+        native_datagrams: bool,
+        stream_window: u64,
+    ) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(SocketAddr::new(source_ip, 0))?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -309,14 +329,14 @@ impl Client {
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_initial_max_data(1_048_576);
-        config.set_initial_max_stream_data_bidi_local(262_144);
+        config.set_initial_max_stream_data_bidi_local(stream_window);
         config.set_initial_max_stream_data_bidi_remote(262_144);
         config.set_initial_max_stream_data_uni(262_144);
         config.set_initial_max_streams_bidi(16);
         config.set_initial_max_streams_uni(16);
         config.set_active_connection_id_limit(2);
         config.set_disable_active_migration(false);
-        config.enable_dgram(true, 256, 256);
+        config.enable_dgram(native_datagrams, 256, 256);
         if enable_early_data {
             config.enable_early_data();
         }
@@ -526,6 +546,22 @@ impl Client {
             &config,
         )?);
         Ok(())
+    }
+
+    fn stream_reset(&mut self, stream_id: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            loop {
+                match self.h3.as_mut().unwrap().poll(&mut self.quic) {
+                    Ok((id, quiche::h3::Event::Reset(code))) if id == stream_id => return code,
+                    Ok(_) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(error) => panic!("HTTP/3 poll while waiting for reset: {error}"),
+                }
+            }
+            self.drive().unwrap();
+        }
+        panic!("stream {stream_id} was not reset");
     }
 
     /// Send the CONNECT-IP request exactly as Cloudflare's clients send it.
@@ -875,6 +911,90 @@ fn raise_sighup() {
         .status()
         .expect("failed to send SIGHUP");
     assert!(status.success(), "kill -HUP failed");
+}
+
+#[test]
+fn warm_basic_cache_is_revoked_on_an_established_http3_connection() {
+    let dir = TempDir::new("basic-cache-reload");
+    let key = p256_key();
+    let (cert, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("localhost")),
+    );
+    let render = |password: &str| {
+        let hash = masque::auth::hash_password(password.as_bytes()).unwrap();
+        server_config_file(&cert, &key_path, &[]).replace(
+            "mode = \"client_cert\"",
+            &format!("mode = \"basic\"\nusername = \"alice\"\npassword_hash = \"{hash}\""),
+        )
+    };
+    let config_path = dir.path().join("masque.toml");
+    let original = render("old-secret");
+    std::fs::write(&config_path, &original).unwrap();
+    let config: ServerConfig = toml::from_str(&original).unwrap();
+    let peer = spawn_reloadable_server(config, config_path.clone())[0];
+    let mut client = Client::connect_anonymous(peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let header = |password: &str| format!("Basic {}", STANDARD.encode(format!("alice:{password}")));
+    let old = header("old-secret");
+    // The second request takes the warm fast path on the same connection.
+    for _ in 0..2 {
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", Some(&old))
+            .unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        assert_eq!(client.capsules(stream, 2, Duration::from_secs(5)).len(), 2);
+    }
+    // A warm connection must still authenticate every subsequent request.
+    for value in [None, Some("Basic YWxpY2U6d3Jvbmc=")] {
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", value)
+            .unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            407
+        );
+    }
+    std::fs::write(&config_path, render("new-secret")).unwrap();
+    raise_sighup();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", Some(&old))
+            .unwrap();
+        if client
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap()
+            == 407
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "warm cached password survived reload"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let new = header("new-secret");
+    let stream = client
+        .send_connect_ip_with_credentials("connect-ip", Some(&new))
+        .unwrap();
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1311,6 +1431,358 @@ fn registered_client_gets_its_pinned_addresses_over_cf_connect_ip() {
             .any(|frame| matches!(frame, CapsuleFrame::RouteAdvertisement(_))),
         "expected ROUTE_ADVERTISEMENT, got {capsules:?}"
     );
+}
+
+#[test]
+fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http3() {
+    let dir = TempDir::new("mapped-policy");
+    let key = p256_key();
+    let (cert, key) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("masque-server")),
+    );
+    let tcp_target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    let udp_target = UdpSocket::bind(ephemeral_addr()).unwrap();
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert;
+    config.tls.key_path = key;
+    config.listeners[0].listen_addr = ephemeral_addr();
+    config.listeners[0].shards = 1;
+    config.listeners[0].auth.enabled = false;
+    config.ip_proxy.enabled = false;
+    config.tcp_proxy.allow_targets = vec!["0.0.0.0/0".into(), "::/0".into()];
+    config.tcp_proxy.deny_targets = vec!["127.0.0.0/8".into()];
+    config.udp_proxy.allow_targets = config.tcp_proxy.allow_targets.clone();
+    config.udp_proxy.deny_targets = config.tcp_proxy.deny_targets.clone();
+    let peer = spawn_server(config)[0];
+    let mut client = Client::connect_anonymous(peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+
+    for host in ["127.0.0.1", "::ffff:127.0.0.1"] {
+        let target = SocketAddr::new(
+            host.parse().unwrap(),
+            tcp_target.local_addr().unwrap().port(),
+        );
+        let authority = target.to_string();
+        let tcp = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":authority", authority.as_bytes()),
+        ];
+        let path = format!(
+            "/.well-known/masque/udp/{}/{}/",
+            host.replace(':', "%3A"),
+            udp_target.local_addr().unwrap().port()
+        );
+        let udp = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-udp"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        for headers in [tcp, udp] {
+            let stream_id = client
+                .h3
+                .as_mut()
+                .unwrap()
+                .send_request(&mut client.quic, &headers, false)
+                .unwrap();
+            client.flush().unwrap();
+            assert_eq!(
+                client
+                    .response_status(stream_id, Duration::from_secs(5))
+                    .unwrap(),
+                403,
+                "{host}"
+            );
+        }
+    }
+}
+
+#[test]
+fn http3_ip_capsules_preserve_setup_and_isolate_malformed_streams() {
+    let fixture = fixture("ip-capsules");
+    let mut client = Client::connect_with_transport(
+        fixture.peer,
+        Some((&fixture.client_cert, &fixture.client_key)),
+        None,
+        false,
+        "127.0.0.1".parse().unwrap(),
+        false,
+        64,
+    )
+    .unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let mut oversized = vec![0];
+    masque::varint::encode_to_vec(70_000, &mut oversized).unwrap();
+    for malformed in [vec![0x20, 2, 0xaa], vec![0, 5, 0, 0x45], oversized] {
+        let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+        assert_eq!(
+            client
+                .response_status(stream_id, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        let frames = client.capsules(stream_id, 2, Duration::from_secs(5));
+        assert_eq!(
+            frames.len(),
+            2,
+            "setup capsules must survive partial writes"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, CapsuleFrame::AddressAssign(_)))
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, CapsuleFrame::RouteAdvertisement(_)))
+        );
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream_id, &malformed, true)
+            .unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            client.stream_reset(stream_id),
+            quiche::h3::WireErrorCode::MessageError as u64
+        );
+        assert!(client.quic.peer_error().is_none());
+    }
+    // Refusing a capsule must leave the connection and address leases usable.
+    let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert_eq!(
+        client.capsules(stream_id, 2, Duration::from_secs(5)).len(),
+        2
+    );
+}
+
+#[test]
+fn http3_udp_capsules_handle_early_fragmented_data_and_small_response_windows() {
+    let dir = TempDir::new("h3-udp-capsules");
+    let key = p256_key();
+    let (cert, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("localhost")),
+    );
+    let target = UdpSocket::bind(ephemeral_addr()).unwrap();
+    target
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let echo = std::thread::spawn(move || {
+        let mut buf = [0; 8192];
+        for _ in 0..3 {
+            let (len, peer) = target.recv_from(&mut buf).unwrap();
+            target.send_to(&buf[..len], peer).unwrap();
+        }
+    });
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert;
+    config.tls.key_path = key_path;
+    config.listeners[0].listen_addr = ephemeral_addr();
+    config.listeners[0].shards = 1;
+    config.listeners[0].auth.username = BASIC_USERNAME.into();
+    config.listeners[0].auth.password_hash =
+        masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap();
+    config.ip_proxy.enabled = false;
+    config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
+    config.udp_proxy.deny_targets.clear();
+    let peer = spawn_server(config)[0];
+    // No QUIC DATAGRAM capability, and only 64 bytes of initial response
+    // credit: every 4 KiB response must survive partial HTTP/3 DATA writes.
+    let mut client = Client::connect_with_transport(
+        peer,
+        None,
+        None,
+        false,
+        "127.0.0.1".parse().unwrap(),
+        false,
+        64,
+    )
+    .unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let path = format!(
+        "/.well-known/masque/udp/{}/{}/",
+        target_addr.ip(),
+        target_addr.port()
+    );
+    let credentials = format!(
+        "Basic {}",
+        STANDARD.encode(format!("{BASIC_USERNAME}:{BASIC_PASSWORD}"))
+    );
+    for marker in [0xab, 0xef, 0xcd] {
+        let headers = [
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-udp"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            quiche::h3::Header::new(b"proxy-authorization", credentials.as_bytes()),
+        ];
+        let stream_id = client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_request(&mut client.quic, &headers, false)
+            .unwrap();
+        let payload = vec![marker; 4096];
+        let mut wire = vec![0x20, 3, 0xaa, 0xbb, 0xcc];
+        masque::capsule::encoder::encode_datagram_context_zero(&payload, &mut wire);
+        // All fragments are sent before the authentication/200 response. The
+        // first fragment ends in the middle of the capsule value.
+        for chunk in wire.chunks(13) {
+            assert_eq!(
+                client
+                    .h3
+                    .as_mut()
+                    .unwrap()
+                    .send_body(&mut client.quic, stream_id, chunk, false)
+                    .unwrap(),
+                chunk.len()
+            );
+        }
+        client.flush().unwrap();
+        assert_eq!(
+            client
+                .response_status(stream_id, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        if marker == 0xef {
+            // Leave a large response blocked after its first fragment, then
+            // close the request. A clean FIN would truncate that capsule.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !client.quic.stream_readable(stream_id) && Instant::now() < deadline {
+                client.drive().unwrap();
+            }
+            assert!(client.quic.stream_readable(stream_id));
+            client
+                .h3
+                .as_mut()
+                .unwrap()
+                .send_body(&mut client.quic, stream_id, &[], true)
+                .unwrap();
+            client.flush().unwrap();
+            assert_eq!(
+                client.stream_reset(stream_id),
+                quiche::h3::WireErrorCode::RequestCancelled as u64
+            );
+            continue;
+        }
+        let frames = client.capsules(stream_id, 1, Duration::from_secs(5));
+        assert_eq!(
+            frames,
+            [CapsuleFrame::Datagram([vec![0], payload].concat())]
+        );
+        assert!(client.quic.peer_error().is_none());
+    }
+    echo.join().unwrap();
+}
+
+#[test]
+fn malformed_datagram_quarter_stream_ids_close_the_http3_connection() {
+    let fixture = fixture("datagram-qsid");
+    let mut oversized = Vec::new();
+    masque::varint::encode_to_vec(1 << 60, &mut oversized).unwrap();
+    let mut maximum = Vec::new();
+    masque::varint::encode_to_vec(masque::varint::MAX_VALUE, &mut maximum).unwrap();
+    maximum.push(0);
+
+    for wire in [Vec::new(), vec![0x40], oversized, maximum] {
+        let mut client =
+            Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+        client.handshake(Duration::from_secs(5)).unwrap();
+        client.init_h3().unwrap();
+        let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+        assert_eq!(
+            client
+                .response_status(stream_id, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+
+        client.quic.dgram_send(&wire).unwrap();
+        client.flush().unwrap();
+        assert!(
+            client.wait_for_close(Duration::from_secs(5)),
+            "wire: {wire:?}"
+        );
+        let error = client
+            .quic
+            .peer_error()
+            .expect("server must send CONNECTION_CLOSE");
+        assert!(
+            error.is_app,
+            "must use an HTTP/3 application error: {error:?}"
+        );
+        assert_eq!(
+            error.error_code,
+            masque::datagram::H3_DATAGRAM_ERROR,
+            "wire: {wire:?}"
+        );
+    }
+}
+
+#[test]
+fn malformed_or_unknown_datagram_contexts_leave_http3_usable() {
+    let fixture = fixture("datagram-context");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream_id, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+
+    for suffix in [&[][..], &[0x40], &[1, 0xaa]] {
+        let mut wire = Vec::new();
+        masque::varint::encode_to_vec(stream_id / 4, &mut wire).unwrap();
+        wire.extend_from_slice(suffix);
+        client.quic.dgram_send(&wire).unwrap();
+    }
+    // An unclaimed but legal QSID is also an ordinary packet drop.
+    let unclaimed = DatagramHeader::new(masque::datagram::MAX_QUARTER_STREAM_ID * 4).unwrap();
+    client
+        .quic
+        .dgram_send(&unclaimed.encode(b"unclaimed"))
+        .unwrap();
+    client.flush().unwrap();
+
+    // Two successive round trips keep a response queued before datagram
+    // processing from masking an erroneous connection close in that round.
+    for _ in 0..2 {
+        let stream_id = client.send_connect_ip("cf-connect-ip").unwrap();
+        assert_eq!(
+            client
+                .response_status(stream_id, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        assert!(client.quic.peer_error().is_none());
+    }
 }
 
 /// One process, two listeners, two authentication modes.

@@ -1,6 +1,7 @@
 // QUIC listener and connection accept loop.
 
 mod authentication;
+pub(crate) mod capsules;
 mod http2;
 mod request;
 mod retry;
@@ -49,6 +50,7 @@ use crate::scheduler::{DirtySet, TimerQueue};
 use crate::systemd;
 use crate::tun::{self, TunManager, TunRecvBatch, TunSendBatch};
 use crate::tunnel::ip::IpTunnel;
+use crate::tunnel::resolver::ResolverBudget;
 use crate::tunnel::tcp::{PendingTcpTunnel, TcpRelayEvent, TcpTunnel, spawn_tcp_connect};
 use crate::tunnel::udp::{PendingUdpTunnel, UdpSetupResult, UdpTunnel, spawn_udp_setup};
 
@@ -1010,6 +1012,7 @@ impl Server {
         let config_reload = config_reload_settings(&config, config_path);
 
         let shared = Arc::new(Shared {
+            resolver: ResolverBudget::default(),
             address_pool: Mutex::new(address_pool),
             routing_table: RwLock::new(RoutingTable::new()),
             cid_shard: RwLock::new(FxHashMap::default()),
@@ -2041,6 +2044,7 @@ struct ReloadListener {
 /// owner, and the ownership maps only when a connection is created or
 /// destroyed, or one of its connection IDs is published or retired.
 struct Shared {
+    resolver: ResolverBudget,
     address_pool: Mutex<AddressPool>,
     routing_table: RwLock<RoutingTable>,
     /// Which shard owns each server-issued connection ID. Consulted when a
@@ -2652,8 +2656,10 @@ impl Shard {
             // Process QUIC DATAGRAMs → forward to target UDP/TUN.
             if !shutting_down {
                 self.flush_tcp_responses(&serviced);
+                self.read_capsule_bodies(&serviced);
                 self.relay_client_datagrams(&serviced, &mut dgram_buf, &mut tun_send)
                     .await;
+                self.finish_capsule_bodies(&serviced);
                 // Flush whatever the relay staged for the TUN device.
                 if let Some(tun) = &self.shared.tun
                     && !tun_send.is_empty()
@@ -3202,6 +3208,7 @@ impl Shard {
                     Arc::clone(&self.metrics),
                     source_admission,
                     scid.clone(),
+                    self.shared.resolver.connection(),
                 );
                 self.connections.insert(scid.clone(), client);
                 scid
@@ -3290,6 +3297,8 @@ impl Shard {
         let mut pending_setups = PendingConnectSetups::default();
         let mut closed_ip_streams: Vec<u64> = Vec::new();
         let mut failed_tcp_streams: Vec<u64> = Vec::new();
+        let mut closed_capsule_streams: Vec<u64> = Vec::new();
+        let mut finished_capsule_streams: Vec<u64> = Vec::new();
         let mut pending_auth: Vec<PendingAuth> = Vec::new();
         let early_udp_budget = client.early_udp_budget();
 
@@ -3301,6 +3310,7 @@ impl Shard {
                         let tcp_setup_count = pending_setups.tcp.len();
                         let udp_setup_count = pending_setups.udp.len();
                         let request_context = RequestContext {
+                            metrics: &self.metrics,
                             config: &self.config,
                             auth: self.auth.as_deref(),
                             stealth_auth: self.stealth_auth,
@@ -3354,6 +3364,11 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Data)) => {
+                        if !client.pending_tcp_tunnels.contains_key(&stream_id)
+                            && !client.tcp_tunnels.contains_key(&stream_id)
+                        {
+                            client.capsule_readable.insert(stream_id);
+                        }
                         // Unread until the CONNECT is authorized, so a caller
                         // that never authenticates buffers nothing here.
                         if client.awaiting_auth.contains_key(&stream_id) {
@@ -3370,6 +3385,11 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
+                        if client.capsule_streams.contains_key(&stream_id) {
+                            finished_capsule_streams.push(stream_id);
+                            continue;
+                        }
+                        closed_capsule_streams.push(stream_id);
                         if let Some(finished) = client.awaiting_auth.get_mut(&stream_id) {
                             finished.client_finished = true;
                         }
@@ -3392,6 +3412,7 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        closed_capsule_streams.push(stream_id);
                         // A late verification result for this stream is moot.
                         client.awaiting_auth.remove(&stream_id);
                         if client.pending_tcp_tunnels.remove(&stream_id).is_some() {
@@ -3421,6 +3442,12 @@ impl Shard {
             }
         }
 
+        for stream_id in closed_capsule_streams {
+            client.remove_capsule_stream(stream_id);
+        }
+        for stream_id in finished_capsule_streams {
+            Self::close_capsule_stream(&self.shared, client, stream_id, false);
+        }
         for stream_id in failed_tcp_streams {
             warn!(
                 stream_id,
@@ -3484,6 +3511,7 @@ impl Shard {
                 self.tcp_policy.clone(),
                 Duration::from_secs(self.config.tcp_proxy.connect_timeout_secs),
                 self.tcp_event_tx.clone(),
+                client.resolver.clone(),
             );
             if let Some(pending) = client.pending_tcp_tunnels.get_mut(&stream_id) {
                 pending.start_connect(connect_task);
@@ -3521,6 +3549,7 @@ impl Shard {
                 enable_target_udp_gso,
                 target_datagram_size,
                 self.udp_setup_tx.clone(),
+                client.resolver.clone(),
             );
             if let Some(pending) = client.pending_udp_tunnels.get_mut(&stream_id) {
                 pending.start_setup(setup_task);
@@ -3541,7 +3570,13 @@ impl Shard {
                 }
                 continue;
             }
-            Self::setup_ip_tunnel(&self.shared, client, stream_id, conn_idx);
+            Self::setup_ip_tunnel(
+                &self.shared,
+                client,
+                stream_id,
+                conn_idx,
+                self.config.ip_proxy.tun_mtu,
+            );
         }
     }
 
@@ -3551,6 +3586,7 @@ impl Shard {
         client: &mut ClientConnection,
         stream_id: u64,
         conn_idx: u64,
+        max_payload: usize,
     ) {
         let mut tunnel = IpTunnel::new(stream_id);
 
@@ -3642,16 +3678,24 @@ impl Shard {
             info!(stream_id, addr = %ip, pinned = pinned.is_some(), "assigned address to IP tunnel");
         }
 
-        // Send ADDRESS_ASSIGN and ROUTE_ADVERTISEMENT back to back: one buffer,
-        // one send_body call. The route advertisement is a default route, so
-        // the client knows it can send all traffic through this tunnel.
+        // Control capsules use the same bounded, partial-write-aware queue as
+        // fallback data. A small peer receive window must not truncate setup.
         let capsules = encode_ip_setup_capsules(&addresses);
-
-        if let Err(e) = h3.send_body(&mut client.quic, stream_id, &capsules, false) {
-            warn!(stream_id, %e, "failed to send CONNECT-IP capsules");
-        }
-
+        client
+            .capsule_streams
+            .insert(stream_id, capsules::CapsuleStream::new(max_payload));
         client.ip_tunnels.insert(stream_id, tunnel);
+        if !client.queue_capsule_bytes(stream_id, capsules) {
+            Self::teardown_ip_tunnel(shared, client, stream_id, conn_idx);
+            let error = quiche::h3::WireErrorCode::ExcessiveLoad as u64;
+            let _ = client
+                .quic
+                .stream_shutdown(stream_id, quiche::Shutdown::Read, error);
+            let _ = client
+                .quic
+                .stream_shutdown(stream_id, quiche::Shutdown::Write, error);
+            return;
+        }
         info!(stream_id, "CONNECT-IP tunnel established");
     }
 
@@ -3663,6 +3707,7 @@ impl Shard {
         conn_idx: u64,
     ) {
         if let Some(tunnel) = client.ip_tunnels.remove(&stream_id) {
+            client.remove_capsule_stream(stream_id);
             info!(stream_id, "IP tunnel closed");
 
             // Release addresses back to the pool.
@@ -3787,8 +3832,35 @@ impl Shard {
         let (send_socket, socket, target_addr, target_udp_gso) = prepared.into_http3();
         let recv_socket = Arc::clone(&socket);
         let response_tx = self.udp_response_tx.clone();
+        let capsule_transport = !client.native_datagrams();
         let target_datagram_size = self.max_datagram_size.clamp(1, MAX_DATAGRAM_SIZE);
         let recv_task = tokio::spawn(async move {
+            if capsule_transport {
+                // Large reliable fallback payloads use one receive buffer and
+                // one packet per queued message, keeping memory independent of
+                // the native path's Linux batch size.
+                let mut buffer = vec![0; capsules::MAX_UDP_PAYLOAD + 1];
+                loop {
+                    let len = match recv_socket.recv(&mut buffer).await {
+                        Ok(len) => len,
+                        Err(_) => return,
+                    };
+                    if len > capsules::MAX_UDP_PAYLOAD {
+                        continue;
+                    }
+                    if response_tx
+                        .send(UdpResponse {
+                            connection_index,
+                            stream_id,
+                            datagrams: vec![header.encode(&buffer[..len])],
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             // One `recvmmsg` per readiness instead of a `recvfrom` per
             // datagram, and one channel send per batch.
             let mut batch = TargetRecvBatch::new(target_datagram_size);
@@ -3858,6 +3930,10 @@ impl Shard {
             "UDP tunnel established"
         );
         client.udp_tunnels.insert(stream_id, tunnel);
+        client.capsule_streams.insert(
+            stream_id,
+            capsules::CapsuleStream::new(capsules::MAX_UDP_PAYLOAD),
+        );
     }
 
     /// Apply an event generated by an asynchronous target TCP task.
@@ -4136,19 +4212,36 @@ impl Shard {
             staged_udp_tunnels.clear();
 
             loop {
-                let len = match client.quic.dgram_recv(dgram_buf) {
-                    Ok(len) => len,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        debug!(%e, "dgram_recv error");
-                        break;
-                    }
+                // Capsules and native QUIC datagrams share target policy,
+                // context handling, source validation, and bounded forwarding.
+                let capsule = client.received_capsules.pop_front();
+                let wire = if let Some(ref capsule) = capsule {
+                    client.received_capsule_bytes -= capsule.len();
+                    capsule.as_slice()
+                } else {
+                    let len = match client.quic.dgram_recv(dgram_buf) {
+                        Ok(len) => len,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            debug!(%e, "dgram_recv error");
+                            break;
+                        }
+                    };
+                    &dgram_buf[..len]
                 };
 
-                let dgram = match datagram::decode_ref(&dgram_buf[..len]) {
+                let dgram = match datagram::decode_ref(wire) {
                     Ok(d) => d,
                     Err(e) => {
                         debug!(%e, "malformed datagram");
+                        if e.is_connection_error() {
+                            let _ = client.quic.close(
+                                true,
+                                datagram::H3_DATAGRAM_ERROR,
+                                b"invalid HTTP Datagram quarter stream id",
+                            );
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -4277,6 +4370,14 @@ impl Shard {
 
                 let datagram_count = batch.datagrams.len();
                 for (index, datagram) in batch.datagrams.into_iter().enumerate() {
+                    if !client.native_datagrams() {
+                        if let Ok(decoded) = datagram::decode_ref(&datagram)
+                            && !client.queue_datagram_capsule(batch.stream_id, decoded.payload)
+                        {
+                            self.metrics.record_datagram_queue_drop(1);
+                        }
+                        continue;
+                    }
                     match client.quic.dgram_send_buf(datagram) {
                         Ok(()) => {}
                         // The send queue is full: stop draining and let the
@@ -4366,6 +4467,17 @@ impl Shard {
             None => return true,
         };
 
+        if !client.native_datagrams() {
+            if let Some(tunnel) = client.ip_tunnels.get_mut(&owner.stream_id) {
+                tunnel.last_activity = Instant::now();
+                self.dirty.mark(owner.conn_id);
+                if !client.queue_datagram_capsule(owner.stream_id, pkt) {
+                    self.metrics.record_datagram_queue_drop(1);
+                }
+            }
+            return true;
+        }
+
         // Update tunnel activity and send DATAGRAM to client.
         if let Some(tunnel) = client.ip_tunnels.get_mut(&owner.stream_id) {
             // Check for backpressure before framing, so a full queue costs no
@@ -4450,6 +4562,7 @@ impl Shard {
                 pending_udp_tunnels,
                 udp_tunnels,
                 ip_tunnels,
+                capsule_streams,
                 index,
                 ..
             } = client;
@@ -4502,7 +4615,17 @@ impl Shard {
                     return true;
                 }
                 info!(stream_id, "closing idle UDP tunnel");
-                if let Some(h3) = h3.as_mut() {
+                if capsule_streams
+                    .get(stream_id)
+                    .is_some_and(capsules::CapsuleStream::has_partial_output)
+                {
+                    let _ = quic.stream_shutdown(
+                        *stream_id,
+                        quiche::Shutdown::Write,
+                        quiche::h3::WireErrorCode::RequestCancelled as u64,
+                    );
+                    wrote = true;
+                } else if let Some(h3) = h3.as_mut() {
                     h3.send_body(quic, *stream_id, b"", true).ok();
                     wrote = true;
                 }
@@ -4516,7 +4639,17 @@ impl Shard {
                     continue;
                 }
                 info!(stream_id, "closing idle IP tunnel");
-                if let Some(h3) = h3.as_mut() {
+                if capsule_streams
+                    .get(stream_id)
+                    .is_some_and(capsules::CapsuleStream::has_partial_output)
+                {
+                    let _ = quic.stream_shutdown(
+                        *stream_id,
+                        quiche::Shutdown::Write,
+                        quiche::h3::WireErrorCode::RequestCancelled as u64,
+                    );
+                    wrote = true;
+                } else if let Some(h3) = h3.as_mut() {
                     h3.send_body(quic, *stream_id, b"", true).ok();
                     wrote = true;
                 }
@@ -4525,6 +4658,17 @@ impl Shard {
 
             if wrote {
                 dirty.mark(*index);
+            }
+            let closed: Vec<_> = client
+                .capsule_streams
+                .keys()
+                .copied()
+                .filter(|id| {
+                    !client.udp_tunnels.contains_key(id) && !client.ip_tunnels.contains_key(id)
+                })
+                .collect();
+            for stream_id in closed {
+                client.remove_capsule_stream(stream_id);
             }
         }
 
@@ -4624,6 +4768,13 @@ impl Shard {
             };
 
             client.quic.on_timeout();
+            if client.quic.local_error().is_some()
+                || client.quic.is_draining()
+                || client.quic.is_closed()
+            {
+                client.deferred_send.discard();
+            }
+            client.flush_capsule_output();
 
             // Build at most one congestion-control send quantum at a time.
             // Linux can collapse equal-sized packets into one GSO aggregate;
@@ -4642,20 +4793,26 @@ impl Shard {
 
                 // `quiche::Connection::send()` serializes and accounts a
                 // packet before returning its desired release time. Resume a
-                // packet retained by the previous loop only once that time is
-                // reached.
+                // group retained by the previous loop only once every packet
+                // in that group is due.
                 if let Some(deadline) = client.deferred_send.deadline() {
                     let now = Instant::now();
                     if deadline > now {
                         break;
                     }
-                    if let Some((packet, send_info)) = client.deferred_send.take_if_due(now) {
+                    while let Some((packet, send_info)) = client.deferred_send.take_if_due(now) {
                         generated_bytes += packet.len();
-                        batch.push(packet, send_info, socket.udp_gso_enabled(), send_quantum);
+                        batch.push(&packet, send_info, socket.udp_gso_enabled(), send_quantum);
+                        client.deferred_send.recycle(packet);
                     }
+                    pacing_blocked = client.deferred_send.deadline().is_some();
                 }
 
-                while batch.packet_count() < MAX_BATCH_PACKETS && generated_bytes < send_quantum {
+                while !pacing_blocked
+                    && batch.packet_count() + client.deferred_send.len() < MAX_BATCH_PACKETS
+                    && generated_bytes < send_quantum
+                    && client.deferred_send.has_capacity(max_packet_size)
+                {
                     let (write, send_info) = match client.quic.send(out) {
                         Ok(v) => v,
                         Err(quiche::Error::Done) => {
@@ -4670,14 +4827,16 @@ impl Shard {
                         }
                     };
 
-                    // Respect quiche's pacing decision. Keep one serialized
-                    // future packet per connection and let the outer event
-                    // loop wake exactly at its release time, instead of
-                    // sleeping here and blocking unrelated connections.
-                    if send_info.at > Instant::now() {
+                    generated_bytes += write;
+                    // Serialize a bounded group ahead of its release time.
+                    // Waiting for the last due time batches timer work without
+                    // sending any packet before quiche authorized it.
+                    if send_info.at > Instant::now() || client.deferred_send.len() != 0 {
                         client.deferred_send.schedule(&out[..write], send_info);
-                        pacing_blocked = true;
-                        break;
+                        if !client.deferred_send.can_prefetch() {
+                            pacing_blocked = true;
+                        }
+                        continue;
                     }
 
                     batch.push(
@@ -4686,7 +4845,6 @@ impl Shard {
                         socket.udp_gso_enabled(),
                         send_quantum,
                     );
-                    generated_bytes += write;
                 }
 
                 if batch.is_empty() {
@@ -4704,7 +4862,7 @@ impl Shard {
                     self.metrics.disable_udp_gso();
                 }
 
-                if quiche_done || pacing_blocked {
+                if quiche_done || pacing_blocked || client.deferred_send.deadline().is_some() {
                     break;
                 }
             }

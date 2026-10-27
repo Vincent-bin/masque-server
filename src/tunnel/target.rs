@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use tokio::time::Instant;
 
+use super::resolver::TargetResolver;
 use crate::policy::TargetPolicy;
 
 /// An HTTP status and operator-facing reason for target setup failure.
@@ -60,11 +61,10 @@ pub(crate) async fn resolve_allowed(
     port: u16,
     policy: &TargetPolicy,
     deadline: Instant,
+    resolver: &TargetResolver,
 ) -> Result<ResolvedTarget, TargetSetupFailure> {
     resolve_allowed_with(host, port, policy, deadline, |host, port| async move {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map(|addresses| addresses.collect())
+        resolver.lookup(host, port).await
     })
     .await
 }
@@ -194,18 +194,20 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_allowed_and_denied_answer_fails_closed() {
         let allowed: SocketAddr = "192.0.2.10:53".parse().unwrap();
-        let denied: SocketAddr = "10.0.0.10:53".parse().unwrap();
-        let error = resolve_allowed_with(
-            "mixed.test",
-            53,
-            &policy(&["192.0.2.0/24"], &["10.0.0.0/8"]),
-            Instant::now() + Duration::from_secs(1),
-            move |_, _| async move { Ok(vec![allowed, denied]) },
-        )
-        .await
-        .unwrap_err();
+        for denied in ["10.0.0.10:53", "[::ffff:10.0.0.10]:53"] {
+            let denied: SocketAddr = denied.parse().unwrap();
+            let error = resolve_allowed_with(
+                "mixed.test",
+                53,
+                &policy(&["0.0.0.0/0", "::/0"], &["10.0.0.0/8"]),
+                Instant::now() + Duration::from_secs(1),
+                move |_, _| async move { Ok(vec![allowed, denied]) },
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(error.status, 403);
+            assert_eq!(error.status, 403);
+        }
     }
 
     #[tokio::test]
