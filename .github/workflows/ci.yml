@@ -74,6 +74,9 @@ jobs:
       - name: Test fleet operations CLI
         run: python3 -m unittest -v tests/test_masque_ops.py
 
+      - name: Test performance reporting and process accounting
+        run: python3 -m unittest -v tests/test_performance_baseline.py
+
   msrv:
     name: Check MSRV (1.88.0)
     if: github.event_name != 'push'

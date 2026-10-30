@@ -221,6 +221,7 @@ struct TcpDownloadResult {
 struct InFlight {
     sent_at: HashMap<u64, Instant>,
     order: VecDeque<(u64, Instant)>,
+    order_limit: usize,
 }
 
 impl InFlight {
@@ -228,22 +229,38 @@ impl InFlight {
         Self {
             sent_at: HashMap::with_capacity(window * 2),
             order: VecDeque::with_capacity(window * 2),
+            order_limit: window.saturating_mul(2).max(1),
         }
     }
 
     fn insert(&mut self, sequence: u64, sent_at: Instant) {
+        // A lost oldest request must not retain one completed queue entry per
+        // packet until its expiry. Keep tombstones bounded by the window too.
+        if self.order.len() >= self.order_limit {
+            let pending = &self.sent_at;
+            self.order
+                .retain(|(sequence, _)| pending.contains_key(sequence));
+        }
         self.sent_at.insert(sequence, sent_at);
         self.order.push_back((sequence, sent_at));
     }
 
     fn remove(&mut self, sequence: &u64) -> bool {
-        self.sent_at.remove(sequence).is_some()
+        self.remove_sent_at(sequence).is_some()
+    }
+
+    fn remove_sent_at(&mut self, sequence: &u64) -> Option<Instant> {
+        self.sent_at.remove(sequence)
     }
 
     fn expire(&mut self, now: Instant, expiry: Duration) -> u64 {
         let mut expired = 0;
 
         while let Some(&(sequence, sent_at)) = self.order.front() {
+            if !self.sent_at.contains_key(&sequence) {
+                self.order.pop_front();
+                continue;
+            }
             if now.saturating_duration_since(sent_at) < expiry {
                 break;
             }
@@ -263,6 +280,73 @@ impl InFlight {
     fn is_empty(&self) -> bool {
         self.sent_at.is_empty()
     }
+}
+
+/// Fixed-memory RTT histogram: sixteen buckets per power of two. Quantiles
+/// are bucket upper bounds (at most 6.25% wide above 16 us), not exact samples.
+#[derive(Debug)]
+struct RttHistogram {
+    buckets: [u64; 1024],
+    total: u64,
+}
+
+impl Default for RttHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: [0; 1024],
+            total: 0,
+        }
+    }
+}
+
+impl RttHistogram {
+    fn record(&mut self, duration: Duration) {
+        let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        let index = if micros < 16 {
+            micros as usize
+        } else {
+            let exponent = 63 - micros.leading_zeros() as usize;
+            16 + (exponent - 4) * 16 + ((micros >> (exponent - 4)) - 16) as usize
+        };
+        self.buckets[index] += 1;
+        self.total += 1;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (count, extra) in self.buckets.iter_mut().zip(&other.buckets) {
+            *count += extra;
+        }
+        self.total += other.total;
+    }
+
+    fn percentile_upper_us(&self, percentile: u8) -> u64 {
+        if self.total == 0 {
+            return 0;
+        }
+        let rank = (u128::from(self.total) * u128::from(percentile.clamp(1, 100))).div_ceil(100);
+        let mut count = 0_u128;
+        for (index, bucket) in self.buckets.iter().enumerate() {
+            count += u128::from(*bucket);
+            if count >= rank {
+                return if index < 16 {
+                    index as u64 + 1
+                } else {
+                    let exponent = (index - 16) / 16 + 4;
+                    let step = (index - 16) % 16;
+                    (17 + step as u64).saturating_mul(1_u64 << (exponent - 4))
+                };
+            }
+        }
+        unreachable!("histogram counts sum to total")
+    }
+}
+
+#[derive(Debug)]
+struct ThroughputStats {
+    sent: u64,
+    received: u64,
+    expired: u64,
+    rtt: RttHistogram,
 }
 
 // ---------------------------------------------------------------------------
@@ -762,7 +846,7 @@ impl Client {
     }
 
     /// Saturate one CONNECT-UDP tunnel with a bounded number of in-flight
-    /// echo requests. Returns (sent packets, received packets, expired packets).
+    /// echo requests, including a bounded histogram of completed-request RTTs.
     fn run_echo_throughput(
         &mut self,
         stream_id: u64,
@@ -770,7 +854,7 @@ impl Client {
         duration: Duration,
         window: usize,
         expiry: Duration,
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<ThroughputStats> {
         if payload_size < 8 {
             bail!("benchmark payload must be at least 8 bytes");
         }
@@ -788,6 +872,7 @@ impl Client {
         let mut sent = 0_u64;
         let mut received = 0_u64;
         let mut expired = 0_u64;
+        let mut rtt = RttHistogram::default();
 
         while Instant::now() < drain_deadline {
             let now = Instant::now();
@@ -833,6 +918,7 @@ impl Client {
                 }
             }
 
+            let received_at = Instant::now();
             loop {
                 let len = match self.quic.dgram_recv(&mut dgram_buf) {
                     Ok(len) => len,
@@ -845,8 +931,9 @@ impl Client {
                     continue;
                 }
                 let sequence = u64::from_be_bytes(dgram.payload[..8].try_into().unwrap());
-                if in_flight.remove(&sequence) {
+                if let Some(sent_at) = in_flight.remove_sent_at(&sequence) {
                     received += 1;
+                    rtt.record(received_at.saturating_duration_since(sent_at));
                 }
                 made_progress = true;
             }
@@ -861,7 +948,12 @@ impl Client {
 
         expired += in_flight.len() as u64;
         self.socket.set_nonblocking(false)?;
-        Ok((sent, received, expired))
+        Ok(ThroughputStats {
+            sent,
+            received,
+            expired,
+            rtt,
+        })
     }
 
     /// Receive a large byte stream through a standard HTTP/3 CONNECT tunnel.
@@ -1781,14 +1873,12 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     #[derive(Debug)]
     struct WorkerStats {
         setup: Duration,
-        sent: u64,
-        received: u64,
-        expired: u64,
+        throughput: ThroughputStats,
     }
 
     #[derive(Debug)]
     enum WorkerOutcome {
-        Finished(WorkerStats),
+        Finished(Box<WorkerStats>),
         SetupFailed(String),
         RuntimeFailed { setup: Duration, error: String },
     }
@@ -1830,12 +1920,9 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             // a second implementation silently changing pacing, draining, or
             // expiry semantics.
             match client.run_echo_throughput(stream_id, payload_size, duration, window, expiry) {
-                Ok((sent, received, expired)) => WorkerOutcome::Finished(WorkerStats {
-                    setup,
-                    sent,
-                    received,
-                    expired,
-                }),
+                Ok(throughput) => {
+                    WorkerOutcome::Finished(Box::new(WorkerStats { setup, throughput }))
+                }
                 Err(error) => WorkerOutcome::RuntimeFailed {
                     setup,
                     error: format!("{error:#}"),
@@ -1854,13 +1941,15 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     let mut expired = 0u64;
     let mut setup_failures = 0u64;
     let mut runtime_failures = 0u64;
+    let mut load_rtt = RttHistogram::default();
     for worker in workers {
         match worker.join() {
             Ok(WorkerOutcome::Finished(stats)) => {
                 setup_latencies.push(stats.setup.as_secs_f64() * 1e3);
-                sent += stats.sent;
-                received += stats.received;
-                expired += stats.expired;
+                sent += stats.throughput.sent;
+                received += stats.throughput.received;
+                expired += stats.throughput.expired;
+                load_rtt.merge(&stats.throughput.rtt);
             }
             Ok(WorkerOutcome::SetupFailed(error)) => {
                 setup_failures += 1;
@@ -1905,6 +1994,13 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             percentile(0.99)
         );
     }
+    let setup_p50 = percentile_nearest_rank(&setup_latencies, 0.50).unwrap_or(0.0);
+    let setup_p95 = percentile_nearest_rank(&setup_latencies, 0.95).unwrap_or(0.0);
+    let setup_p99 = percentile_nearest_rank(&setup_latencies, 0.99).unwrap_or(0.0);
+    let load_rtt_samples = load_rtt.total;
+    let load_rtt_p50_us_upper = load_rtt.percentile_upper_us(50);
+    let load_rtt_p95_us_upper = load_rtt.percentile_upper_us(95);
+    let load_rtt_p99_us_upper = load_rtt.percentile_upper_us(99);
     println!(
         "  tx {:>10.0} pkt/s   echo {:>10.0} pkt/s   app goodput {:.3} Gbit/s   \
          bidirectional relay {:.3} Gbit/s   response shortfall {response_shortfall_pct:.2}% \
@@ -1921,7 +2017,10 @@ rx_packets={received} \
 tx_pps={tx_pps:.3} rx_pps={rx_pps:.3} app_goodput_gbps={goodput:.6} \
 bidirectional_relay_gbps={:.6} response_shortfall_pct={response_shortfall_pct:.6} \
 expired_packets={expired} \
-setup_failures={setup_failures} runtime_failures={runtime_failures}",
+setup_failures={setup_failures} runtime_failures={runtime_failures} \
+setup_p50_ms={setup_p50:.3} setup_p95_ms={setup_p95:.3} setup_p99_ms={setup_p99:.3} \
+load_rtt_samples={load_rtt_samples} load_rtt_p50_us_upper={load_rtt_p50_us_upper} \
+load_rtt_p95_us_upper={load_rtt_p95_us_upper} load_rtt_p99_us_upper={load_rtt_p99_us_upper}",
         goodput * 2.0
     );
     if established == 0 {
@@ -2012,6 +2111,17 @@ impl UdpBenchConfig {
     }
 }
 
+fn print_udp_latency_result(transport: &str, path: &str, sorted: &[f64]) {
+    println!(
+        "UDP_LATENCY_RESULT transport={transport} path={path} payload_bytes=64 samples={} \
+rtt_p50_us={:.3} rtt_p95_us={:.3} rtt_p99_us={:.3}",
+        sorted.len(),
+        percentile_nearest_rank(sorted, 0.50).unwrap(),
+        percentile_nearest_rank(sorted, 0.95).unwrap(),
+        percentile_nearest_rank(sorted, 0.99).unwrap(),
+    );
+}
+
 fn print_udp_result(
     transport: &str,
     path: &str,
@@ -2067,6 +2177,7 @@ fn benchmark_direct_udp(
         direct_latencies.push(started.elapsed().as_secs_f64() * 1e6);
     }
     direct_latencies.sort_by(f64::total_cmp);
+    print_udp_latency_result(transport.as_str(), "direct", &direct_latencies);
     let percentile = |p: f64| percentile_nearest_rank(&direct_latencies, p).unwrap();
     println!(
         "  RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
@@ -2128,6 +2239,7 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
         latencies.push(started.elapsed().as_secs_f64() * 1e6);
     }
     latencies.sort_by(f64::total_cmp);
+    print_udp_latency_result("http3", result_path, &latencies);
     let percentile = |p: f64| percentile_nearest_rank(&latencies, p).unwrap();
     println!(
         "  setup {:.3} ms{}; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
@@ -2148,7 +2260,7 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
         if migrate_before_measurement {
             client.migrate_source(Duration::from_secs(5))?;
         }
-        let (sent, received, expired) = client.run_echo_throughput(
+        let stats = client.run_echo_throughput(
             stream_id,
             payload_size,
             config.duration,
@@ -2160,9 +2272,17 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
             result_path,
             payload_size,
             config.duration,
-            sent,
-            received,
-            expired,
+            stats.sent,
+            stats.received,
+            stats.expired,
+        );
+        println!(
+            "UDP_LOAD_LATENCY_RESULT transport=http3 path={result_path} payload_bytes={payload_size} \
+samples={} load_rtt_p50_us_upper={} load_rtt_p95_us_upper={} load_rtt_p99_us_upper={}",
+            stats.rtt.total,
+            stats.rtt.percentile_upper_us(50),
+            stats.rtt.percentile_upper_us(95),
+            stats.rtt.percentile_upper_us(99),
         );
     }
     Ok(())
@@ -2661,6 +2781,62 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lost_request_does_not_retain_unbounded_completed_entries() {
+        let mut pending = InFlight::with_capacity(2);
+        let sent = Instant::now();
+        pending.insert(0, sent);
+        for sequence in 1..10_000 {
+            pending.insert(sequence, sent);
+            assert_eq!(pending.remove_sent_at(&sequence), Some(sent));
+            assert!(pending.order.len() <= 4);
+            assert_eq!(pending.len(), 1);
+        }
+        assert_eq!(
+            pending.expire(sent + Duration::from_secs(1), Duration::from_secs(1)),
+            1
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn histogram_upper_bounds_cover_samples_with_bounded_quantization() {
+        for micros in [
+            0,
+            1,
+            15,
+            16,
+            17,
+            31,
+            32,
+            1_000,
+            10_000,
+            1_000_000,
+            60_000_000,
+            u64::MAX,
+        ] {
+            let mut histogram = RttHistogram::default();
+            histogram.record(Duration::from_micros(micros));
+            let upper = histogram.percentile_upper_us(99);
+            assert!(upper >= micros);
+            assert!(u128::from(upper) <= u128::from(micros) * 17 / 16 + 1);
+        }
+    }
+
+    #[test]
+    fn merged_histograms_weight_packets_rather_than_averaging_quantiles() {
+        let mut small = RttHistogram::default();
+        small.record(Duration::from_micros(1));
+        let mut large = RttHistogram::default();
+        for _ in 0..100 {
+            large.record(Duration::from_micros(10_000));
+        }
+        small.merge(&large);
+        assert_eq!(small.total, 101);
+        assert_eq!(small.percentile_upper_us(50), large.percentile_upper_us(50));
+        assert_eq!(small.percentile_upper_us(99), large.percentile_upper_us(99));
+    }
 
     #[test]
     fn direct_tcp_download_counts_body_without_http_headers() {

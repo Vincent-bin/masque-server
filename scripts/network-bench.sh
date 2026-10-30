@@ -6,10 +6,12 @@ cd "$(dirname "$0")/.."
 
 BENCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/masque-network-bench.XXXXXX")"
 BIN_DIR="${MASQUE_BENCH_BIN_DIR:-target/release}"
+SERVER_BIN="${MASQUE_BENCH_SERVER_BIN:-$BIN_DIR/masque-server}"
 RESULTS_DIR="${MASQUE_BENCH_RESULTS_DIR:-}"
 PERF_BIN="${MASQUE_BENCH_PERF_BIN:-perf}"
 PERF_PID=""
 SERVER_PID=""
+SERVER_JOB_PID=""
 ECHO_PID=""
 HTTP_PID=""
 TCP_DOWNLOAD_BYTES="${MASQUE_TCP_DOWNLOAD_BYTES:-67108864}"
@@ -22,6 +24,39 @@ BENCH_QUIC_RETRY="${MASQUE_BENCH_QUIC_RETRY:-adaptive}"
 BENCH_CC="${MASQUE_BENCH_CC:-cubic}"
 LOAD_CONNS="${MASQUE_LOAD_CONNS:-}"
 
+# Pick unused loopback ports for each run. Explicit ports are available for
+# controlled environments; a bind collision still fails rather than reusing a
+# service. The kernel can allocate a port again after this preflight closes.
+read -r SERVER_PORT ECHO_PORT HTTP_PORT < <(python3 - <<'PYPORT'
+import socket
+sockets = []
+try:
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.bind(("127.0.0.1", 0))
+    sockets.append(tcp)
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", tcp.getsockname()[1]))
+    sockets.append(udp)
+    for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+        sock = socket.socket(socket.AF_INET, kind)
+        sock.bind(("127.0.0.1", 0))
+        sockets.append(sock)
+    print(tcp.getsockname()[1], sockets[2].getsockname()[1], sockets[3].getsockname()[1])
+finally:
+    for sock in sockets:
+        sock.close()
+PYPORT
+)
+SERVER_PORT="${MASQUE_BENCH_SERVER_PORT:-$SERVER_PORT}"
+ECHO_PORT="${MASQUE_BENCH_ECHO_PORT:-$ECHO_PORT}"
+HTTP_PORT="${MASQUE_BENCH_HTTP_PORT:-$HTTP_PORT}"
+for port in "$SERVER_PORT" "$ECHO_PORT" "$HTTP_PORT"; do
+    case "$port" in ''|*[!0-9]*) echo "benchmark ports must be integers" >&2; exit 2 ;; esac
+    if [ "${#port}" -gt 5 ] || [ "$((10#$port))" -lt 1 ] || [ "$((10#$port))" -gt 65535 ]; then
+        echo "benchmark ports must be between 1 and 65535" >&2; exit 2
+    fi
+done
+
 cleanup() {
     if [ -n "$PERF_PID" ]; then
         kill -INT "$PERF_PID" 2>/dev/null || true
@@ -29,7 +64,15 @@ cleanup() {
     fi
     if [ -n "$SERVER_PID" ]; then
         kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$SERVER_JOB_PID" ]; then
+        if [ -z "$SERVER_PID" ]; then
+            kill "$SERVER_JOB_PID" 2>/dev/null || true
+        fi
+        wait "$SERVER_JOB_PID" 2>/dev/null || true
+    fi
+    if [ -f "$BENCH_DIR/server-resource.txt" ]; then
+        cat "$BENCH_DIR/server-resource.txt"
     fi
     if [ -n "$ECHO_PID" ]; then
         kill "$ECHO_PID" 2>/dev/null || true
@@ -41,7 +84,7 @@ cleanup() {
     fi
     if [ -n "$RESULTS_DIR" ]; then
         mkdir -p "$RESULTS_DIR"
-        for artifact in server.log echo.log http.log perf.data perf.log; do
+        for artifact in server.log echo.log http.log perf.data perf.log server-resource.txt; do
             if [ -f "$BENCH_DIR/$artifact" ]; then
                 cp "$BENCH_DIR/$artifact" "$RESULTS_DIR/$artifact"
             fi
@@ -186,7 +229,7 @@ if [ "$BENCH_TRANSPORT" = http3 ] || [ "$BENCH_TRANSPORT" = both ]; then
     cat >>"$BENCH_DIR/masque.toml" <<EOF
 
 [[listeners]]
-listen_addr = "127.0.0.1:4433"
+listen_addr = "127.0.0.1:$SERVER_PORT"
 transport = "http3"
 shards = $BENCH_SHARDS
 
@@ -201,10 +244,10 @@ EOF
 fi
 
 if [ "$BENCH_TRANSPORT" = http2 ] || [ "$BENCH_TRANSPORT" = both ]; then
-    cat >>"$BENCH_DIR/masque.toml" <<'EOF'
+    cat >>"$BENCH_DIR/masque.toml" <<EOF
 
 [[listeners]]
-listen_addr = "127.0.0.1:4433"
+listen_addr = "127.0.0.1:$SERVER_PORT"
 transport = "http2"
 shards = 1
 
@@ -214,7 +257,7 @@ mode = "basic"
 
 [[listeners.auth.users]]
 username = "test"
-password_hash = "$argon2id$v=19$m=19456,t=2,p=1$1xNVXhqKU7jJ6cqTBJKphQ$GXXAINVTW1qhloFtN1IR8lSr7pI7QEY79fq4K6d8scQ"
+password_hash = "\$argon2id\$v=19\$m=19456,t=2,p=1\$1xNVXhqKU7jJ6cqTBJKphQ\$GXXAINVTW1qhloFtN1IR8lSr7pI7QEY79fq4K6d8scQ"
 EOF
 fi
 
@@ -236,33 +279,61 @@ esac
 if [ -z "${MASQUE_BENCH_BIN_DIR:-}" ]; then
     cargo build --workspace --release
 fi
-for binary in masque-server masque-e2e; do
-    [ -x "$BIN_DIR/$binary" ] || { echo "missing executable: $BIN_DIR/$binary" >&2; exit 2; }
-done
+[ -x "$BIN_DIR/masque-e2e" ] || { echo "missing benchmark client executable" >&2; exit 2; }
+[ -x "$SERVER_BIN" ] || { echo "benchmark server is not executable" >&2; exit 2; }
 printf 'BENCH_CONFIG transport=%s cc=%s shards=%s quic_gso=%s target_gso=%s load_warm_auth=%s\n' \
     "$BENCH_TRANSPORT" "$BENCH_CC" "$BENCH_SHARDS" "$QUIC_GSO_TOML" "$TARGET_GSO_TOML" "${MASQUE_LOAD_WARM_AUTH:-1}"
 
 case "$BENCH_MODE" in
     all|tcp)
         truncate -s "$TCP_DOWNLOAD_BYTES" "$BENCH_DIR/masque-bench.bin"
-        python3 -m http.server 9998 --bind 127.0.0.1 --directory "$BENCH_DIR" \
+        python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$BENCH_DIR" \
             >"$BENCH_DIR/http.log" 2>&1 &
         HTTP_PID=$!
+        # The direct baseline starts immediately and otherwise races Python's
+        # HTTP listener on slower hosts.
+        python3 - "$HTTP_PORT" <<'PYREADY'
+import socket, sys, time
+port = int(sys.argv[1])
+for attempt in range(100):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+            break
+    except OSError:
+        time.sleep(0.05)
+else:
+    raise SystemExit("benchmark HTTP target did not start")
+PYREADY
         ;;
 esac
 
 case "$BENCH_MODE" in
     all|smoke|udp|load)
-        MASQUE_ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        MASQUE_ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
         RUST_LOG=warn \
         "$BIN_DIR/masque-e2e" >"$BENCH_DIR/echo.log" 2>&1 &
         ECHO_PID=$!
         ;;
 esac
 
-RUST_LOG=warn "$BIN_DIR/masque-server" --config "$BENCH_DIR/masque.toml" \
+RUST_LOG=warn python3 scripts/bench-process.py \
+    --pid-file "$BENCH_DIR/server.pid" --result-file "$BENCH_DIR/server-resource.txt" \
+    -- "$SERVER_BIN" --config "$BENCH_DIR/masque.toml" \
     >"$BENCH_DIR/server.log" 2>&1 &
-SERVER_PID=$!
+SERVER_JOB_PID=$!
+for ((attempt=0; attempt<100; attempt++)); do
+    if [ -s "$BENCH_DIR/server.pid" ]; then
+        read -r SERVER_PID <"$BENCH_DIR/server.pid" || true
+        break
+    fi
+    if ! kill -0 "$SERVER_JOB_PID" 2>/dev/null; then
+        echo "benchmark server failed to launch" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+[ -n "$SERVER_PID" ] || { echo "benchmark server launch timed out" >&2; exit 1; }
+kill -0 "$SERVER_PID" 2>/dev/null || { echo "benchmark server exited during launch" >&2; exit 1; }
 if [ "${MASQUE_BENCH_PERF:-0}" = 1 ]; then
     "$PERF_BIN" record --event cpu-clock:u -F 99 --call-graph dwarf,8192 \
         -p "$SERVER_PID" -o "$BENCH_DIR/perf.data" >"$BENCH_DIR/perf.log" 2>&1 &
@@ -274,15 +345,15 @@ case "$BENCH_MODE" in
         for transport in $BENCH_TRANSPORTS; do
             MASQUE_AUTH_CHECK=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
-            MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-            ECHO_SERVER_ADDR=127.0.0.1:9999 \
+            MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+            ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
             RUST_LOG=warn \
             "$BIN_DIR/masque-e2e"
 
             MASQUE_TCP_CHECK=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
-            MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-            ECHO_SERVER_ADDR=127.0.0.1:9999 \
+            MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+            ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
@@ -290,8 +361,8 @@ case "$BENCH_MODE" in
 
             MASQUE_UDP_CHECK=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
-            MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-            ECHO_SERVER_ADDR=127.0.0.1:9999 \
+            MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+            ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
@@ -300,8 +371,8 @@ case "$BENCH_MODE" in
             if [ "$transport" = http3 ]; then
                 MASQUE_MIGRATION_CHECK=1 \
                 MASQUE_BENCH_TRANSPORT=http3 \
-                MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-                ECHO_SERVER_ADDR=127.0.0.1:9999 \
+                MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+                ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
                 MASQUE_USERNAME=test \
                 MASQUE_PASSWORD=test-password \
                 RUST_LOG=warn \
@@ -316,8 +387,8 @@ case "$BENCH_MODE" in
         for transport in $BENCH_TRANSPORTS; do
             MASQUE_TCP_DOWNLOAD=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
-            MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-            MASQUE_TCP_TARGET=127.0.0.1:9998 \
+            MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+            MASQUE_TCP_TARGET="127.0.0.1:$HTTP_PORT" \
             MASQUE_TCP_DOWNLOAD_BYTES="$TCP_DOWNLOAD_BYTES" \
             MASQUE_TCP_DOWNLOAD_REPEATS="$TCP_DOWNLOAD_REPEATS" \
             MASQUE_USERNAME=test \
@@ -333,8 +404,8 @@ case "$BENCH_MODE" in
         for transport in $BENCH_TRANSPORTS; do
             MASQUE_BENCH=1 \
             MASQUE_BENCH_TRANSPORT="$transport" \
-            MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-            ECHO_SERVER_ADDR=127.0.0.1:9999 \
+            MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+            ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
             MASQUE_USERNAME=test \
             MASQUE_PASSWORD=test-password \
             RUST_LOG=warn \
@@ -348,21 +419,22 @@ if [ "$BENCH_MODE" = load ] || {
 }; then
     if [ "${MASQUE_LOAD_WARM_AUTH:-1}" = 1 ]; then
         MASQUE_UDP_CHECK=1 MASQUE_BENCH_TRANSPORT=http3 \
-        MASQUE_SERVER_ADDR=127.0.0.1:4433 ECHO_SERVER_ADDR=127.0.0.1:9999 \
+        MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
         MASQUE_USERNAME=test MASQUE_PASSWORD=test-password RUST_LOG=warn \
         "$BIN_DIR/masque-e2e"
     fi
     MASQUE_LOAD=1 \
     MASQUE_LOAD_CONNS="${LOAD_CONNS:-32}" \
     MASQUE_BENCH_TRANSPORT=http3 \
-    MASQUE_SERVER_ADDR=127.0.0.1:4433 \
-    ECHO_SERVER_ADDR=127.0.0.1:9999 \
+    MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
+    ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
     MASQUE_USERNAME=test \
     MASQUE_PASSWORD=test-password \
     RUST_LOG=warn \
     "$BIN_DIR/masque-e2e"
 fi
 
+kill -0 "$SERVER_PID" 2>/dev/null || { echo "benchmark server exited during measurement" >&2; exit 1; }
 if [ -n "$PERF_PID" ] && ! kill -0 "$PERF_PID" 2>/dev/null; then
     cat "$BENCH_DIR/perf.log" >&2
     echo "perf sampling failed" >&2
