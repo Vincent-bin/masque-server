@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.1 - 2026-10-31
+
+### Fixed
+
+- Retry temporarily flow-controlled HTTP/3 CONNECT response headers instead
+  of discarding TCP, UDP, and IP tunnels. Pending targets remain bounded and
+  are released when a stream is cancelled or times out.
+
+### Added
+
+- Add repeatable performance comparisons and loss-tolerant UDP latency
+  measurements for benchmark workloads.
+
 ## 0.14.0 - 2026-10-27
 
 ### Added
