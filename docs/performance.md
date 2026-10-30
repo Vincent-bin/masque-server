@@ -254,6 +254,102 @@ each can produce a client ceiling that looks like a server result. Always
 record `response_shortfall_pct`; higher offered load is not an improvement if
 fewer responses complete.
 
+## Repeatable performance baseline
+
+Run the standard local matrix with three rounds and a single release build:
+
+```sh
+python3 scripts/performance-baseline.py
+```
+
+The matrix covers HTTP/3 and HTTP/2 UDP and TCP, plus one-connection and
+multi-connection HTTP/3 load. Linux also runs two-shard load; other platforms
+record that case as skipped because server sharding requires Linux. UDP uses both 64-byte and
+1200-byte payloads. `--profile gso` adds the three enabled GSO combinations
+on Linux; the normal HTTP/3 case supplies the both-disabled control.
+`--profile quick --rounds 1 --duration 1` is a harness smoke test, not a
+performance conclusion. `--cc cubic|reno|bbr2` holds the chosen congestion
+controller constant throughout a run.
+
+Compare two compatible MASQUE Server builds with one identical client:
+
+```sh
+python3 scripts/performance-baseline.py \
+  --bin-dir target/release \
+  --reference-server /private/benchmark/reference/masque-server \
+  --rounds 3 --duration 10 \
+  --output /private/benchmark/comparison
+```
+
+Replace the documentation-only paths with private local locations. The output
+directory must be new and outside the checkout. The runner alternates A/B
+order and reverses workload order on alternate rounds. It clears inherited
+`MASQUE_*` settings, so an ambient endpoint, interface, or authentication setting
+cannot redirect the local test. `--bin-dir` skips rebuilding; both server
+binaries must accept the benchmark configuration. A Volto binary requires its
+own configuration adapter and is not accepted as a drop-in reference server.
+
+The private `report.json` includes binary SHA-256 values, workload settings,
+raw numeric records, medians and ranges, and optional A/B comparisons. It omits
+hostnames, addresses, credentials, and executable paths. Per-run logs remain
+in private subdirectories. Server CPU seconds and peak RSS come from `wait4`
+for only the temporary server; they exclude the client and target processes.
+Resource accounting covers the whole case, including startup and direct-control
+intervals. CPU percentage can exceed 100% for multiple busy cores. Compare
+resource usage only alongside equivalent completed traffic.
+The report is checkpointed after every successful workload; `complete = false`
+identifies an interrupted or failed matrix.
+
+UDP RTT percentiles are sequential 64-byte probes before throughput load;
+they do not describe tail latency under saturation. Load setup percentiles are
+connection setup measurements. TCP samples retain their sample indices so a
+cold first CONNECT is not pooled with later warm requests.
+
+HTTP/3 also records completed echo-request RTT while the throughput engine is
+running, in `UDP_LOAD_LATENCY_RESULT` and the `load_rtt_*` fields of
+`LOAD_RESULT`. This is application echo RTT, including client and server
+queueing, encryption, and scheduling, rather than QUIC's path RTT estimate.
+These use a fixed-memory histogram, with sixteen buckets per
+power of two and quantiles reported as `*_us_upper` bucket upper bounds.
+Buckets above 16 microseconds are at most 6.25% wide. Multi-connection results
+merge packet counts, not per-connection percentiles. Expired requests have no
+completed RTT and remain visible in the separate response-shortfall figures.
+The client also bounds completed-entry bookkeeping when an older request is
+lost, so the measurement window does not create an ever-growing tombstone queue.
+
+For an alternating controller comparison using the same server and client:
+
+```sh
+python3 scripts/performance-baseline.py --bin-dir target/release \
+  --profile congestion --reference-cc cubic --cc bbr2 \
+  --rounds 3 --duration 10
+```
+
+The congestion profile only runs QUIC workloads. `--reference-cc` and
+`--reference-server` are mutually exclusive to keep controller and build
+changes separate. The report records each controller explicitly. Loopback
+results validate the harness and local CPU cost; selecting a deployment default
+requires controlled bandwidth, RTT, and loss experiments on an isolated Linux
+test path. Host networking must not be modified to manufacture these conditions.
+
+A/B comparisons need at least three samples. Noisy samples, zero baselines,
+and a drifting direct control are marked `inconclusive`, with explicit reasons
+in each comparison. More unanswered UDP
+responses cannot qualify as a throughput improvement. By default the runner
+reports findings without failing on speed differences. On an isolated, stable
+benchmark machine, add `--fail-on-regression` to return exit code 3 for a
+confirmed regression or 4 for an inconclusive or empty comparison;
+the default tolerance is 10%, with a one-percentage-point response-shortfall
+tolerance. Shared CI runners should validate the harness rather than enforce
+throughput thresholds. This local matrix does not substitute for external-path
+GSO qualification or a controlled RTT/loss/MTU test.
+
+Network benchmark runs select temporary loopback ports by default. For a
+controlled environment, `MASQUE_BENCH_SERVER_PORT`, `MASQUE_BENCH_ECHO_PORT`,
+and `MASQUE_BENCH_HTTP_PORT` select explicit ports for `network-bench.sh`.
+Selection does not reserve the port until bind, so a concurrent user of the
+same port can still make a run fail; rerun it after resolving the collision.
+
 ## Linux verification
 
 During a controlled run:

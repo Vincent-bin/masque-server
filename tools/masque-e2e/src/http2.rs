@@ -24,7 +24,8 @@ use masque::capsule::{CapsuleFrame, encoder};
 
 use super::{
     HttpDownloadResponse, InFlight, TcpDownloadResult, UdpBenchConfig,
-    benchmark_direct_tcp_download, median, print_udp_result, proxy_authorization_value,
+    benchmark_direct_tcp_download, median, print_udp_latency_result, print_udp_result,
+    proxy_authorization_value,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -485,6 +486,7 @@ pub(super) fn benchmark_udp(
             latencies.push(started.elapsed().as_secs_f64() * 1e6);
         }
         latencies.sort_by(f64::total_cmp);
+        print_udp_latency_result("http2", "masque", &latencies);
         let percentile = |p: f64| super::percentile_nearest_rank(&latencies, p).unwrap();
         println!(
             "  setup {:.3} ms; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
