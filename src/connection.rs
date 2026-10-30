@@ -187,6 +187,9 @@ pub struct ClientConnection {
     pub udp_tunnels: FxHashMap<u64, UdpTunnel>,
     /// Active IP tunnels, keyed by stream ID.
     pub ip_tunnels: FxHashMap<u64, IpTunnel>,
+    /// CONNECT-IP response attempts waiting for stream capacity. Addresses
+    /// are not reserved while blocked, so dropping this state leaks no lease.
+    pub(crate) pending_ip_responses: FxHashMap<u64, std::time::Instant>,
     /// Streams whose CONNECT is waiting on credential verification.
     ///
     /// Request-body bytes for these streams are deliberately left unread in
@@ -251,6 +254,7 @@ impl ClientConnection {
             pending_tcp_tunnels: FxHashMap::default(),
             tcp_tunnels: FxHashMap::default(),
             pending_udp_tunnels: FxHashMap::default(),
+            pending_ip_responses: FxHashMap::default(),
             udp_tunnels: FxHashMap::default(),
             ip_tunnels: FxHashMap::default(),
             awaiting_auth: FxHashMap::default(),
@@ -365,6 +369,7 @@ impl ClientConnection {
             + self.pending_udp_tunnels.len()
             + self.udp_tunnels.len()
             + self.ip_tunnels.len()
+            + self.pending_ip_responses.len()
     }
 
     /// Publish tunnel gauges once after this connection's event-loop work.

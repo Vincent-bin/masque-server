@@ -82,6 +82,9 @@ pub struct PendingTcpTunnel {
     pub early_data: Vec<Vec<u8>>,
     pub early_bytes: usize,
     pub client_finished: bool,
+    /// Connected target retained while the HTTP/3 response is flow-controlled.
+    pub(crate) connected: Option<(TcpStream, SocketAddr)>,
+    pub(crate) response_blocked_at: Option<Instant>,
     connect_task: Option<JoinHandle<()>>,
 }
 
@@ -93,6 +96,8 @@ impl PendingTcpTunnel {
             early_data: Vec::new(),
             early_bytes: 0,
             client_finished: false,
+            connected: None,
+            response_blocked_at: None,
             connect_task: None,
         }
     }
@@ -117,6 +122,9 @@ impl PendingTcpTunnel {
 
     pub fn is_idle(&self, timeout: Duration) -> bool {
         self.last_activity.elapsed() > timeout
+            || self
+                .response_blocked_at
+                .is_some_and(|started| started.elapsed() > timeout)
     }
 }
 

@@ -313,6 +313,29 @@ impl Client {
         native_datagrams: bool,
         stream_window: u64,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_windows(
+            peer,
+            identity,
+            session,
+            enable_early_data,
+            source_ip,
+            native_datagrams,
+            stream_window,
+            1_048_576,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_with_windows(
+        peer: SocketAddr,
+        identity: Option<(&Path, &Path)>,
+        session: Option<&[u8]>,
+        enable_early_data: bool,
+        source_ip: std::net::IpAddr,
+        native_datagrams: bool,
+        stream_window: u64,
+        connection_window: u64,
+    ) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(SocketAddr::new(source_ip, 0))?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -328,7 +351,7 @@ impl Client {
         config.set_max_idle_timeout(10_000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_initial_max_data(1_048_576);
+        config.set_initial_max_data(connection_window);
         config.set_initial_max_stream_data_bidi_local(stream_window);
         config.set_initial_max_stream_data_bidi_remote(262_144);
         config.set_initial_max_stream_data_uni(262_144);
@@ -1431,6 +1454,266 @@ fn registered_client_gets_its_pinned_addresses_over_cf_connect_ip() {
             .any(|frame| matches!(frame, CapsuleFrame::RouteAdvertisement(_))),
         "expected ROUTE_ADVERTISEMENT, got {capsules:?}"
     );
+}
+
+#[test]
+fn blocked_responses_resume_after_connection_credit_is_replenished() {
+    use std::io::Write as _;
+    let dir = TempDir::new("response-credit-resume");
+    let key = p256_key();
+    let (cert, key) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("masque-server")),
+    );
+    let bulk_target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    let bulk_address = bulk_target.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut socket, _) = bulk_target.accept().unwrap();
+        let chunk = [0x42; 16384];
+        for _ in 0..1024 {
+            if socket.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+    });
+    let other_target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    other_target.set_nonblocking(true).unwrap();
+    let udp_target = UdpSocket::bind(ephemeral_addr()).unwrap();
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert;
+    config.tls.key_path = key;
+    config.listeners[0].listen_addr = ephemeral_addr();
+    config.listeners[0].shards = 1;
+    config.listeners[0].auth.enabled = false;
+    config.tcp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
+    config.tcp_proxy.deny_targets.clear();
+    config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
+    config.udp_proxy.deny_targets.clear();
+    let peer = spawn_server(config)[0];
+    let mut client = Client::connect_with_windows(
+        peer,
+        None,
+        None,
+        false,
+        "127.0.0.1".parse().unwrap(),
+        true,
+        262_144,
+        8192,
+    )
+    .unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let bulk_authority = bulk_address.to_string();
+    let bulk_headers = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":authority", bulk_authority.as_bytes()),
+    ];
+    let bulk = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &bulk_headers, false)
+        .unwrap();
+    client.flush().unwrap();
+    assert_eq!(
+        client
+            .response_status(bulk, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    // Receive without consuming the body, so the bulk stream exhausts the
+    // connection-level receive window and other responses cannot be written.
+    let until = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < until {
+        client.drive().unwrap();
+    }
+    let authority = other_target.local_addr().unwrap().to_string();
+    let tcp = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":authority", authority.as_bytes()),
+    ];
+    let tcp_stream = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &tcp, false)
+        .unwrap();
+    let path = format!(
+        "/.well-known/masque/udp/127.0.0.1/{}/",
+        udp_target.local_addr().unwrap().port()
+    );
+    let udp = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"connect-udp"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+    ];
+    let udp_stream = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &udp, false)
+        .unwrap();
+    let ip_stream = client.send_connect_ip("connect-ip").unwrap();
+    client.flush().unwrap();
+    let wait = Instant::now() + Duration::from_millis(500);
+    let mut accepted = None;
+    while Instant::now() < wait {
+        client.drive().unwrap();
+        if accepted.is_none() {
+            accepted = other_target.accept().ok();
+        }
+        while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            if [tcp_stream, udp_stream, ip_stream].contains(&id) {
+                panic!("response should be blocked before credit is restored: {event:?}");
+            }
+        }
+    }
+    assert!(
+        accepted.is_some(),
+        "new target must connect before its response can be blocked"
+    );
+    let until = Instant::now() + Duration::from_secs(8);
+    let mut completed = Vec::new();
+    let mut buffer = [0u8; 16384];
+    while Instant::now() < until && completed.len() < 3 {
+        while client
+            .h3
+            .as_mut()
+            .unwrap()
+            .recv_body(&mut client.quic, bulk, &mut buffer)
+            .is_ok()
+        {}
+        client.drive().unwrap();
+        while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            if [tcp_stream, udp_stream, ip_stream].contains(&id) {
+                match event {
+                    quiche::h3::Event::Headers { list, .. } => {
+                        assert!(
+                            list.iter()
+                                .any(|h| h.name() == b":status" && h.value() == b"200")
+                        );
+                        if !completed.contains(&id) {
+                            completed.push(id);
+                        }
+                    }
+                    quiche::h3::Event::Reset(code) => panic!("response reset: {code}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        completed.len(),
+        3,
+        "all blocked responses must resume after credit is returned"
+    );
+}
+
+#[test]
+fn blocked_tcp_connect_response_keeps_target_until_client_reset() {
+    let dir = TempDir::new("blocked-connect-response");
+    let key = p256_key();
+    let (cert, key) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("masque-server")),
+    );
+    let target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    target.set_nonblocking(true).unwrap();
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert;
+    config.tls.key_path = key;
+    config.listeners[0].listen_addr = ephemeral_addr();
+    config.listeners[0].shards = 1;
+    config.listeners[0].auth.enabled = false;
+    config.ip_proxy.enabled = false;
+    config.tcp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
+    config.tcp_proxy.deny_targets.clear();
+    let peer = spawn_server(config)[0];
+    // One byte of per-stream response credit cannot fit an HTTP/3 HEADERS
+    // frame. QUIC control streams have independent credit and still work.
+    let mut client = Client::connect_with_transport(
+        peer,
+        None,
+        None,
+        false,
+        "127.0.0.1".parse().unwrap(),
+        true,
+        1,
+    )
+    .unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let authority = target.local_addr().unwrap().to_string();
+    let headers = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":authority", authority.as_bytes()),
+    ];
+    let stream = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &headers, false)
+        .unwrap();
+    client.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut accepted = None;
+    while Instant::now() < deadline {
+        client.drive().unwrap();
+        match client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            Ok((id, quiche::h3::Event::Reset(_))) if id == stream => {
+                panic!("blocked response was reset")
+            }
+            Ok(_) | Err(quiche::h3::Error::Done) => {}
+            Err(error) => panic!("HTTP/3 failure: {error}"),
+        }
+        if let Ok((socket, _)) = target.accept() {
+            accepted = Some(socket);
+            break;
+        }
+    }
+    let mut target_socket = accepted.expect("target connection must be retained");
+    let still_blocked_until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < still_blocked_until {
+        client.drive().unwrap();
+        match client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            Ok((id, quiche::h3::Event::Reset(_))) if id == stream => {
+                panic!("blocked response was reset while waiting")
+            }
+            Ok(_) | Err(quiche::h3::Error::Done) => {}
+            Err(error) => panic!("HTTP/3 failure: {error}"),
+        }
+    }
+    target_socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    client
+        .quic
+        .stream_shutdown(stream, quiche::Shutdown::Read, 0)
+        .unwrap();
+    client
+        .quic
+        .stream_shutdown(stream, quiche::Shutdown::Write, 0)
+        .unwrap();
+    client.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    target_socket.set_nonblocking(true).unwrap();
+    let mut byte = [0u8; 1];
+    use std::io::Read as _;
+    loop {
+        client.drive().unwrap();
+        match target_socket.read(&mut byte) {
+            Ok(0) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {}
+            result => panic!("target socket not released: {result:?}"),
+        }
+    }
 }
 
 #[test]
