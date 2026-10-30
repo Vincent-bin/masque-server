@@ -2655,6 +2655,9 @@ impl Shard {
 
             // Process QUIC DATAGRAMs → forward to target UDP/TUN.
             if !shutting_down {
+                self.retry_tcp_connect_responses(&serviced);
+                self.retry_udp_connect_responses(&serviced);
+                self.retry_ip_connect_responses(&serviced);
                 self.flush_tcp_responses(&serviced);
                 self.read_capsule_bodies(&serviced);
                 self.relay_client_datagrams(&serviced, &mut dgram_buf, &mut tun_send)
@@ -3385,6 +3388,7 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
+                        client.pending_ip_responses.remove(&stream_id);
                         if client.capsule_streams.contains_key(&stream_id) {
                             finished_capsule_streams.push(stream_id);
                             continue;
@@ -3412,6 +3416,7 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        client.pending_ip_responses.remove(&stream_id);
                         closed_capsule_streams.push(stream_id);
                         // A late verification result for this stream is moot.
                         client.awaiting_auth.remove(&stream_id);
@@ -3655,9 +3660,20 @@ impl Shard {
                 .lock()
                 .expect("address pool poisoned")
                 .release_all(&addresses);
+            if matches!(
+                e,
+                quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done
+            ) {
+                client
+                    .pending_ip_responses
+                    .entry(stream_id)
+                    .or_insert_with(Instant::now);
+                return;
+            }
             warn!(stream_id, %e, "failed to send CONNECT-IP 200");
             return;
         }
+        client.pending_ip_responses.remove(&stream_id);
 
         // A reconnect using the same registered key may briefly overlap its
         // stale predecessor. Inserting replaces the return route atomically;
@@ -3697,6 +3713,34 @@ impl Shard {
             return;
         }
         info!(stream_id, "CONNECT-IP tunnel established");
+    }
+
+    fn retry_ip_connect_responses(&mut self, dirty: &[u64]) {
+        for index in dirty {
+            let Some(conn_id) = self.conn_by_index.get(index) else {
+                continue;
+            };
+            let Some(client) = self.connections.get_mut(conn_id) else {
+                continue;
+            };
+            let streams: Vec<u64> = client.pending_ip_responses.keys().copied().collect();
+            for stream_id in streams {
+                let started = client
+                    .pending_ip_responses
+                    .remove(&stream_id)
+                    .expect("pending response exists");
+                Self::setup_ip_tunnel(
+                    &self.shared,
+                    client,
+                    stream_id,
+                    *index,
+                    self.config.ip_proxy.tun_mtu,
+                );
+                if let Some(blocked_at) = client.pending_ip_responses.get_mut(&stream_id) {
+                    *blocked_at = started;
+                }
+            }
+        }
     }
 
     /// Release addresses and remove routes for a closing IP tunnel.
@@ -3796,9 +3840,6 @@ impl Shard {
             // The stream or connection disappeared while DNS was in flight.
             return;
         };
-        let header = pending.header();
-        let early_datagrams = pending.take_early_datagrams();
-        drop(pending);
         self.dirty.mark(connection_index);
 
         let prepared = match result {
@@ -3825,10 +3866,21 @@ impl Shard {
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
         ];
         if let Err(error) = h3.send_response(&mut client.quic, stream_id, &headers, false) {
+            if matches!(
+                error,
+                quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done
+            ) {
+                pending.prepared = Some(prepared);
+                client.pending_udp_tunnels.insert(stream_id, pending);
+                return;
+            }
             warn!(stream_id, %error, "failed to send CONNECT-UDP response");
             return;
         }
 
+        let header = pending.header();
+        let early_datagrams = pending.take_early_datagrams();
+        drop(pending);
         let (send_socket, socket, target_addr, target_udp_gso) = prepared.into_http3();
         let recv_socket = Arc::clone(&socket);
         let response_tx = self.udp_response_tx.clone();
@@ -3936,6 +3988,30 @@ impl Shard {
         );
     }
 
+    fn retry_udp_connect_responses(&mut self, dirty: &[u64]) {
+        let mut ready = Vec::new();
+        for index in dirty {
+            let Some(conn_id) = self.conn_by_index.get(index) else {
+                continue;
+            };
+            let Some(client) = self.connections.get_mut(conn_id) else {
+                continue;
+            };
+            for (stream_id, pending) in &mut client.pending_udp_tunnels {
+                if let Some(prepared) = pending.prepared.take() {
+                    ready.push(UdpSetupResult {
+                        connection_index: *index,
+                        stream_id: *stream_id,
+                        result: Ok(prepared),
+                    });
+                }
+            }
+        }
+        for result in ready {
+            self.handle_udp_setup_result(result);
+        }
+    }
+
     /// Apply an event generated by an asynchronous target TCP task.
     fn handle_tcp_event_batch(&mut self, first: TcpRelayEvent) {
         let mut next = Some(first);
@@ -4005,6 +4081,15 @@ impl Shard {
                         if let Err(error) =
                             h3.send_response(&mut client.quic, stream_id, &headers, false)
                         {
+                            if matches!(
+                                error,
+                                quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done
+                            ) {
+                                pending.connected = Some((stream, target_addr));
+                                pending.response_blocked_at.get_or_insert_with(Instant::now);
+                                client.pending_tcp_tunnels.insert(stream_id, pending);
+                                return;
+                            }
                             warn!(
                                 stream_id,
                                 %error,
@@ -4082,6 +4167,32 @@ impl Shard {
                     Self::reset_tcp_stream(client, stream_id);
                 }
             }
+        }
+    }
+
+    /// Retry only connections made dirty by incoming packets or timers. A
+    /// blocked response does not mark itself dirty, avoiding a busy loop.
+    fn retry_tcp_connect_responses(&mut self, dirty: &[u64]) {
+        let mut ready = Vec::new();
+        for index in dirty {
+            let Some(conn_id) = self.conn_by_index.get(index) else {
+                continue;
+            };
+            let Some(client) = self.connections.get_mut(conn_id) else {
+                continue;
+            };
+            for (stream_id, pending) in &mut client.pending_tcp_tunnels {
+                if let Some(connected) = pending.connected.take() {
+                    ready.push(TcpRelayEvent::ConnectResult {
+                        connection_index: *index,
+                        stream_id: *stream_id,
+                        result: Ok(connected),
+                    });
+                }
+            }
+        }
+        for event in ready {
+            self.handle_tcp_event(event);
         }
     }
 
@@ -4552,6 +4663,22 @@ impl Shard {
         let dirty = &mut self.dirty;
 
         for (conn_id, client) in &mut self.connections {
+            let expired_ip: Vec<u64> = client
+                .pending_ip_responses
+                .iter()
+                .filter_map(|(stream, started)| (started.elapsed() > timeout).then_some(*stream))
+                .collect();
+            for stream in expired_ip {
+                client.pending_ip_responses.remove(&stream);
+                let code = quiche::h3::WireErrorCode::RequestCancelled as u64;
+                let _ = client
+                    .quic
+                    .stream_shutdown(stream, quiche::Shutdown::Read, code);
+                let _ = client
+                    .quic
+                    .stream_shutdown(stream, quiche::Shutdown::Write, code);
+                dirty.mark(client.index);
+            }
             // Borrow the fields separately so the tunnel maps can be walked
             // while still writing to the same connection's H3 stream.
             let ClientConnection {
@@ -4578,6 +4705,13 @@ impl Shard {
                     return true;
                 }
                 info!(stream_id, "closing idle pending TCP tunnel");
+                if tunnel.connected.is_some() {
+                    let error = quiche::h3::WireErrorCode::RequestCancelled as u64;
+                    let _ = quic.stream_shutdown(*stream_id, quiche::Shutdown::Read, error);
+                    let _ = quic.stream_shutdown(*stream_id, quiche::Shutdown::Write, error);
+                    wrote = true;
+                    return false;
+                }
                 if let Some(h3) = h3.as_mut() {
                     Self::send_error_response(h3, quic, *stream_id, 504);
                     wrote = true;
@@ -4590,6 +4724,13 @@ impl Shard {
                     return true;
                 }
                 info!(stream_id, "closing idle pending UDP tunnel");
+                if tunnel.prepared.is_some() {
+                    let error = quiche::h3::WireErrorCode::RequestCancelled as u64;
+                    let _ = quic.stream_shutdown(*stream_id, quiche::Shutdown::Read, error);
+                    let _ = quic.stream_shutdown(*stream_id, quiche::Shutdown::Write, error);
+                    wrote = true;
+                    return false;
+                }
                 if let Some(h3) = h3.as_mut() {
                     Self::send_error_response(h3, quic, *stream_id, 504);
                     wrote = true;

@@ -167,6 +167,7 @@ pub(crate) struct PendingUdpTunnel {
     started_at: Instant,
     setup_task: Option<JoinHandle<()>>,
     early_datagrams: EarlyUdpDatagrams,
+    pub(crate) prepared: Option<ConnectedUdpTarget>,
 }
 
 impl PendingUdpTunnel {
@@ -179,6 +180,7 @@ impl PendingUdpTunnel {
             started_at: Instant::now(),
             setup_task: None,
             early_datagrams: EarlyUdpDatagrams::new(early_udp_budget),
+            prepared: None,
         }
     }
 
@@ -191,6 +193,7 @@ impl PendingUdpTunnel {
             started_at: Instant::now(),
             setup_task: None,
             early_datagrams,
+            prepared: None,
         }
     }
 
