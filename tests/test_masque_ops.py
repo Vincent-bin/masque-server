@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = ROOT / ".agents" / "skills" / "masque-ops"
 SCRIPT = SKILL_ROOT / "scripts" / "masque-ops.py"
 REPOSITORY_LAUNCHER = ROOT / "scripts" / "masque-ops.py"
+PACKAGE_VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
 SPEC = importlib.util.spec_from_file_location("masque_ops", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 ops = importlib.util.module_from_spec(SPEC)
@@ -531,7 +533,7 @@ class OperationTests(unittest.TestCase):
 
 class SecurityTests(unittest.TestCase):
     def test_skill_is_self_contained_and_versioned(self) -> None:
-        self.assertEqual((SKILL_ROOT / "VERSION").read_text().strip(), "0.14.0")
+        self.assertEqual((SKILL_ROOT / "VERSION").read_text().strip(), PACKAGE_VERSION)
         self.assertEqual(
             (SKILL_ROOT / "scripts/install-latest.sh").read_bytes(),
             (ROOT / "install-latest.sh").read_bytes(),
@@ -555,7 +557,7 @@ class SecurityTests(unittest.TestCase):
                 check=False,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "masque-ops 0.14.0")
+        self.assertEqual(completed.stdout.strip(), f"masque-ops {PACKAGE_VERSION}")
 
     def test_repository_launcher_uses_the_bundled_cli(self) -> None:
         completed = subprocess.run(
@@ -565,7 +567,7 @@ class SecurityTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "masque-ops 0.14.0")
+        self.assertEqual(completed.stdout.strip(), f"masque-ops {PACKAGE_VERSION}")
 
     @unittest.skipUnless(shutil.which("sh"), "POSIX shell is required")
     def test_embedded_remote_scripts_have_valid_shell_syntax(self) -> None:
