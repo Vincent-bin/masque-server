@@ -486,7 +486,7 @@ pub(super) fn benchmark_udp(
             latencies.push(started.elapsed().as_secs_f64() * 1e6);
         }
         latencies.sort_by(f64::total_cmp);
-        print_udp_latency_result("http2", "masque", &latencies);
+        print_udp_latency_result("http2", "masque", &latencies, 0);
         let percentile = |p: f64| super::percentile_nearest_rank(&latencies, p).unwrap();
         println!(
             "  setup {:.3} ms; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",

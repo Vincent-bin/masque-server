@@ -839,7 +839,9 @@ impl Client {
             }
 
             if Instant::now() > deadline {
-                bail!("datagram timeout");
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "datagram timeout").into(),
+                );
             }
             self.drive()?;
         }
@@ -2111,10 +2113,10 @@ impl UdpBenchConfig {
     }
 }
 
-fn print_udp_latency_result(transport: &str, path: &str, sorted: &[f64]) {
+fn print_udp_latency_result(transport: &str, path: &str, sorted: &[f64], expired: usize) {
     println!(
         "UDP_LATENCY_RESULT transport={transport} path={path} payload_bytes=64 samples={} \
-rtt_p50_us={:.3} rtt_p95_us={:.3} rtt_p99_us={:.3}",
+rtt_p50_us={:.3} rtt_p95_us={:.3} rtt_p99_us={:.3} expired_probes={expired}",
         sorted.len(),
         percentile_nearest_rank(sorted, 0.50).unwrap(),
         percentile_nearest_rank(sorted, 0.95).unwrap(),
@@ -2164,20 +2166,45 @@ fn benchmark_direct_udp(
     println!("Direct UDP echo baseline:");
     let direct_socket = connect_echo_socket(echo_addr)?;
     direct_socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let latency_payload = vec![0x3c; 64];
+    let mut latency_payload = vec![0x3c; 64];
     let mut response = [0u8; BUF_SIZE];
     let mut direct_latencies = Vec::with_capacity(config.latency_samples);
-    for _ in 0..config.latency_samples {
+    let mut expired = 0;
+    for sequence in 0..config.latency_samples {
+        latency_payload[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
         let started = Instant::now();
         direct_socket.send(&latency_payload)?;
-        let len = direct_socket.recv(&mut response)?;
-        if response[..len] != latency_payload {
-            bail!("direct UDP latency probe payload mismatch");
+        loop {
+            let remaining = Duration::from_secs(2).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                expired += 1;
+                break;
+            }
+            direct_socket.set_read_timeout(Some(remaining))?;
+            match direct_socket.recv(&mut response) {
+                Ok(len) if response[..len] == latency_payload => {
+                    direct_latencies.push(started.elapsed().as_secs_f64() * 1e6);
+                    break;
+                }
+                Ok(_) => continue, // A late response must not match a later probe.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    expired += 1;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        direct_latencies.push(started.elapsed().as_secs_f64() * 1e6);
+    }
+    if direct_latencies.is_empty() {
+        bail!("all direct UDP latency probes timed out");
     }
     direct_latencies.sort_by(f64::total_cmp);
-    print_udp_latency_result(transport.as_str(), "direct", &direct_latencies);
+    print_udp_latency_result(transport.as_str(), "direct", &direct_latencies, expired);
     let percentile = |p: f64| percentile_nearest_rank(&direct_latencies, p).unwrap();
     println!(
         "  RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
@@ -2227,19 +2254,43 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
         None
     };
 
-    let latency_payload = vec![0x3c; 64];
+    let mut latency_payload = vec![0x3c; 64];
     let mut latencies = Vec::with_capacity(config.latency_samples);
-    for _ in 0..config.latency_samples {
+    let mut expired = 0;
+    for sequence in 0..config.latency_samples {
+        latency_payload[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
         let started = Instant::now();
         client.send_dgram(stream_id, &latency_payload)?;
-        let response = client.recv_dgram(Duration::from_secs(2))?;
-        if response.payload != latency_payload {
-            bail!("latency probe payload mismatch");
+        loop {
+            let remaining = Duration::from_secs(2).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                expired += 1;
+                break;
+            }
+            match client.recv_dgram(remaining) {
+                Ok(response)
+                    if response.stream_id == stream_id && response.payload == latency_payload =>
+                {
+                    latencies.push(started.elapsed().as_secs_f64() * 1e6);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut) =>
+                {
+                    expired += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        latencies.push(started.elapsed().as_secs_f64() * 1e6);
+    }
+    if latencies.is_empty() {
+        bail!("all HTTP/3 UDP latency probes timed out");
     }
     latencies.sort_by(f64::total_cmp);
-    print_udp_latency_result("http3", result_path, &latencies);
+    print_udp_latency_result("http3", result_path, &latencies, expired);
     let percentile = |p: f64| percentile_nearest_rank(&latencies, p).unwrap();
     println!(
         "  setup {:.3} ms{}; RTT 64B ({} samples): p50 {:.1} us, p95 {:.1} us, p99 {:.1} us",
@@ -2781,6 +2832,52 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_udp_benchmark_survives_a_lost_latency_probe() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let address = socket.local_addr().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopped);
+        let server = std::thread::spawn(move || {
+            let mut buffer = [0u8; BUF_SIZE];
+            let mut first = true;
+            while !stop.load(Ordering::Relaxed) {
+                match socket.recv_from(&mut buffer) {
+                    Ok((len, peer)) if first => {
+                        first = false;
+                        // A reply arriving after the first probe timed out must
+                        // not be mistaken for the second probe's response.
+                        std::thread::sleep(Duration::from_millis(2050));
+                        socket.send_to(&buffer[..len], peer).unwrap();
+                    }
+                    Ok((len, peer)) => {
+                        socket.send_to(&buffer[..len], peer).unwrap();
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(e) => panic!("echo server failed: {e}"),
+                }
+            }
+        });
+        let config = UdpBenchConfig {
+            duration: Duration::from_secs(1),
+            window: 8,
+            latency_samples: 2,
+            expiry: Duration::from_millis(100),
+        };
+        let result = benchmark_direct_udp(&address.to_string(), config, BenchTransport::Http3);
+        stopped.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+    }
 
     #[test]
     fn a_lost_request_does_not_retain_unbounded_completed_entries() {
