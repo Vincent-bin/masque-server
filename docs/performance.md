@@ -152,11 +152,34 @@ supporting processes needed by that measurement. `MASQUE_BENCH_SHARDS`
 selects the listener shard count; `0` retains the server's documented
 one-shard-per-core behavior.
 
+For CONNECT-IP, use a Linux host with `unshare`, `ip`, and TUN support. The
+script creates an ephemeral network namespace and needs root or equivalent
+privileges; its echo target and TUN exist only in that namespace:
+
+```sh
+cargo build --workspace --release
+sudo env MASQUE_BENCH_BIN_DIR=target/release MASQUE_IP_BENCH_TUN_OFFLOAD=1 \
+  bash scripts/connect-ip-bench.sh
+```
+
+Alternate `MASQUE_IP_BENCH_TUN_OFFLOAD=0` and `1` for at least three rounds,
+and confirm `IP_BENCH_TUN effective_offload` before interpreting the results.
+The test uses UDP echo packets inside CONNECT-IP; it does not measure TCP
+goodput through a client TUN or performance over a real network path.
+
 `MASQUE_BENCH_TRANSPORT` accepts `http3` (the default), `http2`, or `both` for
 the smoke, TCP, and UDP modes. `both` binds TCP and UDP on the same address and
 runs HTTP/3 first, then HTTP/2. It requires an explicit non-zero HTTP/3 shard
 count. Multi-connection `load` mode remains HTTP/3-only until its native-thread
 packet engine has an equivalent asynchronous HTTP/2 implementation.
+
+For local HTTP/3 TLS verification checks, set `MASQUE_BENCH_VERIFY_TLS=1`.
+The generated loopback certificate is then trusted and its `server` hostname
+is verified. When using the HTTP/3 client directly against a remote endpoint,
+set `MASQUE_BENCH_CA_CERT` to a trusted CA PEM file and `MASQUE_SERVER_NAME`
+to the expected certificate name. Without the CA setting the E2E client does
+not verify the server certificate; do not use credentials you care about on
+that path. This option currently applies to HTTP/3 only.
 
 `MASQUE_BENCH_CC=cubic|reno|bbr2` selects the server's QUIC congestion
 controller for a benchmark; the default is `cubic`. Alternate controllers over
@@ -190,9 +213,16 @@ printing the record.
 Use `MASQUE_BENCH_QUIC_GSO=0|1` for the outer QUIC socket and
 `MASQUE_BENCH_TARGET_GSO=0|1` for CONNECT-UDP target egress; both default to
 `0`. Test them separately so a result can be attributed to one egress path. Set
+`MASQUE_BENCH_QUIC_GRO=0|1` to compare QUIC receive coalescing; it defaults
+to `1`, matching the server default. Set
 `MASQUE_BENCH_OBSERVABILITY=1` to enable the loopback endpoint and metric
 updates during an A/B run; the default `0` measures the uninstrumented packet
 path.
+
+For a privileged Linux profiling run, `MASQUE_BENCH_PERF=1` records the server
+only. Set `MASQUE_BENCH_PERF_EVENT=cpu-clock` to include kernel samples; the
+default `cpu-clock:u` samples userspace only. Sampling adds overhead and should
+be run separately from throughput comparisons.
 
 For HTTP/3 migration A/B testing, run the same UDP command once normally and
 once with `MASQUE_BENCH_MIGRATED=1`. The latter replaces the client's UDP
