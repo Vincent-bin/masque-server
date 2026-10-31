@@ -17,7 +17,10 @@ esac
 bin="${MASQUE_BENCH_BIN_DIR:-target/release}"
 client="${MASQUE_IP_BENCH_CLIENT_BIN:-$bin/masque-e2e}"
 server="$bin/masque-server"
-[ -x "$client" ] && [ -x "$server" ] || { echo 'benchmark executables missing' >&2; exit 2; }
+if [ ! -x "$client" ] || [ ! -x "$server" ]; then
+    echo 'benchmark executables missing' >&2
+    exit 2
+fi
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/masque-ip-bench.XXXXXX")"
 server_job=''
 echo_pid=''
