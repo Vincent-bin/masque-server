@@ -349,6 +349,33 @@ struct ThroughputStats {
     rtt: RttHistogram,
 }
 
+#[derive(Clone, Copy)]
+struct IpEchoTarget {
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    port: u16,
+}
+
+fn ip_echo_payload(packet: &[u8], target: IpEchoTarget) -> Option<&[u8]> {
+    if packet.len() < 28
+        || packet[0] >> 4 != 4
+        || packet[9] != 17
+        || packet[12..16] != target.destination.octets()
+        || packet[16..20] != target.source.octets()
+    {
+        return None;
+    }
+    let offset = usize::from(packet[0] & 15) * 4;
+    if offset < 20
+        || packet.len() < offset + 16
+        || packet[offset..offset + 2] != target.port.to_be_bytes()
+        || packet[offset + 2..offset + 4] != 12345_u16.to_be_bytes()
+    {
+        return None;
+    }
+    Some(&packet[offset + 8..])
+}
+
 // ---------------------------------------------------------------------------
 // QUIC + H3 test client
 // ---------------------------------------------------------------------------
@@ -387,7 +414,25 @@ impl Client {
         let scid = quiche::ConnectionId::from_ref(&scid_buf);
 
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-        config.verify_peer(false);
+        let verify_server = std::env::var_os("MASQUE_BENCH_CA_CERT");
+        let server_name = if let Some(ca_file) = verify_server {
+            let ca_file = ca_file
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("MASQUE_BENCH_CA_CERT is not valid UTF-8"))?;
+            let server_name = std::env::var("MASQUE_SERVER_NAME")
+                .context("MASQUE_SERVER_NAME is required with MASQUE_BENCH_CA_CERT")?;
+            if server_name.trim().is_empty() {
+                bail!("MASQUE_SERVER_NAME must not be empty");
+            }
+            config
+                .load_verify_locations_from_file(&ca_file)
+                .context("load benchmark CA certificate")?;
+            config.verify_peer(true);
+            server_name
+        } else {
+            config.verify_peer(false);
+            std::env::var("MASQUE_SERVER_NAME").unwrap_or_else(|_| "server".into())
+        };
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
         config.set_max_idle_timeout(30_000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -409,7 +454,6 @@ impl Client {
         config.enable_pacing(true);
         config.enable_dgram(true, 1000, 1000);
 
-        let server_name = std::env::var("MASQUE_SERVER_NAME").unwrap_or_else(|_| "server".into());
         let quic = quiche::connect(Some(&server_name), &scid, local, peer, &mut config)?;
 
         Ok(Client {
@@ -856,6 +900,7 @@ impl Client {
         duration: Duration,
         window: usize,
         expiry: Duration,
+        ip_target: Option<IpEchoTarget>,
     ) -> Result<ThroughputStats> {
         if payload_size < 8 {
             bail!("benchmark payload must be at least 8 bytes");
@@ -866,7 +911,19 @@ impl Client {
         let deadline = started + duration;
         let drain_deadline = deadline + expiry;
         let mut payload = vec![0x5a; payload_size];
-        let mut encoded = Vec::with_capacity(payload_size + 16);
+        let sequence_offset = if let Some(target) = ip_target {
+            payload = build_udp_in_ipv4(
+                target.source,
+                target.destination,
+                12345,
+                target.port,
+                &payload,
+            );
+            28
+        } else {
+            0
+        };
+        let mut encoded = Vec::with_capacity(payload.len() + 16);
         let mut packet_buf = [0u8; BUF_SIZE];
         let mut dgram_buf = [0u8; BUF_SIZE];
         let mut in_flight = InFlight::with_capacity(window);
@@ -882,7 +939,8 @@ impl Client {
 
             let mut made_progress = false;
             while now < deadline && in_flight.len() < window {
-                payload[..8].copy_from_slice(&next_sequence.to_be_bytes());
+                payload[sequence_offset..sequence_offset + 8]
+                    .copy_from_slice(&next_sequence.to_be_bytes());
                 masque::datagram::encode_payload_into(stream_id, &payload, &mut encoded)
                     .map_err(|e| anyhow::anyhow!("encode datagram: {e}"))?;
 
@@ -929,10 +987,21 @@ impl Client {
                 };
                 let dgram = masque::datagram::decode_ref(&dgram_buf[..len])
                     .map_err(|e| anyhow::anyhow!("decode dgram: {e}"))?;
-                if dgram.stream_id != stream_id || dgram.payload.len() < 8 {
+                if dgram.stream_id != stream_id {
                     continue;
                 }
-                let sequence = u64::from_be_bytes(dgram.payload[..8].try_into().unwrap());
+                let response = if let Some(target) = ip_target {
+                    let Some(response) = ip_echo_payload(dgram.payload, target) else {
+                        continue;
+                    };
+                    response
+                } else {
+                    dgram.payload
+                };
+                if response.len() != payload_size {
+                    continue;
+                }
+                let sequence = u64::from_be_bytes(response[..8].try_into().unwrap());
                 if let Some(sent_at) = in_flight.remove_sent_at(&sequence) {
                     received += 1;
                     rtt.record(received_at.saturating_duration_since(sent_at));
@@ -1921,7 +1990,14 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             // single-connection benchmark. Keeping one packet engine avoids
             // a second implementation silently changing pacing, draining, or
             // expiry semantics.
-            match client.run_echo_throughput(stream_id, payload_size, duration, window, expiry) {
+            match client.run_echo_throughput(
+                stream_id,
+                payload_size,
+                duration,
+                window,
+                expiry,
+                None,
+            ) {
                 Ok(throughput) => {
                     WorkerOutcome::Finished(Box::new(WorkerStats { setup, throughput }))
                 }
@@ -2317,6 +2393,7 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
             config.duration,
             config.window,
             config.expiry,
+            None,
         )?;
         print_udp_result(
             "http3",
@@ -2620,6 +2697,72 @@ fn test_connect_ip_round_trip(server_addr: &str, echo_addr: &str) -> Result<()> 
     Ok(())
 }
 
+fn benchmark_connect_ip(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let config = UdpBenchConfig::from_env()?;
+    let echo: SocketAddr = echo_addr.parse().context("invalid echo address")?;
+    let std::net::SocketAddr::V4(echo) = echo else {
+        bail!("CONNECT-IP benchmark currently requires an IPv4 echo target");
+    };
+
+    for payload_size in [64, 1_200] {
+        let mut client = Client::connect(server_addr)?;
+        client.handshake()?;
+        client.init_h3()?;
+        let headers = connect_ip_headers(server_addr)?;
+        let stream_id = client.send_request(&headers, false)?;
+        let (_, status) = client.poll_response(Duration::from_secs(5))?;
+        if status != 200 {
+            bail!("CONNECT-IP returned status {status}");
+        }
+        let assigned = client
+            .recv_capsules(stream_id, Duration::from_secs(5))?
+            .iter()
+            .find_map(|frame| match frame {
+                CapsuleFrame::AddressAssign(addrs) => {
+                    addrs.iter().find_map(|address| match &address.ip {
+                        masque::capsule::IpAddress::V4(ip) => Some(*ip),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .context("CONNECT-IP did not assign IPv4")?;
+        let target = IpEchoTarget {
+            source: assigned,
+            destination: *echo.ip(),
+            port: echo.port(),
+        };
+        let stats = client.run_echo_throughput(
+            stream_id,
+            payload_size,
+            config.duration,
+            config.window,
+            config.expiry,
+            Some(target),
+        )?;
+        print_udp_result(
+            "http3",
+            "connect_ip",
+            payload_size,
+            config.duration,
+            stats.sent,
+            stats.received,
+            stats.expired,
+        );
+        println!(
+            "UDP_LOAD_LATENCY_RESULT transport=http3 path=connect_ip payload_bytes={payload_size} samples={} load_rtt_p50_us_upper={} load_rtt_p95_us_upper={} load_rtt_p99_us_upper={}",
+            stats.rtt.total,
+            stats.rtt.percentile_upper_us(50),
+            stats.rtt.percentile_upper_us(95),
+            stats.rtt.percentile_upper_us(99)
+        );
+        if stats.received == 0 {
+            bail!("CONNECT-IP received no echo responses");
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2756,6 +2899,18 @@ fn main() {
         return;
     }
 
+    if std::env::var_os("MASQUE_IP_BENCH").is_some() {
+        if transport != BenchTransport::Http3 {
+            error!("CONNECT-IP benchmark currently requires HTTP/3");
+            std::process::exit(2);
+        }
+        if let Err(error) = benchmark_connect_ip(&server_addr, &echo_addr) {
+            error!(%error, "CONNECT-IP benchmark failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if std::env::var_os("MASQUE_BENCH").is_some() {
         if let Err(e) = benchmark_connect_udp(&server_addr, &echo_addr, transport) {
             error!(%e, "network benchmark failed");
@@ -2832,6 +2987,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_ip_benchmark_accepts_only_expected_udp_echoes() {
+        let target = IpEchoTarget {
+            source: Ipv4Addr::new(10, 89, 0, 2),
+            destination: Ipv4Addr::new(198, 18, 0, 1),
+            port: 9999,
+        };
+        let payload = 42_u64.to_be_bytes();
+        let response = build_udp_in_ipv4(
+            target.destination,
+            target.source,
+            target.port,
+            12345,
+            &payload,
+        );
+        assert_eq!(ip_echo_payload(&response, target), Some(payload.as_slice()));
+        assert!(ip_echo_payload(&response[..27], target).is_none());
+        let mut wrong_port = response;
+        wrong_port[23] ^= 1;
+        assert!(ip_echo_payload(&wrong_port, target).is_none());
+    }
 
     #[test]
     fn direct_udp_benchmark_survives_a_lost_latency_probe() {
