@@ -45,13 +45,14 @@ destination and segment size. With UDP GSO, one message contains multiple
 segments; `sendmmsg` submits multiple messages in one kernel entry.
 
 The batch is constrained by quiche's `send_quantum()` and pacing metadata.
-Batching never sends a packet before the time supplied by quiche.
+To account for millisecond timer resolution, packets may be sent up to 1 ms
+before the time supplied by quiche. This trades a bounded burst for fewer timer
+wakeups; it is not kernel-precision pacing.
 
 Paced output retains at most 64 packets and 128 KiB of payload per connection.
-Packets within a 100-microsecond pacing group share a wakeup at the latest
-deadline in that group, so earlier packets may wait up to 100 microseconds but
-none is sent early. An extra packet beyond the group is retained for its next
-deadline. The queue reuses packet buffers under a separate 128 KiB spare-buffer
+The event loop wakes for the first queued deadline and releases packets through
+one millisecond beyond the current time. Prefetch is bounded to roughly that
+window, with one extra packet retained for the next deadline. The queue reuses packet buffers under a separate 128 KiB spare-buffer
 budget and is discarded when a connection closes. This lets per-packet pacers
 such as BBR2 prepare a bounded burst instead of serializing only one packet per
 timer wakeup. CUBIC remains the default controller.

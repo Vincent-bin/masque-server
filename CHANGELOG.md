@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.2 - 2026-11-03
+
+### Fixed
+
+- Batch paced HTTP/3 output within a bounded one-millisecond release horizon
+  to avoid a single packet per timer wakeup on long-RTT connections. Packets
+  may be sent up to one millisecond before their requested pacing time.
+
+### Added
+
+- Add a read-only local service status overview and protocol architecture
+  documentation.
+
 ## 0.14.1 - 2026-10-31
 
 ### Fixed

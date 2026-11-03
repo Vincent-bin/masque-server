@@ -77,8 +77,7 @@ impl Drop for AwaitingAuth {
     }
 }
 
-/// Serialized packets retained until quiche's pacing deadlines. A bounded
-/// 100 microsecond group amortizes timer wakeups; no packet is released early.
+/// Serialized packets retained across pacing wakeups with bounded storage.
 #[derive(Default)]
 pub(crate) struct DeferredSend {
     packets: std::collections::VecDeque<(Vec<u8>, quiche::SendInfo)>,
@@ -89,17 +88,13 @@ pub(crate) struct DeferredSend {
 
 const MAX_DEFERRED_PACKETS: usize = 64;
 const MAX_DEFERRED_BYTES: usize = 128 * 1024;
-const PACING_GROUP: std::time::Duration = std::time::Duration::from_micros(100);
+/// Match the granularity of the event-loop timer. Packets may be released at
+/// most this far ahead of quiche's desired time to amortize timer wakeups.
+pub(crate) const PACING_HORIZON: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl DeferredSend {
     pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
-        let first = self.packets.front()?.1.at;
-        // A packet beyond this horizon is retained for the next group.
-        self.packets
-            .iter()
-            .take_while(|(_, info)| info.at <= first + PACING_GROUP)
-            .map(|(_, info)| info.at)
-            .max()
+        self.packets.front().map(|(_, info)| info.at)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -113,7 +108,7 @@ impl DeferredSend {
 
     pub(crate) fn can_prefetch(&self) -> bool {
         match (self.packets.front(), self.packets.back()) {
-            (Some((_, first)), Some((_, last))) => last.at <= first.at + PACING_GROUP,
+            (Some((_, first)), Some((_, last))) => last.at <= first.at + PACING_HORIZON,
             _ => true,
         }
     }
@@ -433,30 +428,40 @@ mod tests {
     }
 
     #[test]
-    fn deferred_send_groups_packets_without_releasing_them_early() {
+    fn deferred_send_keeps_packets_outside_the_release_horizon() {
         let now = Instant::now();
         let mut deferred = DeferredSend::default();
-        for micros in [10, 50, 100, 150] {
-            deferred.schedule(
-                &[micros as u8],
-                send_info(now + Duration::from_micros(micros)),
-            );
+        for micros in [10, 510, 1010, 1011] {
+            deferred.schedule(&[1], send_info(now + Duration::from_micros(micros)));
         }
         assert!(!deferred.can_prefetch());
-        assert_eq!(deferred.deadline(), Some(now + Duration::from_micros(100)));
-        assert!(deferred.take_if_due(now).is_none());
-        let group_deadline = deferred.deadline().unwrap();
-        for expected in [10, 50, 100] {
-            let (packet, info) = deferred.take_if_due(group_deadline).unwrap();
-            assert_eq!(packet, [expected]);
-            assert!(info.at <= group_deadline);
+        assert_eq!(deferred.deadline(), Some(now + Duration::from_micros(10)));
+        let horizon = now + Duration::from_micros(1010);
+        for _ in 0..3 {
+            let (packet, info) = deferred.take_if_due(horizon).unwrap();
+            assert!(info.at <= horizon);
             deferred.recycle(packet);
         }
-        assert!(deferred.take_if_due(group_deadline).is_none());
-        assert_eq!(deferred.deadline(), Some(now + Duration::from_micros(150)));
+        assert!(deferred.take_if_due(horizon).is_none());
+        assert_eq!(deferred.deadline(), Some(now + Duration::from_micros(1011)));
         deferred.discard();
-        assert_eq!(deferred.deadline(), None);
         assert_eq!(deferred.bytes, 0);
+    }
+
+    #[test]
+    fn paced_packets_within_one_millisecond_can_share_a_wakeup() {
+        let now = std::time::Instant::now();
+        let mut deferred = DeferredSend::default();
+        deferred.schedule(b"first", send_info(now + Duration::from_millis(1)));
+        deferred.schedule(b"second", send_info(now + Duration::from_micros(1200)));
+        assert!(
+            deferred.can_prefetch(),
+            "200us spacing must not end prefetch"
+        );
+        assert_eq!(deferred.deadline(), Some(now + Duration::from_millis(1)));
+        let horizon = now + Duration::from_millis(2);
+        assert!(deferred.take_if_due(horizon).is_some());
+        assert!(deferred.take_if_due(horizon).is_some());
     }
 
     #[test]
