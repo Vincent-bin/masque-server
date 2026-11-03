@@ -281,34 +281,17 @@ printf '%s' 'phone-password' | masque-server client-config surge \
   --out /root/phone-surge.conf
 ```
 
-#### Surge through a UDP relay
+#### UDP relays and TLS identity
 
-The endpoint is the address and port the client dials; it can be a relay IP.
-SNI and the certificate verification name are independent DNS hostnames. For a
-public-CA certificate whose name differs from the relay address, for example:
+An HTTP/3 client may dial a UDP relay while TLS terminates at this server.
+The address used to reach the relay and the name verified in the server
+certificate may differ. Configure the peer's TLS server name and certificate
+verification according to its documentation, and retain certificate validation.
+The relay must forward UDP to the HTTP/3 listener.
 
-```sh
-printf '%s' 'phone-password' | masque-server client-config surge \
-  --endpoint 203.0.113.9:443 --username phone \
-  --sni proxy.example.com --server-cert-verify-name proxy.example.com \
-  --out /root/phone-relay.conf
-```
-
-The relay must forward UDP to the HTTP/3 listener without terminating TLS.
-Use the name covered by the server certificate for verification. Both options
-are optional and default to Surge's own behavior. The verification-name option
-requires Surge iOS 5.21.0+ or Mac 6.8.0+; MASQUE itself requires iOS 5.22.0+
-or Mac 6.9.0+. See [Surge TLS parameters](https://manual.nssurge.com/policies/tls.html).
-Do not disable certificate verification to make a relay work. The generated file
-contains the password and must be transferred over a trusted channel. These
-options are available in `client-config` and the installer; when using
-`add-user` or `add-listener`, generate the relay file separately with the same
-password, or add the parameters to the generated secret file.
-
-For diagnostics, run `masque-probe proxy.example.com:443 --resolve 203.0.113.9`
-with the Basic credential from the client network; this dials the relay IP while
-verifying the hostname. This probe does not independently vary SNI and the
-verification name. See [Troubleshooting](troubleshooting.md#fake-ip-dns-and-route-selection).
+For diagnostics, `masque-probe` accepts `--resolve` to dial a selected address
+while keeping the endpoint hostname for TLS verification. See
+[Troubleshooting](troubleshooting.md#fake-ip-dns-and-route-selection).
 
 ### `mode = "client_cert"`
 

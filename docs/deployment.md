@@ -79,8 +79,6 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |
 | `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables Surge configuration generation |
 | `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated Surge configuration |
-| `MASQUE_BASIC_CLIENT_SNI` | Optional DNS hostname sent as TLS SNI for the Surge configuration |
-| `MASQUE_BASIC_CLIENT_VERIFY_NAME` | Optional DNS hostname for Surge certificate verification |
 | `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret Surge output path; defaults to `/root/masque-surge.conf` when generation is enabled |
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
 | `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |

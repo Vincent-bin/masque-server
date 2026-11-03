@@ -446,18 +446,6 @@ generate_basic_client_config() {
     if [ -n "${MASQUE_BASIC_CLIENT_NAME:-}" ]; then
         set -- "$@" --name "$MASQUE_BASIC_CLIENT_NAME"
     fi
-    basic_client_sni=${MASQUE_BASIC_CLIENT_SNI:-}
-    basic_client_verify_name=${MASQUE_BASIC_CLIENT_VERIFY_NAME:-}
-    if can_prompt; then
-        basic_client_sni=$(prompt_value "TLS SNI hostname for relay (leave empty for default)" "$basic_client_sni")
-        basic_client_verify_name=$(prompt_value "TLS certificate verification hostname (leave empty for default)" "$basic_client_verify_name")
-    fi
-    if [ -n "$basic_client_sni" ]; then
-        set -- "$@" --sni "$basic_client_sni"
-    fi
-    if [ -n "$basic_client_verify_name" ]; then
-        set -- "$@" --server-cert-verify-name "$basic_client_verify_name"
-    fi
     if ! printf '%s' "$AUTH_PASSWORD" | "$@"; then
         # client-config normally creates atomically and then exits. If a later
         # output/sync error happens after creation, do not leave a secret for a

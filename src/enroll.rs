@@ -243,35 +243,6 @@ pub fn surge_proxy_config(
     ))
 }
 
-/// Add independently validated TLS names for a UDP relay endpoint.
-pub fn surge_relay_options(
-    config: &mut String,
-    sni: Option<&str>,
-    verify_name: Option<&str>,
-) -> anyhow::Result<()> {
-    for (key, value) in [("sni", sni), ("server-cert-verify-name", verify_name)] {
-        if let Some(value) = value {
-            if value.is_empty()
-                || value.len() > 253
-                || value.split('.').any(|label| {
-                    label.is_empty()
-                        || label.len() > 63
-                        || label.starts_with('-')
-                        || label.ends_with('-')
-                        || !label
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                })
-            {
-                bail!("{key} must be an ASCII DNS hostname");
-            }
-            config.pop(); // final newline
-            config.push_str(&format!(", {key}={value}\n"));
-        }
-    }
-    Ok(())
-}
-
 /// A stable default that remains readable when several server accounts are
 /// imported into the same Surge configuration.
 pub fn default_surge_proxy_name(endpoint: &ClientEndpoint) -> String {
