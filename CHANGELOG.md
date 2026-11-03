@@ -7,6 +7,11 @@ pre-1.0.
 
 ## Unreleased
 
+### Changed
+
+- Update QUIC, HTTP/2, runtime, and TUN dependencies; record QUIC path MTU
+  updates in the existing path-event metrics.
+
 ## 0.14.2 - 2026-11-03
 
 ### Fixed
