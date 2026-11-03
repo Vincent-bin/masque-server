@@ -4934,14 +4934,17 @@ impl Shard {
 
                 // `quiche::Connection::send()` serializes and accounts a
                 // packet before returning its desired release time. Resume a
-                // group retained by the previous loop only once every packet
-                // in that group is due.
+                // group retained by the previous loop once its first packet
+                // is due. Release up to one timer tick ahead to batch sends.
                 if let Some(deadline) = client.deferred_send.deadline() {
                     let now = Instant::now();
                     if deadline > now {
                         break;
                     }
-                    while let Some((packet, send_info)) = client.deferred_send.take_if_due(now) {
+                    let release_horizon = now + crate::connection::PACING_HORIZON;
+                    while let Some((packet, send_info)) =
+                        client.deferred_send.take_if_due(release_horizon)
+                    {
                         generated_bytes += packet.len();
                         batch.push(&packet, send_info, socket.udp_gso_enabled(), send_quantum);
                         client.deferred_send.recycle(packet);
@@ -4970,9 +4973,11 @@ impl Shard {
 
                     generated_bytes += write;
                     // Serialize a bounded group ahead of its release time.
-                    // Waiting for the last due time batches timer work without
-                    // sending any packet before quiche authorized it.
-                    if send_info.at > Instant::now() || client.deferred_send.len() != 0 {
+                    // Packets within one timer tick can share this send; later
+                    // packets remain bounded in the deferred queue.
+                    if send_info.at > Instant::now() + crate::connection::PACING_HORIZON
+                        || client.deferred_send.len() != 0
+                    {
                         client.deferred_send.schedule(&out[..write], send_info);
                         if !client.deferred_send.can_prefetch() {
                             pacing_blocked = true;
