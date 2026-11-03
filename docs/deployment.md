@@ -79,6 +79,8 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |
 | `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables Surge configuration generation |
 | `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated Surge configuration |
+| `MASQUE_BASIC_CLIENT_SNI` | Optional DNS hostname sent as TLS SNI for the Surge configuration |
+| `MASQUE_BASIC_CLIENT_VERIFY_NAME` | Optional DNS hostname for Surge certificate verification |
 | `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret Surge output path; defaults to `/root/masque-surge.conf` when generation is enabled |
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
 | `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |
@@ -166,6 +168,34 @@ The installer creates:
 
 It preserves every existing configuration and referenced TLS file byte for
 byte during an upgrade.
+
+## Local status and reload feedback
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml status
+```
+
+The read-only overview reports the systemd service state, the on-disk
+configuration validation result and configured listeners, certificate expiry,
+and the latest recognizable reload outcome in the current systemd invocation.
+It reads up to 500 journal records and needs permission to access the journal.
+If systemd, the invocation ID, logs, or a matching record are unavailable, the
+reload result is `unknown`; it is never inferred from `systemctl reload` alone.
+The on-disk configuration may have changed since the last reload or restart,
+and successful reloads cover only TLS identity and active credentials, not
+listener or other settings. Use the journal for details:
+
+```sh
+sudo systemctl reload masque
+sudo masque-server --config /etc/masque/masque.toml status
+sudo journalctl -u masque -n 20 --no-pager
+```
+
+Status validates the configuration independently; a failure returns a nonzero
+exit status after reporting available service information. An inactive or
+unavailable systemd service is displayed but does not itself change the exit
+status. Certificate expiry is read from the configured file, not the running
+process. The command does not check external network reachability.
 
 ## Certificates
 

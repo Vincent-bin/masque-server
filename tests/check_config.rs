@@ -641,3 +641,40 @@ fn check_config_rejects_an_unknown_congestion_controller() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn status_reports_valid_and_invalid_disk_configuration() {
+    let dir = TempDir::new();
+    let (cert, key) = write_server_identity(dir.path());
+    let config = dir.path().join("masque.toml");
+    std::fs::write(
+        &config,
+        config_text("127.0.0.1:8449".parse().unwrap(), &cert, &key, "cubic"),
+    )
+    .unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_masque-server"))
+            .arg("--config")
+            .arg(&config)
+            .arg("status")
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("configuration: valid (on disk"));
+    assert!(stdout.contains("configured listener 127.0.0.1:8449"));
+    assert!(stdout.contains("certificate expires:"));
+    assert!(stdout.contains("last reload in current service invocation:"));
+    std::fs::write(&config, "invalid = [").unwrap();
+    let output = run();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("configuration: invalid or unavailable")
+    );
+}

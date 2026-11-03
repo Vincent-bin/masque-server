@@ -66,6 +66,14 @@ enum Command {
         #[arg(long)]
         endpoint: String,
 
+        /// TLS SNI hostname, independent of the dial endpoint.
+        #[arg(long)]
+        sni: Option<String>,
+
+        /// Hostname used to verify the server certificate.
+        #[arg(long)]
+        server_cert_verify_name: Option<String>,
+
         /// Basic username.
         #[arg(long)]
         username: String,
@@ -78,6 +86,8 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Summarize the local systemd service, configuration, TLS and last reload.
+    Status,
     /// Validate the configuration without binding sockets or creating a TUN.
     CheckConfig,
     /// Validate the configuration and inspect CONNECT-IP host prerequisites.
@@ -477,6 +487,9 @@ fn enroll_client(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if matches!(cli.command, Some(Command::Status)) {
+        return support::print_status(&cli.config, cli.cert.as_deref(), cli.key.as_deref());
+    }
     if matches!(cli.command, Some(Command::HashPassword)) {
         let mut password = Zeroizing::new(String::new());
         std::io::stdin().read_to_string(&mut password)?;
@@ -495,6 +508,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::ClientConfig {
         format,
         endpoint,
+        sni,
+        server_cert_verify_name,
         username,
         name,
         out,
@@ -506,11 +521,16 @@ async fn main() -> anyhow::Result<()> {
         let name = name
             .clone()
             .unwrap_or_else(|| enroll::default_surge_proxy_name(&endpoint));
-        let contents = Zeroizing::new(match format {
+        let mut contents = Zeroizing::new(match format {
             BasicClientArg::Surge => {
                 enroll::surge_proxy_config(&name, &endpoint, username, &password)?
             }
         });
+        enroll::surge_relay_options(
+            &mut contents,
+            sni.as_deref(),
+            server_cert_verify_name.as_deref(),
+        )?;
         match out {
             Some(path) => {
                 enroll::write_client_config(path, &contents)?;
