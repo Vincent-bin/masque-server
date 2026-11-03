@@ -321,7 +321,7 @@ choose_auth_mode() {
                 echo
                 echo "Choose an authentication mode:"
                 echo "  1) Basic          username and password on every CONNECT request"
-                echo "  2) Client cert    TLS client certificate for usque/mihomo-style clients"
+                echo "  2) Client cert    TLS client certificate matched against a public-key roster"
                 echo "  3) Dual           both, on two ports of one server"
             } >/dev/tty
             requested_mode=$(prompt_value "Authentication mode" 1)
@@ -413,7 +413,7 @@ generate_basic_client_config() {
     if [ -z "$basic_client_endpoint" ] && can_prompt; then
         {
             echo
-            echo "A Surge configuration can be generated while the plaintext Basic"
+            echo "A client configuration can be generated while the plaintext Basic"
             echo "password is available. The server cannot recover it from its hash later."
         } >/dev/tty
         basic_client_endpoint=$(prompt_value \
@@ -428,7 +428,7 @@ generate_basic_client_config() {
     if [ -z "$BASIC_CLIENT_CONFIG_OUT" ]; then
         if can_prompt; then
             BASIC_CLIENT_CONFIG_OUT=$(prompt_value \
-                "Secret Surge configuration output path" /root/masque-surge.conf)
+                "Secret client configuration output path" /root/masque-surge.conf)
         else
             BASIC_CLIENT_CONFIG_OUT=/root/masque-surge.conf
         fi
@@ -947,7 +947,7 @@ if [ "$PRINT_SECRETS" -eq 1 ] && [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic;
         echo "  Password: supplied through MASQUE_AUTH_PASSWORD (not repeated)"
     fi
     if [ -n "$BASIC_CLIENT_CONFIG_OUT" ]; then
-        echo "  Secret Surge configuration: $BASIC_CLIENT_CONFIG_OUT"
+        echo "  Secret client configuration: $BASIC_CLIENT_CONFIG_OUT"
     fi
 fi
 
@@ -964,8 +964,8 @@ fi
 if [ "$PRINT_SECRETS" -eq 1 ] && [ -n "$ENROLL_OUTPUT" ]; then
     echo
     echo "Client-certificate enrollment result"
-    echo "  Secret usque JSON: $CLIENT_CONFIG_OUT"
-    echo "  The mihomo block below also contains the client private key."
+    echo "  Secret client JSON: $CLIENT_CONFIG_OUT"
+    echo "  The proxy block below also contains the client private key."
     echo
     cat "$ENROLL_OUTPUT"
 fi

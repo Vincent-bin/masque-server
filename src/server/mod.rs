@@ -1754,7 +1754,7 @@ fn build_quic_config(
     tls::configure_dynamic_identity(&mut builder, tls_identity);
     if let Some(roster) = client_certs {
         // quiche's normal peer verification cannot express the self-signed,
-        // public-key roster used by usque-compatible clients, so install the
+        // public-key roster, so install the
         // same custom verifier HTTP/2 uses.
         configure_client_cert_verification(&mut builder, roster);
     }

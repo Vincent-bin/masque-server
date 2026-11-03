@@ -72,9 +72,6 @@ pub enum AuthMode {
     Basic,
     /// A TLS client certificate, matched against the `[[clients]]` roster by
     /// public key during the TLS handshake.
-    ///
-    /// This is what Cloudflare's WARP MASQUE endpoint does, and what clients
-    /// built against it (usque) expect: they never send `Proxy-Authorization`.
     ClientCert,
 }
 
