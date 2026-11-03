@@ -13,6 +13,49 @@ is a compatibility path for TCP-only networks. Its core rules are:
 - UDP overload results in bounded loss rather than unbounded latency; and
 - Linux fast paths remain isolated from portable protocol code.
 
+## System overview
+
+```mermaid
+flowchart LR
+    Client["MASQUE client"]
+
+    subgraph Server["MASQUE Server · single process"]
+        direction TB
+        subgraph Transport["Transport and connections"]
+            H3["HTTP/3<br/>QUIC / UDP<br/>shard event loops"]
+            H2["HTTP/2<br/>TLS / TCP<br/>async connection tasks"]
+        end
+
+        Auth["Authentication and dispatch<br/>Basic or client certificate"]
+        Policy["Shared state<br/>policies · admission · address pool"]
+        TCP["CONNECT<br/>TCP tunnel"]
+        UDP["CONNECT-UDP<br/>UDP tunnel"]
+        IP["CONNECT-IP<br/>IP tunnel"]
+        TUN["Linux TUN<br/>address assignment and routing"]
+        Ops["Operations and observability<br/>status · logs · health · metrics"]
+
+        H3 --> Auth
+        H2 --> Auth
+        Auth --> Policy
+        Policy --> TCP
+        Policy --> UDP
+        Policy --> IP
+        IP --> TUN
+    end
+
+    Client -->|"HTTP/3"| H3
+    Client -->|"HTTP/2"| H2
+    TCP -->|"TCP socket"| TargetTCP["TCP target"]
+    UDP -->|"UDP socket"| TargetUDP["UDP target"]
+    TUN -->|"host forwarding / routing / NAT"| Network["Target network"]
+```
+
+HTTP/3 and HTTP/2 use different connection handling paths and share policy,
+authentication admission, and tunnel resources. CONNECT and CONNECT-UDP reach
+targets through ordinary sockets; CONNECT-IP requires Linux TUN and host-managed
+forwarding and routing. NAT is optional and depends on the host network.
+Certificate identity and active credentials can be reloaded without restarting.
+
 ## Runtime components
 
 ```text

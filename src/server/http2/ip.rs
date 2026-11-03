@@ -35,7 +35,7 @@ const MAX_CONTROL_CAPSULE_SIZE: usize = 64 * 1024;
 /// RFC 9484 uses Extended CONNECT and keeps Context ID zero in each DATAGRAM
 /// capsule. Cloudflare's TCP fallback predates that shape: it uses a regular
 /// CONNECT plus `cf-connect-proto`, and removes the zero byte from capsule
-/// values. usque intentionally mirrors the latter.
+/// values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum IpCapsuleMode {
     Standard,

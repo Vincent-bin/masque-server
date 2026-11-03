@@ -43,10 +43,10 @@ from `/dev/tty`. A new installation offers three modes:
 
 - `basic` creates the first account, generates a high-entropy password unless
   one is provided, prints the credentials once, and optionally writes a secret
-  Surge configuration while the plaintext is available; it also asks whether
+  client configuration while the plaintext is available; it also asks whether
   to hide failed authentication behind an empty 404 (off by default);
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
-  entry, writes the usque JSON to a new `0600` file, and prints the mihomo block;
+  entry, writes a JSON configuration to a new `0600` file, and prints a proxy block;
 - `dual` does both, writing a
   [two-listener configuration](configuration.md#listeners) that serves
   credentials on one port and certificates on another. The authentication mode
@@ -77,9 +77,9 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
 | `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |
-| `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables Surge configuration generation |
-| `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated Surge configuration |
-| `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret Surge output path; defaults to `/root/masque-surge.conf` when generation is enabled |
+| `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables client configuration generation |
+| `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated client configuration |
+| `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret client output path; defaults to `/root/masque-surge.conf` when generation is enabled |
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
 | `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |
 | `MASQUE_TLS_CERT` / `MASQUE_TLS_KEY` | Source PEM certificate and key copied into `/etc/masque/certs` |
@@ -167,6 +167,34 @@ The installer creates:
 It preserves every existing configuration and referenced TLS file byte for
 byte during an upgrade.
 
+## Local status and reload feedback
+
+```sh
+sudo masque-server --config /etc/masque/masque.toml status
+```
+
+The read-only overview reports the systemd service state, the on-disk
+configuration validation result and configured listeners, certificate expiry,
+and the latest recognizable reload outcome in the current systemd invocation.
+It reads up to 500 journal records and needs permission to access the journal.
+If systemd, the invocation ID, logs, or a matching record are unavailable, the
+reload result is `unknown`; it is never inferred from `systemctl reload` alone.
+The on-disk configuration may have changed since the last reload or restart,
+and successful reloads cover only TLS identity and active credentials, not
+listener or other settings. Use the journal for details:
+
+```sh
+sudo systemctl reload masque
+sudo masque-server --config /etc/masque/masque.toml status
+sudo journalctl -u masque -n 20 --no-pager
+```
+
+Status validates the configuration independently; a failure returns a nonzero
+exit status after reporting available service information. An inactive or
+unavailable systemd service is displayed but does not itself change the exit
+status. Certificate expiry is read from the configured file, not the running
+process. The command does not check external network reachability.
+
 ## Certificates
 
 Install the full certificate chain and unencrypted private key:
@@ -219,8 +247,8 @@ have been verified.
 
 These requirements come from CONNECT-IP, not from Basic versus client
 certificate authentication. A certificate-authenticated CONNECT or CONNECT-UDP
-client still uses userspace sockets; mihomo/usque-style clients combine client
-certificates with `cf-connect-ip`, which is why they need the host path below.
+client still uses userspace sockets; CONNECT-IP requires the host path below
+regardless of the authentication mode.
 
 After the service has created its TUN interface, run the read-only diagnostic:
 

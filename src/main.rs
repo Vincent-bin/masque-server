@@ -78,6 +78,8 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Summarize the local systemd service, configuration, TLS and last reload.
+    Status,
     /// Validate the configuration without binding sockets or creating a TUN.
     CheckConfig,
     /// Validate the configuration and inspect CONNECT-IP host prerequisites.
@@ -392,7 +394,7 @@ fn auth_label(auth: &config::AuthSection) -> &'static str {
 
 fn usque_port_instruction(port: u16) -> String {
     format!(
-        "# Start usque with --connect-port {port} (short form: -P {port}); add --http2 for an HTTP/2 listener."
+        "# For the generated JSON, set --connect-port {port} (short form: -P {port}); add --http2 for an HTTP/2 listener."
     )
 }
 
@@ -434,17 +436,17 @@ fn enroll_client(
         }
     }
 
-    // usque's JSON schema stores only the endpoint IP; its connection port is
+    // The JSON schema stores only the endpoint IP; its connection port is
     // a launch flag. Always print it so a non-443 deployment cannot silently
     // fall back to the client's default port.
     println!("\n{}", usque_port_instruction(endpoint.port()));
 
-    // The same enrollment, spelled for mihomo-style clients. Emitted alongside
+    // The same enrollment in a proxy configuration format. Emitted alongside
     // rather than behind a flag: the encodings differ in ways that are easy to
     // get subtly wrong by hand, and a wrong key only shows up as a handshake
     // failure much later.
     println!(
-        "\n# Or, for a mihomo-style client, add to its config.yaml \
+        "\n# Or add the following proxy block to a compatible configuration \
          (also contains the private key):\n"
     );
     print!(
@@ -477,6 +479,9 @@ fn enroll_client(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if matches!(cli.command, Some(Command::Status)) {
+        return support::print_status(&cli.config, cli.cert.as_deref(), cli.key.as_deref());
+    }
     if matches!(cli.command, Some(Command::HashPassword)) {
         let mut password = Zeroizing::new(String::new());
         std::io::stdin().read_to_string(&mut password)?;
@@ -515,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
             Some(path) => {
                 enroll::write_client_config(path, &contents)?;
                 println!(
-                    "Surge client configuration written to {} (contains the plaintext password)",
+                    "Client configuration written to {} (contains the plaintext password)",
                     path.display()
                 );
             }

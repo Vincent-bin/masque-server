@@ -15,7 +15,7 @@ a staging environment.
 - CONNECT-UDP ([RFC 9298]) using HTTP Datagrams
 - CONNECT-IP ([RFC 9484]) with Linux TUN integration
 - HTTP/3 over UDP for performance, plus HTTP/2 Extended CONNECT and the
-  Cloudflare/usque CONNECT-IP dialect over TCP/TLS as compatibility fallbacks
+  `cf-connect-ip` CONNECT-IP dialect over TCP/TLS as compatibility fallbacks
 - Multiple HTTP Basic accounts per listener with Argon2id password
   verification and optional 404 response camouflage, or TLS client-certificate
   authentication against a public-key roster
@@ -35,6 +35,7 @@ a staging environment.
 - Atomic `SIGHUP` reload of the full TLS certificate chain, Basic account sets,
   and certificate roster without dropping established tunnels; active roster
   updates disconnect only revoked certificate clients
+- Read-only `status` for local service, configuration, certificate, and reload feedback
 - Read-only `doctor` checks for CONNECT-IP TUN, forwarding, route, firewall,
   and NAT prerequisites without modifying the host
 - A packaged client-side `masque-probe` that verifies TLS, authentication,
@@ -128,9 +129,9 @@ identity remains active.
 
 Authentication is fail-closed. In `basic` mode the server refuses to start until
 at least one uniquely named account with a valid Argon2id hash is configured.
-Clients such as Surge send Basic authorization on their first CONNECT, so a
-Basic listener may set `stealth = true` to return an ordinary empty 404 instead
-of advertising a 407 challenge to unauthenticated probes. See
+A Basic listener may set `stealth = true` to return an ordinary empty 404 instead
+of advertising a 407 challenge to unauthenticated probes. This requires peers to
+send Basic authorization on their first CONNECT request. See
 [Authentication](docs/configuration.md#authentication) for the compatibility
 and security limits of this option.
 
@@ -166,9 +167,7 @@ Every value, including `--transport http2|http3`, is also available as a flag
 for provisioning scripts. See
 [Adding a listener](docs/configuration.md#adding-a-listener). A new socket is
 bound at startup, so open UDP for HTTP/3 or TCP for HTTP/2, restart the service,
-and confirm it came up. A new HTTP/3 Basic listener accepts the same
-`--emit-client surge --client-endpoint ... --client-out ...` options shown
-below, so its only plaintext credential can be delivered in the same operation.
+and confirm it came up.
 
 Basic accounts on an existing listener can be managed without editing TOML or
 restarting the server. If the file has only one Basic listener, its address can
@@ -177,9 +176,7 @@ be omitted:
 ```sh
 printf '%s\n' 'a-strong-password' | sudo masque-server \
   --config /etc/masque/masque.toml add-user \
-  --username phone --password-stdin \
-  --emit-client surge --client-endpoint proxy.example.com:8449 \
-  --client-out /root/phone-surge.conf
+  --username phone --password-stdin
 sudo masque-server --config /etc/masque/masque.toml list-users
 sudo systemctl reload masque
 ```
@@ -188,16 +185,6 @@ sudo systemctl reload masque
 last account is refused. Existing scalar `username` / `password_hash` files are
 accepted and are migrated to the multi-account form by the first account edit.
 See [Basic account management](docs/configuration.md#basic-account-management).
-
-The generated Surge file is created as mode `0600` and contains the plaintext
-password. If an account already exists and its password is still known, generate
-the same file without changing the server configuration:
-
-```sh
-printf '%s' 'a-strong-password' | masque-server client-config surge \
-  --endpoint proxy.example.com:8449 --username phone \
-  --out /root/phone-surge.conf
-```
 
 CONNECT-IP is independent of the authentication mode: it needs Linux host
 forwarding because it carries complete IP packets through `masque0`, while
@@ -254,11 +241,9 @@ curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/inst
 For a new configuration the installer prompts for `basic`, `client_cert`, or
 `dual` authentication, optional Basic stealth mode, and optional TLS file
 locations. Basic mode creates the
-first account, generates a random password when none is supplied, and can write
-a ready-to-import Surge configuration while the plaintext is still available.
-Client-certificate mode enrolls the first
-client, adds its `[[clients]]` entry, writes its secret JSON as mode `0600`, and
-prints the matching usque and mihomo configuration. Dual mode does both, writing
+first account and generates a random password when none is supplied.
+Client-certificate mode enrolls the first client, adds its `[[clients]]` entry,
+and writes its secret configuration as mode `0600`. Dual mode does both, writing
 a two-listener configuration that serves credentials on one port and
 certificates on another. At the end a fresh installation prints the installed
 version, service state, and effective server configuration with the password
@@ -299,6 +284,20 @@ does this automatically when TLS material is present.
 
 See [Deployment](docs/deployment.md) for certificates, systemd hardening,
 upgrades, and diagnostics.
+
+## Protocol compatibility
+
+| Protocol | Transport | Authentication | Verification evidence |
+| --- | --- | --- | --- |
+| CONNECT (TCP) | HTTP/3 or HTTP/2 | Basic or client certificate | HTTP/2 and HTTP/3 integration and probe tests. |
+| CONNECT-UDP | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | HTTP/2 and HTTP/3 integration and probe tests. |
+| CONNECT-IP (RFC 9484) | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | Protocol setup and address assignment are tested; forwarding requires Linux TUN and host routing. |
+| `cf-connect-ip` | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | Synthetic interoperability tests cover certificate authentication and address assignment; see [testing](docs/testing.md#cloudflare-compatible-client-interop). |
+
+Authentication and transport are configured per listener. These entries describe
+server protocol support; actual interoperability depends on the peer's supported
+protocols, transports, and authentication. See [protocol behavior](docs/protocols.md)
+and [testing](docs/testing.md).
 
 ## Documentation
 

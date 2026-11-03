@@ -156,10 +156,9 @@ connect, and vice versa. To serve both kinds of client, define two listeners.
 | `users[].password_hash` | Argon2id PHC string |
 | `[[clients]]` | `client_cert` only; the roster of allowed clients |
 
-Choose `basic` for standards-compliant MASQUE clients. Choose `client_cert` for
-VPN-style clients modelled on Cloudflare WARP, such as usque and mihomo, which
-never send credentials; see
-[Cloudflare-compatible clients](protocols.md#cloudflare-compatible-clients).
+Choose `basic` for peers that send HTTP Basic credentials, or `client_cert`
+for peers that authenticate using a registered TLS client public key. See
+[CONNECT-IP compatibility](protocols.md#cloudflare-compatible-clients).
 
 ### `mode = "basic"` (default)
 
@@ -200,10 +199,8 @@ receive `407 Proxy Authentication Required`.
 
 With `stealth = true`, every such authentication failure instead receives the
 same empty `404` as an unsupported request, with no `Proxy-Authenticate`
-header. [Surge](https://manual.nssurge.com/policies/masque.html) sends Basic
-authorization proactively on each CONNECT and is compatible with this setting.
-A client that waits for a 407 challenge is not:
-it must remain on the default setting. Changing `stealth` requires a restart;
+header. The peer must send Basic authorization on its first CONNECT; a peer
+that waits for a 407 challenge must use the default setting. Changing `stealth` requires a restart;
 account changes remain reloadable with `SIGHUP`.
 
 This option reduces the application-response fingerprint of an unauthenticated
@@ -254,8 +251,8 @@ the final account cannot be removed. Send `SIGHUP` after a successful edit.
 Future requests on existing HTTP/2 and HTTP/3 connections use the new account
 snapshot, while tunnels already authorized continue uninterrupted.
 
-When adding an account, the same command can write the matching Surge proxy
-declaration before discarding the plaintext password:
+When adding an account, the command can write a client configuration in a
+supported format before discarding the plaintext password:
 
 ```sh
 printf '%s' 'phone-password' | sudo masque-server \
@@ -266,8 +263,8 @@ printf '%s' 'phone-password' | sudo masque-server \
 ```
 
 `--client-endpoint` is intentionally explicit: a wildcard listener such as
-`0.0.0.0:8449` is not an address a remote client can dial. Surge MASQUE uses
-HTTP/3, so client output is refused for an HTTP/2 listener. The output is a new
+`0.0.0.0:8449` is not an address a remote client can dial. The selected output
+format uses HTTP/3, so it is refused for an HTTP/2 listener. The output is a new
 mode-`0600` file and an existing path is never replaced. If `--client-out` is
 omitted the secret declaration goes to stdout with a warning.
 
@@ -280,6 +277,18 @@ printf '%s' 'phone-password' | masque-server client-config surge \
   --endpoint proxy.example.com:8449 --username phone \
   --out /root/phone-surge.conf
 ```
+
+#### UDP relays and TLS identity
+
+An HTTP/3 client may dial a UDP relay while TLS terminates at this server.
+The address used to reach the relay and the name verified in the server
+certificate may differ. Configure the peer's TLS server name and certificate
+verification according to its documentation, and retain certificate validation.
+The relay must forward UDP to the HTTP/3 listener.
+
+For diagnostics, `masque-probe` accepts `--resolve` to dial a selected address
+while keeping the endpoint hostname for TLS verification. See
+[Troubleshooting](troubleshooting.md#fake-ip-dns-and-route-selection).
 
 ### `mode = "client_cert"`
 
@@ -330,18 +339,16 @@ masque-server --config masque.toml enroll-client \
     --ipv4 10.89.0.2 --ipv6 fd00:abcd::2 --out client.json
 ```
 
-This prints three things: the `[[clients]]` block for this file, a JSON
-configuration for usque-style clients, and a `proxies:` entry for mihomo-style
-clients. The client halves contain the private key — treat the output as a
-secret. Generating both spellings matters because the same key is encoded
-differently for each: usque takes the server key as PEM and addresses bare,
-mihomo takes it as bare base64 and addresses in CIDR form.
+This prints the `[[clients]]` block for this file, a JSON configuration, and a
+`proxies:` entry. Both client configurations contain the private key and must
+be treated as secrets. Their encodings differ: JSON uses a PEM server key and
+bare addresses; the `proxies:` entry uses base64 DER and CIDR addresses.
 
-The usque JSON fills both `endpoint_v4` / `endpoint_v6` and the corresponding
+The JSON fills both `endpoint_v4` / `endpoint_v6` and the corresponding
 `endpoint_h2_v4` / `endpoint_h2_v6` fields with the enrolled server address, so
 the same file works with its default HTTP/3 mode and its `--http2` fallback.
 
-The generated mihomo entry uses the active `ip_proxy.tun_mtu` value from the
+The generated `proxies:` entry uses the active `ip_proxy.tun_mtu` value from the
 same server configuration, so a non-default MTU stays consistent on both ends.
 
 `--out` writes the JSON to a file created as a new `0600` file on Unix; an
@@ -446,7 +453,7 @@ listener 0.0.0.0:443 transport=http3 auth=basic shards=1 max_datagram_size=1350
 listener 0.0.0.0:4443 transport=http2 auth=client_cert shards=1
 ```
 
-The usque JSON schema stores the endpoint IP but not its port, so enrollment
+The generated JSON stores the endpoint IP but not its port, so enrollment
 also prints the matching launch argument — `--connect-port 443` for the example
 above, `--connect-port 8449` for a server on 8449. Omitting it silently falls
 back to the client's default port. Add `--http2` when selecting an HTTP/2
@@ -584,9 +591,9 @@ add-listener options:
       --password-hash <PHC>  Argon2id hash, as printed by hash-password
       --password-stdin      Read the password from stdin and hash it here
       --stealth            Return 404 instead of challenging failed Basic auth
-      --emit-client surge   Emit the Basic credential in Surge syntax
+      --emit-client surge   Emit the Basic credential in the selected format
       --client-endpoint <HOST:PORT>  Public endpoint written to that client config
-      --client-name <NAME>  Optional Surge proxy name
+      --client-name <NAME>  Optional proxy name
       --client-out <PATH>   Create a private client file instead of using stdout
       --disable-auth        Write enabled = false (trusted networks only)
       --no-bind-check       Do not test-bind the new address
@@ -754,9 +761,8 @@ are not retransmitted; a full queue drops traffic.
 
 ### Client-driven two-hop MASQUE
 
-A client such as [Surge](https://manual.nssurge.com/policies/parameters.html#underlying-proxy)
-can establish an Exit MASQUE connection through an Entry MASQUE policy
-(`underlying-proxy`). This is a nested client connection, not a server-to-server
+A peer that supports nested proxy connections can establish an Exit MASQUE
+connection through an Entry MASQUE connection. This is a nested client connection, not a server-to-server
 option: the Entry needs only an ordinary HTTP/3 listener, while the client dials
 another HTTP/3 listener on the Exit through a CONNECT-UDP tunnel.
 
@@ -817,8 +823,7 @@ may use `1200` instead of adding a second port.
 
 `max_datagram_size` is a QUIC UDP-packet ceiling, not an operating-system
 interface MTU. The listener setting constrains both directions of the inner
-QUIC connection through transport negotiation; no MASQUE MTU option is needed
-in Surge. Do not expect `discover_pmtu` to remove the encapsulation overhead.
+QUIC connection through transport negotiation; no separate client-side MASQUE MTU option is needed for this listener setting. Do not expect `discover_pmtu` to remove the encapsulation overhead.
 
 The 1200-byte listener is suitable for CONNECT and CONNECT-UDP. It cannot carry
 the default 1280-byte CONNECT-IP packets. Keep CONNECT-IP on a normal listener,

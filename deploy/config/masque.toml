@@ -46,14 +46,13 @@ enabled = true
 # "basic"       — RFC 7617 Proxy-Authorization, checked per request.
 # "client_cert" — a TLS client certificate, matched against [[clients]] below.
 #
-# Pick "client_cert" for VPN-style clients modelled on Cloudflare WARP MASQUE
-# (for example usque): they authenticate during the TLS handshake and never
-# send Proxy-Authorization, so they cannot work against "basic".
+# Pick "client_cert" when peers authenticate using a TLS client certificate.
+# A listener configured for Basic authentication requires Proxy-Authorization.
 #
 # To serve both kinds of client, add the second listener shown at the end of
 # this file. Every listener has its own explicit authentication table.
 mode = "basic"
-# Optional response camouflage for clients such as Surge that send credentials
+# Optional response camouflage for peers that send credentials
 # on their first CONNECT. Missing or invalid credentials receive the same empty
 # 404 as an unsupported request instead of a 407 challenge.
 stealth = false
@@ -77,7 +76,7 @@ password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
 # must agree, or every packet is dropped as spoofed.
 #
 # The client JSON stores only the endpoint IP. The command also prints the
-# matching usque --connect-port/-P argument; do not omit it on non-443 servers.
+# matching --connect-port/-P argument; do not omit it on non-443 servers.
 # An --out path is created as a new 0600 file on Unix and is never overwritten.
 #
 # [[clients]]

@@ -25,7 +25,7 @@ use super::resolver::TargetResolver;
 use super::target::{TargetSetupFailure, resolve_allowed};
 
 /// Early client DATAGRAMs retained while authorization or target setup is in
-/// flight. Surge sends its first packet immediately after the CONNECT headers,
+/// flight. A peer may send its first packet immediately after CONNECT headers,
 /// before it has received the successful response, so dropping these packets
 /// makes an otherwise valid CONNECT-UDP tunnel look dead.
 ///

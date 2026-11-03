@@ -328,6 +328,95 @@ fn basic_user_count(auth: &crate::config::AuthSection) -> usize {
     }
 }
 
+/// Read-only local service overview. Journal evidence is scoped to the current
+/// systemd invocation; an absent or inaccessible record is never called success.
+pub fn print_status(
+    path: &Path,
+    cert_override: Option<&Path>,
+    key_override: Option<&Path>,
+) -> anyhow::Result<()> {
+    println!("masque-server {}", env!("CARGO_PKG_VERSION"));
+    let service = systemd_summary();
+    println!(
+        "systemd service: {} ({})",
+        service.active_state.as_deref().unwrap_or("unavailable"),
+        service.sub_state.as_deref().unwrap_or("unknown")
+    );
+    let reload = if service.active_state.as_deref() == Some("active") {
+        last_reload_result()
+    } else {
+        None
+    };
+    println!(
+        "last reload in current service invocation: {}",
+        reload.unwrap_or("unknown (no accessible matching journal record)")
+    );
+    println!("reload evidence is historical; it does not prove later file changes were applied");
+
+    let result = (|| -> anyhow::Result<()> {
+        let text = fs::read_to_string(path).context("cannot read configuration")?;
+        let mut cfg = crate::config::parse_toml(&text).context("cannot parse configuration")?;
+        if let Some(cert) = cert_override {
+            cfg.tls.cert_path = cert.to_path_buf();
+        }
+        if let Some(key) = key_override {
+            cfg.tls.key_path = key.to_path_buf();
+        }
+        if let Some(cert) = read_certificate_window(&cfg.tls.cert_path) {
+            println!("certificate expires: {}", cert.not_after());
+        } else {
+            println!("certificate expiry: unavailable");
+        }
+        let listeners =
+            crate::server::validate_config(&cfg).context("configuration validation failed")?;
+        println!("configuration: valid (on disk; may differ from the running process)");
+        for listener in listeners {
+            println!(
+                "configured listener {} transport={} auth={}",
+                listener.listen_addr,
+                listener.transport.as_str(),
+                auth_label(&listener.auth)
+            );
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        println!("configuration: invalid or unavailable");
+    }
+    result
+}
+
+fn last_reload_result() -> Option<&'static str> {
+    let id = command_line(
+        "systemctl",
+        &[
+            "show",
+            "masque.service",
+            "--property=InvocationID",
+            "--value",
+        ],
+    )?;
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let filter = format!("_SYSTEMD_INVOCATION_ID={id}");
+    let output = command_line(
+        "journalctl",
+        &["--no-pager", "-n", "500", "-o", "cat", &filter],
+    )?;
+    classify_reload(&output)
+}
+
+fn classify_reload(journal: &str) -> Option<&'static str> {
+    journal.lines().rev().find_map(|line| {
+        if line.contains("configuration reload failed, keeping the previous TLS identity and authentication state") {
+            Some("failed; previous identity and authentication remain active")
+        } else if line.contains("TLS identity and authentication state reloaded") || line.contains("TLS identity reloaded") {
+            Some("succeeded")
+        } else { None }
+    })
+}
+
 fn read_certificate_window(path: &Path) -> Option<X509> {
     let pem = fs::read(path).ok()?;
     X509::stack_from_pem(&pem).ok()?.into_iter().next()
@@ -448,5 +537,26 @@ mod tests {
         assert!(json.contains("\"basic_user_count\": 1"));
         assert!(json.contains("\"stealth\": false"));
         assert!(json.contains("\"registered_client_count\": 1"));
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::classify_reload;
+    #[test]
+    fn last_reload_reports_latest_known_result() {
+        assert_eq!(classify_reload("unrelated"), None);
+        assert_eq!(
+            classify_reload(
+                "TLS identity reloaded\nconfiguration reload failed, keeping the previous TLS identity and authentication state"
+            ),
+            Some("failed; previous identity and authentication remain active")
+        );
+        assert_eq!(
+            classify_reload(
+                "configuration reload failed, keeping the previous TLS identity and authentication state\nTLS identity and authentication state reloaded"
+            ),
+            Some("succeeded")
+        );
     }
 }

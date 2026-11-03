@@ -194,23 +194,15 @@ replaces its UDP socket when `MASQUE_MIGRATION_CHECK=1`. Add
 `MASQUE_BENCH_MIGRATED=1` to its normal `MASQUE_BENCH=1` invocation to run the
 64-byte and 1200-byte measurements only after that path has validated.
 
-What it cannot cover is packet forwarding, because that needs a TUN device.
-Qualifying a real client therefore needs a Linux host with root. Two clients are
-known to interoperate, and testing both is worthwhile because they are
-independent implementations of the same protocol:
+The synthetic test does not cover packet forwarding because that requires a
+TUN device. Qualifying a peer therefore needs a Linux host with appropriate
+network privileges. The commands below are examples of testing independent
+implementations; adapt them to the peer and configuration under test.
 
-- [mihomo](https://wiki.metacubex.one/config/proxies/masque/) — ships prebuilt
-  binaries, and can be run as a plain local proxy, so it needs neither a
-  toolchain nor a TUN device nor root. Start here.
-- [usque](https://github.com/Diniboy1123/usque) — the reference client; needs a
-  Go toolchain (currently Go ≥ 1.26) and root, since it only runs as a TUN.
+`masque-server enroll-client` emits configuration examples with the same key
+and address assignments in different encodings. Treat these outputs as secrets.
 
-`masque-server enroll-client` prints configuration for both. Their field
-encodings differ in ways that are easy to get wrong by hand — mihomo wants the
-server key as bare base64 and addresses in CIDR form, usque wants PEM and bare
-addresses — so use the generated blocks rather than transcribing.
-
-**1. Build the client.** Only needed for usque; mihomo ships binaries.
+**1. Build the example peer.** Skip this step when using a prebuilt binary.
 
 ```sh
 git clone https://github.com/Diniboy1123/usque && cd usque && go build .
@@ -261,7 +253,7 @@ sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -s 10.89.0.0/24 -o <wan-if> -j MASQUERADE
 ```
 
-**5. Connect.** With mihomo, paste the generated `proxies:` block into a config
+**5. Connect.** For the local proxy example, paste the generated `proxies:` block into a config
 with a listener and a catch-all rule, then run it unprivileged:
 
 ```yaml
@@ -277,7 +269,7 @@ rules:
 ./mihomo -d <config-dir>          # no root, no TUN
 ```
 
-With usque, the JSON stores the endpoint IP but not its port, so the port is a
+For the TUN example, the JSON stores the endpoint IP but not its port, so the port is a
 flag — enrollment prints the exact argument:
 
 ```sh

@@ -146,7 +146,7 @@ The CLI requires a verified root SSH entry for this one operation. It confirms
 that the host is Linux and unconfigured, all required commands and release
 assets exist, and the configured remote TLS files are readable. A Basic
 password is read or generated only inside the CLI and sent in encrypted SSH
-standard input, never in a process argument. Generated Surge and certificate
+standard input, never in a process argument. Generated Basic and certificate
 client files stream directly from SSH into new local files with mode `0600`;
 their contents and paths are not emitted. The installer suppresses credential,
 client-key, and rendered-configuration output, then the CLI checks systemd,

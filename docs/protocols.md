@@ -152,41 +152,32 @@ MASQUE extension. Standards-based HTTP/2 CONNECT-UDP and CONNECT-IP require
 Extended CONNECT and Capsule Protocol support; an ordinary HTTP proxy client
 is sufficient only for standard CONNECT. The additional Cloudflare-compatible
 CONNECT-IP shape below is deliberately supported for deployed clients.
-Configuration syntaxes in products such as Surge are client-specific and are
-not part of the RFCs. Test authentication, target policy, TCP, UDP, and DNS
-separately when qualifying a client.
+Client configuration syntax is outside these protocols. Test authentication,
+target policy, TCP, UDP, and DNS separately when qualifying a peer.
 
 ## Cloudflare-compatible clients
 
-VPN-style MASQUE clients modelled on Cloudflare WARP — for example
-[usque](https://github.com/Diniboy1123/usque) and
-[mihomo](https://wiki.metacubex.one/config/proxies/masque/) — diverge from
-RFC 9484 in ways the server accommodates. Everything below is on by default
-except the authentication mode.
+The server supports an additional CONNECT-IP wire format alongside RFC 9484.
+It can be selected independently of client implementation.
 
-**HTTP/3 `:protocol` is `cf-connect-ip`.** Cloudflare's endpoint uses that
-instead of the registered `connect-ip`, and these clients send only it. Both are in
-`ip_proxy.connect_protocols` by default. This is not optional: usque and mihomo
-are independent implementations, and both were observed sending byte-identical
-requests — `:protocol: cf-connect-ip`, `:authority: cloudflareaccess.com`,
-`:path: /` — so a server accepting only `connect-ip` answers `404` to every
-client in this family.
+**HTTP/3 `:protocol` is `cf-connect-ip`.** This value and the registered
+`connect-ip` value are included in `ip_proxy.connect_protocols` by default.
+The `cf-connect-ip` format accepts requests such as `:authority: cloudflareaccess.com`
+and `:path: /`.
 
-**HTTP/3 `:authority` and `:path` are fixed.** The request arrives as
+**HTTP/3 `:authority` and `:path`.** Some peers use
 `:authority: cloudflareaccess.com` and `:path: /`, with no URI Template
 variables. The CONNECT-IP path ignores both, so `ip_proxy.uri_template` does not
-apply to these clients.
+apply to this format.
 
-**Authentication is a TLS client certificate.** No `Proxy-Authorization` is
-ever sent, so a listener using `auth.mode = "basic"` refuses these clients with
-`407`. Use `auth.mode = "client_cert"` on that listener and enroll each client's public key; see
-[Authentication](configuration.md#authentication). To keep serving
-standards-compliant clients at the same time, give each mode its own
-[listener](configuration.md#listeners) — the mode fixes the TLS
-context, so the two cannot share a socket, but they can share a process.
+**Authentication is configured per listener.** Both Basic and client
+certificate modes are available to this protocol format. A peer that sends no
+`Proxy-Authorization` needs a listener configured for client certificate
+authentication or another compatible authentication policy; see
+[Authentication](configuration.md#authentication). Each listener has one
+authentication mode, and multiple listeners can share one process.
 
-**The HTTP/2 fallback uses a separate deployed wire shape.** usque's `--http2`
-mode sends an ordinary CONNECT with `cf-connect-proto: cf-connect-ip`, not an
+**The HTTP/2 compatibility format uses a separate wire shape.** It sends an ordinary CONNECT with `cf-connect-proto: cf-connect-ip`, not an
 Extended CONNECT `:protocol`. Its DATAGRAM capsule value contains the raw IP
 packet and omits the otherwise mandatory Context ID zero. The server detects
 that exact header and mirrors the framing on responses. Standards-based H2
@@ -214,8 +205,8 @@ from those. Two consequences:
 `masque-server enroll-client` generates both sides at once, which is the
 reliable way to keep them consistent.
 
-**Keepalive interacts with the idle timeout.** These clients default to a 30s
-keepalive period. Keep `server.idle_timeout_secs` above it; the default is 60.
+**Keepalive interacts with the idle timeout.** Keep `server.idle_timeout_secs`
+above the peer's keepalive period; the default is 60 seconds.
 
 **HTTP/2 fallback is available when the client supports it.** These clients may
 carry CONNECT-IP over TCP/H2 instead of QUIC. Point that mode at a listener with
