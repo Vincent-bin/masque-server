@@ -170,6 +170,12 @@ case "${MASQUE_BENCH_QUIC_GSO:-0}" in
         ;;
 esac
 
+case "${MASQUE_BENCH_QUIC_GRO:-1}" in
+    0) QUIC_GRO_TOML=false ;;
+    1) QUIC_GRO_TOML=true ;;
+    *) echo "MASQUE_BENCH_QUIC_GRO must be 0 or 1" >&2; exit 2 ;;
+esac
+
 case "$TCP_DIRECT_BASELINE" in
     0) unset MASQUE_TCP_DIRECT_BASELINE ;;
     1) export MASQUE_TCP_DIRECT_BASELINE=1 ;;
@@ -194,6 +200,16 @@ fi
 
 bash scripts/gen-certs.sh "$BENCH_DIR/certs"
 
+case "${MASQUE_BENCH_VERIFY_TLS:-0}" in
+    0) ;;
+    1)
+        [ "$BENCH_TRANSPORT" = http3 ] || { echo "TLS verification check requires HTTP/3" >&2; exit 2; }
+        export MASQUE_BENCH_CA_CERT="$BENCH_DIR/certs/server.crt"
+        export MASQUE_SERVER_NAME="${MASQUE_SERVER_NAME:-server}"
+        ;;
+    *) echo "MASQUE_BENCH_VERIFY_TLS must be 0 or 1" >&2; exit 2 ;;
+esac
+
 cat >"$BENCH_DIR/masque.toml" <<EOF
 [server]
 idle_timeout_secs = 30
@@ -207,6 +223,7 @@ cc_algorithm = "$BENCH_CC"
 max_datagram_size = 1350
 enable_dgram = true
 enable_udp_gso = $QUIC_GSO_TOML
+enable_udp_gro = $QUIC_GRO_TOML
 retry_mode = "$BENCH_QUIC_RETRY"
 
 [tcp_proxy]
@@ -281,8 +298,8 @@ if [ -z "${MASQUE_BENCH_BIN_DIR:-}" ]; then
 fi
 [ -x "$BIN_DIR/masque-e2e" ] || { echo "missing benchmark client executable" >&2; exit 2; }
 [ -x "$SERVER_BIN" ] || { echo "benchmark server is not executable" >&2; exit 2; }
-printf 'BENCH_CONFIG transport=%s cc=%s shards=%s quic_gso=%s target_gso=%s load_warm_auth=%s\n' \
-    "$BENCH_TRANSPORT" "$BENCH_CC" "$BENCH_SHARDS" "$QUIC_GSO_TOML" "$TARGET_GSO_TOML" "${MASQUE_LOAD_WARM_AUTH:-1}"
+printf 'BENCH_CONFIG transport=%s cc=%s shards=%s quic_gso=%s quic_gro=%s target_gso=%s load_warm_auth=%s\n' \
+    "$BENCH_TRANSPORT" "$BENCH_CC" "$BENCH_SHARDS" "$QUIC_GSO_TOML" "$QUIC_GRO_TOML" "$TARGET_GSO_TOML" "${MASQUE_LOAD_WARM_AUTH:-1}"
 
 case "$BENCH_MODE" in
     all|tcp)
@@ -335,7 +352,7 @@ done
 [ -n "$SERVER_PID" ] || { echo "benchmark server launch timed out" >&2; exit 1; }
 kill -0 "$SERVER_PID" 2>/dev/null || { echo "benchmark server exited during launch" >&2; exit 1; }
 if [ "${MASQUE_BENCH_PERF:-0}" = 1 ]; then
-    "$PERF_BIN" record --event cpu-clock:u -F 99 --call-graph dwarf,8192 \
+    "$PERF_BIN" record --event "${MASQUE_BENCH_PERF_EVENT:-cpu-clock:u}" -F 99 --call-graph dwarf,8192 \
         -p "$SERVER_PID" -o "$BENCH_DIR/perf.data" >"$BENCH_DIR/perf.log" 2>&1 &
     PERF_PID=$!
 fi
