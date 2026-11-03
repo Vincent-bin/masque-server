@@ -100,7 +100,7 @@ All metric names start with `masque_`.
 | `masque_connections_accepted_total` | counter | `listener`, `transport`, `auth` | Accepted connection objects |
 | `masque_connections_rejected_total` | counter | `listener`, `transport`, `auth`, `reason` | Connections rejected at a resource limit |
 | `masque_quic_retries_total` | counter | `listener`, `transport`, `auth`, `result` | Retry packets sent or invalid Retry tokens received |
-| `masque_quic_path_events_total` | counter | `listener`, `transport`, `auth`, `event` | QUIC path discovery, validation, failure, closure, CID reuse, and completed peer migration events |
+| `masque_quic_path_events_total` | counter | `listener`, `transport`, `auth`, `event` | QUIC path discovery, validation, failure, closure, CID reuse, completed peer migration, and validated path MTU updates |
 | `masque_quic_path_migrations_rejected_total` | counter | `listener`, `transport`, `auth`, `reason` | Validated migrations refused by the new source's resource limit |
 | `masque_quic_cross_shard_forwarded_packets_total` | counter | `listener`, `transport`, `auth` | QUIC packets delivered through the userspace wrong-shard fallback; normally zero with Linux CID steering |
 | `masque_quic_cross_shard_forwarded_bytes_total` | counter | `listener`, `transport`, `auth` | Bytes delivered through the userspace wrong-shard fallback |

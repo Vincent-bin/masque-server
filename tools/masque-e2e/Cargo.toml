@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 masque = { package = "masque-server", path = "../.." }
-quiche = "0.29.3"
+quiche = "0.30.0"
 anyhow = "1"
 base64 = "0.22.1"
 boring = "4.3"

@@ -2878,9 +2878,19 @@ impl Shard {
                         "peer reused a source connection ID on another path"
                     );
                 }
+                quiche::PathEvent::PmtuUpdated { pmtu, .. } => {
+                    debug!(
+                        connection_index = client.index,
+                        pmtu, "QUIC path MTU updated"
+                    );
+                }
                 quiche::PathEvent::New(..)
                 | quiche::PathEvent::Validated(..)
                 | quiche::PathEvent::Closed(..) => {}
+                _ => debug!(
+                    connection_index = client.index,
+                    "unrecognized QUIC path event"
+                ),
             }
         }
         true

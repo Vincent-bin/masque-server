@@ -410,6 +410,7 @@ impl ListenerMetrics {
                 &shard.quic_path_reused_source_cid
             }),
             ("peer_migrated", |shard| &shard.quic_path_peer_migrated),
+            ("pmtu_updated", |shard| &shard.quic_path_pmtu_updated),
         ] {
             writeln!(
                 out,
@@ -577,6 +578,7 @@ pub(crate) struct ShardMetrics {
     quic_path_closed: AtomicU64,
     quic_path_reused_source_cid: AtomicU64,
     quic_path_peer_migrated: AtomicU64,
+    quic_path_pmtu_updated: AtomicU64,
     quic_migration_source_limit: AtomicU64,
     quic_cross_shard_forwarded_packets: AtomicU64,
     quic_cross_shard_forwarded_bytes: AtomicU64,
@@ -628,6 +630,7 @@ impl ShardMetrics {
             quic_path_closed: AtomicU64::new(0),
             quic_path_reused_source_cid: AtomicU64::new(0),
             quic_path_peer_migrated: AtomicU64::new(0),
+            quic_path_pmtu_updated: AtomicU64::new(0),
             quic_migration_source_limit: AtomicU64::new(0),
             quic_cross_shard_forwarded_packets: AtomicU64::new(0),
             quic_cross_shard_forwarded_bytes: AtomicU64::new(0),
@@ -739,6 +742,8 @@ impl ShardMetrics {
             quiche::PathEvent::Closed(..) => &self.quic_path_closed,
             quiche::PathEvent::ReusedSourceConnectionId(..) => &self.quic_path_reused_source_cid,
             quiche::PathEvent::PeerMigrated(..) => &self.quic_path_peer_migrated,
+            quiche::PathEvent::PmtuUpdated { .. } => &self.quic_path_pmtu_updated,
+            _ => return,
         };
         counter.fetch_add(1, RELAXED);
     }
@@ -1192,6 +1197,11 @@ mod tests {
             "127.0.0.1:8449".parse().unwrap(),
             "192.0.2.2:50001".parse().unwrap(),
         ));
+        listener.record_quic_path_event(&quiche::PathEvent::PmtuUpdated {
+            local: "127.0.0.1:8449".parse().unwrap(),
+            peer: "192.0.2.2:50001".parse().unwrap(),
+            pmtu: 1350,
+        });
         listener.record_quic_migration_source_limit();
         listener.record_cross_shard_forward(3, 3600);
         listener.record_shard_queue_drop(2);
@@ -1244,6 +1254,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "masque_quic_path_events_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",event=\"peer_migrated\"} 1"
+        ));
+        assert!(rendered.contains(
+            "masque_quic_path_events_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",event=\"pmtu_updated\"} 1"
         ));
         assert!(rendered.contains(
             "masque_quic_path_migrations_rejected_total{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",reason=\"source_limit\"} 1"
