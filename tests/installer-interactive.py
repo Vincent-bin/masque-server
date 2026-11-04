@@ -12,6 +12,7 @@ prompts = [
     (b"Enable Basic stealth mode?", b"no\n"),
     (b"Certificate choice", b"1\n"),
     (b"Public hostname or IP for certificate", b"proxy.example.com\n"),
+    (b"Basic authentication username", b"\n"),
     (b"Transport", b"2\n"),
     (b"Public http2 listen port", b"8449\n"),
 ]
