@@ -471,15 +471,21 @@ install_tls_material() {
             2|existing)
                 cert_source=$(prompt_value "PEM full-chain certificate path" "")
                 key_source=$(prompt_value "Unencrypted PEM private-key path" "")
-                [ -n "$cert_source" ] && [ -n "$key_source" ] || die "both TLS paths are required"
+                if [ -z "$cert_source" ] || [ -z "$key_source" ]; then
+                    die "both TLS paths are required"
+                fi
                 ;;
             *) die "certificate choice must be 1 or 2" ;;
         esac
     fi
 
     if [ "${MASQUE_TLS_MODE:-existing}" = self_signed ]; then
-        [ -z "$cert_source" ] && [ -z "$key_source" ] || die "self-signed TLS cannot be combined with TLS source files"
-        [ ! -e "$TLS_CERT_PATH" ] && [ ! -e "$TLS_KEY_PATH" ] || die "refusing to overwrite existing TLS material"
+        if [ -n "$cert_source" ] || [ -n "$key_source" ]; then
+            die "self-signed TLS cannot be combined with TLS source files"
+        fi
+        if [ -e "$TLS_CERT_PATH" ] || [ -e "$TLS_KEY_PATH" ]; then
+            die "refusing to overwrite existing TLS material"
+        fi
         command -v openssl >/dev/null 2>&1 || die "openssl is required to generate a self-signed certificate"
         PUBLIC_HOST=${MASQUE_TLS_NAME:-}
         if [ -z "$PUBLIC_HOST" ] && can_prompt; then
