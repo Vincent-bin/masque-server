@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.5 - 2026-11-04
+
+### Added
+
+- Allow TCP and UDP target CIDRs and ports to be restricted per listener
+  on HTTP/2 and HTTP/3. Listener restrictions narrow the global policy.
+
+### Changed
+
+- Enable TCP_NODELAY for HTTP/2 and batch ready CONNECT-UDP response
+  capsules within bounded limits.
+- Document Linux HTTP/2 small-packet measurements and the HTTP/3 GSO and
+  pacing comparison with simulated delay and loss.
+
 ## 0.14.4 - 2026-11-04
 
 ### Changed
