@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "masque-probe"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "masque-server"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "anyhow",
  "argon2",
