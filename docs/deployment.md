@@ -74,6 +74,7 @@ The following environment variables make provisioning non-interactive:
 | --- | --- |
 | `MASQUE_VERSION` | Exact published version/tag instead of the latest stable release |
 | `MASQUE_AUTH_MODE` | `basic`, `client_cert`, or `dual` |
+| `MASQUE_TRANSPORT` | `http3` (default) or `http2` for freshly generated listeners |
 | `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
 | `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |

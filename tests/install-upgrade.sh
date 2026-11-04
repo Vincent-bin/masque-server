@@ -309,6 +309,7 @@ rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
 # Automation can provision a fresh host without putting credentials or the
 # rendered configuration into captured logs.
 MASQUE_AUTH_MODE=basic \
+    MASQUE_TRANSPORT=http2 \
     MASQUE_AUTH_USERNAME=private-automation-user \
     MASQUE_AUTH_PASSWORD=private-automation-password \
     MASQUE_PRINT_SECRETS=0 \
@@ -331,6 +332,34 @@ grep -q 'Credential and generated configuration output was suppressed' \
     die "fresh automation printed its Basic password"
 ! grep -q 'Effective server configuration' "$TEST_TMP/suppressed-fresh.log" ||
     die "fresh automation printed its rendered configuration"
+grep -q '^transport = "http2"$' "$CONFIG_PATH" ||
+    die "fresh installation did not select HTTP/2"
+"$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/http2-check.log" 2>&1 ||
+    die "HTTP/2 fresh configuration failed check-config"
+grep -q 'transport=http2 auth=basic' "$TEST_TMP/http2-check.log" ||
+    die "HTTP/2 fresh listener was not reported by check-config"
+rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
+
+# Dual authentication over HTTP/2 must configure both listeners consistently.
+MASQUE_AUTH_MODE=dual \
+    MASQUE_TRANSPORT=http2 \
+    MASQUE_AUTH_USERNAME=proxy-user \
+    MASQUE_AUTH_PASSWORD=a-strong-password \
+    MASQUE_LISTEN_PORT=8449 \
+    MASQUE_CERT_LISTEN_PORT=8450 \
+    MASQUE_CLIENT_NAME=laptop \
+    MASQUE_CLIENT_ENDPOINT=203.0.113.9:8450 \
+    MASQUE_CLIENT_CONFIG_OUT="$TEST_TMP/http2-dual-client.json" \
+    MASQUE_PRINT_SECRETS=0 \
+    MASQUE_START_SERVICE=0 \
+    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/http2-dual.log" 2>&1 ||
+    die "fresh HTTP/2 dual installation failed"
+"$CANDIDATE" --config "$CONFIG_PATH" check-config >"$TEST_TMP/http2-dual-check.log" 2>&1 ||
+    die "HTTP/2 dual configuration failed check-config"
+grep -q 'transport=http2 auth=basic' "$TEST_TMP/http2-dual-check.log" ||
+    die "HTTP/2 Basic listener was not reported"
+grep -q 'transport=http2 auth=client_cert' "$TEST_TMP/http2-dual-check.log" ||
+    die "HTTP/2 certificate listener was not reported"
 rm -f -- "$CONFIG_PATH" "$(dirname "$CONFIG_PATH")/.masque.toml.lock"
 
 # An incompatible existing configuration must fail before replacement.

@@ -543,7 +543,7 @@ append_certificate_listener() {
 # the CONNECT-IP address pool — is shared by the one process.
 [[listeners]]
 listen_addr = "0.0.0.0:$cert_port"
-transport = "http3"
+transport = "$FRESH_TRANSPORT"
 shards = 1
 
 [listeners.auth]
@@ -575,12 +575,18 @@ choose_listen_port() {
 }
 
 configure_fresh_listen_port() {
-    listen_port=$(choose_listen_port "Public UDP listen port" 443 \
+    FRESH_TRANSPORT=${MASQUE_TRANSPORT:-http3}
+    case "$FRESH_TRANSPORT" in
+        http2|http3) ;;
+        *) die "MASQUE_TRANSPORT must be http2 or http3" ;;
+    esac
+    listen_port=$(choose_listen_port "Public $FRESH_TRANSPORT listen port" 443 \
         "${MASQUE_LISTEN_PORT:-}")
 
     CONFIG_REWRITE_TMP=$(mktemp /etc/masque/.masque-listen.XXXXXX)
     chmod 0600 "$CONFIG_REWRITE_TMP"
-    sed "s|^listen_addr = \"0.0.0.0:443\"$|listen_addr = \"0.0.0.0:$listen_port\"|" \
+    sed -e "s|^listen_addr = \"0.0.0.0:443\"$|listen_addr = \"0.0.0.0:$listen_port\"|" \
+        -e "s|^transport = \"http3\"$|transport = \"$FRESH_TRANSPORT\"|" \
         "$CONFIG_TMP" >"$CONFIG_REWRITE_TMP"
     if ! grep -q "^listen_addr = \"0.0.0.0:$listen_port\"$" \
         "$CONFIG_REWRITE_TMP"; then
@@ -591,7 +597,7 @@ configure_fresh_listen_port() {
 
     if [ "$AUTH_MODE" = dual ]; then
         cert_listen_port=$(choose_listen_port \
-            "Public UDP listen port for certificate clients" 4443 \
+            "Public $FRESH_TRANSPORT listen port for certificate clients" 4443 \
             "${MASQUE_CERT_LISTEN_PORT:-}")
         if [ "$cert_listen_port" = "$listen_port" ]; then
             die "the two listeners need different ports; both asked for $listen_port"

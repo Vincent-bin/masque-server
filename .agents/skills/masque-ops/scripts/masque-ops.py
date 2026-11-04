@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import dataclasses
 import datetime as dt
+import getpass
 import ipaddress
 import json
 import os
@@ -27,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -395,6 +398,12 @@ class BootstrapConfig:
     client_ipv4: str | None = None
     client_ipv6: str | None = None
     client_config: Path | None = None
+    tls_mode: str = "existing"
+    tls_name: str | None = None
+    tls_ca_file: Path | None = None
+    install_dependencies: bool = False
+    transport: str = "http3"
+    verify_dual: bool = False
 
     @property
     def uses_basic(self) -> bool:
@@ -425,6 +434,7 @@ class Host:
     canary: bool
     probe: ProbeConfig | None
     bootstrap: BootstrapConfig | None
+    ssh_password_file: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -451,6 +461,246 @@ class Inventory:
             raise OpsError(f"unknown host(s): {', '.join(unknown)}")
         return tuple(by_name[name] for name in names)
 
+    def default_host(self, *, canary_for_fleet: bool = False) -> Host:
+        if len(self.hosts) == 1:
+            return self.hosts[0]
+        if canary_for_fleet:
+            canaries = [host for host in self.hosts if host.canary]
+            if len(canaries) == 1:
+                return canaries[0]
+            raise OpsError("select a host or designate exactly one canary")
+        raise OpsError("select an explicit host when the inventory contains multiple hosts")
+
+
+def initialize_inventory(
+    path: Path,
+    *,
+    ssh_host: str,
+    endpoint_host: str,
+    ssh_port: int = 22,
+    listen_port: int = 443,
+    identity_file: str | None = None,
+    ssh_password_file: str | None = None,
+    ssh_password: str | None = None,
+    known_hosts_file: str | None = None,
+    tls_cert_path: str = "/etc/masque-bootstrap/fullchain.pem",
+    tls_key_path: str = "/etc/masque-bootstrap/privkey.pem",
+    ca_cert: str | None = None,
+    self_signed: bool = False,
+    proxy_password: str | None = None,
+    add_host: bool = False,
+    auth_mode: str = "basic",
+    transport: str = "http3",
+    connect_ip: bool = False,
+    cert_listen_port: int = 4443,
+    skip_tcp: bool = False,
+    skip_udp: bool = False,
+) -> dict[str, object]:
+    """Create a private first-host template without contacting the server."""
+    path = Path(os.path.abspath(path.expanduser()))
+    ssh_host = require_string(ssh_host, "SSH host")
+    endpoint_host = require_string(endpoint_host, "proxy hostname")
+    for value in (ssh_host, endpoint_host):
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            if not HOST_RE.fullmatch(value):
+                raise OpsError("SSH and proxy hosts must be hostnames or IP addresses")
+    require_int(ssh_port, "SSH port", 1, 65535)
+    require_int(listen_port, "proxy port", 1, 65535)
+    if auth_mode not in {"basic", "client_cert", "dual"}:
+        raise OpsError("authentication must be basic, client_cert or dual")
+    if transport not in {"http2", "http3"}:
+        raise OpsError("transport must be http2 or http3")
+    require_int(cert_listen_port, "certificate listener port", 1, 65535)
+    if auth_mode == "dual" and cert_listen_port == listen_port:
+        raise OpsError("Basic and certificate listeners need different ports")
+    if auth_mode == "client_cert" and proxy_password is not None:
+        raise OpsError("a proxy password is not used with certificate-only authentication")
+    if skip_tcp and skip_udp and not connect_ip:
+        raise OpsError("select at least one protocol check")
+    require_remote_path(tls_cert_path, "TLS certificate path")
+    require_remote_path(tls_key_path, "TLS key path")
+    try:
+        path.parent.resolve().relative_to(PROTECTED_SOURCE_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise OpsError("inventory must be stored outside the operations tool directory")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_parent(path, "inventory")
+    existing: Inventory | None = None
+    original: bytes | None = None
+    original_stat: os.stat_result | None = None
+    if add_host:
+        existing = load_inventory(path)
+        original_stat = path.lstat()
+        original = path.read_bytes()
+    elif path.exists() or path.is_symlink():
+        raise OpsError("inventory already exists; use --add-host to add a node")
+    if identity_file is not None:
+        ensure_private_file(resolve_local_path(identity_file, path.parent), "SSH identity")
+    if ssh_password is not None and (identity_file is not None or ssh_password_file is not None):
+        raise OpsError("choose only one SSH authentication method")
+    if ssh_password is not None and (
+        not ssh_password or len(ssh_password.encode("utf-8")) > 1024
+        or any(c in ssh_password for c in ("\0", "\r", "\n"))
+    ):
+        raise OpsError("SSH password must be one non-empty line of at most 1024 bytes")
+    if ssh_password_file is not None:
+        if identity_file is not None:
+            raise OpsError("choose either an SSH identity or an SSH password file")
+        password_source = resolve_local_path(ssh_password_file, path.parent)
+        ensure_private_parent(password_source, "SSH password")
+        read_private_password(password_source, "SSH password")
+    if known_hosts_file is not None:
+        ensure_integrity_file(
+            resolve_local_path(known_hosts_file, path.parent), "known_hosts file"
+        )
+    if ca_cert is not None and self_signed:
+        raise OpsError("a self-signed certificate generates its own probe CA")
+    if ca_cert is not None and auth_mode == "client_cert":
+        raise OpsError("certificate enrollment pins the server key and does not use --ca-cert")
+    if ca_cert is not None:
+        ensure_integrity_file(resolve_local_path(ca_cert, path.parent), "probe CA certificate")
+
+    secret_dir = path.parent / "secrets"
+    secret_dir.mkdir(mode=0o700, exist_ok=True)
+    password_path = secret_dir / f"bootstrap-{secrets.token_hex(12)}.password"
+    client_path = secret_dir / f"client-{secrets.token_hex(12)}.json"
+    if auth_mode in {"basic", "dual"}:
+        ensure_secret_destination(password_path, "bootstrap password", allow_existing=False)
+    if auth_mode in {"client_cert", "dual"}:
+        ensure_secret_destination(client_path, "client enrollment", allow_existing=False)
+    if proxy_password is not None and (
+        not proxy_password or len(proxy_password.encode("utf-8")) > 1024
+        or any(c in proxy_password for c in ("\0", "\r", "\n"))
+    ):
+        raise OpsError("proxy password must be one non-empty line of at most 1024 bytes")
+    if self_signed:
+        remote_tls_dir = f"/etc/masque-bootstrap-{secrets.token_hex(12)}"
+        tls_cert_path = remote_tls_dir + "/fullchain.pem"
+        tls_key_path = remote_tls_dir + "/privkey.pem"
+        ca_path = secret_dir / f"bootstrap-ca-{secrets.token_hex(12)}.pem"
+        ensure_secret_destination(ca_path, "bootstrap CA certificate", allow_existing=False)
+        ca_cert = str(ca_path)
+    generated_ssh_password: Path | None = None
+    if ssh_password is not None:
+        generated_ssh_password = secret_dir / f"ssh-{secrets.token_hex(12)}.password"
+        write_private_file(generated_ssh_password, ssh_password.encode("utf-8"), "SSH password")
+        ssh_password_file = str(generated_ssh_password)
+    q = lambda value: json.dumps(value, ensure_ascii=True)
+    # Brackets are required around an IPv6 literal in a host:port endpoint.
+    try:
+        addr = ipaddress.ip_address(endpoint_host)
+        endpoint = f"[{endpoint_host}]:{listen_port}" if addr.version == 6 else f"{endpoint_host}:{listen_port}"
+    except ValueError:
+        endpoint = f"{endpoint_host}:{listen_port}"
+    cert_port = cert_listen_port if auth_mode == "dual" else listen_port
+    cert_endpoint = f"[{endpoint_host}]:{cert_port}" if ":" in endpoint_host else f"{endpoint_host}:{cert_port}"
+    name = "node-" + secrets.token_hex(6) if existing else "initial-node"
+    canary = existing is None or not any(host.canary for host in existing.hosts)
+    lines = [
+        "[[hosts]]",
+        f"name = {q(name)}",
+        f"address = {q(ssh_host)}",
+        'user = "root"',
+        f"port = {ssh_port}",
+        "sudo = false",
+        f"canary = {'true' if canary else 'false'}",
+    ]
+    if identity_file is not None:
+        lines.append(f"identity_file = {q(identity_file)}")
+    if ssh_password_file is not None:
+        lines.append(f"ssh_password_file = {q(ssh_password_file)}")
+    if known_hosts_file is not None:
+        lines.append(f"known_hosts_file = {q(known_hosts_file)}")
+    lines.extend([
+        "[hosts.bootstrap]",
+        f"auth_mode = {q(auth_mode)}",
+        f"transport = {q(transport)}",
+        *(["verify_dual = true"] if auth_mode == "dual" else []),
+        "install_dependencies = true",
+        f"listen_port = {listen_port}",
+        f"tls_cert_path = {q(tls_cert_path)}",
+        f"tls_key_path = {q(tls_key_path)}",
+        *(['tls_mode = "self_signed"', f"tls_name = {q(endpoint_host)}", f"tls_ca_file = {q(ca_cert)}"] if self_signed else []),
+    ])
+    if auth_mode in {"basic", "dual"}:
+        lines.extend(['basic_username = "masque"', f"basic_password_file = {q(str(password_path))}"])
+    if auth_mode in {"client_cert", "dual"}:
+        if auth_mode == "dual":
+            lines.append(f"cert_listen_port = {cert_listen_port}")
+        lines.extend(['client_name = "client"', f"client_endpoint = {q(cert_endpoint)}", f"client_config = {q(str(client_path))}"])
+    lines.extend(["[hosts.probe]", f"endpoint = {q(cert_endpoint if auth_mode == 'client_cert' else endpoint)}", f"transport = {q(transport)}"])
+    if auth_mode == "client_cert":
+        lines.append(f"client_config = {q(str(client_path))}")
+    else:
+        lines.extend(['username = "masque"', f"password_file = {q(str(password_path))}"])
+    if connect_ip:
+        lines.append("connect_ip = true")
+    if skip_tcp:
+        lines.append("skip_tcp = true")
+    if skip_udp:
+        lines.append("skip_udp = true")
+    if ca_cert is not None and auth_mode != "client_cert":
+        lines.append(f"ca_cert = {q(ca_cert)}")
+    new_host = ("\n".join(lines) + "\n").encode("utf-8")
+    content = ((original.rstrip() + b"\n\n") if original else b"schema_version = 1\n") + new_host
+    created_inventory = False
+    created_proxy_password = False
+    candidate: Path | None = None
+    try:
+        if proxy_password is not None:
+            write_private_file(password_path, proxy_password.encode("utf-8"), "proxy password")
+            created_proxy_password = True
+        if existing is None:
+            write_private_file(path, content, "inventory")
+            created_inventory = True
+            load_inventory(path)
+        else:
+            descriptor, temporary = tempfile.mkstemp(prefix=".masque-inventory-", dir=path.parent)
+            candidate = Path(temporary)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            updated = load_inventory(candidate)
+            if len(updated.hosts) != len(existing.hosts) + 1 or updated.hosts[:-1] != existing.hosts:
+                raise OpsError("inventory update would change existing hosts")
+            ensure_private_file(path, "inventory")
+            current_stat = path.lstat()
+            if (current_stat.st_dev, current_stat.st_ino) != (
+                original_stat.st_dev, original_stat.st_ino
+            ) or path.read_bytes() != original:
+                raise OpsError("inventory changed during setup; retry")
+            os.replace(candidate, path)
+    except Exception:
+        if created_inventory:
+            path.unlink(missing_ok=True)
+        if generated_ssh_password is not None:
+            generated_ssh_password.unlink(missing_ok=True)
+        if created_proxy_password:
+            password_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if candidate is not None:
+            candidate.unlink(missing_ok=True)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "added" if existing else "created",
+        "host": name,
+        "canary_selected": canary,
+        "probe_configured": True,
+        "password": ("not_used" if auth_mode == "client_cert" else
+                     "saved_privately" if proxy_password is not None else "generated_during_bootstrap"),
+        "tls": "self_signed_on_bootstrap" if self_signed else "existing_remote_files_required",
+        "auth_mode": auth_mode,
+        "transport": transport,
+        "connect_ip_requested": connect_ip,
+    }
+
 
 TOP_LEVEL_KEYS = {
     "schema_version",
@@ -464,6 +714,7 @@ CONNECTION_KEYS = {
     "user",
     "port",
     "identity_file",
+    "ssh_password_file",
     "known_hosts_file",
     "sudo",
     "connect_timeout_secs",
@@ -491,10 +742,16 @@ PROBE_KEYS = {
 }
 BOOTSTRAP_KEYS = {
     "auth_mode",
+    "transport",
+    "verify_dual",
     "listen_port",
     "cert_listen_port",
     "tls_cert_path",
     "tls_key_path",
+    "tls_mode",
+    "tls_name",
+    "tls_ca_file",
+    "install_dependencies",
     "basic_username",
     "basic_stealth",
     "basic_password_file",
@@ -557,6 +814,8 @@ def parse_probe(raw: object, inventory_dir: Path, host_name: str) -> ProbeConfig
         )
     if client_config is not None and username is not None:
         raise OpsError("probe.client_config cannot be combined with Basic credentials")
+    if client_config is not None and table.get("ca_cert") is not None:
+        raise OpsError("probe.client_config cannot be combined with ca_cert")
 
     def optional_text(key: str) -> str | None:
         value = table.get(key)
@@ -630,6 +889,12 @@ def parse_bootstrap(
         raise OpsError("bootstrap.auth_mode must be basic, client_cert, or dual")
     uses_basic = auth_mode in {"basic", "dual"}
     uses_client_certs = auth_mode in {"client_cert", "dual"}
+    verify_dual = require_bool(table.get("verify_dual", False), "bootstrap.verify_dual")
+    if verify_dual and auth_mode != "dual":
+        raise OpsError("bootstrap.verify_dual requires dual authentication")
+    transport = require_string(table.get("transport", "http3"), "bootstrap.transport")
+    if transport not in {"http3", "http2"}:
+        raise OpsError("bootstrap.transport must be http3 or http2")
     listen_port = require_int(
         table.get("listen_port", 443), "bootstrap.listen_port", 1, 65535
     )
@@ -705,16 +970,36 @@ def parse_bootstrap(
             "bootstrap certificate-client settings require client_cert or dual auth_mode"
         )
 
+    tls_mode = require_string(table.get("tls_mode", "existing"), "bootstrap.tls_mode")
+    if tls_mode not in {"existing", "self_signed"}:
+        raise OpsError("bootstrap.tls_mode must be existing or self_signed")
+    cert_path = require_remote_path(table.get("tls_cert_path"), "bootstrap.tls_cert_path")
+    key_path = require_remote_path(table.get("tls_key_path"), "bootstrap.tls_key_path")
+    tls_name = None
+    tls_ca_file = None
+    if tls_mode == "self_signed":
+        tls_name = require_string(table.get("tls_name"), "bootstrap.tls_name")
+        try:
+            ipaddress.ip_address(tls_name)
+        except ValueError:
+            if not HOST_RE.fullmatch(tls_name) or ":" in tls_name:
+                raise OpsError("bootstrap.tls_name must be a hostname or IP address")
+        if not re.fullmatch(r"/etc/masque-bootstrap-[0-9a-f]{24}/fullchain\.pem", cert_path):
+            raise OpsError("self-signed TLS files require a dedicated bootstrap directory")
+        if key_path != cert_path.removesuffix("fullchain.pem") + "privkey.pem":
+            raise OpsError("self-signed TLS key must be in the bootstrap directory")
+        tls_ca_file = optional_path(table, "tls_ca_file", inventory_dir)
+        if tls_ca_file is None:
+            raise OpsError("bootstrap.tls_ca_file is required for self-signed TLS")
+    elif "tls_name" in table or "tls_ca_file" in table:
+        raise OpsError("bootstrap.tls_name and tls_ca_file require self_signed mode")
+
     return BootstrapConfig(
         auth_mode=auth_mode,
         listen_port=listen_port,
         cert_listen_port=cert_listen_port,
-        tls_cert_path=require_remote_path(
-            table.get("tls_cert_path"), "bootstrap.tls_cert_path"
-        ),
-        tls_key_path=require_remote_path(
-            table.get("tls_key_path"), "bootstrap.tls_key_path"
-        ),
+        tls_cert_path=cert_path,
+        tls_key_path=key_path,
         basic_username=basic_username,
         basic_stealth=require_bool(
             table.get("basic_stealth", False), "bootstrap.basic_stealth"
@@ -728,6 +1013,14 @@ def parse_bootstrap(
         client_ipv4=client_ipv4,
         client_ipv6=client_ipv6,
         client_config=client_config,
+        tls_mode=tls_mode,
+        tls_name=tls_name,
+        tls_ca_file=tls_ca_file,
+        install_dependencies=require_bool(
+            table.get("install_dependencies", False), "bootstrap.install_dependencies"
+        ),
+        transport=transport,
+        verify_dual=verify_dual,
     )
 
 
@@ -783,7 +1076,10 @@ def load_inventory(path: Path) -> Inventory:
         seen_names.add(name)
         address = require_string(table.get("address"), f"hosts[{name}].address")
         if not HOST_RE.fullmatch(address):
-            raise OpsError(f"invalid SSH address for host {name}: {address}")
+            try:
+                ipaddress.ip_address(address)
+            except ValueError as error:
+                raise OpsError(f"invalid SSH address for host {name}") from error
         user = require_string(
             merged_value(table, defaults, "user", "root"), f"hosts[{name}].user"
         )
@@ -797,7 +1093,10 @@ def load_inventory(path: Path) -> Inventory:
             raise OpsError(f"duplicate SSH destination for host {name}")
         seen_destinations.add(destination)
 
-        identity_raw = merged_value(table, defaults, "identity_file", None)
+        identity_raw = (
+            None if "ssh_password_file" in table and "identity_file" not in table
+            else merged_value(table, defaults, "identity_file", None)
+        )
         identity_file = (
             None
             if identity_raw is None
@@ -805,6 +1104,17 @@ def load_inventory(path: Path) -> Inventory:
                 require_string(identity_raw, "identity_file"), inventory_dir
             )
         )
+        ssh_password_raw = (
+            None if "identity_file" in table and "ssh_password_file" not in table
+            else merged_value(table, defaults, "ssh_password_file", None)
+        )
+        ssh_password_file = (
+            None if ssh_password_raw is None else resolve_local_path(
+                require_string(ssh_password_raw, "ssh_password_file"), inventory_dir
+            )
+        )
+        if identity_file is not None and ssh_password_file is not None:
+            raise OpsError("choose either an SSH identity or an SSH password file")
         known_hosts_raw = merged_value(table, defaults, "known_hosts_file", None)
         known_hosts_file = (
             None
@@ -823,6 +1133,11 @@ def load_inventory(path: Path) -> Inventory:
         if "bootstrap" in table:
             bootstrap = parse_bootstrap(table["bootstrap"], inventory_dir, name)
         if bootstrap is not None and probe is not None:
+            if (bootstrap.tls_mode == "self_signed" and probe.client_config is None
+                    and probe.ca_cert != bootstrap.tls_ca_file):
+                raise OpsError("self-signed bootstrap probe must use the generated CA certificate")
+            if probe.transport not in {bootstrap.transport, "auto"}:
+                raise OpsError("bootstrap probe transport does not match the listener")
             if probe.password_file is not None and (
                 not bootstrap.uses_basic
                 or probe.username != bootstrap.basic_username
@@ -838,6 +1153,10 @@ def load_inventory(path: Path) -> Inventory:
                 raise OpsError(
                     f"hosts[{name}] certificate probe must use the bootstrap client configuration"
                 )
+        if bootstrap is not None and bootstrap.verify_dual and (
+            probe is None or probe.username is None or probe.password_file is None
+        ):
+            raise OpsError("dual verification requires a configured Basic probe")
         hosts.append(
             Host(
                 name=name,
@@ -875,6 +1194,7 @@ def load_inventory(path: Path) -> Inventory:
                 ),
                 probe=probe,
                 bootstrap=bootstrap,
+                ssh_password_file=ssh_password_file,
             )
         )
     return Inventory(path, repository, state_path, probe_binary, tuple(hosts))
@@ -901,9 +1221,9 @@ class SshClient:
             "-F",
             "/dev/null",
             "-o",
-            "BatchMode=yes",
+            "BatchMode=no" if host.ssh_password_file is not None else "BatchMode=yes",
             "-o",
-            "PasswordAuthentication=no",
+            "PasswordAuthentication=yes" if host.ssh_password_file is not None else "PasswordAuthentication=no",
             "-o",
             "KbdInteractiveAuthentication=no",
             "-o",
@@ -929,6 +1249,10 @@ class SshClient:
             "-p",
             str(host.port),
         ]
+        if host.ssh_password_file is not None:
+            ensure_private_parent(host.ssh_password_file, "SSH password")
+            ensure_private_file(host.ssh_password_file, "SSH password")
+            arguments.extend(["-o", "PreferredAuthentications=password", "-o", "NumberOfPasswordPrompts=1"])
         if host.identity_file is not None:
             ensure_private_file(host.identity_file, f"SSH identity for {host.name}")
             arguments.extend(
@@ -942,6 +1266,26 @@ class SshClient:
         arguments.extend([f"{host.user}@{host.address}", command])
         return arguments
 
+    @contextlib.contextmanager
+    def environment(self, host: Host):
+        if host.ssh_password_file is None:
+            yield None
+            return
+        ensure_private_parent(host.ssh_password_file, "SSH password")
+        ensure_private_file(host.ssh_password_file, "SSH password")
+        with tempfile.TemporaryDirectory(prefix=".masque-askpass-", dir=host.ssh_password_file.parent) as directory:
+            helper = Path(directory) / "askpass"
+            helper.write_text('#!/bin/sh\nexec /bin/cat "$MASQUE_OPS_SSH_PASSWORD_FILE"\n', encoding="utf-8")
+            helper.chmod(0o700)
+            environment = os.environ.copy()
+            environment.update({
+                "SSH_ASKPASS": str(helper),
+                "SSH_ASKPASS_REQUIRE": "force",
+                "DISPLAY": environment.get("DISPLAY") or ":masque-ops",
+                "MASQUE_OPS_SSH_PASSWORD_FILE": str(host.ssh_password_file),
+            })
+            yield environment
+
     def run(
         self,
         host: Host,
@@ -951,15 +1295,17 @@ class SshClient:
         timeout: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(
-                self.arguments(host, command),
-                input=input_text,
-                stdin=subprocess.DEVNULL if input_text is None else None,
-                text=True,
-                capture_output=True,
-                timeout=timeout or host.command_timeout_secs,
-                check=False,
-            )
+            with self.environment(host) as environment:
+                return subprocess.run(
+                    self.arguments(host, command),
+                    input=input_text,
+                    stdin=subprocess.DEVNULL if input_text is None else None,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout or host.command_timeout_secs,
+                    check=False,
+                    env=environment,
+                )
         except subprocess.TimeoutExpired as error:
             raise OpsError(f"SSH command timed out on {host.name}") from error
         except OSError as error:
@@ -981,14 +1327,16 @@ class SshClient:
         try:
             with os.fdopen(descriptor, "wb", closefd=True) as output:
                 try:
-                    completed = subprocess.run(
-                        self.arguments(host, command),
-                        stdin=subprocess.DEVNULL,
-                        stdout=output,
-                        stderr=subprocess.PIPE,
-                        timeout=host.command_timeout_secs,
-                        check=False,
-                    )
+                    with self.environment(host) as environment:
+                        completed = subprocess.run(
+                            self.arguments(host, command),
+                            stdin=subprocess.DEVNULL,
+                            stdout=output,
+                            stderr=subprocess.PIPE,
+                            timeout=host.command_timeout_secs,
+                            check=False,
+                            env=environment,
+                        )
                 except subprocess.TimeoutExpired as error:
                     raise OpsError(
                         f"secret retrieval timed out on {host.name}"
@@ -1124,6 +1472,12 @@ for required in curl tar sha256sum awk grep head mktemp install systemctl openss
         fi
     fi
 done
+package_manager=none
+if command -v apt-get >/dev/null 2>&1; then
+    package_manager=apt
+elif command -v dnf >/dev/null 2>&1; then
+    package_manager=dnf
+fi
 
 printf '%s\n' \
     'masque_ops_bootstrap_preflight=1' \
@@ -1131,9 +1485,52 @@ printf '%s\n' \
     "arch=$(uname -m 2>/dev/null || true)" \
     "binary_exists=$([ -e "$binary" ] && printf yes || printf no)" \
     "config_exists=$([ -e "$config" ] && printf yes || printf no)" \
+    "tls_cert_exists=$([ -e "$cert" ] || [ -L "$cert" ] && printf yes || printf no)" \
+    "tls_key_exists=$([ -e "$key" ] || [ -L "$key" ] && printf yes || printf no)" \
     "tls_cert_readable=$([ -r "$cert" ] && printf yes || printf no)" \
     "tls_key_readable=$([ -r "$key" ] && printf yes || printf no)" \
+    "package_manager=$package_manager" \
     "missing_commands=$missing"
+"""
+
+SELF_SIGNED_CERT_SCRIPT = r"""# MASQUE_OPS_SELF_SIGNED_CERT_V1
+set -eu
+umask 077
+directory=${MASQUE_CERT_PATH%/*}
+# The local parser restricts this to a unique /etc/masque-bootstrap-* path.
+mkdir -m 0700 -- "$directory"
+complete=0
+cleanup() {
+    if [ "$complete" -ne 1 ]; then
+        rm -f -- "$MASQUE_CERT_PATH" "$MASQUE_KEY_PATH"
+        rmdir -- "$directory" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -nodes -days 365 -subj "/CN=masque-server" \
+    -addext "subjectAltName=$MASQUE_CERT_SAN" \
+    -keyout "$MASQUE_KEY_PATH" -out "$MASQUE_CERT_PATH" >/dev/null 2>&1
+chmod 0600 "$MASQUE_KEY_PATH" "$MASQUE_CERT_PATH"
+complete=1
+"""
+
+PREPARE_DEPENDENCIES_SCRIPT = r"""# MASQUE_OPS_PREPARE_DEPENDENCIES_V1
+set -eu
+[ "$(id -u)" -eq 0 ]
+[ ! -e /usr/local/bin/masque-server ] && [ ! -e /etc/masque/masque.toml ]
+case "$1" in
+    apt)
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y curl tar coreutils gawk grep openssl libc-bin passwd
+        ;;
+    dnf)
+        dnf install -y curl tar coreutils gawk grep openssl glibc-common shadow-utils
+        ;;
+    *) exit 2 ;;
+esac
 """
 
 
@@ -1144,9 +1541,12 @@ class BootstrapPreflight:
     arch: str | None = None
     binary_exists: bool = False
     config_exists: bool = False
+    tls_cert_exists: bool = False
+    tls_key_exists: bool = False
     tls_cert_readable: bool = False
     tls_key_readable: bool = False
     missing_commands: tuple[str, ...] = ()
+    package_manager: str | None = None
     error: str | None = None
 
 
@@ -1167,9 +1567,12 @@ def parse_bootstrap_preflight(output: str) -> BootstrapPreflight:
         arch=fields.get("arch") or None,
         binary_exists=fields.get("binary_exists") == "yes",
         config_exists=fields.get("config_exists") == "yes",
+        tls_cert_exists=fields.get("tls_cert_exists") == "yes",
+        tls_key_exists=fields.get("tls_key_exists") == "yes",
         tls_cert_readable=fields.get("tls_cert_readable") == "yes",
         tls_key_readable=fields.get("tls_key_readable") == "yes",
         missing_commands=missing,
+        package_manager=fields.get("package_manager") or None,
     )
 
 
@@ -1379,7 +1782,9 @@ class ProbeRunner:
             probe.client_config not in allow_missing or probe.client_config.exists()
         ):
             ensure_private_file(probe.client_config, "probe client configuration")
-        if probe.ca_cert is not None:
+        if probe.ca_cert is not None and (
+            probe.ca_cert not in allow_missing or probe.ca_cert.exists()
+        ):
             ensure_integrity_file(probe.ca_cert, "probe CA certificate")
 
     def run(self, host: Host) -> dict[str, object]:
@@ -1474,6 +1879,116 @@ class ProbeRunner:
             codes = ", ".join(str(code) for code in failed_codes) or "UNKNOWN"
             raise OpsError(f"external MASQUE probe failed for {host.name}: {codes}")
         return summary
+
+
+def configure_probe(
+    inventory: Inventory,
+    host: Host,
+    values: dict[str, object],
+    password: str | None,
+    runner: ProbeRunner,
+) -> dict[str, object]:
+    """Test a new probe before atomically adding it to a private inventory."""
+    if host.probe is not None:
+        raise OpsError("a probe is already configured for the selected host")
+    ensure_private_parent(inventory.path, "inventory")
+    ensure_private_file(inventory.path, "inventory")
+    original_stat = inventory.path.lstat()
+    original = inventory.path.read_bytes()
+    secret: Path | None = None
+    committed = False
+    candidate: Path | None = None
+    try:
+        if password is not None:
+            if not password or len(password.encode("utf-8")) > 1024 or any(
+                c in password for c in ("\0", "\r", "\n")
+            ):
+                raise OpsError(
+                    "password must be one non-empty line of at most 1024 bytes"
+                )
+            secret_dir = inventory.path.parent / "secrets"
+            secret_dir.mkdir(mode=0o700, exist_ok=True)
+            destination = secret_dir / f"probe-{secrets.token_hex(12)}.password"
+            write_private_file(destination, password.encode("utf-8"), "probe password")
+            secret = destination
+            values["password_file"] = str(secret)
+
+        probe = parse_probe(values, inventory.path.parent, host.name)
+        for path in (probe.password_file, probe.client_config):
+            if path is not None:
+                ensure_private_parent(path, "probe credential")
+        try:
+            tested = runner.run(dataclasses.replace(host, probe=probe))
+        except OpsError as error:
+            raise OpsError(
+                f"{error}. Nothing was saved; check authentication, target policy, "
+                "and network routing. For private CAs or routing issues, see "
+                "--ca-cert, --resolve, and --interface."
+            ) from error
+        text = original.decode("utf-8")
+        starts = list(re.finditer(r"(?m)^[ \t]*\[\[hosts\]\][ \t]*(?:\#.*)?$", text))
+        location: int | None = None
+        for index, start in enumerate(starts):
+            end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+            try:
+                section = tomllib.loads(text[start.start() : end])
+            except tomllib.TOMLDecodeError as error:
+                raise OpsError("cannot safely edit this inventory layout") from error
+            hosts = section.get("hosts")
+            if (
+                set(section) != {"hosts"}
+                or not isinstance(hosts, list)
+                or len(hosts) != 1
+            ):
+                raise OpsError("cannot safely edit this inventory layout")
+            if hosts[0].get("name") == host.name:
+                location = end
+        if location is None:
+            raise OpsError("cannot safely locate the selected host")
+        stanza = "\n[hosts.probe]\n" + "".join(
+            f"{key} = {json.dumps(value, ensure_ascii=True)}\n"
+            for key, value in values.items()
+        )
+        updated = text[:location].rstrip() + "\n" + stanza + "\n" + text[location:]
+        parsed = tomllib.loads(updated)
+        old_data = tomllib.loads(text)
+        matching = [h for h in old_data["hosts"] if h.get("name") == host.name]
+        if len(matching) != 1:
+            raise OpsError("cannot safely locate the selected host")
+        matching[0]["probe"] = values
+        if parsed != old_data:
+            raise OpsError("inventory edit would change unrelated settings")
+
+        descriptor, path = tempfile.mkstemp(
+            prefix=".masque-inventory-", dir=inventory.path.parent
+        )
+        candidate = Path(path)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(updated.encode("utf-8"))
+            output.flush()
+            os.fsync(output.fileno())
+        load_inventory(candidate)
+        ensure_private_file(inventory.path, "inventory")
+        current_stat = inventory.path.lstat()
+        if (
+            (current_stat.st_dev, current_stat.st_ino)
+            != (original_stat.st_dev, original_stat.st_ino)
+            or inventory.path.read_bytes() != original
+        ):
+            raise OpsError("inventory changed during probe setup; retry")
+        os.replace(candidate, inventory.path)
+        committed = True
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "configured",
+            "probe": tested,
+        }
+    finally:
+        if candidate is not None:
+            candidate.unlink(missing_ok=True)
+        if secret is not None and not committed:
+            secret.unlink(missing_ok=True)
 
 
 class StateStore:
@@ -1699,12 +2214,13 @@ class FleetOperator:
             for path in (
                 bootstrap.basic_password_file,
                 bootstrap.client_config,
+                bootstrap.tls_ca_file,
             )
             if path is not None
         }
         return frozenset(
             path
-            for path in (probe.password_file, probe.client_config)
+            for path in (probe.password_file, probe.client_config, probe.ca_cert)
             if path is not None and path in generated and not path.exists()
         )
 
@@ -1725,6 +2241,7 @@ class FleetOperator:
         for path, label in (
             (bootstrap.basic_client_config, "bootstrap Basic client configuration"),
             (bootstrap.client_config, "bootstrap certificate client configuration"),
+            (bootstrap.tls_ca_file, "bootstrap CA certificate"),
         ):
             if path is not None:
                 ensure_secret_destination(path, label, allow_existing=False)
@@ -1749,6 +2266,7 @@ class FleetOperator:
             "MASQUE_RUN_HOST_DIAGNOSTICS": "0",
             "MASQUE_PRINT_SECRETS": "0",
             "MASQUE_AUTH_MODE": bootstrap.auth_mode,
+            "MASQUE_TRANSPORT": bootstrap.transport,
             "MASQUE_LISTEN_PORT": str(bootstrap.listen_port),
             "MASQUE_TLS_CERT": bootstrap.tls_cert_path,
             "MASQUE_TLS_KEY": bootstrap.tls_key_path,
@@ -1890,6 +2408,58 @@ class FleetOperator:
             f"config={last.config_check or 'unknown'}"
         )
 
+    def prepare_self_signed_certificate(self, host: Host) -> None:
+        bootstrap = host.bootstrap
+        if bootstrap is None or bootstrap.tls_mode != "self_signed":
+            raise OpsError("self-signed bootstrap settings are not configured")
+        if bootstrap.tls_name is None or bootstrap.tls_ca_file is None:
+            raise OpsError("self-signed bootstrap settings are incomplete")
+        try:
+            ipaddress.ip_address(bootstrap.tls_name)
+            san = "IP:" + bootstrap.tls_name
+        except ValueError:
+            san = "DNS:" + bootstrap.tls_name
+        values = {
+            "MASQUE_CERT_PATH": bootstrap.tls_cert_path,
+            "MASQUE_KEY_PATH": bootstrap.tls_key_path,
+            "MASQUE_CERT_SAN": san,
+        }
+        payload = "\n".join(
+            f"export {key}={shlex.quote(value)}" for key, value in values.items()
+        ) + "\n" + SELF_SIGNED_CERT_SCRIPT
+        result = self.ssh.run(
+            host, remote_argv(host, ["sh", "-s"], admin=False),
+            input_text=payload, timeout=host.command_timeout_secs,
+        )
+        if result.returncode:
+            raise OpsError("self-signed certificate preparation failed")
+        self.ssh.download_private(
+            host,
+            remote_argv(host, ["head", "-c", "1048577", "--", bootstrap.tls_cert_path], admin=False),
+            bootstrap.tls_ca_file,
+            "bootstrap CA certificate",
+        )
+
+    def prepare_bootstrap_dependencies(self, host: Host) -> None:
+        remote = self.bootstrap_preflight(host)
+        if (
+            not remote.reachable
+            or remote.os != "Linux"
+            or remote.binary_exists
+            or remote.config_exists
+            or remote.package_manager not in {"apt", "dnf"}
+            or "systemctl" in remote.missing_commands
+        ):
+            raise OpsError("empty-host dependency preflight failed")
+        command = remote_argv(host, ["sh", "-s", "--", remote.package_manager], admin=False)
+        result = self.ssh.run(host, command, input_text=PREPARE_DEPENDENCIES_SCRIPT,
+                              timeout=host.deploy_timeout_secs)
+        if result.returncode:
+            raise OpsError("empty-host dependency installation failed")
+        after = self.bootstrap_preflight(host)
+        if not after.reachable or after.missing_commands:
+            raise OpsError("empty-host dependencies remain unavailable")
+
     def bootstrap_one(self, host: Host, release: Release) -> dict[str, object]:
         plan = plan_bootstrap(self, host, release)
         if not plan["ready"]:
@@ -1903,6 +2473,10 @@ class FleetOperator:
         password = None
         password_created = False
         try:
+            if plan.get("install_dependencies"):
+                self.prepare_bootstrap_dependencies(host)
+            if bootstrap.tls_mode == "self_signed":
+                self.prepare_self_signed_certificate(host)
             if bootstrap.basic_password_file is not None:
                 if bootstrap.basic_password_file.exists():
                     password = read_private_password(
@@ -1936,6 +2510,16 @@ class FleetOperator:
                 )
             after = self.verify_bootstrap(host, release.tag)
             probe = self.probes.run(host)
+            certificate_probe = None
+            if bootstrap.verify_dual:
+                if host.probe is None or bootstrap.client_endpoint is None or bootstrap.client_config is None:
+                    raise OpsError("dual probe configuration is incomplete")
+                certificate = dataclasses.replace(
+                    host.probe, endpoint=bootstrap.client_endpoint, username=None,
+                    password_file=None, client_config=bootstrap.client_config,
+                    ca_cert=None, server_name=None,
+                )
+                certificate_probe = self.probes.run(dataclasses.replace(host, probe=certificate))
         except OpsError as error:
             self._audit_best_effort(
                 "bootstrap_failed",
@@ -1965,6 +2549,8 @@ class FleetOperator:
             "status": "installed",
             "version": release.tag,
             "probe": probe,
+            "certificate_probe": certificate_probe,
+            "connect_ip_forwarding_verified": False if host.probe and host.probe.connect_ip else None,
             "basic_password_created": password_created,
             "credential_files_saved": sum(
                 path is not None
@@ -2276,8 +2862,13 @@ def plan_bootstrap(
     operator: FleetOperator, host: Host, release: Release
 ) -> dict[str, object]:
     blockers: list[str] = []
+    install_dependencies = False
     if host.bootstrap is None:
         blockers.append("bootstrap settings are not configured")
+    elif host.bootstrap.transport == "http2":
+        version = VERSION_RE.fullmatch(release.tag)
+        if version is None or tuple(int(version.group(part)) for part in ("major", "minor", "patch")) < (0, 14, 4):
+            blockers.append("HTTP/2 bootstrap requires a release containing transport-aware installation (v0.14.4 or newer)")
     if host.user != "root" or host.use_sudo:
         blockers.append("fresh bootstrap requires an explicit root SSH inventory entry")
     try:
@@ -2295,13 +2886,24 @@ def plan_bootstrap(
             blockers.append("target host is not Linux")
         if remote.binary_exists or remote.config_exists:
             blockers.append("MASQUE is already installed or partially configured")
-        if not remote.tls_cert_readable or not remote.tls_key_readable:
+        if host.bootstrap is not None and host.bootstrap.tls_mode == "self_signed":
+            if remote.tls_cert_exists or remote.tls_key_exists:
+                blockers.append("self-signed TLS destination already exists")
+        elif not remote.tls_cert_readable or not remote.tls_key_readable:
             blockers.append("configured remote TLS material is not readable")
         if remote.missing_commands:
-            blockers.append(
-                "target is missing required commands: "
-                + ", ".join(remote.missing_commands)
-            )
+            if (
+                host.bootstrap is not None
+                and host.bootstrap.install_dependencies
+                and remote.package_manager in {"apt", "dnf"}
+                and "systemctl" not in remote.missing_commands
+            ):
+                install_dependencies = True
+            else:
+                blockers.append(
+                    "target is missing required commands: "
+                    + ", ".join(remote.missing_commands)
+                )
         if remote.arch is None or not release.supports(remote.arch):
             blockers.append(
                 "target release assets are missing for the remote architecture"
@@ -2313,6 +2915,8 @@ def plan_bootstrap(
         "ready": not blockers,
         "blockers": blockers,
         "probe_configured": host.probe is not None,
+        "install_dependencies": install_dependencies,
+        "certificate_mode": host.bootstrap.tls_mode if host.bootstrap else None,
     }
 
 
@@ -2449,6 +3053,34 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", help="validate local inventory and secret file permissions"
     )
 
+    initialize = subcommands.add_parser(
+        "init-inventory", help="create a private inventory for an empty Linux host"
+    )
+    initialize.add_argument("--ssh-host", help="SSH hostname or IP address")
+    initialize.add_argument("--endpoint-host", help="proxy hostname; defaults to SSH host")
+    initialize.add_argument("--add-host", action="store_true", help="add a node to an existing private inventory")
+    initialize.add_argument("--ssh-port", type=int, default=22)
+    initialize.add_argument("--listen-port", type=int, default=443)
+    initialize.add_argument("--auth-mode", choices=("basic", "client_cert", "dual"), help="authentication required by the peer")
+    initialize.add_argument("--transport", choices=("http3", "http2"), help="transport supported by the peer")
+    initialize.add_argument("--cert-listen-port", type=int, default=4443, help="second listener port for dual authentication")
+    initialize.add_argument("--connect-ip", action="store_true", help="also check CONNECT-IP negotiation")
+    initialize.add_argument("--skip-tcp", action="store_true", help="peer does not need CONNECT-TCP")
+    initialize.add_argument("--skip-udp", action="store_true", help="peer does not need CONNECT-UDP")
+    ssh_auth = initialize.add_mutually_exclusive_group()
+    ssh_auth.add_argument("--identity-file", help="existing SSH private key")
+    ssh_auth.add_argument("--ssh-password-file", help="existing private SSH password file")
+    ssh_auth.add_argument("--ssh-password-prompt", action="store_true", help="enter SSH password privately")
+    initialize.add_argument("--proxy-password-prompt", action="store_true", help="enter proxy password privately")
+    initialize.add_argument("--known-hosts-file", help="verified SSH known-hosts file")
+    initialize.add_argument("--tls-cert-path", default="/etc/masque-bootstrap/fullchain.pem")
+    initialize.add_argument("--tls-key-path", default="/etc/masque-bootstrap/privkey.pem")
+    initialize.add_argument("--ca-cert", help="local CA certificate for the external probe")
+    tls_choice = initialize.add_mutually_exclusive_group()
+    tls_choice.add_argument("--self-signed", dest="self_signed", action="store_true", help="generate a self-signed certificate during bootstrap (default)")
+    tls_choice.add_argument("--existing-certificate", dest="self_signed", action="store_false", help="use already prepared remote TLS files")
+    initialize.set_defaults(self_signed=True)
+
     status = subcommands.add_parser(
         "status", help="read fleet version and health state"
     )
@@ -2460,10 +3092,36 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("hosts", nargs="*")
     plan.add_argument("--version", help="exact tag; omit for latest stable release")
 
+    configure = subcommands.add_parser(
+        "configure-probe", help="test and save an external probe for one host"
+    )
+    configure.add_argument("host", nargs="?", help="omit for a single host or the fleet canary")
+    configure.add_argument("--endpoint", help="proxy hostname and port")
+    configure.add_argument("--transport", choices=("http3", "http2", "auto"), default="http3")
+    auth = configure.add_mutually_exclusive_group()
+    auth.add_argument("--username", help="Basic authentication username")
+    auth.add_argument("--client-config", help="existing private certificate enrollment JSON")
+    auth.add_argument("--no-auth", action="store_true", help="the listener needs no authentication")
+    configure.add_argument("--password-file", help="existing private Basic password file")
+    configure.add_argument("--resolve", help="connect to this IP while verifying the endpoint hostname")
+    configure.add_argument("--interface", help="bind the HTTP/3 probe to this local interface")
+    configure.add_argument("--ca-cert", help="additional trusted CA certificate")
+    configure.add_argument("--connect-ip", action="store_true", help="also test CONNECT-IP negotiation")
+    configure.add_argument("--tcp-target", help="TCP target allowed by server policy")
+    configure.add_argument("--udp-target", help="UDP target allowed by server policy")
+    configure.add_argument("--udp-mode", choices=("dns", "echo"), default="dns")
+    configure.add_argument("--timeout-secs", type=int, default=8, help="timeout per probe step (1-60)")
+
+    export_ca = subcommands.add_parser(
+        "export-probe-ca", help="copy the probe's public CA certificate to a private file"
+    )
+    export_ca.add_argument("host", nargs="?", help="omit for a single host or the fleet canary")
+    export_ca.add_argument("--out", required=True, type=Path, help="new local output file")
+
     deploy = subcommands.add_parser(
         "deploy", help="deploy one exact release to one host"
     )
-    deploy.add_argument("host")
+    deploy.add_argument("host", nargs="?", help="omit when the inventory has one host")
     deploy.add_argument("--version", required=True, help="exact release tag")
     deploy.add_argument(
         "--apply", action="store_true", help="authorize the remote mutation"
@@ -2478,15 +3136,15 @@ def build_parser() -> argparse.ArgumentParser:
         "bootstrap",
         help="preflight or install an exact release on one unconfigured Linux host",
     )
-    bootstrap.add_argument("host")
-    bootstrap.add_argument("--version", required=True, help="exact release tag")
+    bootstrap.add_argument("host", nargs="?", help="omit when only one bootstrap host exists")
+    bootstrap.add_argument("--version", help="exact tag; omit for a latest-stable preflight")
     bootstrap.add_argument(
         "--apply", action="store_true", help="authorize the fresh installation"
     )
 
     rollout = subcommands.add_parser(
         "rollout",
-        help="deploy canary first, then the remaining selected hosts sequentially",
+        help="upgrade one host or deploy a canary before the rest of a fleet",
     )
     rollout.add_argument("hosts", nargs="*")
     rollout.add_argument("--version", required=True, help="exact release tag")
@@ -2505,7 +3163,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollback = subcommands.add_parser(
         "rollback", help="restore the prior successful version recorded for one host"
     )
-    rollback.add_argument("host")
+    rollback.add_argument("host", nargs="?", help="omit when the inventory has one host")
     rollback.add_argument(
         "--apply", action="store_true", help="authorize the remote mutation"
     )
@@ -2528,14 +3186,210 @@ def require_apply(enabled: bool) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    if arguments.command == "init-inventory":
+        ssh_host = arguments.ssh_host
+        if not ssh_host:
+            if not sys.stdin.isatty():
+                raise OpsError("provide --ssh-host or run in a terminal")
+            print("SSH hostname or IP: ", end="", file=sys.stderr, flush=True)
+            ssh_host = input().strip()
+        auth_mode = arguments.auth_mode
+        transport = arguments.transport
+        connect_ip = arguments.connect_ip
+        skip_tcp = arguments.skip_tcp
+        skip_udp = arguments.skip_udp
+        if not auth_mode:
+            if not sys.stdin.isatty():
+                raise OpsError("specify --auth-mode after confirming the peer's authentication capabilities")
+            print("Peer authentication: [1] Basic, [2] client certificate, [3] both: ", end="", file=sys.stderr, flush=True)
+            auth_mode = {"1": "basic", "2": "client_cert", "3": "dual"}.get(input().strip())
+            if not auth_mode:
+                raise OpsError("select an authentication method supported by the peer")
+        if not transport:
+            if not sys.stdin.isatty():
+                raise OpsError("specify --transport after confirming the peer's protocol support")
+            print("Peer transport: [1] HTTP/3, [2] HTTP/2: ", end="", file=sys.stderr, flush=True)
+            transport = {"1": "http3", "2": "http2"}.get(input().strip())
+            if not transport:
+                raise OpsError("select a transport supported by the peer")
+        if sys.stdin.isatty() and not skip_tcp:
+            print("Test CONNECT-TCP? [Y/n]: ", end="", file=sys.stderr, flush=True)
+            response = input().strip().lower()
+            if response not in ("", "n", "no", "y", "yes"):
+                raise OpsError("answer yes or no")
+            skip_tcp = response in ("n", "no")
+        if sys.stdin.isatty() and not skip_udp:
+            print("Test CONNECT-UDP? [Y/n]: ", end="", file=sys.stderr, flush=True)
+            response = input().strip().lower()
+            if response not in ("", "n", "no", "y", "yes"):
+                raise OpsError("answer yes or no")
+            skip_udp = response in ("n", "no")
+        if not connect_ip and sys.stdin.isatty():
+            print("Test CONNECT-IP negotiation? [y/N]: ", end="", file=sys.stderr, flush=True)
+            response = input().strip().lower()
+            if response not in ("", "n", "no", "y", "yes"):
+                raise OpsError("answer yes or no")
+            connect_ip = response in ("y", "yes")
+        password_prompt = arguments.ssh_password_prompt
+        if not arguments.identity_file and not arguments.ssh_password_file and not password_prompt and sys.stdin.isatty():
+            print("SSH authentication: [1] key/agent (default), [2] password: ", end="", file=sys.stderr, flush=True)
+            method = input().strip()
+            if method == "2":
+                password_prompt = True
+            elif method not in ("", "1"):
+                raise OpsError("unknown SSH authentication choice")
+        ssh_password = None
+        if password_prompt:
+            if not sys.stdin.isatty():
+                raise OpsError("SSH password must be entered in a terminal")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", getpass.GetPassWarning)
+                    ssh_password = getpass.getpass("SSH password (hidden): ")
+            except (getpass.GetPassWarning, EOFError) as error:
+                raise OpsError("cannot read an SSH password securely from the terminal") from error
+        proxy_password = None
+        if arguments.proxy_password_prompt and auth_mode == "client_cert":
+            raise OpsError("a proxy password is not used with certificate-only authentication")
+        if arguments.proxy_password_prompt or (auth_mode != "client_cert" and sys.stdin.isatty()):
+            if not sys.stdin.isatty():
+                raise OpsError("proxy password must be entered in a terminal")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", getpass.GetPassWarning)
+                    proxy_password = getpass.getpass(
+                        "Proxy password (hidden; leave blank to generate): "
+                    ) or None
+            except (getpass.GetPassWarning, EOFError) as error:
+                raise OpsError("cannot read a proxy password securely from the terminal") from error
+        result = initialize_inventory(
+            arguments.inventory,
+            ssh_host=ssh_host,
+            endpoint_host=arguments.endpoint_host or ssh_host,
+            ssh_port=arguments.ssh_port,
+            listen_port=arguments.listen_port,
+            identity_file=arguments.identity_file,
+            ssh_password_file=arguments.ssh_password_file,
+            ssh_password=ssh_password,
+            known_hosts_file=arguments.known_hosts_file,
+            tls_cert_path=arguments.tls_cert_path,
+            tls_key_path=arguments.tls_key_path,
+            ca_cert=arguments.ca_cert,
+            self_signed=arguments.self_signed,
+            proxy_password=proxy_password,
+            add_host=arguments.add_host,
+            auth_mode=auth_mode,
+            transport=transport,
+            connect_ip=connect_ip,
+            cert_listen_port=arguments.cert_listen_port,
+            skip_tcp=skip_tcp,
+            skip_udp=skip_udp,
+        )
+        if not arguments.json:
+            print("Private inventory updated. Verify the SSH host key, then run bootstrap preflight.")
+        emit(result, arguments.json)
+        return 0
     inventory = load_inventory(arguments.inventory)
     operator = FleetOperator(inventory)
     releases = ReleaseClient(inventory.repository)
+
+    if arguments.command == "export-probe-ca":
+        if arguments.host:
+            host = inventory.select([arguments.host], require_names=True)[0]
+        else:
+            host = inventory.default_host(canary_for_fleet=True)
+        ca_path = host.probe.ca_cert if host.probe else None
+        if ca_path is None and host.bootstrap is not None:
+            ca_path = host.bootstrap.tls_ca_file
+        if ca_path is None:
+            raise OpsError("the selected probe has no custom CA certificate")
+        ensure_integrity_file(ca_path, "probe CA certificate")
+        contents = ca_path.read_bytes()
+        if (len(contents) > 1024 * 1024 or b"-----BEGIN CERTIFICATE-----" not in contents
+                or b"-----END CERTIFICATE-----" not in contents):
+            raise OpsError("probe CA certificate is not a bounded PEM certificate")
+        if b"PRIVATE KEY-----" in contents:
+            raise OpsError("probe CA certificate must not contain private key material")
+        destination = Path(os.path.abspath(arguments.out.expanduser()))
+        write_private_file(destination, contents, "exported CA certificate")
+        if not arguments.json:
+            print("Public CA certificate exported; no private key was copied.")
+        emit({"schema_version": SCHEMA_VERSION, "status": "exported"}, arguments.json)
+        return 0
+
+    if arguments.command == "configure-probe":
+        if arguments.host:
+            host = inventory.select([arguments.host], require_names=True)[0]
+        else:
+            host = inventory.default_host(canary_for_fleet=True)
+        if host.probe is not None:
+            raise OpsError("a probe is already configured for the selected host")
+        interactive = sys.stdin.isatty()
+
+        def prompt(message: str) -> str:
+            if not interactive:
+                raise OpsError("missing setup options; run in a terminal or pass explicit options")
+            print(message, end="", file=sys.stderr, flush=True)
+            return input().strip()
+
+        endpoint = arguments.endpoint or prompt("Proxy hostname and port: ")
+        username = arguments.username
+        client_config = arguments.client_config
+        no_auth = arguments.no_auth
+        if not username and not client_config and not no_auth:
+            method = prompt("Authentication: [1] Basic (default), [2] client certificate, [3] none: ")
+            if method in ("", "1"):
+                username = prompt("Basic username: ")
+            elif method == "2":
+                client_config = prompt("Client enrollment JSON path: ")
+            elif method == "3":
+                no_auth = True
+            else:
+                raise OpsError("unknown authentication choice")
+        if arguments.password_file and not username:
+            raise OpsError("--password-file requires --username")
+        values: dict[str, object] = {"endpoint": endpoint, "transport": arguments.transport}
+        password: str | None = None
+        if username:
+            values["username"] = username
+            if arguments.password_file:
+                values["password_file"] = arguments.password_file
+            else:
+                if not interactive:
+                    raise OpsError("Basic authentication requires --password-file outside a terminal")
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", getpass.GetPassWarning)
+                        password = getpass.getpass("Basic password (hidden): ")
+                except (getpass.GetPassWarning, EOFError) as error:
+                    raise OpsError("cannot read a password securely from the terminal") from error
+        elif client_config:
+            values["client_config"] = client_config
+        elif not no_auth:
+            raise OpsError("choose an authentication method")
+        for name in ("resolve", "interface", "ca_cert", "tcp_target", "udp_target"):
+            value = getattr(arguments, name)
+            if value:
+                values[name] = value
+        if arguments.connect_ip:
+            values["connect_ip"] = True
+        if arguments.udp_mode != "dns":
+            values["udp_mode"] = arguments.udp_mode
+        if arguments.timeout_secs != 8:
+            values["timeout_secs"] = arguments.timeout_secs
+        result = configure_probe(inventory, host, values, password, operator.probes)
+        if not arguments.json:
+            print("Probe tested and saved; no server changes were made.")
+        emit(result, arguments.json)
+        return 0
 
     if arguments.command == "validate":
         for host in inventory.hosts:
             if host.identity_file is not None:
                 ensure_private_file(host.identity_file, f"SSH identity for {host.name}")
+            if host.ssh_password_file is not None:
+                ensure_private_parent(host.ssh_password_file, "SSH password")
+                read_private_password(host.ssh_password_file, "SSH password")
             if host.known_hosts_file is not None:
                 ensure_integrity_file(
                     host.known_hosts_file, f"known_hosts file for {host.name}"
@@ -2554,6 +3408,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         host.bootstrap.client_config,
                         "bootstrap certificate client configuration",
                     ),
+                    (host.bootstrap.tls_ca_file, "bootstrap CA certificate"),
                 ):
                     if path is not None:
                         ensure_secret_destination(path, label, allow_existing=True)
@@ -2609,7 +3464,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command == "deploy":
         require_apply(arguments.apply)
-        host = inventory.select([arguments.host], require_names=True)[0]
+        host = (
+            inventory.select([arguments.host], require_names=True)[0]
+            if arguments.host else inventory.default_host()
+        )
         release = releases.fetch(arguments.version)
         result = operator.deploy_one(
             host, release, releases, bootstrap=arguments.bootstrap
@@ -2620,7 +3478,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if arguments.command == "bootstrap":
-        host = inventory.select([arguments.host], require_names=True)[0]
+        if arguments.host:
+            host = inventory.select([arguments.host], require_names=True)[0]
+        else:
+            candidates = [item for item in inventory.hosts if item.bootstrap is not None]
+            if len(candidates) != 1:
+                raise OpsError("select a host or configure exactly one bootstrap host")
+            host = candidates[0]
+        if arguments.apply and not arguments.version:
+            raise OpsError("bootstrap --apply requires the exact version from preflight")
         release = releases.fetch(arguments.version)
         plan = plan_bootstrap(operator, host, release)
         if not arguments.apply:
@@ -2631,6 +3497,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"[fresh] {host.name}: uninstalled -> {release.tag} "
                     f"(fresh_install){suffix}"
                 )
+                if plan["install_dependencies"]:
+                    print("Will install missing base dependencies on the empty host.")
+                if plan["certificate_mode"] == "self_signed":
+                    print("Will generate a self-signed certificate for the probe and server.")
+                if plan["probe_configured"]:
+                    print("Will verify the installation with an external probe.")
             emit(plan, arguments.json)
             return 0 if plan["ready"] else 1
         if not plan["ready"]:
@@ -2660,6 +3532,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "the requested canary is not in the selected rollout hosts"
                 )
             canary = selected[0]
+        elif len(hosts) == 1:
+            canary = hosts[0]
         else:
             selected = [host for host in hosts if host.canary]
             if len(selected) != 1:
@@ -2667,7 +3541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             canary = selected[0]
         if canary.probe is None and not arguments.allow_no_probe:
             raise OpsError(
-                "the canary has no external probe; configure one or explicitly use --allow-no-probe"
+                "the selected host has no external probe; configure one or explicitly use --allow-no-probe"
             )
         ordered = [canary, *(host for host in hosts if host.name != canary.name)]
         results = []
@@ -2686,7 +3560,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command == "rollback":
         require_apply(arguments.apply)
-        host = inventory.select([arguments.host], require_names=True)[0]
+        host = (
+            inventory.select([arguments.host], require_names=True)[0]
+            if arguments.host else inventory.default_host()
+        )
         result = operator.rollback_one(host, releases)
         if not arguments.json:
             print(f"{host.name}: rolled back to {result['version']}")

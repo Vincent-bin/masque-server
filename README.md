@@ -55,9 +55,9 @@ a staging environment.
 
 ## AI-assisted operations with the `masque-ops` Skill
 
-Install the Codex-compatible Skill, its deterministic CLI, inventory example,
-and the release-matched `masque-probe` on a Linux or macOS administration
-machine with one command:
+On a Linux or macOS administration machine, ask the AI assistant to install the
+operations bundle using the command below. It installs the Skill, deterministic
+CLI, inventory example, and release-matched `masque-probe` together:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-ops.sh | sh
@@ -78,6 +78,21 @@ explicitly:
 $masque-ops validate the fleet and inspect its current status
 ```
 
+For a new empty Linux host, give the AI its SSH connection details and ask it
+to prepare an installation. If a client is already chosen, provide its name,
+documentation, or a configuration example with all secrets and endpoints
+removed. The AI identifies the required transport, CONNECT variants and
+authentication without binding the server to that client. If support is
+unknown, choose the protocol and authentication explicitly.
+`masque-ops init-inventory` creates a private
+inventory with a generated proxy password destination and an
+external probe. It supports an SSH key or privately entered SSH password and
+defaults to generating a self-signed certificate during bootstrap. The AI can
+also use existing TLS files. Verify the SSH host key through a separate trusted
+channel, then review the bootstrap preflight before authorizing installation.
+For self-signed TLS, clients must trust the generated certificate. DNS, cloud
+firewalls and network prerequisites may need separate provider-side setup.
+
 As an alternative, Codex's built-in installer can install the self-contained
 Skill directly from the repository. This does not create the shell command or
 install the probe:
@@ -86,8 +101,8 @@ install the probe:
 $skill-installer install the masque-ops skill from https://github.com/Vincent-bin/masque-server/tree/main/.agents/skills/masque-ops
 ```
 
-Copy `~/.config/masque-server/fleet.example.toml` to `fleet.toml`, replace its
-documentation values, and keep it mode `0600`. The AI passes only that path and
+For advanced or multi-host setups, the installed inventory example is also
+available as a template. The AI passes only the private inventory path and
 host aliases to the CLI; the CLI—not the AI—reads the inventory, SSH identity,
 passwords, or generated client credentials. It can inspect an existing fleet
 or bootstrap an explicitly configured empty Linux host. Start with a read-only
@@ -95,6 +110,10 @@ request, review the plan, and authorize `--apply` separately. A repository
 checkout remains supported through [`scripts/masque-ops.py`](scripts/masque-ops.py).
 See [AI-assisted fleet operations](docs/operations.md) for setup, bootstrap,
 rollout, and rollback instructions.
+
+To set up an external check for a single host or the designated fleet canary, run
+`masque-ops configure-probe` on the administration machine. The guided setup
+tests the connection before saving its private local configuration.
 
 ## Quick start
 

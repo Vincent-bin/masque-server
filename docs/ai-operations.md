@@ -11,8 +11,9 @@ specified in [AGENTS.md](../AGENTS.md).
 
 | Request | Supported interface | Activation and verification | Boundary |
 | --- | --- | --- | --- |
+| Prepare an empty host | Install the documented operations bundle, then use `masque-ops init-inventory` | Generates a private first-host inventory and probe; credentials are entered privately or generated | Verify the SSH host key out of band; DNS, provider firewall and certificate trust still need an appropriate external path |
 | Inspect a fleet or plan a release | `masque-ops validate`, `status`, and `plan` | Read-only; review blockers and target version | Does not authorize a mutation or prove client traffic works |
-| Bootstrap an empty host | `masque-ops bootstrap` without `--apply`, then the authorized `--apply` operation | Validate preflight, service and configuration; run the configured external probe | Only the declared empty-host profile is supported; no previous release exists to restore |
+| Bootstrap an empty host | `masque-ops bootstrap` without `--apply`, then the authorized `--apply` operation | Prepare supported missing dependencies and optional self-signed TLS, validate service and configuration, then run the external probe | Only the declared empty-host profile is supported; no previous release exists to restore |
 | Deploy or roll back a release | `masque-ops plan`, followed by authorized `deploy`, `rollout`, or `rollback` | Check the recorded result, service, unchanged configuration hash and configured probe; stop on failure | Rollback restores a release, not arbitrary configuration or host network changes |
 | Add a local listener | `masque-server add-listener`, with `--dry-run` when applicable | Validate the intended change, then restart and check service and external traffic | The bind check is not a reservation; a listener needs a restart. The command does not keep a backup |
 | Manage local Basic accounts | `list-users`, `add-user`, `set-password`, `remove-user` | Validate the resulting configuration, reload credentials and verify intended access and rejection | These commands edit local configuration; a release rollout is not a configuration rollback |
