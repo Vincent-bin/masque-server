@@ -41,6 +41,14 @@ shards = 1
 # ip_proxy.tun_mtu consistently on both ends. See docs/configuration.md.
 # max_datagram_size = 1200
 
+# Optional target restrictions for this listener. They can only narrow the
+# global TCP and UDP policies. Omit either allow list to inherit that dimension.
+# [listeners.tcp_targets]
+# allow_targets = ["192.0.2.0/24"]
+# allow_ports = [443]
+# [listeners.udp_targets]
+# allow_ports = [443, 853]
+
 [listeners.auth]
 enabled = true
 # "basic"       — RFC 7617 Proxy-Authorization, checked per request.

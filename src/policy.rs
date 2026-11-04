@@ -1,14 +1,62 @@
 // Target policy filter — allow/deny lists based on CIDR ranges.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
+use anyhow::Context;
 use ipnet::IpNet;
+
+use crate::config::TargetRestrictionSection;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetRestrictions {
+    allow: Option<Arc<[IpNet]>>,
+    deny: Arc<[IpNet]>,
+    ports: Option<Arc<[u16]>>,
+}
+
+impl TargetRestrictions {
+    pub(crate) fn from_section(section: &TargetRestrictionSection) -> anyhow::Result<Self> {
+        fn parse_rules(rules: &[String]) -> anyhow::Result<Arc<[IpNet]>> {
+            rules
+                .iter()
+                .map(|rule| {
+                    rule.parse::<IpNet>()
+                        .map(canonical_net)
+                        .with_context(|| format!("invalid target CIDR {rule:?}"))
+                })
+                .collect()
+        }
+
+        let ports = section
+            .allow_ports
+            .as_ref()
+            .map(|ports| {
+                anyhow::ensure!(!ports.contains(&0), "allow_ports cannot include port zero");
+                let mut ports = ports.clone();
+                ports.sort_unstable();
+                ports.dedup();
+                Ok::<_, anyhow::Error>(Arc::from(ports))
+            })
+            .transpose()?;
+        Ok(Self {
+            allow: section
+                .allow_targets
+                .as_deref()
+                .map(parse_rules)
+                .transpose()?,
+            deny: parse_rules(&section.deny_targets)?,
+            ports,
+        })
+    }
+}
 
 /// Policy checker for target addresses.
 #[derive(Clone)]
 pub struct TargetPolicy {
     allow: Vec<IpNet>,
     deny: Vec<IpNet>,
+    restrictions: Option<TargetRestrictions>,
 }
 
 impl TargetPolicy {
@@ -19,7 +67,20 @@ impl TargetPolicy {
         Self {
             allow: parse_cidrs(allow),
             deny: parse_cidrs(deny),
+            restrictions: None,
         }
+    }
+
+    pub(crate) fn with_restrictions(mut self, restrictions: Option<TargetRestrictions>) -> Self {
+        self.restrictions = restrictions;
+        self
+    }
+
+    pub(crate) fn allows_port(&self, port: u16) -> bool {
+        self.restrictions
+            .as_ref()
+            .and_then(|rules| rules.ports.as_ref())
+            .is_none_or(|ports| ports.binary_search(&port).is_ok())
     }
 
     /// Check whether `addr` is allowed by the policy.
@@ -33,6 +94,15 @@ impl TargetPolicy {
         // Judge both spellings against the IPv4 rules, before an IPv6 wildcard
         // can bypass a deny such as 127.0.0.0/8 or 169.254.0.0/16.
         let addr = addr.to_canonical();
+        if let Some(rules) = &self.restrictions
+            && (rules.deny.iter().any(|net| net.contains(&addr))
+                || rules
+                    .allow
+                    .as_ref()
+                    .is_some_and(|allow| !allow.iter().any(|net| net.contains(&addr))))
+        {
+            return false;
+        }
         // Deny takes precedence
         for net in &self.deny {
             if net.contains(&addr) {
@@ -70,26 +140,64 @@ fn parse_cidrs(strings: &[String]) -> Vec<IpNet> {
                 None
             })
         })
-        .map(|net| {
-            // Preserve explicitly configured mapped CIDRs as aliases of their
-            // IPv4 equivalents. Only prefixes wholly inside ::ffff:0:0/96
-            // qualify; a broader IPv6 network stays an IPv6 network.
-            if let IpNet::V6(v6) = net
-                && v6.prefix_len() >= 96
-                && let Some(v4) = v6.network().to_ipv4_mapped()
-            {
-                return IpNet::new(IpAddr::V4(v4), v6.prefix_len() - 96)
-                    .expect("a mapped IPv6 prefix translates to a valid IPv4 prefix");
-            }
-            net
-        })
+        .map(canonical_net)
         .collect()
+}
+
+fn canonical_net(net: IpNet) -> IpNet {
+    // Preserve explicitly configured mapped CIDRs as aliases of their
+    // IPv4 equivalents. Only prefixes wholly inside ::ffff:0:0/96
+    // qualify; a broader IPv6 network stays an IPv6 network.
+    if let IpNet::V6(v6) = net
+        && v6.prefix_len() >= 96
+        && let Some(v4) = v6.network().to_ipv4_mapped()
+    {
+        return IpNet::new(IpAddr::V4(v4), v6.prefix_len() - 96)
+            .expect("a mapped IPv6 prefix translates to a valid IPv4 prefix");
+    }
+    net
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn listener_restrictions_preserve_global_denies_and_match_ports() {
+        let restrictions = TargetRestrictions::from_section(&TargetRestrictionSection {
+            allow_targets: Some(vec!["192.0.2.0/24".into()]),
+            deny_targets: vec!["192.0.2.20/32".into()],
+            allow_ports: Some(vec![443]),
+        })
+        .unwrap();
+        let target =
+            policy(&["0.0.0.0/0"], &["192.0.2.30/32"]).with_restrictions(Some(restrictions));
+        assert!(target.allows_port(443));
+        assert!(!target.allows_port(80));
+        assert!(target.is_allowed("::ffff:192.0.2.10".parse().unwrap()));
+        for addr in ["192.0.2.20", "192.0.2.30", "198.51.100.1"] {
+            assert!(!target.is_allowed(addr.parse().unwrap()), "{addr}");
+        }
+    }
+
+    #[test]
+    fn malformed_listener_restrictions_are_rejected() {
+        assert!(
+            TargetRestrictions::from_section(&TargetRestrictionSection {
+                deny_targets: vec!["192.0.2.0/99".into()],
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            TargetRestrictions::from_section(&TargetRestrictionSection {
+                allow_ports: Some(vec![0]),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
 
     fn policy(allow: &[&str], deny: &[&str]) -> TargetPolicy {
         TargetPolicy::new(

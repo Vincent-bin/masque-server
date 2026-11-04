@@ -80,6 +80,12 @@ where
     R: FnOnce(String, u16) -> Fut,
     Fut: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
+    if !policy.allows_port(port) {
+        return Err(TargetSetupFailure {
+            status: 403,
+            reason: "target port denied by policy".into(),
+        });
+    }
     let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
@@ -110,8 +116,7 @@ where
         });
     }
 
-    let ips: Vec<_> = unique.iter().map(|address| address.ip()).collect();
-    if !policy.all_allowed(&ips) {
+    if !unique.iter().all(|address| policy.is_allowed(address.ip())) {
         return Err(TargetSetupFailure {
             status: 403,
             reason: "target denied by policy".into(),

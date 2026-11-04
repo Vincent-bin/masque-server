@@ -516,6 +516,8 @@ mod tests {
             transport: ListenerTransport::Http3,
             shards: 1,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: config.listeners[0].auth.clone(),
         }];
 

@@ -162,6 +162,18 @@ pub(super) fn plan_listeners(config: &ServerConfig) -> anyhow::Result<Vec<Listen
                 transport: listener.transport,
                 shards,
                 max_datagram_size: listener.max_datagram_size,
+                tcp_targets: listener
+                    .tcp_targets
+                    .as_ref()
+                    .map(crate::policy::TargetRestrictions::from_section)
+                    .transpose()
+                    .with_context(|| format!("listener {} tcp_targets", listener.listen_addr))?,
+                udp_targets: listener
+                    .udp_targets
+                    .as_ref()
+                    .map(crate::policy::TargetRestrictions::from_section)
+                    .transpose()
+                    .with_context(|| format!("listener {} udp_targets", listener.listen_addr))?,
                 auth: listener.auth.clone(),
             },
         });

@@ -262,6 +262,8 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         transport,
         shards,
         max_datagram_size: request.max_datagram_size,
+        tcp_targets: None,
+        udp_targets: None,
         auth,
     };
 
@@ -1549,6 +1551,8 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             transport: config::ListenerTransport::Http3,
             shards: 1,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,
@@ -1601,6 +1605,8 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             transport: config::ListenerTransport::Http3,
             shards: 2,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
@@ -1635,6 +1641,8 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
             transport: config::ListenerTransport::Http3,
             shards: 1,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: false,
                 mode: AuthMode::Basic,
