@@ -1,8 +1,15 @@
 # Private fleet inventory
 
-The operations CLI requires Python 3.11 or newer. Resolve paths relative to the
-Skill directory and copy `assets/fleet.example.toml` to the private inventory
-location:
+The operations CLI requires Python 3.11 or newer. For an empty host,
+`init-inventory` creates the first private inventory, default canary, Basic
+bootstrap settings and external probe without exposing credentials. It can
+securely prompt for an SSH or proxy password, or use an existing SSH identity.
+The default self-signed mode prepares a certificate during authorized bootstrap
+and keeps its public trust certificate locally. Verify the host key through an
+independent channel; password authentication never disables host-key checking.
+
+For an advanced inventory, resolve paths relative to the Skill directory and
+copy `assets/fleet.example.toml` to the private inventory location:
 
 ```sh
 install -d -m 0700 ~/.config/masque-server ~/.config/masque-server/secrets
@@ -76,9 +83,19 @@ credentials, its paths must match the bootstrap paths exactly. See
 
 ## External probes
 
+A guided first-time setup is available through `masque-ops configure-probe`.
+It selects the sole host or fleet canary by default, prompts for connection details and
+authentication, performs a real probe, and saves the configuration only after
+success. It never overwrites an existing probe. A Basic password entered at the
+terminal is hidden and saved in a new private file; an existing password file
+or certificate enrollment JSON can also be supplied with command options.
+The AI should let the operator enter secrets locally rather than requesting
+them in conversation. See `configure-probe --help` and the operations guide.
+
 A host's optional `[hosts.probe]` runs `masque-probe` on the administration
 machine after a deployment. Basic authentication uses `username` plus a
 `password_file`; the password file is connected directly to probe stdin and is
 never placed in the process arguments or parsed by `masque-ops`. Certificate
-authentication uses `client_config`. A rollout requires a canary probe unless
-the operator explicitly accepts the weaker `--allow-no-probe` check.
+authentication uses `client_config`. A rollout normally requires a probe for
+the sole host or canary unless the operator explicitly accepts the weaker
+`--allow-no-probe` check.

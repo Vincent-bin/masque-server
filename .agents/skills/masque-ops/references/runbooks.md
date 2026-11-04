@@ -51,6 +51,15 @@ requires the configuration SHA-256 to match its preflight value.
 
 ## Install an empty host
 
+For a first host, use `init-inventory` to generate a private inventory with a
+canary, Basic authentication and probe. Use `--add-host` to append another
+empty host without replacing the existing inventory. The JSON result identifies
+the selected host for subsequent CLI calls; do not include its alias in chat.
+SSH and proxy passwords can be entered privately at a terminal. A self-signed
+certificate and supported missing base packages are prepared only during the
+explicitly authorized bootstrap. Existing PEM certificates are also supported.
+See the inventory reference and operations guide for trust and network limits.
+
 Keep the SSH destination, key, verified host-key file, remote TLS paths, and
 credential output paths in the private inventory. Do not open that inventory in
 an AI session. Validate it, inspect the empty host, and run the bootstrap
@@ -81,9 +90,11 @@ and inspect status if post-install verification fails.
 
 ## Fleet rollout
 
-Select exactly one canary in inventory or with `--canary`. The canary is
-upgraded and externally probed before the remaining hosts are changed, one at a
-time:
+For a single selected host, `rollout` selects it automatically without a
+canary designation and normally requires its external probe. For multiple
+selected hosts, choose exactly one canary in inventory or with `--canary`.
+The canary is upgraded and externally probed before the remaining hosts are
+changed, one at a time:
 
 ```sh
 "$OPS_CLI" --inventory "$inventory" \

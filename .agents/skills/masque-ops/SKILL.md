@@ -18,11 +18,27 @@ was installed globally.
    `~/.config/masque-server/fleet.toml`. Never open or print that file; pass its
    path only to the bundled CLI, which owns parsing and secret handling.
 2. Read [references/inventory.md](references/inventory.md) when creating or
-   validating inventory, SSH, probes, or sudo access.
+   validating inventory, SSH, probes, or sudo access. For a first empty host,
+   use `init-inventory` to create a private inventory and probe defaults instead
+   of asking the operator to write TOML. The CLI can generate a self-signed
+   certificate, install missing dependencies, and generate the proxy password
+   during an authorized bootstrap. Password entry belongs in a local terminal.
+   Confirm the SSH host key out of band and explain self-signed trust and any
+   external DNS or firewall prerequisites.
+   Before choosing authentication or transport, ask whether the operator has a
+   particular peer, its documentation, or a redacted configuration example.
+   Use those inputs only to determine protocol and authentication capabilities;
+   do not copy private endpoints or credentials into conversation or source.
+   If capabilities are unknown, explain the choices and ask the operator to
+   select them. Do not claim compatibility from a format example alone.
 3. Run `validate`, then the read-only `status` command. If validation reports a
    missing local probe and the operator authorized tool installation, run this
    Skill's `scripts/install-probe.sh` with `MASQUE_VERSION` set to the exact
    target version; do not fetch or construct another installer.
+   To set up an external probe, use `configure-probe`; it tests the connection
+   before updating the private local inventory. The operator can enter a Basic
+   password privately at the terminal or supply an existing credential path.
+   Do not request passwords or client private keys in the conversation.
 4. Before any upgrade, run `plan --version vX.Y.Z`. Before a fresh installation,
    run `bootstrap HOST --version vX.Y.Z` without `--apply`. Report blockers from
    the CLI's sanitized output only.

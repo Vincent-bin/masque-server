@@ -45,7 +45,77 @@ Set `MASQUE_OPS_INSTALL_PROBE=0` to skip the probe. A repository checkout also
 works through `scripts/masque-ops.py`, and its repo-scoped Skill is discovered
 without running this installer.
 
-## Set up an inventory
+## New empty host
+
+The AI can install the operations bundle, CLI and probe using the installation
+command above. On the administration machine, generate a private inventory for
+one empty host instead of editing a template:
+
+```sh
+masque-ops init-inventory --ssh-host 203.0.113.10 \
+  --auth-mode basic --transport http3 --self-signed
+```
+
+Before selecting the options, tell the AI whether a peer is already chosen.
+A client name, official documentation, or a configuration example with all
+endpoints and secrets removed can help identify the peer's capabilities. The
+AI should verify transport, authentication and CONNECT variants, ask about
+unknowns, and report what has not been tested. The server and inventory do
+not store a client product name or require a particular implementation.
+
+In a terminal, choose an existing SSH key/agent or enter the SSH password
+without echo. With `--ssh-password-prompt`, the password is entered privately;
+with `--proxy-password-prompt`, the operator can choose the proxy password.
+Otherwise the CLI generates a proxy password at bootstrap and keeps it in a
+private file. Do not paste either password into an AI conversation. Guided
+setup asks for Basic, client-certificate or dual authentication, HTTP/2 or
+HTTP/3, and which CONNECT paths to test. Noninteractive setup requires
+`--auth-mode` and `--transport` explicitly. With dual authentication, the
+two listeners use separate ports, and fresh bootstrap probes both modes.
+Subsequent upgrades and rollbacks check the configured primary probe only;
+the certificate listener needs a separate probe if both modes must be checked.
+`--skip-tcp` and `--skip-udp` affect the probe, not server capabilities;
+`--connect-ip` tests negotiation, not forwarding. The inventory and credential
+files remain outside the checkout.
+
+The transport-aware fresh installer requires a release that includes this
+feature (v0.14.4 or newer); the tool rejects older releases for HTTP/2 setup.
+The generated certificate-client enrollment file contains a private key and
+must be delivered privately. A configuration example does not prove runtime
+compatibility: verify the selected protocol paths after installation.
+If an inventory already exists, pass `--add-host` to append a new empty host;
+existing entries and the current canary are preserved. Use the JSON result's
+host identifier for that host's bootstrap command, without publishing it.
+
+The default self-signed mode creates a certificate on the empty server during
+bootstrap and retrieves only its public certificate for the probe. Clients must
+install or otherwise trust that certificate. It expires after 365 days; the
+tool does not automatically renew it or redistribute a replacement. After installation, use
+`masque-ops export-probe-ca --out /private/public-ca.pem` to copy the public
+certificate into a new file in a private directory; the command refuses to
+copy a private key or overwrite a file. To use an existing domain
+certificate instead, pass `--existing-certificate`, the public proxy hostname
+as `--endpoint-host`, and `--tls-cert-path` / `--tls-key-path` for the existing
+remote PEM files. For a private CA also pass `--ca-cert` for a local trusted CA.
+The tool does not issue or renew ACME certificates. For a public certificate,
+the operator or an independently authorized certificate workflow can obtain
+and renew one with an ACME client, and place the PEM files on the server.
+For example, after installing Certbot and pointing the domain at the server,
+`certbot certonly --standalone -d proxy.example.com` uses HTTP validation; TCP
+port 80 must be reachable and free during issuance and renewal. Configure a
+renewal deploy hook to install the renewed chain and key and reload MASQUE;
+see [Certbot's user guide](https://eff-certbot.readthedocs.io/en/stable/using.html).
+
+Verify the SSH host key independently before the first connection. AI can then
+run `masque-ops validate` and `masque-ops bootstrap` for a latest-stable
+preflight. Review its exact version and planned dependency installation; after
+authorization, run `masque-ops bootstrap --version vX.Y.Z --apply`. On empty
+Debian/Ubuntu or DNF-based hosts, missing installer dependencies are installed
+automatically. The tool does not open host or cloud firewalls, configure DNS,
+or set up CONNECT-IP forwarding; arrange those separately when required.
+Fresh install has no previous version to restore if post-install checks fail.
+
+## Advanced inventory setup
 
 Copy the installed example and protect the private file:
 
@@ -82,9 +152,11 @@ replacement. `masque-ops` also checks `~/.local/bin` when `masque-probe` is not
 already in `PATH`.
 
 Verify SSH host fingerprints out of band before placing them in the configured
-`known_hosts_file`. The tool enables strict host-key checking, disables ambient
-SSH configuration, password and keyboard-interactive login, forwarding, agent
-forwarding, local commands, and shared control sockets.
+`known_hosts_file`. The tool enables strict host-key checking and disables
+ambient SSH configuration, keyboard-interactive login, forwarding, agent
+forwarding, local commands, and shared control sockets. SSH password login is
+enabled only when a private password file is explicitly configured; otherwise
+the default is noninteractive key or agent authentication.
 
 ## Read-only inspection
 
@@ -106,6 +178,44 @@ authorization, password, or private-key material. They can still contain
 client IP or destination metadata from the journal, so review output before
 sharing it. Place `--json` before the subcommand for structured output.
 
+## Set up an external probe
+
+On the administration machine, run:
+
+```sh
+masque-ops configure-probe
+```
+
+The guided setup selects the only host, or the designated canary in a fleet,
+asks for its proxy
+hostname and port and authentication method, and tests HTTP/3, TCP CONNECT,
+and CONNECT-UDP before saving anything to the inventory. Basic passwords are
+entered without terminal echo and saved to a new private file outside the
+checkout. Certificate authentication uses an existing private enrollment JSON.
+The command refuses to overwrite an existing probe. It changes only local
+inventory and does not deploy or change the server. Keep the inventory and
+credentials private; do not paste them into chat or a repository.
+
+For automation, pass the endpoint and an existing private credential file:
+
+```sh
+masque-ops configure-probe --endpoint proxy.example.com:8449 \
+  --username probe-user --password-file /private/probe-password
+```
+
+Use `--client-config /private/client.json` instead of the Basic options for
+certificate authentication. Use `--no-auth` only for a listener with no
+authentication. Specify a host as the positional argument if the inventory
+has multiple hosts without exactly one canary. `--transport http2` tests HTTP/2; the
+default is HTTP/3 and does not silently fall back. Use `--ca-cert` for a
+private CA, and `--resolve` or `--interface` for a known DNS or route issue.
+The interface option affects HTTP/3 only. See `configure-probe --help`.
+
+If the test fails, the inventory is unchanged and any newly entered password
+file is removed. Check the listener, credentials and network path, then rerun
+the command. Default TCP and UDP targets must be allowed by server policy;
+CONNECT-IP negotiation is optional and does not test packet forwarding.
+
 ## Deploy and roll back
 
 Mutations require an exact version and the explicit `--apply` gate:
@@ -117,9 +227,11 @@ masque-ops rollout --version vX.Y.Z --apply
 masque-ops rollback edge-a --apply
 ```
 
-`rollout` requires exactly one selected canary and normally requires an
-external `masque-probe` for it. It deploys the canary first and then proceeds
-sequentially. A host is considered upgraded only after systemd is active, the
+With one selected host, `rollout` selects it automatically and normally requires
+an external `masque-probe`; no canary designation is needed. With multiple
+selected hosts, it requires exactly one canary, verifies it first, and then
+proceeds sequentially. For a single-host inventory, `deploy` and `rollback`
+also select the host automatically. A host is considered upgraded only after systemd is active, the
 new binary version matches, the live configuration passes `check-config`, and
 its SHA-256 still matches the preflight snapshot, and the optional external
 TCP/UDP/IP probe succeeds. A failed host is restored to its prior version when
@@ -127,7 +239,7 @@ possible, and the rollout stops without touching later hosts.
 
 ## Bootstrap an empty Linux host
 
-Add `[hosts.bootstrap]` to the host's private inventory entry. It describes the
+For advanced setups, add `[hosts.bootstrap]` to the host's private inventory entry. It describes the
 authentication mode, ports, existing remote ACME certificate paths, and local
 mode-`0600` destinations for generated credentials. The installed example
 shows Basic mode; `client_cert` and `dual` additionally require

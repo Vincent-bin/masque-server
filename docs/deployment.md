@@ -46,7 +46,7 @@ from `/dev/tty`. A new installation offers three modes:
   client configuration while the plaintext is available; it also asks whether
   to hide failed authentication behind an empty 404 (off by default);
 - `client_cert` enrolls the first client, appends the generated `[[clients]]`
-  entry, writes a JSON configuration to a new `0600` file, and prints a proxy block;
+  entry and writes a secret JSON configuration to a new `0600` file;
 - `dual` does both, writing a
   [two-listener configuration](configuration.md#listeners) that serves
   credentials on one port and certificates on another. The authentication mode
@@ -55,18 +55,23 @@ from `/dev/tty`. A new installation offers three modes:
 Dual mode asks for a second port, defaulting to `4443`, and writes two explicit
 `[[listeners]]` entries, each with its own `[listeners.auth]` table.
 
-Client-certificate enrollment needs the server's ECDSA certificate immediately
-because the generated client configuration pins its public key, so `client_cert`
-and `dual` both require it. Supply the PEM full chain and unencrypted private
-key when prompted. Basic mode may defer TLS installation, but the service cannot
-start until both files exist.
+Choose HTTP/3 (UDP) or HTTP/2 (TCP), and either supply a PEM full chain and
+unencrypted private key or generate a self-signed ECDSA certificate. Self-signed
+generation requires OpenSSL and a public hostname or IP for the certificate;
+peers must trust the public certificate. It expires after 365 days and must be
+renewed and redistributed manually. Certificate-client enrollment pins the
+server's public key and requires an IP endpoint. In unattended Basic installs
+TLS may still be deferred, but the service cannot start until both files exist.
 
 The final output includes the installed version, authentication mode, service
 state, the resolved listeners with the authentication each demands, and the
-complete effective TOML with the password hash redacted. It also includes a
-generated Basic password or, in `client_cert` and `dual` modes, client private
-key material. Treat the terminal output as a secret and do not capture it in a
-public provisioning log.
+complete effective TOML with the password hash redacted. It includes a generated
+Basic password but does not print the client private key; transfer the generated
+client JSON securely. Treat terminal output as a secret. The installer reports
+socket and local firewall observations for each selected port, without changing
+firewall rules. UFW and firewalld rule observations do not establish effective
+access, and other local firewall layers may apply. Check cloud security groups
+and upstream firewalls, then test the connection externally.
 
 The following environment variables make provisioning non-interactive:
 
@@ -74,6 +79,7 @@ The following environment variables make provisioning non-interactive:
 | --- | --- |
 | `MASQUE_VERSION` | Exact published version/tag instead of the latest stable release |
 | `MASQUE_AUTH_MODE` | `basic`, `client_cert`, or `dual` |
+| `MASQUE_TRANSPORT` | `http3` (default) or `http2` for freshly generated listeners |
 | `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
 | `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |
@@ -83,13 +89,14 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
 | `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |
 | `MASQUE_TLS_CERT` / `MASQUE_TLS_KEY` | Source PEM certificate and key copied into `/etc/masque/certs` |
+| `MASQUE_TLS_MODE` / `MASQUE_TLS_NAME` | `self_signed` and the public DNS name or IP generate a certificate; requires OpenSSL and does not overwrite existing TLS files |
 | `MASQUE_CLIENT_NAME` | First certificate-authenticated client label |
 | `MASQUE_CLIENT_ENDPOINT` | Required public server endpoint in `IP:port` form |
 | `MASQUE_CLIENT_IPV4` / `MASQUE_CLIENT_IPV6` | Pinned addresses; use `none` to omit one family |
 | `MASQUE_CLIENT_CONFIG_OUT` | Absolute secret JSON output path; defaults to `/root/masque-client.json` |
 | `MASQUE_START_SERVICE` | `1` to start/restart, `0` to stage only; bootstrap default is `1` |
 | `MASQUE_RUN_HOST_DIAGNOSTICS` | `1` to run the read-only CONNECT-IP host check after installation (default), `0` to skip |
-| `MASQUE_PRINT_SECRETS` | `0` suppresses credentials, client private keys, and the rendered fresh configuration for automation; default `1` |
+| `MASQUE_PRINT_SECRETS` | `0` suppresses credentials and the rendered fresh configuration for automation; default `1` |
 
 For example, a non-interactive client-certificate installation is:
 
