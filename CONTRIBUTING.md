@@ -14,17 +14,16 @@ cargo build --workspace --locked
 cargo test --workspace --locked
 ```
 
-Before submitting a change:
+For a quick local check, run `scripts/check.sh quick`. Before submitting a
+change, run the shared local and CI checks:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo +1.88.0 check --workspace --locked
-cargo test --workspace --locked
+scripts/check.sh full
 ```
 
-Changes to packet handling, scheduling, buffering, or authentication must also
-run the relevant E2E or benchmark command described in
+This requires the pinned Rust toolchain, Rust 1.88.0, Clang, CMake, Python 3,
+and ShellCheck. The full check does not replace the platform-specific, E2E,
+or performance checks selected by the change matrix in
 [`docs/testing.md`](docs/testing.md).
 
 ## Design rules

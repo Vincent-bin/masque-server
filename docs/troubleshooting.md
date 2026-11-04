@@ -5,6 +5,56 @@ or firewall rules. `masque-probe` exercises the actual protocol from the client
 network; `check-config`, `doctor`, and `support-bundle` inspect the server
 without changing it.
 
+## Evidence workflow for AI-assisted diagnosis
+
+Start with read-only checks and preserve the distinction between an observation,
+an inference, and an untested hypothesis. Record the approximate incident time,
+affected transport and traffic type, client-side symptom, recent relevant
+change, and server/probe versions when known. Use generic host roles in reports.
+
+| Evidence | What it can establish | What it cannot establish |
+| --- | --- | --- |
+| Fleet `validate` and `status` | Inventory validation and reported service, version, configuration and certificate state | End-to-end traffic or root cause |
+| Bounded fleet `diagnose` | Filtered, time-relevant service diagnostics | Complete history or absence of sensitive client/destination metadata |
+| Local `check-config` and `status` | Whether the selected on-disk configuration validates and the reported local service/reload state | A live bind, the configuration previously loaded by a running process, or external connectivity |
+| Local `doctor` | Read-only evidence of CONNECT-IP host prerequisites | A successful forwarding path or the correctness of all firewall and network state |
+| Client-side `masque-probe --json` | Results for the checks actually run from that client path, including selected transport, warning/failure codes and duration | Unselected or skipped transports, every client network, or CONNECT-IP packet forwarding from negotiation alone |
+| Local `support-bundle` | Structured snapshot of a valid configuration, service metadata, and diagnostic result levels | Invalid configurations, logs, actual traffic, or end-to-end success |
+
+For a fleet, use the `masque-ops` Skill's `validate`, `status`, and bounded
+`diagnose` flow; do not replace it with ad hoc SSH or read private inventory.
+For local diagnosis, choose the corresponding local commands below. A support
+bundle is produced only after configuration validation succeeds; if validation
+fails, record the sanitized validation failure instead of treating the missing
+bundle as evidence that the service is healthy.
+
+Run a probe from the affected client network when available. Capture the
+requested and selected transport, each relevant check's status and code, and
+whether TCP, UDP, or IP checks were skipped. Auto mode may report success after
+HTTP/2 fallback even though HTTP/3 failed; use an explicit transport to isolate
+each requested path. CONNECT-IP negotiation alone does not verify packet
+forwarding. Compare equivalent checks before and after a change, and include
+time and scope so unrelated observations are not conflated.
+
+Use a concise sanitized evidence record:
+
+```text
+Scope: generic host role, affected transport and traffic type, incident time
+Observed: source, check and status/code; relevant version and duration if known
+Inference: likely explanation and the evidence supporting it
+Not verified: skipped/unavailable checks and alternative explanations
+Next check: smallest read-only test that distinguishes those explanations
+```
+
+Probe JSON, support bundles, local status output, and even filtered fleet
+diagnostics can contain endpoints, listener addresses, aliases, TUN names, or
+other private metadata. Keep raw reports private and outside the repository;
+extract only the minimum facts into the record. Never share credentials, hashes,
+private paths, or raw configuration. Follow [AGENTS.md](../AGENTS.md) before
+publishing any diagnostic summary. Do not change configuration or perform a
+deployment solely because one signal suggests a cause; use the supported change
+workflow and its authorization and verification boundaries.
+
 ## Client-side connectivity probe
 
 Install the standalone probe on a Linux or macOS x86_64/ARM64 client; the
