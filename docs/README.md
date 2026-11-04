@@ -7,6 +7,8 @@
   and systemd operation.
 - [Operations](operations.md): guarded fleet inspection, rollout, and rollback,
   with an optional repo-scoped AI Skill.
+- [AI-assisted changes](ai-operations.md): supported configuration and deployment
+  workflows, verification evidence, and current automation boundaries.
 - [Protocols](protocols.md): supported MASQUE, HTTP/2, and HTTP/3 behavior.
 - [Performance](performance.md): fast paths, tuning, and benchmark rules.
 - [Observability](observability.md): health, readiness, Prometheus, Grafana,

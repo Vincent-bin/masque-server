@@ -1,0 +1,205 @@
+//! HTTP/3 shard output operations.
+
+use super::*;
+
+impl Shard {
+    /// Send an RFC 7617 Basic proxy-authentication challenge.
+    pub(super) fn send_proxy_auth_required(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+    ) {
+        let headers = [
+            quiche::h3::Header::new(b":status", b"407"),
+            quiche::h3::Header::new(
+                b"proxy-authenticate",
+                b"Basic realm=\"masque\", charset=\"UTF-8\"",
+            ),
+            quiche::h3::Header::new(b"content-length", b"0"),
+        ];
+
+        if let Err(e) = h3.send_response(quic, stream_id, &headers, true) {
+            warn!(stream_id, %e, "failed to send proxy authentication challenge");
+        }
+    }
+
+    /// Reject a request whose Basic credentials have not been verified.
+    ///
+    /// A stealth listener deliberately emits the same empty 404 as an
+    /// unsupported request. Ordinary listeners retain the challenge or the
+    /// overload status supplied by the caller.
+    pub(super) fn send_auth_rejection(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        stealth: bool,
+        fallback_status: u16,
+    ) {
+        if stealth {
+            Self::send_error_response(h3, quic, stream_id, 404);
+        } else if fallback_status == 407 {
+            Self::send_proxy_auth_required(h3, quic, stream_id);
+        } else {
+            Self::send_error_response(h3, quic, stream_id, fallback_status);
+        }
+    }
+
+    /// Send an HTTP error response.
+    pub(super) fn send_error_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        status: u16,
+    ) {
+        // Every status we send is three digits, so format it without a
+        // heap-allocated String.
+        let status_buf = [
+            b'0' + (status / 100 % 10) as u8,
+            b'0' + (status / 10 % 10) as u8,
+            b'0' + (status % 10) as u8,
+        ];
+
+        let headers = [
+            quiche::h3::Header::new(b":status", &status_buf),
+            quiche::h3::Header::new(b"content-length", b"0"),
+        ];
+
+        if let Err(e) = h3.send_response(quic, stream_id, &headers, true) {
+            warn!(stream_id, %e, "failed to send response");
+        }
+    }
+
+    /// Drive the connections with work pending: handle timers, flush outgoing
+    /// packets, and queue each one's next wakeup.
+    pub(super) async fn drive_connections(
+        &mut self,
+        dirty: &[u64],
+        out: &mut [u8],
+        batch: &mut SendPacketBatch,
+    ) {
+        let socket = &mut self.socket;
+        let connections = &mut self.connections;
+        let conn_by_index = &self.conn_by_index;
+        let timers = &mut self.timers;
+
+        for index in dirty {
+            let Some(conn_id) = conn_by_index.get(index) else {
+                continue;
+            };
+            let Some(client) = connections.get_mut(conn_id) else {
+                continue;
+            };
+
+            client.quic.on_timeout();
+            if client.quic.local_error().is_some()
+                || client.quic.is_draining()
+                || client.quic.is_closed()
+            {
+                client.deferred_send.discard();
+            }
+            client.flush_capsule_output();
+
+            // Build at most one congestion-control send quantum at a time.
+            // Linux can collapse equal-sized packets into one GSO aggregate;
+            // remaining messages are still emitted by one sendmmsg syscall.
+            loop {
+                batch.clear();
+                let max_packet_size = client.quic.max_send_udp_payload_size();
+                let send_quantum = client
+                    .quic
+                    .send_quantum()
+                    .max(max_packet_size)
+                    .min(MAX_DATAGRAM_SIZE);
+                let mut generated_bytes = 0;
+                let mut quiche_done = false;
+                let mut pacing_blocked = false;
+
+                // `quiche::Connection::send()` serializes and accounts a
+                // packet before returning its desired release time. Resume a
+                // group retained by the previous loop once its first packet
+                // is due. Release up to one timer tick ahead to batch sends.
+                if let Some(deadline) = client.deferred_send.deadline() {
+                    let now = Instant::now();
+                    if deadline > now {
+                        break;
+                    }
+                    let release_horizon = now + crate::connection::PACING_HORIZON;
+                    while let Some((packet, send_info)) =
+                        client.deferred_send.take_if_due(release_horizon)
+                    {
+                        generated_bytes += packet.len();
+                        batch.push(&packet, send_info, socket.udp_gso_enabled(), send_quantum);
+                        client.deferred_send.recycle(packet);
+                    }
+                    pacing_blocked = client.deferred_send.deadline().is_some();
+                }
+
+                while !pacing_blocked
+                    && batch.packet_count() + client.deferred_send.len() < MAX_BATCH_PACKETS
+                    && generated_bytes < send_quantum
+                    && client.deferred_send.has_capacity(max_packet_size)
+                {
+                    let (write, send_info) = match client.quic.send(out) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => {
+                            quiche_done = true;
+                            break;
+                        }
+                        Err(e) => {
+                            error!(%e, "quiche send error");
+                            client.quic.close(false, 0x1, b"send error").ok();
+                            quiche_done = true;
+                            break;
+                        }
+                    };
+
+                    generated_bytes += write;
+                    // Serialize a bounded group ahead of its release time.
+                    // Packets within one timer tick can share this send; later
+                    // packets remain bounded in the deferred queue.
+                    if send_info.at > Instant::now() + crate::connection::PACING_HORIZON
+                        || client.deferred_send.len() != 0
+                    {
+                        client.deferred_send.schedule(&out[..write], send_info);
+                        if !client.deferred_send.can_prefetch() {
+                            pacing_blocked = true;
+                        }
+                        continue;
+                    }
+
+                    batch.push(
+                        &out[..write],
+                        send_info,
+                        socket.udp_gso_enabled(),
+                        send_quantum,
+                    );
+                }
+
+                if batch.is_empty() {
+                    break;
+                }
+
+                let udp_gso_before_send = socket.udp_gso_enabled();
+                match socket.send_batch(batch).await {
+                    Ok(()) => self
+                        .metrics
+                        .record_send_batch(batch.packet_count(), batch.byte_count()),
+                    Err(e) => warn!(%e, "socket send error"),
+                }
+                if udp_gso_before_send && !socket.udp_gso_enabled() {
+                    self.metrics.disable_udp_gso();
+                }
+
+                if quiche_done || pacing_blocked || client.deferred_send.deadline().is_some() {
+                    break;
+                }
+            }
+
+            // quiche's timer moves on nearly every recv and send, so the
+            // connection's next wakeup is only knowable once it is fully
+            // driven.
+            Self::reschedule(client, timers, Instant::now());
+            client.sync_metrics();
+        }
+    }
+}

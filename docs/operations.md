@@ -15,6 +15,9 @@ certificates, users, routes, forwarding, firewall, NAT, or monitoring services.
 It targets the paths and service name used by the official Linux installer;
 custom installation layouts are intentionally outside its scope.
 
+For choosing between configuration edits, activation, release operations, and
+their verification, see [AI-assisted changes](ai-operations.md).
+
 ## Install the operations bundle
 
 Python 3.11 or newer and OpenSSH are required on the administration machine.

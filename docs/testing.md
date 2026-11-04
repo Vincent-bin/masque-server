@@ -1,5 +1,33 @@
 # Testing
 
+## Select checks for a change
+
+Run `scripts/check.sh quick` during iteration and `scripts/check.sh full`
+before submission. The latter combines CI's `quality`, `msrv`, and workspace
+`test` checks; these modes can also be run separately. It needs the pinned Rust
+toolchain plus 1.88.0, Clang, CMake, Python 3, and ShellCheck. A cold native
+build can be expensive; quick checks avoid compilation. Full does not include
+the privileged, platform-specific, scheduled, or performance checks below.
+
+Apply every relevant row when a change spans multiple areas. Focused commands
+are additional to the full check, not substitutes for it. When a required
+environment is unavailable, report the missing command, reason, and resulting
+coverage gap; do not claim equivalent coverage from another platform.
+
+| Change | Entry points and additional validation | Cost / prerequisites |
+| --- | --- | --- |
+| Authentication, TLS, or reload | `src/server/authentication.rs`, `src/server/http2/auth.rs`, `src/server/mod.rs`; run `cargo test --test http2_connect` and `cargo test --test client_cert_connect_ip`, including rejection and reload/rollback behavior | Native Rust build; integration tests use local networking |
+| Packet processing, scheduling, or buffering | `src/net/`, `src/server/mod.rs`, `src/scheduler.rs`, `src/tunnel/`; run `scripts/e2e-test.sh` and relevant benchmarks below, including resource bounds and overload behavior | E2E needs Docker, TUN and `NET_ADMIN`; benchmarks are potentially long and need controlled conditions |
+| Configuration and defaults | `src/config.rs`, `src/server/validation.rs`, `deploy/config/`; run `cargo test --test check_config` and, for editing, `cargo test --test add_listener`; verify old configurations and update examples | Native Rust build; local tests |
+| Linux network fast paths or TUN | `src/net/`, `src/tun.rs`; run applicable Linux-specific checks below and `scripts/e2e-test.sh`; also validate the portable fallback | Linux and potentially privileged Docker/TUN access; macOS does not cover these paths |
+| Operations CLI or installer | `scripts/masque-ops.py`, `.agents/skills/masque-ops/`, installer scripts; run `python3 -m unittest -v tests/test_masque_ops.py` and relevant installer tests; check packaged Skill copies stay synchronized | Python 3 and shell; no live fleet needed |
+| Protocol framing | `src/capsule/`, `src/datagram.rs`, H2/H3 request paths; run relevant integration tests and bounded parser fuzzing below | Native Rust build; fuzzing needs nightly and `cargo-fuzz` |
+
+CI runs `quality` on Linux, `msrv` separately, and `test` on Linux and macOS.
+Its Linux-only shutdown and installer-upgrade tests, release packaging, and the
+scheduled verification workflow remain separate; see their workflow files for
+the exact environment and commands.
+
 ## Validation matrix
 
 | Layer | Command | Purpose |

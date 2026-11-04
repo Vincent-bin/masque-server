@@ -113,6 +113,13 @@ bounded drain begins. The packaged watchdog uses the same liveness decision.
 | Path | Responsibility |
 | --- | --- |
 | `src/server/mod.rs` | Server startup, shard event loop, and tunnel coordination |
+| `src/server/listener_address.rs` | Listener bind-address overlap rules used by planning and binding |
+| `src/server/validation.rs` | Startup and `check-config` validation, listener planning, and resource ceilings |
+| `src/server/shard_tunnels.rs` | HTTP/3 CONNECT setup, TCP relay, and tunnel teardown |
+| `src/server/shard_datagrams.rs` | HTTP/3 client, target UDP, and TUN datagram forwarding |
+| `src/server/shard_lifecycle.rs` | Certificate roster enforcement and idle tunnel cleanup |
+| `src/server/shard_output.rs` | HTTP/3 error responses and connection output driving |
+| `src/server/shard_packets.rs` | HTTP/3 packet ingress, connection IDs, and timers |
 | `src/server/http2.rs` | HTTP/2 TCP/TLS listener lifecycle and shared connection context |
 | `src/server/http2/connection.rs` | H2 connection lifecycle, graceful drain, roster enforcement, and request dispatch |
 | `src/server/http2/request.rs` | HTTP/2 CONNECT recognition and post-authentication target validation |
@@ -148,6 +155,46 @@ bounded drain begins. The packaged watchdog uses the same liveness decision.
 The primary server remains one crate so release LTO can optimize across the
 QUIC, scheduler, and tunnel boundary. Platform-specific network code is a
 module boundary rather than a crate boundary.
+
+## Navigating the HTTP/3 server
+
+`src/server/mod.rs` coordinates several lifecycles. Search for these symbols
+rather than relying on line numbers:
+
+1. `validate_config` and `validate_server_config` in `validation.rs` check the
+   listener plan and shared settings. Address overlap rules are in `listener_address.rs` and are
+   also used when binding resolves ephemeral ports. `Server::bind_with_reload`
+   constructs shared resources and listeners; `Server::run` starts and drains
+   their tasks.
+2. `Shard::bind` / `Shard::from_socket` construct a shard; `Shard::run` waits
+   for packet, timer, setup, relay, and shutdown events. `handle_packet` in
+   `shard_packets.rs` handles ingress, and `drive_connections` in
+   `shard_output.rs` advances ready connections.
+3. `src/server/request.rs` classifies and dispatches requests, while
+   `src/server/authentication.rs` schedules bounded Basic verification. The
+   shard applies completed setups in `shard_tunnels.rs` and relays UDP and TUN
+   traffic in `shard_datagrams.rs` through its `apply_*`, `handle_*`, and
+   `relay_*` methods.
+4. `reload_configuration` prepares and installs reloadable state; the reload
+   listener and roster enforcement coordinate the effect on active sessions.
+
+Keep ownership and event-loop boundaries explicit when extracting a cohesive
+part of this module. Changes to shared policy, authentication, or resources
+also need the separate HTTP/2 path reviewed.
+
+## Invariants and regression evidence
+
+These references are starting points, not an exhaustive proof. Select all
+applicable tests using the [change matrix](testing.md#select-checks-for-a-change).
+
+| Invariant | Implementation and regression evidence |
+| --- | --- |
+| A QUIC connection is mutated by its owning shard | `Shard::run` and packet routing in `src/server/mod.rs`; migration and shard-routing coverage in `tests/client_cert_connect_ip.rs` |
+| Blocking DNS and Argon2 do not block a shard; work remains bounded across cancellation | `src/tunnel/resolver.rs` and `src/server/authentication.rs`, including their unit tests for cancelled lookups and shared authentication work |
+| Queues and buffers remain bounded; UDP overload may drop instead of growing without limit | Queue limits in `src/server/mod.rs`, `src/tunnel/udp.rs`, and `src/net/`; `tests/resource_exhaustion.rs` and the Linux pressure checks in [Testing](testing.md#scheduled-verification) |
+| TCP flow control provides backpressure | `src/tunnel/tcp.rs` and `src/server/http2/tcp.rs`; transport integration tests in `tests/http2_connect.rs` and Docker E2E |
+| Configuration validation and reload fail safely | `src/config.rs`, `validate_server_config` in `src/server/validation.rs` and `reload_configuration` in `src/server/mod.rs`; `tests/check_config.rs`, `tests/http2_connect.rs`, and `tests/client_cert_connect_ip.rs` |
+| Linux fast paths have portable boundaries | `src/net/quic.rs`, `src/net/target_udp.rs`, and `src/tun.rs`; Linux-specific and macOS coverage are distinguished in [Testing](testing.md#linux-specific-checks) |
 
 ## Event loop
 

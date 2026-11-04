@@ -51,31 +51,8 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-1.97.1-native-
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Check shell scripts
-        run: |
-          sh -n install-latest.sh install-ops.sh install-probe.sh \
-            deploy/install.sh deploy/masque-maintain \
-            scripts/validate-release.sh tests/install-upgrade.sh \
-            tests/install-ops.sh tests/install-probe.sh tests/release-metadata.sh \
-            tests/systemd-shutdown.sh
-          sh tests/install-ops.sh
-          sh tests/install-probe.sh
-          sh tests/release-metadata.sh
-          shellcheck install-latest.sh install-ops.sh install-probe.sh deploy/install.sh \
-            deploy/masque-maintain scripts/*.sh \
-            tests/*.sh tests/e2e/*.sh
-
-      - name: Test fleet operations CLI
-        run: python3 -m unittest -v tests/test_masque_ops.py
-
-      - name: Test performance reporting and process accounting
-        run: python3 -m unittest -v tests/test_performance_baseline.py
+      - name: Run shared quality checks
+        run: scripts/check.sh quality
 
   msrv:
     name: Check MSRV (1.88.0)
@@ -105,7 +82,7 @@ jobs:
             cargo-${{ runner.os }}-1.88.0-native-
 
       - name: Check workspace
-        run: cargo +1.88.0 check --workspace --locked
+        run: scripts/check.sh msrv
 
   test:
     name: Test (${{ matrix.os }})
@@ -144,7 +121,7 @@ jobs:
             cargo-${{ runner.os }}-1.97.1-native-
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: scripts/check.sh test
 
       - name: Test systemd shutdown signals
         if: runner.os == 'Linux'
