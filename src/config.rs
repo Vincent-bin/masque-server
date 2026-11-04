@@ -218,9 +218,22 @@ pub struct ListenerSection {
     /// ordinary single-hop listeners.
     #[serde(default)]
     pub max_datagram_size: Option<usize>,
+    #[serde(default)]
+    pub tcp_targets: Option<TargetRestrictionSection>,
+    #[serde(default)]
+    pub udp_targets: Option<TargetRestrictionSection>,
     /// Authentication for this listener. Required so a socket's trust boundary
     /// is never inherited from a distant part of the file.
     pub auth: AuthSection,
+}
+
+/// Additional restrictions on a listener's globally permitted destinations.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TargetRestrictionSection {
+    pub allow_targets: Option<Vec<String>>,
+    pub deny_targets: Vec<String>,
+    pub allow_ports: Option<Vec<u16>>,
 }
 
 fn default_listener_shards() -> usize {
@@ -234,6 +247,8 @@ pub struct ResolvedListener {
     pub transport: ListenerTransport,
     pub shards: usize,
     pub max_datagram_size: Option<usize>,
+    pub tcp_targets: Option<crate::policy::TargetRestrictions>,
+    pub udp_targets: Option<crate::policy::TargetRestrictions>,
     pub auth: AuthSection,
 }
 
@@ -421,6 +436,8 @@ impl Default for ServerConfig {
                 transport: ListenerTransport::Http3,
                 shards: default_listener_shards(),
                 max_datagram_size: None,
+                tcp_targets: None,
+                udp_targets: None,
                 auth: AuthSection::default(),
             }],
         }

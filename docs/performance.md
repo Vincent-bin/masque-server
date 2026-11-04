@@ -35,6 +35,29 @@ while HTTP/3 DATAGRAM frames are not. Compare reachability cost, application
 goodput, CPU, latency, and response shortfall rather than treating the result as
 a claim that the wire protocols have equal behavior.
 
+HTTP/2 sends small DATA frames with `TCP_NODELAY`. The CONNECT-UDP
+response path combines already queued datagrams into a bounded group of
+capsules before handing them to H2 flow control. It sends when the batch limit
+is reached or no more packets are ready, without waiting for more packets.
+
+An alternating Linux loopback run used the same release benchmark client,
+a window of 256, and three seconds per payload. Medians from three runs per
+variant:
+
+| Server variant | 64 B (pps) | 1200 B (pps) | Unloaded 64 B p99 (µs) | CPU time per echo (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| v0.14.4 baseline | 136,906 | 82,847 | 262 | 8.31 |
+| TCP_NODELAY only | 253,502 | 63,260 | 326 | 7.89 |
+| TCP_NODELAY and capsule batching | 245,521 | 131,860 | 324 | 6.58 |
+
+The combined variant reduced response shortfall from 0.056% to 0.033% at
+64 bytes and from 0.199% to 0.131% at 1200 bytes. Total measured server CPU
+time rose from 5.47 s to 7.46 s as the server handled more packets. CPU time
+per echo is the whole-run CPU time divided by echoes across both payloads,
+including setup costs. A batching-only variant regressed sharply at 64 bytes
+and was discarded. The unloaded p99 comes from 50 probes per run and does
+not establish tail latency under load.
+
 ## Linux fast paths
 
 ### QUIC socket
@@ -186,6 +209,46 @@ that path. This option currently applies to HTTP/3 only.
 controller for a benchmark; the default is `cubic`. Alternate controllers over
 at least three runs with the same payload, window, duration, and expiry. Inspect
 goodput, RTT, response shortfall, and the direct baseline together.
+
+For controlled HTTP/3 WAN tests, run the benchmark in an isolated Linux
+container or network namespace with `tc`. Match only UDP packets with the
+benchmark server port as source or destination so the target echo and direct
+baseline stay unshaped. For example, in the isolated namespace:
+
+```sh
+port=19443
+tc qdisc add dev lo root handle 1: prio bands 3 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+tc qdisc add dev lo parent 1:1 handle 10: netem delay 30ms loss 0.2% limit 20000
+tc filter add dev lo protocol ip parent 1: pref 1 flower ip_proto udp dst_port "$port" classid 1:1
+tc filter add dev lo protocol ip parent 1: pref 2 flower ip_proto udp src_port "$port" classid 1:1
+MASQUE_BENCH_SERVER_PORT="$port" MASQUE_BENCH_MODE=udp \
+  MASQUE_BENCH_TRANSPORT=http3 MASQUE_BENCH_WINDOW=512 scripts/network-bench.sh
+tc -s qdisc show dev lo
+```
+
+Compare GSO on/off with the same binary and pacing variants with GSO fixed.
+`MASQUE_BENCH_SERVER_BIN` selects a different server while keeping the same
+client binary. Check the qdisc counters and observed RTT before comparing
+results. Record both the single-connection UDP run and the loaded RTT
+percentiles from a multi-connection run.
+
+In a three-run Linux loopback comparison with the profile above, CUBIC, one
+shard, and target GSO disabled, the isolated qdisc recorded 668 drops across
+375,917 transmitted packets. The table reports medians. The single connection
+used a window of 512 for four seconds per payload. The eight-connection run
+used a window of 128 per connection and 64-byte payloads for five seconds.
+
+| QUIC variant | Single 64 B (pps) | Single 1200 B (Mbit/s) | Eight connections (pps) | Loaded p99 upper bound (ms) | Loaded response shortfall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GSO off, 1 ms pacing horizon | 7,441 | 22.52 | 12,771 | 69.63 | 1.94% |
+| GSO requested, 1 ms pacing horizon | 7,180 | 17.65 | 12,587 | 65.54 | 2.13% |
+| GSO off, zero pacing horizon | 7,065 | 21.13 | 11,593 | 65.54 | 2.71% |
+
+The eight-connection server CPU totals were 0.44 s, 0.42 s, and 0.39 s
+respectively, including setup. Neither variant improved goodput and shortfall
+together in this run, so the defaults were kept. The loopback qdisc operates
+on kernel packets, and its loss behavior with GSO can differ from physical
+network loss. Confirm the result on the intended network before tuning GSO.
 
 UDP runs emit one `UDP_RESULT` record per payload and path. TCP runs include a
 `transport` field in every `TCP_DOWNLOAD_RESULT` and `TCP_DOWNLOAD_SUMMARY`, so

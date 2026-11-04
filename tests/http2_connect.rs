@@ -637,13 +637,16 @@ async fn client_certificate_authenticates_http2_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_udp_relays_datagram_capsules_over_http2() {
+    const PACKETS: u8 = 24;
     let files = TestFiles::new();
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
     let target_task = tokio::spawn(async move {
         let mut buf = [0_u8; 256];
-        let (read, peer) = target.recv_from(&mut buf).await.unwrap();
-        target.send_to(&buf[..read], peer).await.unwrap();
+        for _ in 0..PACKETS {
+            let (read, peer) = target.recv_from(&mut buf).await.unwrap();
+            target.send_to(&buf[..read], peer).await.unwrap();
+        }
     });
 
     let (server_addr, server_task) = spawn_http2_server(&files).await;
@@ -668,31 +671,92 @@ async fn connect_udp_relays_datagram_capsules_over_http2() {
     assert_eq!(response.headers()["capsule-protocol"], "?1");
 
     let mut capsule = Vec::new();
-    encoder::encode_datagram_context_zero(b"udp over h2", &mut capsule);
+    for packet in 0..PACKETS {
+        encoder::encode_datagram_context_zero(&[packet; 64], &mut capsule);
+    }
     request_body.send_data(Bytes::from(capsule), false).unwrap();
 
     let mut response_body = response.into_body();
-    let data = tokio::time::timeout(Duration::from_secs(2), response_body.data())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    response_body
-        .flow_control()
-        .release_capacity(data.len())
-        .unwrap();
-    let frames = CapsuleDecoder::new().decode(&data).unwrap();
+    let mut decoder = CapsuleDecoder::new();
+    let mut frames = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while frames.len() < usize::from(PACKETS) {
+            let data = response_body.data().await.unwrap().unwrap();
+            response_body
+                .flow_control()
+                .release_capacity(data.len())
+                .unwrap();
+            frames.extend(decoder.decode(&data).unwrap());
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         frames,
-        vec![CapsuleFrame::Datagram(
-            [vec![0], b"udp over h2".to_vec()].concat()
-        )]
+        (0..PACKETS)
+            .map(|packet| { CapsuleFrame::Datagram([&[0][..], &[packet; 64][..]].concat()) })
+            .collect::<Vec<_>>()
     );
 
     request_body.send_data(Bytes::new(), true).unwrap();
     target_task.await.unwrap();
     server_task.abort();
     driver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_targets_restrict_only_that_http2_listener() {
+    let files = TestFiles::new();
+    let tcp_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = http2_config(&files);
+    let mut restricted = config.listeners[0].clone();
+    restricted.tcp_targets = Some(masque::config::TargetRestrictionSection {
+        allow_ports: Some(vec![]),
+        ..Default::default()
+    });
+    restricted.udp_targets = Some(masque::config::TargetRestrictionSection {
+        deny_targets: vec!["127.0.0.0/8".into()],
+        ..Default::default()
+    });
+    config.listeners.push(restricted);
+    let mut server = Server::bind(config).await.unwrap();
+    let addresses = server.listen_addrs().to_vec();
+    let server_task = tokio::spawn(async move { server.run().await.unwrap() });
+
+    for (address, expected) in addresses
+        .into_iter()
+        .zip([StatusCode::OK, StatusCode::FORBIDDEN])
+    {
+        let (mut client, driver) = connect_h2(address).await;
+        let (tcp, _body) = client
+            .send_request(connect_request(tcp_target.local_addr().unwrap()), false)
+            .unwrap();
+        let mut udp = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!(
+                "https://localhost/.well-known/masque/udp/127.0.0.1/{}/",
+                udp_target.local_addr().unwrap().port()
+            ))
+            .header("capsule-protocol", "?1")
+            .body(())
+            .unwrap();
+        udp.extensions_mut()
+            .insert(h2::ext::Protocol::from_static("connect-udp"));
+        let (udp, _udp_body) = client.send_request(udp, false).unwrap();
+        for response in [tcp, udp] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status(),
+                expected
+            );
+        }
+        driver.abort();
+    }
+    server_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

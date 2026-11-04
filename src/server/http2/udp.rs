@@ -20,6 +20,8 @@ use crate::uri::UdpTarget;
 use crate::varint;
 
 const MAX_UDP_PAYLOAD: usize = 65_527;
+const RESPONSE_BATCH_PACKETS: usize = 16;
+const RESPONSE_BATCH_BYTES: usize = 4 * 1024;
 
 pub(super) async fn serve(
     stream_id: u32,
@@ -101,21 +103,37 @@ pub(super) async fn serve(
         // One extra byte detects a datagram larger than the configured limit;
         // never forward a silently truncated prefix.
         let mut recv = vec![0_u8; max_payload + 1];
-        let mut capsule = Vec::with_capacity(max_payload + 16);
         loop {
-            let read = socket.recv(&mut recv).await?;
-            if read > max_payload {
-                debug!(
-                    stream_id,
-                    read, max_payload, "dropping oversized HTTP/2 target datagram"
-                );
-                continue;
+            let mut read = socket.recv(&mut recv).await?;
+            let mut capsules = Vec::new();
+            // Drain only packets that are already ready. The final capsule can
+            // cross the soft byte limit by at most one datagram. Flow control
+            // is applied before reading another batch.
+            for index in 0..RESPONSE_BATCH_PACKETS {
+                if read <= max_payload {
+                    if capsules.is_empty() {
+                        capsules.reserve(read + 8);
+                    }
+                    encoder::encode_datagram_context_zero(&recv[..read], &mut capsules);
+                } else {
+                    debug!(
+                        stream_id,
+                        read, max_payload, "dropping oversized HTTP/2 target datagram"
+                    );
+                }
+                if capsules.len() >= RESPONSE_BATCH_BYTES || index + 1 == RESPONSE_BATCH_PACKETS {
+                    break;
+                }
+                match socket.try_recv(&mut recv) {
+                    Ok(len) => read = len,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error.into()),
+                }
             }
-            activity.touch();
-            // The HTTP Datagram payload begins with Context ID zero.
-            capsule.clear();
-            encoder::encode_datagram_context_zero(&recv[..read], &mut capsule);
-            send_data(&mut send, Bytes::copy_from_slice(&capsule), false).await?;
+            if !capsules.is_empty() {
+                activity.touch();
+                send_data(&mut send, Bytes::from(capsules), false).await?;
+            }
         }
     };
 

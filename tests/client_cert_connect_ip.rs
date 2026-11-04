@@ -823,6 +823,8 @@ fn dual_fixture_with_stealth(tag: &str, stealth: bool) -> DualFixture {
             transport: ListenerTransport::Http3,
             shards: 1,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::Basic,
@@ -837,6 +839,8 @@ fn dual_fixture_with_stealth(tag: &str, stealth: bool) -> DualFixture {
             transport: ListenerTransport::Http3,
             shards: 1,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: true,
                 mode: AuthMode::ClientCert,
@@ -1050,6 +1054,8 @@ fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
             transport: ListenerTransport::Http3,
             shards: 2,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: false,
                 ..Default::default()
@@ -1060,6 +1066,8 @@ fn ephemeral_multi_shard_listeners_share_only_their_own_port() {
             transport: ListenerTransport::Http3,
             shards: 2,
             max_datagram_size: None,
+            tcp_targets: None,
+            udp_targets: None,
             auth: AuthSection {
                 enabled: false,
                 ..Default::default()
@@ -1738,7 +1746,11 @@ fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http3() {
     config.tcp_proxy.allow_targets = vec!["0.0.0.0/0".into(), "::/0".into()];
     config.tcp_proxy.deny_targets = vec!["127.0.0.0/8".into()];
     config.udp_proxy.allow_targets = config.tcp_proxy.allow_targets.clone();
-    config.udp_proxy.deny_targets = config.tcp_proxy.deny_targets.clone();
+    config.udp_proxy.deny_targets.clear();
+    config.listeners[0].udp_targets = Some(masque::config::TargetRestrictionSection {
+        deny_targets: vec!["::ffff:127.0.0.0/104".into()],
+        ..Default::default()
+    });
     let peer = spawn_server(config)[0];
     let mut client = Client::connect_anonymous(peer).unwrap();
     client.handshake(Duration::from_secs(5)).unwrap();

@@ -21,7 +21,8 @@ a staging environment.
   authentication against a public-key roster
 - Multiple listeners in one process, each with its own Basic or client-certificate
   authentication mode while sharing proxy policies, client roster, and TUN state
-- CIDR allow and deny policies for TCP and UDP targets
+- Global CIDR allow and deny policies for TCP and UDP targets, with optional
+  per-listener CIDR and port restrictions
 - Adaptive QUIC Retry plus process-wide per-source connection and Basic-auth
   admission limits
 - QUIC NAT rebinding and validated client-address migration without dropping

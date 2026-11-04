@@ -31,6 +31,11 @@ pub(super) async fn serve(
     _source_admission: SourceAdmission,
 ) {
     let _connection_metrics = ConnectionMetricsGuard::new(Arc::clone(&context.metrics));
+    // H2 flow-control updates and small DATAGRAM capsules should not wait
+    // behind an unacknowledged TCP segment.
+    if let Err(error) = stream.set_nodelay(true) {
+        debug!(%peer, %error, "failed to disable Nagle on HTTP/2 connection");
+    }
     let tls = match tokio::time::timeout(
         TLS_HANDSHAKE_TIMEOUT,
         tokio_boring::accept(&context.acceptor, stream),

@@ -95,7 +95,7 @@ Each HTTP/2 listener has one asynchronous TCP accept loop. Every accepted TLS/H2
 connection and CONNECT stream runs in its own bounded Tokio task, with H2 flow
 control carrying backpressure to the target socket. CONNECT-UDP and CONNECT-IP
 DATA frames are incrementally decoded into DATAGRAM capsules. These tasks share
-the same target policies, authentication admission semaphores, certificate
+the same global target policies, authentication admission semaphores, certificate
 roster, address pool, TUN routing table, limits, and metrics registry as the
 HTTP/3 shards. A bounded per-stream channel connects an HTTP/2 CONNECT-IP task
 to the shared TUN read side; HTTP/2 never participates in QUIC connection-ID
@@ -267,9 +267,10 @@ connection.
 
 `[[listeners]]` runs one or more listeners in one process. Startup resolves each
 entry into a small listener plan containing its transport, address, shard count,
-optional QUIC packet ceiling, and authentication. Every worker references the same process-wide
-`ServerConfig`, so proxy policies, TLS tuning, and limits are shared rather than
-copied. Each listener owns one authentication snapshot shared by its shards and
+optional QUIC packet ceiling, authentication, and optional target restrictions.
+Every worker references the same process-wide `ServerConfig`. A CONNECT or
+CONNECT-UDP target must pass both the global policy and any listener restriction.
+Each listener owns one authentication snapshot shared by its shards and
 established HTTP/2 connections. QUIC tuning applies only to HTTP/3; its
 `max_datagram_size` default may be overridden by one listener. HTTP/2
 flow-control tuning applies only to HTTP/2. The authentication mode

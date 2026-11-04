@@ -393,14 +393,31 @@ mode = "client_cert"
 | `shards` | HTTP/3 event loops; defaults to `1`. HTTP/2 must use exactly `1` |
 | `max_datagram_size` | Optional HTTP/3 packet ceiling; inherits `quic.max_datagram_size` when absent and is rejected on HTTP/2 |
 | `[listeners.auth]` | Required; authentication is always explicit per socket |
+| `[listeners.tcp_targets]` / `[listeners.udp_targets]` | Optional restrictions on CONNECT and CONNECT-UDP destinations for this listener |
 
-Apart from that one QUIC packet-size override, everything else stays
-server-wide: TLS, HTTP/2 and QUIC settings, TCP/UDP target policies, connection
+TLS, HTTP/2 and QUIC defaults, global TCP/UDP target policies, connection
 limits, one `[[clients]]` roster, one TUN device, one CONNECT-IP address pool,
-and one routing table. That is the reason to run two listeners in one process
+and one routing table stay server-wide. That is the reason to run two listeners in one process
 rather than two processes — two processes would need two TUN devices and two
 address pools, and overlapping pools hand the same tunnel address to two
 clients.
+
+Add either target table to a listener to narrow the corresponding global
+policy. For example, the following TCP restriction permits port 443 in a
+documentation network if the global TCP policy also permits the destination:
+
+```toml
+[listeners.tcp_targets]
+allow_targets = ["192.0.2.0/24"]
+deny_targets = ["192.0.2.10/32"]
+allow_ports = [443]
+```
+
+Omit `allow_targets` or `allow_ports` to inherit that dimension from the global
+policy. An explicit empty list denies every target in that dimension.
+`deny_targets` adds to the global denies. Every resolved address must pass both
+policies. Invalid CIDRs and port zero are rejected by `check-config`.
+These tables do not govern CONNECT-IP forwarding. Restart after editing them.
 
 Use one HTTP/3 shard until a benchmark shows one event loop is CPU-bound.
 Memory and the effective connection capacity increase with the shard count.
