@@ -257,17 +257,20 @@ release with:
 curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
 ```
 
-For a new configuration the installer prompts for `basic`, `client_cert`, or
-`dual` authentication, optional Basic stealth mode, and optional TLS file
-locations. Basic mode creates the
+For a new configuration the installer prompts for HTTP/3 or HTTP/2, `basic`,
+`client_cert`, or `dual` authentication, and either existing TLS files or a
+self-signed certificate. Basic mode creates the
 first account and generates a random password when none is supplied.
 Client-certificate mode enrolls the first client, adds its `[[clients]]` entry,
 and writes its secret configuration as mode `0600`. Dual mode does both, writing
 a two-listener configuration that serves credentials on one port and
 certificates on another. At the end a fresh installation prints the installed
 version, service state, and effective server configuration with the password
-hash redacted. It also offers to run the read-only CONNECT-IP host diagnostic;
-the installer never configures forwarding, firewall rules, routes, or NAT.
+hash redacted, connection parameters, and read-only listener and firewall
+observations. A local rule does not prove external connectivity: check cloud
+security groups and test from another network. Self-signed certificates require
+peer trust and manual renewal. The installer also offers a read-only CONNECT-IP
+host diagnostic; it never configures forwarding, firewall rules, routes, or NAT.
 
 The same command is also the upgrade command. When
 `/etc/masque/masque.toml` already exists, the candidate binary checks that

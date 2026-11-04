@@ -117,6 +117,42 @@ PATH=$MOCK_BIN:$PATH
 export PATH MOCK_STATE
 
 install -d /etc/masque/certs /usr/local/bin /etc/systemd/system
+
+# Fresh self-signed setup checks certificate identity, permissions, and bounded
+# local observations without changing the runner's firewall.
+install -d "$TEST_TMP/access-bin"
+cat >"$TEST_TMP/access-bin/ss" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'LISTEN 0 128 0.0.0.0:8449 0.0.0.0:*'
+EOF
+cat >"$TEST_TMP/access-bin/ufw" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'Status: active' '8449/tcp ALLOW Anywhere'
+EOF
+chmod 0755 "$TEST_TMP/access-bin/ss" "$TEST_TMP/access-bin/ufw"
+PATH="$TEST_TMP/access-bin:$PATH" MASQUE_TLS_MODE=self_signed \
+    MASQUE_TLS_NAME=proxy.example.com MASQUE_AUTH_MODE=basic \
+    MASQUE_TRANSPORT=http2 MASQUE_LISTEN_PORT=8449 MASQUE_START_SERVICE=0 \
+    "$PACKAGE_DIR/install.sh" >"$TEST_TMP/self-signed.log" 2>&1 ||
+    die "fresh self-signed installation failed"
+openssl x509 -in /etc/masque/certs/server.crt -noout -ext subjectAltName |
+    grep -q 'DNS:proxy.example.com' || die "self-signed certificate SAN is missing"
+[ "$(stat -c '%a' /etc/masque/certs/server.key)" = 640 ] ||
+    die "self-signed private key permissions are incorrect"
+grep -q 'Socket: present (ownership and external reachability not verified)' "$TEST_TMP/self-signed.log" ||
+    die "socket observation was not reported"
+grep -q 'UFW: ALLOW rule observed' "$TEST_TMP/self-signed.log" ||
+    die "UFW evidence was not reported"
+grep -q 'External reachability is unverified' "$TEST_TMP/self-signed.log" ||
+    die "external verification limitation was not reported"
+rm -f -- "$CONFIG_PATH" /etc/masque/certs/server.crt /etc/masque/certs/server.key
+
+MASQUE_START_SERVICE=0 python3 tests/installer-interactive.py "$PACKAGE_DIR/install.sh" ||
+    die "interactive self-signed installation failed"
+grep -q '^transport = "http2"$' "$CONFIG_PATH" ||
+    die "interactive transport selection was not saved"
+rm -f -- "$CONFIG_PATH" /etc/masque/certs/server.crt /etc/masque/certs/server.key
+
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -days 1 -subj /CN=localhost \
     -keyout /etc/masque/certs/server.key \
@@ -215,6 +251,8 @@ grep -Eq 'password_hash[[:space:]]*=[[:space:]]*"<redacted>"' "$TEST_TMP/dual.lo
     die "fresh installation did not redact its generated password hash"
 grep -q 'Host diagnostics: not requested' "$TEST_TMP/dual.log" ||
     die "fresh installation did not report the explicitly skipped host diagnostics"
+! grep -q 'private-key=' "$TEST_TMP/dual.log" ||
+    die "fresh installation printed the client private key"
 
 [ "$(grep -c '^\[\[listeners\]\]$' "$CONFIG_PATH")" -eq 2 ] ||
     die "dual mode did not write two listeners"

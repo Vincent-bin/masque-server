@@ -61,6 +61,9 @@ SERVICE_RESULT="enabled, not started"
 RUN_HOST_DIAGNOSTICS=1
 HOST_DIAGNOSTICS_RESULT="not run"
 PRINT_SECRETS=1
+TLS_TEMP_DIR=
+SELF_SIGNED=0
+PUBLIC_HOST=
 
 cleanup() {
     cleanup_status=$?
@@ -82,6 +85,7 @@ cleanup() {
     [ -z "$PROMETHEUS_RULES_INSTALL_TMP" ] || rm -f -- "$PROMETHEUS_RULES_INSTALL_TMP"
     [ -z "$GRAFANA_DASHBOARD_INSTALL_TMP" ] || rm -f -- "$GRAFANA_DASHBOARD_INSTALL_TMP"
     [ -z "$UPGRADE_BACKUP_DIR" ] || rm -rf -- "$UPGRADE_BACKUP_DIR"
+    [ -z "$TLS_TEMP_DIR" ] || rm -rf -- "$TLS_TEMP_DIR"
     if [ "$cleanup_status" -ne 0 ] && [ "$BASIC_CLIENT_CONFIG_CREATED" -eq 1 ]; then
         rm -f -- "$BASIC_CLIENT_CONFIG_OUT"
     fi
@@ -410,15 +414,6 @@ generate_auth_credentials() {
 
 generate_basic_client_config() {
     basic_client_endpoint=${MASQUE_BASIC_CLIENT_ENDPOINT:-}
-    if [ -z "$basic_client_endpoint" ] && can_prompt; then
-        {
-            echo
-            echo "A client configuration can be generated while the plaintext Basic"
-            echo "password is available. The server cannot recover it from its hash later."
-        } >/dev/tty
-        basic_client_endpoint=$(prompt_value \
-            "Public Basic endpoint (host:port; leave empty to skip)" "")
-    fi
     # Skipping this optional artifact is a successful fresh installation.
     # A bare `return` here would preserve the failed `[ -n ... ]` status and,
     # under `set -e`, terminate unattended installs without an error message.
@@ -466,20 +461,49 @@ install_tls_material() {
         die "MASQUE_TLS_CERT and MASQUE_TLS_KEY must be supplied together"
     fi
 
-    if [ "$prompt_for_tls" -eq 1 ] && [ -z "$cert_source" ] &&
+    if [ "$prompt_for_tls" -eq 1 ] && [ -z "$cert_source" ] && [ -z "${MASQUE_TLS_MODE:-}" ] &&
         { [ ! -r "$TLS_CERT_PATH" ] || [ ! -r "$TLS_KEY_PATH" ]; } &&
         can_prompt; then
-        if mode_uses_client_certs; then
-            echo "Client-certificate enrollment needs the server certificate now." \
-                >/dev/tty
-            cert_source=$(prompt_value "PEM full-chain certificate path" "")
-        else
-            cert_source=$(prompt_value \
-                "PEM full-chain certificate path (leave empty to install later)" "")
+        echo "Choose TLS certificate: 1) generate self-signed  2) use existing PEM files" >/dev/tty
+        tls_choice=$(prompt_value "Certificate choice" 1)
+        case "$tls_choice" in
+            1|self-signed) MASQUE_TLS_MODE=self_signed ;;
+            2|existing)
+                cert_source=$(prompt_value "PEM full-chain certificate path" "")
+                key_source=$(prompt_value "Unencrypted PEM private-key path" "")
+                [ -n "$cert_source" ] && [ -n "$key_source" ] || die "both TLS paths are required"
+                ;;
+            *) die "certificate choice must be 1 or 2" ;;
+        esac
+    fi
+
+    if [ "${MASQUE_TLS_MODE:-existing}" = self_signed ]; then
+        [ -z "$cert_source" ] && [ -z "$key_source" ] || die "self-signed TLS cannot be combined with TLS source files"
+        [ ! -e "$TLS_CERT_PATH" ] && [ ! -e "$TLS_KEY_PATH" ] || die "refusing to overwrite existing TLS material"
+        command -v openssl >/dev/null 2>&1 || die "openssl is required to generate a self-signed certificate"
+        PUBLIC_HOST=${MASQUE_TLS_NAME:-}
+        if [ -z "$PUBLIC_HOST" ] && can_prompt; then
+            PUBLIC_HOST=$(prompt_value "Public hostname or IP for certificate" "")
         fi
-        if [ -n "$cert_source" ]; then
-            key_source=$(prompt_value "Unencrypted PEM private-key path" "")
-        fi
+        case "$PUBLIC_HOST" in
+            ''|-*|*[!A-Za-z0-9.:-]*) die "provide a valid public hostname or IP in MASQUE_TLS_NAME" ;;
+        esac
+        case "$PUBLIC_HOST" in
+            *:*) tls_san="IP:$PUBLIC_HOST" ;;
+            *[!0-9.]*) tls_san="DNS:$PUBLIC_HOST" ;;
+            *) tls_san="IP:$PUBLIC_HOST" ;;
+        esac
+        TLS_TEMP_DIR=$(mktemp -d /etc/masque/certs/.self-signed.XXXXXX)
+        chmod 0700 "$TLS_TEMP_DIR"
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -days 365 -subj /CN=masque -addext "subjectAltName=$tls_san" \
+            -keyout "$TLS_TEMP_DIR/key.pem" -out "$TLS_TEMP_DIR/cert.pem" >/dev/null 2>&1 ||
+            die "could not generate self-signed certificate; check the hostname or IP and OpenSSL version"
+        cert_source=$TLS_TEMP_DIR/cert.pem
+        key_source=$TLS_TEMP_DIR/key.pem
+        SELF_SIGNED=1
+    elif [ "${MASQUE_TLS_MODE:-existing}" != existing ]; then
+        die "MASQUE_TLS_MODE must be existing or self_signed"
     fi
 
     if [ -n "$cert_source" ]; then
@@ -575,7 +599,13 @@ choose_listen_port() {
 }
 
 configure_fresh_listen_port() {
-    FRESH_TRANSPORT=${MASQUE_TRANSPORT:-http3}
+    FRESH_TRANSPORT=${MASQUE_TRANSPORT:-}
+    if [ -z "$FRESH_TRANSPORT" ] && can_prompt; then
+        echo "Choose transport: 1) HTTP/3 (UDP)  2) HTTP/2 (TCP)" >/dev/tty
+        FRESH_TRANSPORT=$(prompt_value "Transport" 1)
+        case "$FRESH_TRANSPORT" in 1) FRESH_TRANSPORT=http3 ;; 2) FRESH_TRANSPORT=http2 ;; esac
+    fi
+    FRESH_TRANSPORT=${FRESH_TRANSPORT:-http3}
     case "$FRESH_TRANSPORT" in
         http2|http3) ;;
         *) die "MASQUE_TRANSPORT must be http2 or http3" ;;
@@ -838,6 +868,71 @@ run_host_diagnostics() {
     fi
 }
 
+# Report observations only: a local rule or socket does not prove that packets
+# can reach this host or that every firewall layer permits them.
+report_port_observation() {
+    observation_port=$1
+    observation_proto=$2
+    echo "  $observation_proto/$observation_port:"
+    if command -v ss >/dev/null 2>&1; then
+        if [ "$observation_proto" = udp ]; then ss_args=-lnu; else ss_args=-lnt; fi
+        if socket_output=$(ss -H "$ss_args" 2>/dev/null); then
+            if printf '%s\n' "$socket_output" | awk -v port="$observation_port" \
+                '$4 ~ (":" port "$") { found=1 } END { exit !found }'; then
+                echo "    Socket: present (ownership and external reachability not verified)"
+            else
+                echo "    Socket: not observed"
+            fi
+        else
+            echo "    Socket: unknown (ss failed)"
+        fi
+    else
+        echo "    Socket: unknown (ss unavailable)"
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw_output=$(ufw status 2>/dev/null); then
+        if printf '%s\n' "$ufw_output" | grep -qi '^Status: active'; then
+            rule=$(printf '%s\n' "$ufw_output" | awk -v target="$observation_port/$observation_proto" \
+                '$1 == target && ($2 == "ALLOW" || $2 == "DENY" || $2 == "REJECT") { print $2; exit }')
+            if [ -n "$rule" ]; then
+                echo "    UFW: $rule rule observed; source, ordering and other layers not verified"
+            else
+                echo "    UFW: active; effective access unknown (inspect rules and defaults)"
+            fi
+        else
+            echo "    UFW: not active or status unknown; other firewall layers may apply"
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --query-port="$observation_port/$observation_proto" >/dev/null 2>&1; then
+            echo "    firewalld: port rule found in default zone; active zone and other layers not verified"
+        else
+            echo "    firewalld: no matching default-zone port rule, or query failed; access unknown"
+        fi
+    else
+        echo "    Firewall: effective access unknown (inspect local rules, including nftables/iptables)"
+    fi
+}
+
+report_fresh_access() {
+    [ "$FRESH_CONFIG" -eq 1 ] || return 0
+    if [ "$FRESH_TRANSPORT" = http3 ]; then access_proto=udp; else access_proto=tcp; fi
+    echo
+    echo "Connection parameters:"
+    echo "  Public host: ${PUBLIC_HOST:-not specified; use the reachable hostname or IP}"
+    echo "  Transport: $FRESH_TRANSPORT ($access_proto)"
+    echo "  Primary port: $listen_port"
+    if [ "$AUTH_MODE" = dual ]; then echo "  Certificate port: $cert_listen_port"; fi
+    if [ "$SELF_SIGNED" -eq 1 ]; then
+        echo "  TLS: self-signed; peers must trust the public certificate at $TLS_CERT_PATH"
+        echo "  Certificate expires after 365 days; renewal and redistribution are manual."
+    fi
+    echo
+    echo "Local listener and firewall observations (read-only):"
+    report_port_observation "$listen_port" "$access_proto"
+    if [ "$AUTH_MODE" = dual ]; then report_port_observation "$cert_listen_port" "$access_proto"; fi
+    echo "  Check provider security groups and upstream firewalls for these ports."
+    echo "  External reachability is unverified; test from another network."
+}
+
 [ -x "$CANDIDATE_BIN" ] || die "release package is missing executable $CANDIDATE_BIN"
 [ -x "$CANDIDATE_PROBE" ] || die "release package is missing executable $CANDIDATE_PROBE"
 [ -x "$CANDIDATE_MAINTENANCE" ] ||
@@ -891,6 +986,9 @@ if [ "$FRESH_CONFIG" -eq 1 ]; then
         choose_basic_stealth
     fi
     install_tls_material 1
+    if [ -z "$PUBLIC_HOST" ] && can_prompt; then
+        PUBLIC_HOST=$(prompt_value "Public hostname or IP for connection summary (optional)" "")
+    fi
     render_new_config
     configure_fresh_listen_port
 
@@ -937,6 +1035,7 @@ if [ -n "$listener_summary" ]; then
     echo "Listeners:"
     printf '%s\n' "$listener_summary"
 fi
+report_fresh_access
 
 # CONFIG_CHANGED first: only a freshly rendered configuration has credentials to
 # print, and on an upgrade AUTH_MODE is a summary of what was found rather than
@@ -967,13 +1066,11 @@ else
     echo "Existing configuration was preserved and is not printed during upgrades."
 fi
 
-if [ "$PRINT_SECRETS" -eq 1 ] && [ -n "$ENROLL_OUTPUT" ]; then
+if [ -n "$ENROLL_OUTPUT" ]; then
     echo
     echo "Client-certificate enrollment result"
     echo "  Secret client JSON: $CLIENT_CONFIG_OUT"
-    echo "  The proxy block below also contains the client private key."
-    echo
-    cat "$ENROLL_OUTPUT"
+    echo "  This file contains a client private key; transfer it securely."
 fi
 
 echo
