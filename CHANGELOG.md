@@ -7,10 +7,14 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.3 - 2026-11-04
+
 ### Changed
 
 - Update QUIC, HTTP/2, runtime, and TUN dependencies; record QUIC path MTU
   updates in the existing path-event metrics.
+- Split server implementation into focused modules and document AI-assisted
+  operations, troubleshooting, and development checks.
 
 ## 0.14.2 - 2026-11-03
 
