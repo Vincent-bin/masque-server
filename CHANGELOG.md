@@ -7,6 +7,16 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.4 - 2026-11-04
+
+### Changed
+
+- Guide AI-assisted deployments through peer protocol and authentication
+  requirements, private inventory creation, and external probe setup.
+- Simplify manual installation with transport and TLS selection, optional
+  self-signed certificates, connection summaries, and read-only port checks.
+- Report the limits of local firewall observations and external verification.
+
 ## 0.14.3 - 2026-11-04
 
 ### Changed
