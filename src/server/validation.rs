@@ -413,6 +413,17 @@ pub(super) fn validate_server_config(
         }
     }
 
+    for (name, size) in [
+        ("udp_recv_buffer_size", config.quic.udp_recv_buffer_size),
+        ("udp_send_buffer_size", config.quic.udp_send_buffer_size),
+    ] {
+        if size > 16 * 1024 * 1024 {
+            anyhow::bail!(
+                "quic.{name} must be between 0 and 16777216 bytes (0 keeps the OS default)"
+            );
+        }
+    }
+
     if !(1..=MAX_HTTP2_STREAM_WINDOW).contains(&config.http2.initial_stream_window) {
         anyhow::bail!(
             "http2.initial_stream_window ({}) must be between 1 and {MAX_HTTP2_STREAM_WINDOW}",

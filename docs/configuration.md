@@ -716,6 +716,8 @@ initial_max_streams_bidi = 128
 enable_dgram = true
 enable_udp_gso = false
 enable_udp_gro = true
+udp_recv_buffer_size = 2097152
+udp_send_buffer_size = 2097152
 cc_algorithm = "cubic"
 initial_congestion_window_packets = 32
 initial_max_data = 16777216
@@ -759,6 +761,24 @@ Important relationships:
   `ip_proxy.tun_mtu` consistently on both ends before using CONNECT-IP there.
 - UDP GSO is opt-in because some virtual egress paths advertise it but drop
   super-packets. Enable it only after an external-path A/B test.
+- `udp_recv_buffer_size` and `udp_send_buffer_size` request `SO_RCVBUF` and
+  `SO_SNDBUF` once per QUIC shard socket, in bytes (`0..16777216`). Zero keeps
+  the OS default, including for existing configurations that omit these fields.
+  The example above and the fresh-install template explicitly request 2 MiB
+  per direction. This is the tested starting point, not a universal optimum.
+  They require a restart and do not change HTTP/2 or per-tunnel target sockets.
+  For a measured socket-buffer bottleneck, start by testing `2097152` (2 MiB)
+  for each. Requests can be capped or rejected by the OS; startup warnings
+  report that condition while the server retains the available buffer.
+  Startup `udp_recv_buffer_bytes` / `udp_send_buffer_bytes` and the per-shard
+  `masque_quic_udp_socket_buffer_bytes` gauge report the actual kernel values,
+  not the request. Linux reports twice the accepted request for bookkeeping;
+  a successful 2 MiB request normally reads back as 4 MiB. Gauge samples are
+  omitted if readback fails. Limits apply per socket, so budget across all
+  HTTP/3 listeners and shards. Increasing buffers cannot repair an egress
+  path that drops GSO aggregates; compare GSO on/off with identical buffers.
+  Older binaries reject these new fields; retain a compatible configuration
+  when planning a rollback to a release without socket-buffer tuning.
 - Supported congestion controllers are `cubic`, `reno`, and `bbr2`. CUBIC is
   the current default. Paced output uses bounded packet groups; compare
   controllers on the deployment's actual RTT and loss profile before changing

@@ -14,10 +14,14 @@ SERVER_PID=""
 SERVER_JOB_PID=""
 ECHO_PID=""
 HTTP_PID=""
-TCP_DOWNLOAD_BYTES="${MASQUE_TCP_DOWNLOAD_BYTES:-67108864}"
 TCP_DOWNLOAD_REPEATS="${MASQUE_TCP_DOWNLOAD_REPEATS:-2}"
 TCP_DIRECT_BASELINE="${MASQUE_TCP_DIRECT_BASELINE:-1}"
 BENCH_MODE="${MASQUE_BENCH_MODE:-all}"
+if [ "$BENCH_MODE" = mixed ]; then
+    TCP_DOWNLOAD_BYTES="${MASQUE_TCP_DOWNLOAD_BYTES:-4294967296}"
+else
+    TCP_DOWNLOAD_BYTES="${MASQUE_TCP_DOWNLOAD_BYTES:-67108864}"
+fi
 BENCH_SHARDS="${MASQUE_BENCH_SHARDS:-1}"
 BENCH_TRANSPORT="${MASQUE_BENCH_TRANSPORT:-http3}"
 BENCH_QUIC_RETRY="${MASQUE_BENCH_QUIC_RETRY:-adaptive}"
@@ -97,9 +101,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 case "$BENCH_MODE" in
-    all|smoke|tcp|udp|load) ;;
+    all|smoke|tcp|udp|load|mixed) ;;
     *)
-        echo "MASQUE_BENCH_MODE must be all, smoke, tcp, udp, or load" >&2
+        echo "MASQUE_BENCH_MODE must be all, smoke, tcp, udp, load, or mixed" >&2
         exit 2
         ;;
 esac
@@ -122,8 +126,8 @@ case "$BENCH_QUIC_RETRY" in
         ;;
 esac
 
-if [ "$BENCH_MODE" = load ] && [ "$BENCH_TRANSPORT" != http3 ]; then
-    echo "MASQUE_BENCH_MODE=load currently requires MASQUE_BENCH_TRANSPORT=http3" >&2
+if [ "$BENCH_MODE" = mixed ] && [ "$BENCH_TRANSPORT" != http3 ]; then
+    echo "MASQUE_BENCH_MODE=mixed requires MASQUE_BENCH_TRANSPORT=http3" >&2
     exit 2
 fi
 
@@ -176,6 +180,21 @@ case "${MASQUE_BENCH_QUIC_GRO:-1}" in
     *) echo "MASQUE_BENCH_QUIC_GRO must be 0 or 1" >&2; exit 2 ;;
 esac
 
+# Omit unspecified fields so the same harness can run older release binaries.
+SOCKET_BUFFER_TOML=""
+for direction in RECV SEND; do
+    variable="MASQUE_BENCH_UDP_${direction}_BUFFER_SIZE"
+    value="${!variable:-}"
+    [ -n "$value" ] || continue
+    case "$value" in *[!0-9]*) echo "$variable must be bytes in 0..16777216" >&2; exit 2 ;; esac
+    if [ "${#value}" -gt 8 ] || [ "$((10#$value))" -gt 16777216 ]; then
+        echo "$variable must be bytes in 0..16777216" >&2; exit 2
+    fi
+    field="$(printf '%s' "$direction" | tr '[:upper:]' '[:lower:]')"
+    SOCKET_BUFFER_TOML="${SOCKET_BUFFER_TOML}
+udp_${field}_buffer_size = $((10#$value))"
+done
+
 case "$TCP_DIRECT_BASELINE" in
     0) unset MASQUE_TCP_DIRECT_BASELINE ;;
     1) export MASQUE_TCP_DIRECT_BASELINE=1 ;;
@@ -224,6 +243,7 @@ max_datagram_size = 1350
 enable_dgram = true
 enable_udp_gso = $QUIC_GSO_TOML
 enable_udp_gro = $QUIC_GRO_TOML
+$SOCKET_BUFFER_TOML
 retry_mode = "$BENCH_QUIC_RETRY"
 
 [tcp_proxy]
@@ -298,11 +318,12 @@ if [ -z "${MASQUE_BENCH_BIN_DIR:-}" ]; then
 fi
 [ -x "$BIN_DIR/masque-e2e" ] || { echo "missing benchmark client executable" >&2; exit 2; }
 [ -x "$SERVER_BIN" ] || { echo "benchmark server is not executable" >&2; exit 2; }
-printf 'BENCH_CONFIG transport=%s cc=%s shards=%s quic_gso=%s quic_gro=%s target_gso=%s load_warm_auth=%s\n' \
-    "$BENCH_TRANSPORT" "$BENCH_CC" "$BENCH_SHARDS" "$QUIC_GSO_TOML" "$QUIC_GRO_TOML" "$TARGET_GSO_TOML" "${MASQUE_LOAD_WARM_AUTH:-1}"
+printf 'BENCH_CONFIG transport=%s cc=%s shards=%s quic_gso=%s quic_gro=%s target_gso=%s load_warm_auth=%s udp_recv_buffer_size=%s udp_send_buffer_size=%s\n' \
+    "$BENCH_TRANSPORT" "$BENCH_CC" "$BENCH_SHARDS" "$QUIC_GSO_TOML" "$QUIC_GRO_TOML" "$TARGET_GSO_TOML" "${MASQUE_LOAD_WARM_AUTH:-1}" \
+    "${MASQUE_BENCH_UDP_RECV_BUFFER_SIZE:-os_default}" "${MASQUE_BENCH_UDP_SEND_BUFFER_SIZE:-os_default}"
 
 case "$BENCH_MODE" in
-    all|tcp)
+    all|tcp|mixed)
         truncate -s "$TCP_DOWNLOAD_BYTES" "$BENCH_DIR/masque-bench.bin"
         python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$BENCH_DIR" \
             >"$BENCH_DIR/http.log" 2>&1 &
@@ -325,7 +346,7 @@ PYREADY
 esac
 
 case "$BENCH_MODE" in
-    all|smoke|udp|load)
+    all|smoke|udp|load|mixed)
         MASQUE_ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
         RUST_LOG=warn \
         "$BIN_DIR/masque-e2e" >"$BENCH_DIR/echo.log" 2>&1 &
@@ -434,17 +455,25 @@ esac
 if [ "$BENCH_MODE" = load ] || {
     [ "$BENCH_MODE" = all ] && [ -n "$LOAD_CONNS" ] && [ "$LOAD_CONNS" != 0 ]
 }; then
-    if [ "${MASQUE_LOAD_WARM_AUTH:-1}" = 1 ]; then
-        MASQUE_UDP_CHECK=1 MASQUE_BENCH_TRANSPORT=http3 \
+    for transport in $BENCH_TRANSPORTS; do
+        if [ "${MASQUE_LOAD_WARM_AUTH:-1}" = 1 ]; then
+            MASQUE_UDP_CHECK=1 MASQUE_BENCH_TRANSPORT="$transport" \
+            MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
+            MASQUE_USERNAME=test MASQUE_PASSWORD=test-password RUST_LOG=warn \
+            "$BIN_DIR/masque-e2e"
+        fi
+        MASQUE_LOAD=1 MASQUE_BENCH_TRANSPORT="$transport" \
         MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
         MASQUE_USERNAME=test MASQUE_PASSWORD=test-password RUST_LOG=warn \
         "$BIN_DIR/masque-e2e"
-    fi
-    MASQUE_LOAD=1 \
-    MASQUE_LOAD_CONNS="${LOAD_CONNS:-32}" \
-    MASQUE_BENCH_TRANSPORT=http3 \
+    done
+fi
+
+if [ "$BENCH_MODE" = mixed ]; then
+    MASQUE_MIXED=1 MASQUE_BENCH_TRANSPORT=http3 \
     MASQUE_SERVER_ADDR="127.0.0.1:$SERVER_PORT" \
     ECHO_SERVER_ADDR="127.0.0.1:$ECHO_PORT" \
+    MASQUE_TCP_TARGET="127.0.0.1:$HTTP_PORT" \
     MASQUE_USERNAME=test \
     MASQUE_PASSWORD=test-password \
     RUST_LOG=warn \

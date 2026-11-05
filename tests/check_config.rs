@@ -167,6 +167,49 @@ fn check_config_validates_without_binding_the_listen_port() {
 }
 
 #[test]
+fn quic_socket_buffer_requests_are_bounded_and_do_not_bind() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let config_path = dir.path().join("masque.toml");
+    let base = config_text(
+        occupied.local_addr().unwrap(),
+        &cert_path,
+        &key_path,
+        "cubic",
+    );
+    for field in ["udp_recv_buffer_size", "udp_send_buffer_size"] {
+        for (size, valid) in [
+            (0, true),
+            (2097152, true),
+            (16777216, true),
+            (16777217, false),
+        ] {
+            std::fs::write(
+                &config_path,
+                base.replace("[quic]", &format!("[quic]\n{field} = {size}")),
+            )
+            .unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+                .arg("--config")
+                .arg(&config_path)
+                .arg("check-config")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                valid,
+                "{field}={size}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !valid {
+                assert!(String::from_utf8_lossy(&output.stderr).contains(field));
+            }
+        }
+    }
+}
+
+#[test]
 fn doctor_is_read_only_and_succeeds_when_connect_ip_is_disabled() {
     let dir = TempDir::new();
     let (cert_path, key_path) = write_server_identity(dir.path());

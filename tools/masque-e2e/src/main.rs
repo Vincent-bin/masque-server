@@ -15,7 +15,7 @@ use masque::capsule::CapsuleFrame;
 use masque::capsule::decoder::CapsuleDecoder;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod http2;
 
@@ -349,6 +349,22 @@ struct ThroughputStats {
     rtt: RttHistogram,
 }
 
+enum EchoPath<'a> {
+    Udp,
+    Ip(IpEchoTarget),
+    Mixed {
+        download: Option<&'a mut MixedDownload>,
+        tcp_client: Option<&'a mut Client>,
+        pps: u64,
+    },
+}
+
+struct MixedDownload {
+    stream: u64,
+    response: HttpDownloadResponse,
+    measured_bytes: u64,
+}
+
 #[derive(Clone, Copy)]
 struct IpEchoTarget {
     source: Ipv4Addr,
@@ -487,12 +503,13 @@ impl Client {
     }
 
     /// Receive one packet from the network and feed it to QUIC.
-    fn recv_once(&mut self) -> Result<bool> {
+    fn recv_once(&mut self, max_wait: Duration) -> Result<bool> {
         let timeout = self
             .quic
             .timeout()
             .unwrap_or(Duration::from_millis(50))
-            .max(Duration::from_millis(1));
+            .max(Duration::from_millis(1))
+            .min(max_wait);
         self.socket.set_read_timeout(Some(timeout))?;
 
         let mut buf = [0u8; BUF_SIZE];
@@ -522,7 +539,7 @@ impl Client {
     /// One round of flush → recv → flush.
     fn drive(&mut self) -> Result<()> {
         self.flush()?;
-        self.recv_once()?;
+        self.recv_once(Duration::MAX)?;
         self.flush()?;
         Ok(())
     }
@@ -604,7 +621,7 @@ impl Client {
             if Instant::now() > deadline {
                 bail!("handshake timeout");
             }
-            self.recv_once()?;
+            self.recv_once(Duration::MAX)?;
         }
     }
 
@@ -650,10 +667,34 @@ impl Client {
         }
     }
 
+    /// Queue headers, allowing QUIC to recover writable capacity first.
+    fn queue_request(&mut self, headers: &[quiche::h3::Header], fin: bool) -> Result<u64> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            anyhow::ensure!(!self.quic.is_closed(), "QUIC closed while queuing request");
+            let h3 = self.h3.as_mut().context("H3 not initialised")?;
+            match h3.send_request(&mut self.quic, headers, fin) {
+                Ok(stream_id) => return Ok(stream_id),
+                // quiche rolls back partially created request state. Retry the
+                // complete call after receiving ACKs or flow-control credit.
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    debug!("HTTP/3 request blocked; waiting for QUIC capacity");
+                    self.flush()?;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    anyhow::ensure!(
+                        !remaining.is_zero(),
+                        "HTTP/3 request blocked for 10 seconds"
+                    );
+                    self.recv_once(remaining)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// Send an HTTP/3 request; returns the stream ID.
     fn send_request(&mut self, headers: &[quiche::h3::Header], fin: bool) -> Result<u64> {
-        let h3 = self.h3.as_mut().context("H3 not initialised")?;
-        let stream_id = h3.send_request(&mut self.quic, headers, fin)?;
+        let stream_id = self.queue_request(headers, fin)?;
         self.flush()?;
         Ok(stream_id)
     }
@@ -666,8 +707,8 @@ impl Client {
         body: &[u8],
         fin: bool,
     ) -> Result<u64> {
+        let stream_id = self.queue_request(headers, false)?;
         let h3 = self.h3.as_mut().context("H3 not initialised")?;
-        let stream_id = h3.send_request(&mut self.quic, headers, false)?;
         let written = h3.send_body(&mut self.quic, stream_id, body, fin)?;
         if written != body.len() {
             bail!("short early CONNECT body write: {written}/{}", body.len());
@@ -900,7 +941,7 @@ impl Client {
         duration: Duration,
         window: usize,
         expiry: Duration,
-        ip_target: Option<IpEchoTarget>,
+        path: EchoPath<'_>,
     ) -> Result<ThroughputStats> {
         if payload_size < 8 {
             bail!("benchmark payload must be at least 8 bytes");
@@ -911,6 +952,15 @@ impl Client {
         let deadline = started + duration;
         let drain_deadline = deadline + expiry;
         let mut payload = vec![0x5a; payload_size];
+        let (ip_target, mut download, mut tcp_client, pps) = match path {
+            EchoPath::Ip(target) => (Some(target), None, None, 0),
+            EchoPath::Mixed {
+                download,
+                tcp_client,
+                pps,
+            } => (None, download, tcp_client, pps),
+            EchoPath::Udp => (None, None, None, 0),
+        };
         let sequence_offset = if let Some(target) = ip_target {
             payload = build_udp_in_ipv4(
                 target.source,
@@ -938,7 +988,13 @@ impl Client {
             expired += in_flight.expire(now, expiry);
 
             let mut made_progress = false;
-            while now < deadline && in_flight.len() < window {
+            let due = if pps == 0 {
+                u64::MAX
+            } else {
+                (now.duration_since(started).as_nanos() * u128::from(pps) / 1_000_000_000) as u64
+                    + 1
+            };
+            while now < deadline && in_flight.len() < window && sent < due {
                 payload[sequence_offset..sequence_offset + 8]
                     .copy_from_slice(&next_sequence.to_be_bytes());
                 masque::datagram::encode_payload_into(stream_id, &payload, &mut encoded)
@@ -958,23 +1014,22 @@ impl Client {
 
             self.flush()?;
 
-            loop {
-                match self.socket.recv(&mut packet_buf) {
-                    Ok(len) => {
-                        let info = quiche::RecvInfo {
-                            from: self.peer,
-                            to: self.local,
-                        };
-                        match self.quic.recv(&mut packet_buf[..len], info) {
-                            Ok(_) | Err(quiche::Error::Done) => {}
-                            Err(e) => bail!("QUIC recv: {e}"),
-                        }
-                        made_progress = true;
+            made_progress |= self.recv_packet_burst(&mut packet_buf)?;
+
+            if let Some(download) = download.as_deref_mut() {
+                if let Some(tcp) = tcp_client.as_deref_mut() {
+                    // Keep the two sockets on the same benchmark thread so
+                    // the control does not add a download worker core.
+                    let mut tcp_progress = tcp.recv_packet_burst(&mut packet_buf)?;
+                    tcp_progress |= tcp.poll_mixed_download(download, deadline, &mut dgram_buf)?;
+                    if !tcp_progress && tcp.quic.timeout().is_some_and(|t| t.is_zero()) {
+                        tcp.quic.on_timeout();
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        break;
-                    }
-                    Err(e) => bail!("socket recv: {e}"),
+                    tcp.flush()?;
+                    made_progress |= tcp_progress;
+                } else {
+                    made_progress |=
+                        self.poll_mixed_download(download, deadline, &mut dgram_buf)?;
                 }
             }
 
@@ -1013,7 +1068,11 @@ impl Client {
                 break;
             }
             if !made_progress {
-                std::thread::yield_now();
+                if self.quic.timeout().is_some_and(|timeout| timeout.is_zero()) {
+                    self.quic.on_timeout();
+                } else {
+                    std::thread::yield_now();
+                }
             }
         }
 
@@ -1025,6 +1084,72 @@ impl Client {
             expired,
             rtt,
         })
+    }
+
+    fn recv_packet_burst(&mut self, buf: &mut [u8]) -> Result<bool> {
+        let mut received = false;
+        for _ in 0..2048 {
+            match self.socket.recv(buf) {
+                Ok(len) => {
+                    let info = quiche::RecvInfo {
+                        from: self.peer,
+                        to: self.local,
+                    };
+                    match self.quic.recv(&mut buf[..len], info) {
+                        Ok(_) | Err(quiche::Error::Done) => {}
+                        Err(error) => bail!("QUIC receive: {error}"),
+                    }
+                    received = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(received)
+    }
+
+    fn poll_mixed_download(
+        &mut self,
+        download: &mut MixedDownload,
+        deadline: Instant,
+        buf: &mut [u8],
+    ) -> Result<bool> {
+        let h3 = self.h3.as_mut().context("H3 not initialised")?;
+        loop {
+            match h3.poll(&mut self.quic) {
+                Ok((sid, quiche::h3::Event::Reset(code))) if sid == download.stream => {
+                    bail!("mixed CONNECT download reset with code {code}");
+                }
+                Ok(_) => {}
+                Err(quiche::h3::Error::Done) => break,
+                Err(error) => bail!("poll mixed CONNECT download: {error}"),
+            }
+        }
+        let mut progress = false;
+        // Bound TCP work between turns of the UDP echo loop.
+        for _ in 0..128 {
+            match h3.recv_body(&mut self.quic, download.stream, buf) {
+                Ok(len) if len != 0 => {
+                    let before = download.response.body_bytes;
+                    let now = Instant::now();
+                    download.response.ingest(&buf[..len], now)?;
+                    if now < deadline {
+                        download.measured_bytes += download.response.body_bytes - before;
+                        if download.response.expected_body_bytes(None)
+                            == Some(download.response.body_bytes)
+                        {
+                            bail!(
+                                "mixed download completed during the sample; increase the file size"
+                            );
+                        }
+                    }
+                    progress = true;
+                }
+                Ok(_) | Err(quiche::h3::Error::Done) => break,
+                Err(error) => bail!("receive mixed CONNECT download: {error}"),
+            }
+        }
+        Ok(progress)
     }
 
     /// Receive a large byte stream through a standard HTTP/3 CONNECT tunnel.
@@ -1417,6 +1542,91 @@ fn connect_udp_tunnel(server_addr: &str, echo_addr: &str) -> Result<(Client, u64
     }
     std::thread::sleep(Duration::from_millis(100));
     Ok((client, stream_id))
+}
+
+fn benchmark_http3_mixed(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let config = UdpBenchConfig::from_env()?;
+    let pps = env_usize("MASQUE_MIXED_UDP_PPS", 3000)?;
+    anyhow::ensure!(
+        (1..=1_000_000).contains(&pps),
+        "mixed UDP rate must be in 1..=1000000"
+    );
+    let (mut client, stream) = connect_udp_tunnel(server_addr, echo_addr)?;
+    let topology = match std::env::var("MASQUE_MIXED_DOWNLOAD").as_deref() {
+        Ok("0") => "none",
+        Ok("1") | Err(std::env::VarError::NotPresent) => "shared",
+        Ok("separate") => "separate",
+        _ => bail!("MASQUE_MIXED_DOWNLOAD must be 0, 1, or separate"),
+    };
+    let mut tcp_client = None;
+    if topology == "separate" {
+        let mut tcp = Client::connect(server_addr)?;
+        tcp.handshake()?;
+        tcp.init_h3()?;
+        tcp_client = Some(tcp);
+    }
+    let mut download = if topology == "none" {
+        None
+    } else {
+        let tcp = tcp_client.as_mut().unwrap_or(&mut client);
+        let target: SocketAddr = std::env::var("MASQUE_TCP_TARGET")
+            .context("mixed benchmark requires MASQUE_TCP_TARGET")?
+            .parse()
+            .context("parse mixed download target")?;
+        let stream = tcp.send_request(&connect_tcp_headers(&target.to_string())?, false)?;
+        let response = tcp.poll_response(Duration::from_secs(10))?;
+        anyhow::ensure!(
+            response == (stream, 200),
+            "mixed TCP CONNECT failed: {response:?}"
+        );
+        let request = format!(
+            "GET /masque-bench.bin HTTP/1.1\r\nHost: {target}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        );
+        tcp.send_body_all(stream, request.as_bytes(), true)?;
+        tcp.socket.set_nonblocking(true)?;
+        Some(MixedDownload {
+            stream,
+            response: HttpDownloadResponse::new(),
+            measured_bytes: 0,
+        })
+    };
+    let stats = client.run_echo_throughput(
+        stream,
+        64,
+        config.duration,
+        config.window,
+        config.expiry,
+        EchoPath::Mixed {
+            download: download.as_mut(),
+            tcp_client: tcp_client.as_mut(),
+            pps: pps as u64,
+        },
+    )?;
+    let mut tcp_bytes = 0;
+    if let Some(download) = &download {
+        anyhow::ensure!(
+            download.response.status == Some(200) && download.measured_bytes > 0,
+            "no successful TCP download overlapped the UDP sample"
+        );
+        tcp_bytes = download.measured_bytes;
+    }
+    anyhow::ensure!(
+        stats.sent > 0 && stats.received > 0,
+        "mixed run had no successful UDP traffic"
+    );
+    let seconds = config.duration.as_secs_f64();
+    println!(
+        "H3_MIXED_RESULT download={} tcp_connection={topology} udp_requested_pps={pps} duration_secs={seconds} udp_tx_pps={:.3} \
+         udp_rx_pps={:.3} udp_shortfall_pct={:.6} udp_expired={} udp_p99_us_upper={} tcp_body_bytes={tcp_bytes} tcp_mbps={:.3}",
+        u8::from(download.is_some()),
+        stats.sent as f64 / seconds,
+        stats.received as f64 / seconds,
+        100.0 * (stats.sent - stats.received) as f64 / stats.sent as f64,
+        stats.expired,
+        stats.rtt.percentile_upper_us(99),
+        tcp_bytes as f64 * 8.0 / seconds / 1_000_000.0,
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,7 +2206,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
                 duration,
                 window,
                 expiry,
-                None,
+                EchoPath::Udp,
             ) {
                 Ok(throughput) => {
                     WorkerOutcome::Finished(Box::new(WorkerStats { setup, throughput }))
@@ -2393,7 +2603,7 @@ fn benchmark_http3_udp(server_addr: &str, echo_addr: &str, config: UdpBenchConfi
             config.duration,
             config.window,
             config.expiry,
-            None,
+            EchoPath::Udp,
         )?;
         print_udp_result(
             "http3",
@@ -2738,7 +2948,7 @@ fn benchmark_connect_ip(server_addr: &str, echo_addr: &str) -> Result<()> {
             config.duration,
             config.window,
             config.expiry,
-            Some(target),
+            EchoPath::Ip(target),
         )?;
         print_udp_result(
             "http3",
@@ -2887,12 +3097,24 @@ fn main() {
         return;
     }
 
-    if std::env::var_os("MASQUE_LOAD").is_some() {
-        if transport == BenchTransport::Http2 {
-            error!("HTTP/2 multi-connection load mode is not implemented; use tcp or udp mode");
+    if std::env::var_os("MASQUE_MIXED").is_some() {
+        if transport != BenchTransport::Http3 {
+            error!("mixed TCP and UDP benchmark requires HTTP/3");
             std::process::exit(2);
         }
-        if let Err(e) = load_test(&server_addr, &echo_addr) {
+        if let Err(e) = benchmark_http3_mixed(&server_addr, &echo_addr) {
+            error!(%e, "mixed benchmark failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if std::env::var_os("MASQUE_LOAD").is_some() {
+        let result = match transport {
+            BenchTransport::Http2 => http2::load_test(&server_addr, &echo_addr),
+            BenchTransport::Http3 => load_test(&server_addr, &echo_addr),
+        };
+        if let Err(e) = result {
             error!(%e, "load test failed");
             std::process::exit(1);
         }

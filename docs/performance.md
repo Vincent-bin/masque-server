@@ -62,6 +62,39 @@ not establish tail latency under load.
 
 ### QUIC socket
 
+See the [GSO and socket-buffer verification report](performance-gso-buffers.md)
+for local and external-path measurements, including their limits.
+
+QUIC socket buffers can be tuned independently with
+`quic.udp_recv_buffer_size` and `quic.udp_send_buffer_size`. They default to
+zero when omitted, preserving OS defaults; the fresh-install template requests
+2 MiB each. Both settings apply per shard on restart. Start a controlled
+buffer-size experiment at 2 MiB each; verify the actual values in startup logs
+or `masque_quic_udp_socket_buffer_bytes`. A larger `net.core.rmem_max` or
+`net.core.wmem_max` only raises the Linux request ceiling; it does not enlarge
+existing sockets or make an application request more buffer. Linux normally
+reports twice the accepted `SO_RCVBUF` / `SO_SNDBUF` request. Keep host defaults
+unchanged when using these per-socket settings.
+
+Compare GSO with the same effective buffers, warmup, traffic, and client.
+Record listener socket-drop deltas and host UDP `RcvbufErrors` /
+`SndbufErrors` deltas during each measurement. Host counters include other
+UDP sockets, and cumulative totals cannot establish loss in the test window.
+Buffering may absorb bursts, but does not prove an external path can carry
+GSO traffic or guarantee higher throughput.
+
+The local harness accepts `MASQUE_BENCH_UDP_RECV_BUFFER_SIZE` and
+`MASQUE_BENCH_UDP_SEND_BUFFER_SIZE` in bytes. Unset variables omit the new
+fields so the same harness still works with older server binaries. For example:
+
+```sh
+MASQUE_BENCH_MODE=udp MASQUE_BENCH_TRANSPORT=http3 \
+MASQUE_BENCH_QUIC_GSO=1 \
+MASQUE_BENCH_UDP_RECV_BUFFER_SIZE=2097152 \
+MASQUE_BENCH_UDP_SEND_BUFFER_SIZE=2097152 \
+scripts/network-bench.sh
+```
+
 The Linux adapter drains packets with `recvmmsg`, optionally receives GRO
 aggregates, and restores logical QUIC packet boundaries. Output is grouped by
 destination and segment size. With UDP GSO, one message contains multiple
@@ -150,6 +183,55 @@ super-packet correctly.
 
 ## Local benchmark
 
+The HTTP/3 client retries temporarily blocked request headers within a
+ten-second deadline and stops if the connection closes. Time spent waiting
+for QUIC capacity is included in the reported CONNECT setup interval.
+
+### Linux HTTP/3 GSO comparison
+
+A November 2026 check measured the v0.14.5 server on a four-vCPU Linux x86_64
+host. Release binaries used Rust 1.97.1 and GNU libc. The benchmark client,
+server and local targets shared the host inside an isolated container. The
+server used CUBIC, Basic authentication, verified TLS, one QUIC connection,
+one shard and target UDP GSO disabled, with QUIC GSO varied as shown.
+
+Values are medians of three runs, reversing case order on alternate rounds.
+Each TCP run downloaded 256 MiB three times; its warm rate is the median of
+downloads two and three. UDP samples ran for three seconds per payload with
+512 requests in flight and a one-second expiry. Mixed samples offered 3,000
+64-byte UDP packets/s alongside an unrestricted download on the same
+connection.
+
+| Metric | QUIC GSO off | QUIC GSO on |
+| --- | ---: | ---: |
+| TCP warm download (Gbit/s) | 2.46 | 7.13 |
+| TCP warm rate range (Gbit/s) | 2.43–2.47 | 7.10–7.26 |
+| 64 B UDP echo (kpps) | 275.0 | 280.1 |
+| 64 B UDP response shortfall | 0.119% | 0.119% |
+| 64 B UDP loaded p99 upper bound (ms) | 0.832 | 0.832 |
+| 1200 B UDP echo (Gbit/s) | 1.24 | 1.83 |
+| 1200 B UDP response shortfall | 0.213% | 0.177% |
+| 1200 B UDP loaded p99 upper bound (ms) | 3.712 | 2.304 |
+| Mixed TCP download (Gbit/s) | 2.34 | 6.62 |
+| Mixed UDP p99 upper bound (ms) | 7.936 | 2.688 |
+| Mixed UDP response shortfall | 16.833% | 0.000% |
+
+These measurements cover local processing and queueing. They do not qualify
+GSO on an external network path or measure multi-host scaling. UDP p99 counts
+completed echoes; expired requests appear in response shortfall. The fixed
+in-flight window and differing shortfall must be considered together with
+the latency figures.
+
+Two further experiments used three alternating A/B runs with QUIC GSO on,
+four-second samples and the same client. A 64-packet budget for draining
+target responses changed 1200-byte UDP p99 from 2.176 to 2.432 ms with almost
+unchanged throughput. Increasing target-side batches from 16 to 32 packets
+changed that p99 from 2.176 to 2.304 ms. In the latter experiment, eight
+connections with 128 in-flight requests each went from 138.8 to 129.3 kpps
+and from 5.120 to 6.144 ms p99. Both experimental changes were discarded.
+
+### Running the benchmark
+
 ```sh
 scripts/network-bench.sh
 ```
@@ -170,8 +252,8 @@ MASQUE_TCP_DOWNLOAD_REPEATS=3 \
 scripts/network-bench.sh
 ```
 
-`MASQUE_BENCH_MODE` accepts `all` (the default), `smoke`, `tcp`, `udp`, or
-`load`. Focused modes still build the release workspace and start only the
+`MASQUE_BENCH_MODE` accepts `all` (the default), `smoke`, `tcp`, `udp`,
+`load`, or `mixed`. Focused modes still build the release workspace and start only the
 supporting processes needed by that measurement. `MASQUE_BENCH_SHARDS`
 selects the listener shard count; `0` retains the server's documented
 one-shard-per-core behavior.
@@ -194,8 +276,157 @@ goodput through a client TUN or performance over a real network path.
 `MASQUE_BENCH_TRANSPORT` accepts `http3` (the default), `http2`, or `both` for
 the smoke, TCP, and UDP modes. `both` binds TCP and UDP on the same address and
 runs HTTP/3 first, then HTTP/2. It requires an explicit non-zero HTTP/3 shard
-count. Multi-connection `load` mode remains HTTP/3-only until its native-thread
-packet engine has an equivalent asynchronous HTTP/2 implementation.
+count. `load` accepts either transport or `both`. HTTP/2 uses asynchronous
+stream workers and HTTP/3 uses one native thread per connection.
+
+For a fixed offered load over HTTP/2, set the number of connections, the
+number of CONNECT-UDP streams per connection, and the per-stream rate:
+
+```sh
+MASQUE_BENCH_MODE=load MASQUE_BENCH_TRANSPORT=http2 \
+  MASQUE_LOAD_CONNS=8 MASQUE_LOAD_STREAMS_PER_CONN=2 \
+  MASQUE_LOAD_PPS_PER_STREAM=4000 MASQUE_LOAD_WINDOW=256 \
+  MASQUE_LOAD_PAYLOAD=64 MASQUE_LOAD_DURATION_SECS=6 scripts/network-bench.sh
+```
+
+`MASQUE_LOAD_PPS_PER_STREAM=0` saturates each stream. With a fixed rate,
+compare the achieved `tx_pps` to the requested total before comparing RTT
+or CPU. `H2_LOAD_RESULT` reports the achieved rates, response shortfall,
+expired echoes, and RTT histogram bounds across all streams.
+
+An alternating comparison of the checksummed Linux x86_64 release binaries
+used one benchmark client, eight connections with two tunnels each, 64-byte
+packets, a window of 256 per tunnel, and six seconds of traffic per run.
+The table shows medians of three runs per version and load level.
+
+| Offered load | Version | Actual TX (kpps) | Echo RX (kpps) | Loaded p99 upper bound (ms) | Response shortfall | Server CPU time (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 64 kpps | v0.14.4 | 63.99 | 63.99 | 3.20 | 0.00% | 2.79 |
+| 64 kpps | v0.14.5 | 64.00 | 64.00 | 0.99 | 0.00% | 3.37 |
+| 160 kpps | v0.14.4 | 159.60 | 156.27 | 3.07 | 2.14% | 5.49 |
+| 160 kpps | v0.14.5 | 159.98 | 157.25 | 1.41 | 1.71% | 7.26 |
+| Saturation | v0.14.4 | 331.54 | 327.63 | 1.34 | 1.18% | 9.41 |
+| Saturation | v0.14.5 | 340.27 | 336.34 | 1.22 | 1.15% | 9.77 |
+
+v0.14.5 reduced the measured tail at both fixed rates while using more CPU.
+At saturation, received throughput rose 2.7%, with nearly flat CPU time per
+echo (4.79 to 4.83 µs). CPU totals include setup. These are co-located Linux
+loopback results, so the ceiling includes contention with the benchmark
+client and echo process. They measure the two releases as shipped, including
+both TCP_NODELAY and capsule batching.
+
+Use `mixed` to compare paced 64-byte UDP with and without a bulk TCP download.
+Set `MASQUE_MIXED_DOWNLOAD=0` for UDP alone, `1` for both tunnels on the same
+HTTP/3 connection, or `separate` for one connection per tunnel. One benchmark
+thread drives both sockets in the separate mode:
+
+```sh
+MASQUE_BENCH_MODE=mixed MASQUE_BENCH_TRANSPORT=http3 \
+  MASQUE_MIXED_DOWNLOAD=1 MASQUE_MIXED_UDP_PPS=3000 \
+  MASQUE_BENCH_DURATION_SECS=8 MASQUE_BENCH_WINDOW=512 \
+  MASQUE_TCP_DOWNLOAD_BYTES=4294967296 scripts/network-bench.sh
+```
+
+The local target serves a sparse file. The mixed run rejects a download
+that finishes during the sample or sends no body bytes in the sample.
+`H3_MIXED_RESULT` reports connection topology, achieved UDP rate, application RTT p99, response
+shortfall, and TCP body goodput during the same interval. Repeat with the
+isolated `tc` profile below for a controlled delayed or lossy path.
+
+The following v0.14.5 Linux x86_64 results used CUBIC, one shard, QUIC GSO
+off, a window of 512, and 3,000 offered 64-byte packets per second for
+eight seconds. The qdisc delayed traffic 30 ms each way. Values are medians
+of three alternating runs per combination.
+
+| Injected loss per direction | Workload | Echo RX (pps) | UDP p99 upper bound (ms) | UDP response shortfall | TCP download (Mbit/s) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 0% | UDP only | 3,000 | 61.44 | 0.00% | — |
+| 0% | UDP + download, shared connection | 3,000 | 114.69 | 0.00% | 765.02 |
+| 0% | UDP + download, separate connections | 3,000 | 63.49 | 0.00% | 566.96 |
+| 0.2% | UDP only | 2,990 | 147.46 | 0.34% | — |
+| 0.2% | UDP + download, shared connection | 2,990 | 245.76 | 0.33% | 49.75 |
+| 0.2% | UDP + download, separate connections | 2,988 | 221.18 | 0.41% | 74.40 |
+
+Without injected loss, separating the connections recovered most of the
+extra UDP latency in the shared connection. With loss, the p99 ranges
+overlapped: 147–213 ms for UDP alone, 180–246 ms shared, and 147–279 ms
+separate. The sample measures application RTT across the client, proxy,
+and target. Download throughput varied across runs and was measured only
+in the mixed workloads.
+
+A separate diagnostic build sampled one in 64 UDP echoes on the server in
+the no-loss profile. It tracked the return path from reading the UDP target
+socket through QUIC queueing, packet generation, and successful submission
+to the server socket. Each run contributed 375 samples. Values are medians
+of the three per-run p99s and are calculated independently for each stage.
+
+| Workload | Target response to QUIC enqueue | QUIC enqueue to packet generation | Packet generation to socket submission | Total |
+| --- | ---: | ---: | ---: | ---: |
+| UDP only | 23 µs | 9 µs | 18 µs | 32 µs |
+| UDP + download, shared | 1.31 ms | 47.30 ms | 213 µs | 47.39 ms |
+| UDP + download, separate | 657 µs | 10 µs | 21 µs | 664 µs |
+
+The queue wait before packet generation accounts for most of the observed
+server-side delay in the shared workload. This measurement ends at socket
+submission and includes no kernel or network transit time. Sharing a
+connection also shares its congestion and pacing state, so this experiment
+does not distinguish a congestion-credit wait from frame selection.
+
+An experimental server limited TCP response writes to 16 KiB per drive
+when DATAGRAMs were queued. In three alternating shared-connection runs
+against the same diagnostic build, it reduced median server queue p99 from
+50.47 to 46.76 ms. Application UDP p99 remained 114.69 ms in all six runs,
+and TCP throughput varied substantially. The cap was left out of the server.
+
+A follow-up diagnostic build counted quiche short-packet construction
+attempts while a DATAGRAM was pending. In the same no-loss, 60 ms RTT
+shared-connection profile, the congestion allowance was too small for
+the head DATAGRAM on 76–82% of attempts. A DATAGRAM could fit but frame
+selection preferred STREAM on 0.5–0.7% of attempts. These are counts of
+attempts rather than fractions of elapsed queue time.
+
+Forcing DATAGRAM selection when it fit eliminated the STREAM preference
+cases. Over three alternating runs per variant, median DATAGRAM enqueue
+to packet-generation p99 remained about 47.4 ms and application UDP p99
+remained 114.69 ms. All runs delivered 3,000 echoes/s with no response
+shortfall. The experiment supports a congestion-budget explanation for
+this workload, so the temporary frame-selection change was discarded.
+
+The same diagnostic build also tested quiche's send-capacity factor at
+1.00, 0.75, and 0.50. This factor scales how much STREAM data the
+application can enqueue against the current send capacity. It does not
+reserve congestion window space for DATAGRAM frames. Each factor ran three
+times in rotating order in the same shared-connection profile.
+
+| Send-capacity factor | UDP p99 upper bound (ms) | QUIC enqueue to packet-generation p99 (ms) | TCP download median (Mbit/s) | TCP download range (Mbit/s) |
+| --- | ---: | ---: | ---: | ---: |
+| 1.00 (default) | 114.69 | 48.66 | 145.90 | 32.70–865.05 |
+| 0.75 | 114.69 | 51.04 | 108.66 | 87.84–249.36 |
+| 0.50 | 114.69 | 53.51 | 79.01 | 30.72–120.13 |
+
+All nine runs delivered 3,000 echoes/s with no response shortfall. The lower
+factors did not reduce UDP tail latency or the measured queue wait. Download
+rates varied widely, so this sample does not establish the size of a TCP
+throughput penalty. The server retained quiche's default factor.
+
+The same shared-connection profile compared CUBIC and BBR2 using the
+checksummed v0.14.5 Linux x86_64 release binary. Five runs per algorithm
+and loss level alternated order. Only the server congestion controller
+changed. All samples used a 60 ms configured RTT, 3,000 offered 64-byte UDP
+packets/s, and a concurrent unrestricted TCP download.
+
+| Injected loss per direction | Server algorithm | UDP p99 upper bound (ms) | UDP response shortfall | TCP download median (Mbit/s) | TCP download range (Mbit/s) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 0% | CUBIC | 114.69 | 0.00% | 459.76 | 101.10–982.25 |
+| 0% | BBR2 | 253.95 | 0.69% | 1026.10 | 921.51–1035.64 |
+| 0.2% | CUBIC | 163.84 | 0.36% | 33.62 | 11.77–125.47 |
+| 0.2% | BBR2 | 212.99 | 0.41% | 668.84 | 645.03–677.98 |
+
+BBR2 delivered more download throughput and a higher UDP p99 in these
+mixed runs. With loss, the per-run UDP p99 ranges overlapped (139–246 ms
+for CUBIC and 147–311 ms for BBR2). The TCP rate was an outcome of each
+run, so the comparison measures the trade-off under an unrestricted
+download and does not isolate latency at equal TCP throughput.
 
 For local HTTP/3 TLS verification checks, set `MASQUE_BENCH_VERIFY_TLS=1`.
 The generated loopback certificate is then trusted and its `server` hostname
@@ -380,8 +611,7 @@ directory must be new and outside the checkout. The runner alternates A/B
 order and reverses workload order on alternate rounds. It clears inherited
 `MASQUE_*` settings, so an ambient endpoint, interface, or authentication setting
 cannot redirect the local test. `--bin-dir` skips rebuilding; both server
-binaries must accept the benchmark configuration. A Volto binary requires its
-own configuration adapter and is not accepted as a drop-in reference server.
+binaries must accept the same MASQUE Server benchmark configuration.
 
 The private `report.json` includes binary SHA-256 values, workload settings,
 raw numeric records, medians and ranges, and optional A/B comparisons. It omits

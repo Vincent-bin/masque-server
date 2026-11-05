@@ -8,6 +8,7 @@
 
 use std::future::poll_fn;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -23,9 +24,9 @@ use masque::capsule::decoder::{CapsuleDecoder, DecodeError};
 use masque::capsule::{CapsuleFrame, encoder};
 
 use super::{
-    HttpDownloadResponse, InFlight, TcpDownloadResult, UdpBenchConfig,
-    benchmark_direct_tcp_download, median, print_udp_latency_result, print_udp_result,
-    proxy_authorization_value,
+    HttpDownloadResponse, InFlight, RttHistogram, TcpDownloadResult, ThroughputStats,
+    UdpBenchConfig, benchmark_direct_tcp_download, env_usize, median, print_udp_latency_result,
+    print_udp_result, proxy_authorization_value,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -254,7 +255,7 @@ pub(super) fn test_tcp(server_addr: &str, echo_addr: &str) -> Result<()> {
 }
 
 struct UdpTunnel {
-    _connection: Connection,
+    _connection: Arc<Connection>,
     request_body: h2::SendStream<Bytes>,
     response_body: h2::RecvStream,
     decoder: CapsuleDecoder,
@@ -262,7 +263,15 @@ struct UdpTunnel {
 
 impl UdpTunnel {
     async fn connect(server_addr: &str, echo_addr: &str) -> Result<Self> {
-        let connection = Connection::connect(server_addr).await?;
+        Self::open(
+            Arc::new(Connection::connect(server_addr).await?),
+            server_addr,
+            echo_addr,
+        )
+        .await
+    }
+
+    async fn open(connection: Arc<Connection>, server_addr: &str, echo_addr: &str) -> Result<Self> {
         let mut sender = connection.ready_sender().await?;
         if !sender.is_extended_connect_protocol_enabled() {
             bail!("server did not advertise HTTP/2 Extended CONNECT");
@@ -340,20 +349,24 @@ impl UdpTunnel {
         &mut self,
         chunk: Bytes,
         in_flight: &mut InFlight,
-        received: &mut u64,
+        stats: &mut ThroughputStats,
     ) -> Result<()> {
         self.response_body
             .flow_control()
             .release_capacity(chunk.len())?;
         let mut payloads = Vec::new();
         self.decode_chunk(&chunk, &mut payloads)?;
+        let received_at = Instant::now();
         for payload in payloads {
             if payload.len() < 8 {
                 continue;
             }
             let sequence = u64::from_be_bytes(payload[..8].try_into().unwrap());
-            if in_flight.remove(&sequence) {
-                *received += 1;
+            if let Some(sent_at) = in_flight.remove_sent_at(&sequence) {
+                stats.received += 1;
+                stats
+                    .rtt
+                    .record(received_at.saturating_duration_since(sent_at));
             }
         }
         Ok(())
@@ -365,28 +378,38 @@ impl UdpTunnel {
         duration: Duration,
         window: usize,
         expiry: Duration,
-    ) -> Result<(u64, u64, u64)> {
+        started: Instant,
+        pps: u64,
+    ) -> Result<ThroughputStats> {
         if payload_size < 8 {
             bail!("benchmark payload must be at least 8 bytes");
         }
 
-        let started = Instant::now();
         let deadline = started + duration;
         let drain_deadline = deadline + expiry;
         let mut payload = vec![0x5a; payload_size];
         let mut in_flight = InFlight::with_capacity(window);
         let mut next_sequence = 0_u64;
-        let mut sent = 0_u64;
-        let mut received = 0_u64;
-        let mut expired = 0_u64;
+        let mut stats = ThroughputStats {
+            sent: 0,
+            received: 0,
+            expired: 0,
+            rtt: RttHistogram::default(),
+        };
 
         while Instant::now() < drain_deadline {
             let now = Instant::now();
-            expired += in_flight.expire(now, expiry);
+            stats.expired += in_flight.expire(now, expiry);
             let mut made_progress = false;
 
             if now < deadline && in_flight.len() < window {
-                let available = window - in_flight.len();
+                let mut available = window - in_flight.len();
+                if pps != 0 {
+                    let due = (now.saturating_duration_since(started).as_nanos() * u128::from(pps)
+                        / 1_000_000_000) as u64
+                        + 1;
+                    available = available.min(due.saturating_sub(stats.sent) as usize);
+                }
                 let mut capsule_batch = Vec::with_capacity(
                     UDP_CAPSULE_BATCH_BYTES.min(available.saturating_mul(payload_size + 16)),
                 );
@@ -402,19 +425,26 @@ impl UdpTunnel {
                     sequences.push(next_sequence);
                     next_sequence += 1;
                 }
-                send_data_all(&mut self.request_body, Bytes::from(capsule_batch), false).await?;
-                let sent_at = Instant::now();
-                for sequence in sequences {
-                    in_flight.insert(sequence, sent_at);
-                    sent += 1;
+                if !capsule_batch.is_empty() {
+                    let sent_at = Instant::now();
+                    tokio::time::timeout_at(
+                        drain_deadline.into(),
+                        send_data_all(&mut self.request_body, Bytes::from(capsule_batch), false),
+                    )
+                    .await
+                    .context("HTTP/2 send capacity timed out")??;
+                    for sequence in sequences {
+                        in_flight.insert(sequence, sent_at);
+                        stats.sent += 1;
+                    }
+                    made_progress = true;
                 }
-                made_progress = true;
             }
 
             loop {
                 match self.poll_data_now().await {
                     Poll::Ready(Some(Ok(chunk))) => {
-                        self.consume_chunk(chunk, &mut in_flight, &mut received)?;
+                        self.consume_chunk(chunk, &mut in_flight, &mut stats)?;
                         made_progress = true;
                     }
                     Poll::Ready(Some(Err(error))) => return Err(error.into()),
@@ -436,7 +466,7 @@ impl UdpTunnel {
                     .await
                 {
                     Ok(Some(Ok(chunk))) => {
-                        self.consume_chunk(chunk, &mut in_flight, &mut received)?;
+                        self.consume_chunk(chunk, &mut in_flight, &mut stats)?;
                     }
                     Ok(Some(Err(error))) => return Err(error.into()),
                     Ok(None) => bail!("HTTP/2 CONNECT-UDP response ended during benchmark"),
@@ -445,9 +475,82 @@ impl UdpTunnel {
             }
         }
 
-        expired += in_flight.len() as u64;
-        Ok((sent, received, expired))
+        stats.expired += in_flight.len() as u64;
+        Ok(stats)
     }
+}
+
+pub(super) fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
+    let connections = env_usize("MASQUE_LOAD_CONNS", 8)?;
+    let streams = env_usize("MASQUE_LOAD_STREAMS_PER_CONN", 2)?;
+    let duration = env_usize("MASQUE_LOAD_DURATION_SECS", 10)?;
+    let payload = env_usize("MASQUE_LOAD_PAYLOAD", 64)?;
+    let window = env_usize("MASQUE_LOAD_WINDOW", 256)?;
+    let expiry = env_usize("MASQUE_LOAD_EXPIRY_MS", 1_000)?;
+    let pps = env_usize("MASQUE_LOAD_PPS_PER_STREAM", 0)?;
+    anyhow::ensure!(
+        (1..=128).contains(&connections)
+            && (1..=32).contains(&streams)
+            && connections * streams <= 512
+            && (1..=3600).contains(&duration)
+            && (8..=1200).contains(&payload)
+            && (1..=1000).contains(&window)
+            && (1..=60_000).contains(&expiry)
+            && pps <= 1_000_000,
+        "HTTP/2 load configuration is outside benchmark bounds"
+    );
+    runtime()?.block_on(async {
+        let mut tunnels = Vec::with_capacity(connections * streams);
+        for _ in 0..connections {
+            let connection = Arc::new(
+                tokio::time::timeout(CONNECT_TIMEOUT, Connection::connect(server_addr)).await??,
+            );
+            for _ in 0..streams {
+                tunnels.push(UdpTunnel::open(Arc::clone(&connection), server_addr, echo_addr).await?);
+            }
+        }
+        let mut workers = tokio::task::JoinSet::new();
+        let started = Instant::now() + Duration::from_millis(50);
+        for mut tunnel in tunnels {
+            workers.spawn(async move {
+                tokio::time::sleep_until(started.into()).await;
+                tunnel.run_echo_throughput(
+                    payload,
+                    Duration::from_secs(duration as u64),
+                    window,
+                    Duration::from_millis(expiry as u64),
+                    started,
+                    pps as u64,
+                ).await
+            });
+        }
+        let mut sent = 0;
+        let mut received = 0;
+        let mut expired = 0;
+        let mut rtt = RttHistogram::default();
+        while let Some(result) = workers.join_next().await {
+            let stats = result??;
+            sent += stats.sent;
+            received += stats.received;
+            expired += stats.expired;
+            rtt.merge(&stats.rtt);
+        }
+        anyhow::ensure!(sent > 0 && received > 0, "HTTP/2 load run had no successful echo traffic");
+        println!(
+            "H2_LOAD_RESULT connections={connections} streams_per_connection={streams} duration_secs={duration} \
+             payload_bytes={payload} requested_pps_per_stream={pps} tx_packets={sent} rx_packets={received} \
+             tx_pps={:.3} rx_pps={:.3} response_shortfall_pct={:.6} expired_packets={expired} \
+             load_rtt_samples={} load_rtt_p50_us_upper={} load_rtt_p95_us_upper={} load_rtt_p99_us_upper={}",
+            sent as f64 / duration as f64,
+            received as f64 / duration as f64,
+            100.0 * (sent - received) as f64 / sent as f64,
+            rtt.total,
+            rtt.percentile_upper_us(50),
+            rtt.percentile_upper_us(95),
+            rtt.percentile_upper_us(99),
+        );
+        Ok(())
+    })
 }
 
 pub(super) fn test_udp(server_addr: &str, echo_addr: &str) -> Result<()> {
@@ -500,17 +603,24 @@ pub(super) fn benchmark_udp(
         drop(tunnel);
         for payload_size in [64, 1_200] {
             let mut tunnel = UdpTunnel::connect(server_addr, echo_addr).await?;
-            let (sent, received, expired) = tunnel
-                .run_echo_throughput(payload_size, config.duration, config.window, config.expiry)
+            let stats = tunnel
+                .run_echo_throughput(
+                    payload_size,
+                    config.duration,
+                    config.window,
+                    config.expiry,
+                    Instant::now(),
+                    0,
+                )
                 .await?;
             print_udp_result(
                 "http2",
                 "masque",
                 payload_size,
                 config.duration,
-                sent,
-                received,
-                expired,
+                stats.sent,
+                stats.received,
+                stats.expired,
             );
         }
         Ok(())

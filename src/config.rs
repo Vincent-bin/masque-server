@@ -295,6 +295,10 @@ pub struct QuicSection {
     pub enable_udp_gso: bool,
     /// Use UDP generic receive offload for QUIC receives when Linux supports it.
     pub enable_udp_gro: bool,
+    /// Requested SO_RCVBUF/SO_SNDBUF bytes per QUIC shard socket; zero keeps
+    /// the OS default. These do not apply to per-tunnel target UDP sockets.
+    pub udp_recv_buffer_size: usize,
+    pub udp_send_buffer_size: usize,
     /// Congestion control algorithm: `cubic`, `reno`, or `bbr2`.
     pub cc_algorithm: String,
     /// Initial congestion window, in packets.
@@ -494,6 +498,8 @@ impl Default for QuicSection {
             // opt-in until an operator has verified the actual egress path.
             enable_udp_gso: false,
             enable_udp_gro: true,
+            udp_recv_buffer_size: 0,
+            udp_send_buffer_size: 0,
             // CUBIC is the established default. The bounded pacing queue also
             // supports BBR2; select controllers from actual path measurements.
             cc_algorithm: "cubic".into(),
@@ -616,6 +622,8 @@ enabled = false
         assert!(cfg.quic.enable_dgram);
         assert!(!cfg.quic.enable_udp_gso);
         assert!(cfg.quic.enable_udp_gro);
+        assert_eq!(cfg.quic.udp_recv_buffer_size, 0);
+        assert_eq!(cfg.quic.udp_send_buffer_size, 0);
         assert_eq!(cfg.quic.cc_algorithm, "cubic");
         assert!(cfg.quic.initial_max_stream_data <= cfg.quic.max_stream_window);
         assert!(cfg.quic.initial_max_data <= cfg.quic.max_connection_window);

@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- Configure bounded receive and send buffers on each QUIC listener socket.
+  Startup logs and per-shard metrics report the actual kernel buffer sizes,
+  with warnings when an operating-system limit prevents the requested size.
+
+### Changed
+
+- Request 2 MiB per QUIC socket direction in the fresh-install template.
+  Existing configurations that omit the new settings retain OS defaults;
+  zero explicitly selects that behavior. No global socket sysctls are changed.
+- Add independent socket-buffer controls to the network benchmark and document
+  local and external-path GSO measurements, including their limitations.
+
 ## 0.14.5 - 2026-11-04
 
 ### Added
