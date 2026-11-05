@@ -59,6 +59,12 @@ was installed globally.
    This is advice, not authorization or a supported remote configuration
    operation; do not change settings during a release rollout.
 
+For releases with BBR2 as the QUIC default, fresh configurations use BBR2.
+Explicit `quic.cc_algorithm` values remain authoritative; configurations that
+omit it adopt the default of the installed version. Before upgrades, explain
+this behavior change and assess the path using throughput, latency, and loss.
+Changing an existing fleet configuration is outside this CLI's capabilities.
+
 ## Safety boundaries
 
 - Use exact release tags for mutations. Do not deploy a branch, commit, local

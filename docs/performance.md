@@ -111,7 +111,8 @@ one millisecond beyond the current time. Prefetch is bounded to roughly that
 window, with one extra packet retained for the next deadline. The queue reuses packet buffers under a separate 128 KiB spare-buffer
 budget and is discarded when a connection closes. This lets per-packet pacers
 such as BBR2 prepare a bounded burst instead of serializing only one packet per
-timer wakeup. CUBIC remains the default controller.
+timer wakeup. BBR2 is the default controller; explicitly select CUBIC if the
+workload performs better with it.
 
 ### Target UDP sockets
 

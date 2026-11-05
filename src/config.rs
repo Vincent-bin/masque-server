@@ -500,9 +500,9 @@ impl Default for QuicSection {
             enable_udp_gro: true,
             udp_recv_buffer_size: 0,
             udp_send_buffer_size: 0,
-            // CUBIC is the established default. The bounded pacing queue also
-            // supports BBR2; select controllers from actual path measurements.
-            cc_algorithm: "cubic".into(),
+            // BBR2 can improve cold-connection throughput on long, lossy
+            // paths. Operators can explicitly select CUBIC for their workload.
+            cc_algorithm: "bbr2".into(),
             initial_congestion_window_packets: 32,
             initial_max_data: 16 * 1024 * 1024,
             initial_max_stream_data: 4 * 1024 * 1024,
@@ -624,7 +624,7 @@ enabled = false
         assert!(cfg.quic.enable_udp_gro);
         assert_eq!(cfg.quic.udp_recv_buffer_size, 0);
         assert_eq!(cfg.quic.udp_send_buffer_size, 0);
-        assert_eq!(cfg.quic.cc_algorithm, "cubic");
+        assert_eq!(cfg.quic.cc_algorithm, "bbr2");
         assert!(cfg.quic.initial_max_stream_data <= cfg.quic.max_stream_window);
         assert!(cfg.quic.initial_max_data <= cfg.quic.max_connection_window);
         assert!(!cfg.quic.discover_pmtu);
@@ -962,8 +962,20 @@ enable_udp_gro = false
         assert!(cfg.quic.enable_udp_gso);
         assert!(!cfg.quic.enable_udp_gro);
         // Tuning knobs absent from the file keep their defaults.
-        assert_eq!(cfg.quic.cc_algorithm, "cubic");
+        assert_eq!(cfg.quic.cc_algorithm, "bbr2");
         assert_eq!(cfg.quic.dgram_send_queue_len, 2048);
+    }
+
+    #[test]
+    fn congestion_controller_defaults_and_explicit_legacy_override() {
+        let omitted = parse_with_listener("");
+        assert_eq!(omitted.quic.cc_algorithm, "bbr2");
+
+        let partial = parse_with_listener("[quic]\nenable_udp_gso = true\n");
+        assert_eq!(partial.quic.cc_algorithm, "bbr2");
+
+        let legacy = parse_with_listener("[quic]\ncc_algorithm = \"cubic\"\n");
+        assert_eq!(legacy.quic.cc_algorithm, "cubic");
     }
 
     #[test]
@@ -1067,7 +1079,7 @@ key_path = "certs/server.key"
 max_datagram_size = 1350
 initial_max_streams_bidi = 128
 enable_dgram = true
-cc_algorithm = "cubic"
+cc_algorithm = "bbr2"
 initial_congestion_window_packets = 32
 initial_max_data = 16777216
 initial_max_stream_data = 4194304

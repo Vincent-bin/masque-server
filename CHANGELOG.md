@@ -7,6 +7,12 @@ pre-1.0.
 
 ## Unreleased
 
+### Changed
+
+- Use BBR2 as the default QUIC congestion controller. Explicit controller
+  selections remain unchanged; older configurations that omit the setting
+  adopt BBR2 after upgrading and can pin `cubic` to retain prior behavior.
+
 ## 0.14.6 - 2026-11-05
 
 ### Added

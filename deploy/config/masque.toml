@@ -125,7 +125,7 @@ udp_send_buffer_size = 2097152
 
 # Congestion control: "cubic", "reno", or "bbr2". Paced packets are grouped
 # under bounded deadlines; compare throughput, latency, and loss on your path.
-cc_algorithm = "cubic"
+cc_algorithm = "bbr2"
 initial_congestion_window_packets = 32
 
 # Flow control. The initial windows cap a stream at window/RTT until quiche
