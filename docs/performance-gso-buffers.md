@@ -111,6 +111,32 @@ A separate traced run with QUIC GSO disabled and target UDP GSO enabled saw
 target path used GSO. Tracing was excluded from the benchmark timings. These
 are local processing measurements and do not qualify a WAN target path.
 
+### LAN target egress
+
+A second three-round comparison used a UDP echo target on a separate machine
+on the local network. The benchmark client and server remained on the Linux
+host; each case used a single HTTP/3 connection, one shard, ten seconds,
+512 in-flight requests, QUIC GSO enabled and 2 MiB buffer requests. Only
+`udp_proxy.enable_udp_gso` changed. The echo target was a single-process
+Python server, which may limit throughput independently of the proxy.
+
+| Payload | Target GSO | Goodput (Gbit/s) | Response shortfall | RTT p99 upper bound (ms) | Server CPU (% of one core) | CPU seconds per million replies |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 64 B | Off | 0.0306 | 0.0002% | 9.728 | 99.2% | 17.498 |
+| 64 B | On | 0.0304 | 0.0002% | 9.728 | 98.4% | 17.122 |
+| 1200 B | Off | 0.5688 | 0.0212% | 9.728 | 122.0% | 20.975 |
+| 1200 B | On | 0.5670 | 0.0035% | 9.728 | 115.7% | 20.529 |
+
+Values are medians. In this workload throughput and the histogram's p99 bound
+were similar, while server CPU was lower in the GSO-on sample. These few runs
+are not sufficient to establish a general CPU improvement, and the LAN path
+is not a WAN test. CPU accounting includes startup and drain; normalizing by
+completed replies still leaves those fixed costs in the measurement.
+
+A separate traced 1200-byte LAN run kept QUIC GSO off and target GSO on: all
+11,586 observed segmented `sendmmsg` calls succeeded. Tracing was not used in
+the comparison runs.
+
 ## Reproduction
 
 Use `quic.udp_recv_buffer_size = 2097152` and
