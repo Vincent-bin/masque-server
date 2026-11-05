@@ -320,6 +320,19 @@ impl ListenerMetrics {
         )
         .unwrap();
         for (index, shard) in self.shards.iter().enumerate() {
+            for (direction, bytes) in [
+                ("receive", shard.quic_udp_recv_buffer_bytes.load(RELAXED)),
+                ("send", shard.quic_udp_send_buffer_bytes.load(RELAXED)),
+            ] {
+                // No UDP buffer gauge for HTTP/2 or failed readback.
+                if bytes > 0 {
+                    writeln!(
+                        out,
+                        "masque_quic_udp_socket_buffer_bytes{{{label},shard=\"{index}\",direction=\"{direction}\"}} {bytes}"
+                    )
+                    .unwrap();
+                }
+            }
             let heartbeat_age = now_millis.saturating_sub(shard.last_heartbeat_millis.load(RELAXED))
                 as f64
                 / 1_000.0;
@@ -565,6 +578,8 @@ pub(crate) struct ShardMetrics {
     event_loop_lag_max_micros: AtomicU64,
     quic_udp_gso_enabled: AtomicBool,
     quic_udp_gro_enabled: AtomicBool,
+    quic_udp_recv_buffer_bytes: AtomicU64,
+    quic_udp_send_buffer_bytes: AtomicU64,
     connections_active: AtomicU64,
     connections_active_max: AtomicU64,
     connections_accepted: AtomicU64,
@@ -617,6 +632,8 @@ impl ShardMetrics {
             event_loop_lag_max_micros: AtomicU64::new(0),
             quic_udp_gso_enabled: AtomicBool::new(udp_gso),
             quic_udp_gro_enabled: AtomicBool::new(udp_gro),
+            quic_udp_recv_buffer_bytes: AtomicU64::new(0),
+            quic_udp_send_buffer_bytes: AtomicU64::new(0),
             connections_active: AtomicU64::new(0),
             connections_active_max: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
@@ -669,6 +686,12 @@ impl ShardMetrics {
     pub(crate) fn set_udp_offload_state(&self, udp_gso: bool, udp_gro: bool) {
         self.quic_udp_gso_enabled.store(udp_gso, RELAXED);
         self.quic_udp_gro_enabled.store(udp_gro, RELAXED);
+    }
+
+    /// Publish getsockopt readback once at startup, outside the packet path.
+    pub(crate) fn set_udp_buffer_sizes(&self, recv: usize, send: usize) {
+        self.quic_udp_recv_buffer_bytes.store(recv as u64, RELAXED);
+        self.quic_udp_send_buffer_bytes.store(send as u64, RELAXED);
     }
 
     /// Reflect the runtime fallback after an external path rejects GSO.
@@ -994,6 +1017,11 @@ fn render_listener_headers(out: &mut String) {
             "gauge",
         ),
         (
+            "masque_quic_udp_socket_buffer_bytes",
+            "QUIC shard socket buffer size reported by the OS, including Linux's doubled accounting allowance.",
+            "gauge",
+        ),
+        (
             "masque_event_loop_lag_seconds",
             "Delay of the latest scheduled proxy-shard heartbeat.",
             "gauge",
@@ -1182,6 +1210,11 @@ mod tests {
             true,
         );
         let listener = &shards[0];
+        listener.set_udp_buffer_sizes(131072, 262144);
+        shards[1].set_udp_buffer_sizes(524288, 1048576);
+        let buffers = metrics.render();
+        assert!(buffers.contains("masque_quic_udp_socket_buffer_bytes{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",shard=\"0\",direction=\"receive\"} 131072"));
+        assert!(buffers.contains("masque_quic_udp_socket_buffer_bytes{listener=\"127.0.0.1:8449\",transport=\"http3\",auth=\"basic\",shard=\"1\",direction=\"send\"} 1048576"));
         metrics.set_ready(true);
         listener.connection_opened();
         listener.record_receive_batch(4, 4800);

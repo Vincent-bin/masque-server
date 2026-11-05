@@ -112,6 +112,7 @@ All metric names start with `masque_`.
 | `masque_quic_send_bytes_total` | counter | `listener`, `transport`, `auth` | Sent HTTP/3 QUIC UDP bytes |
 | `masque_quic_udp_gso_enabled` | gauge | `listener`, `transport`, `auth` | Bound HTTP/3 socket is using UDP GSO |
 | `masque_quic_udp_gro_enabled` | gauge | `listener`, `transport`, `auth` | Bound HTTP/3 socket is using UDP GRO |
+| `masque_quic_udp_socket_buffer_bytes` | gauge | `listener`, `transport`, `auth`, `shard`, `direction` | OS-reported QUIC socket buffer (`receive` / `send`); Linux includes doubled accounting; absent if readback failed |
 | `masque_tcp_relay_batches_total` | counter | `listener`, `transport`, `auth` | HTTP/3 event-loop rounds consuming target TCP events |
 | `masque_tcp_relay_events_total` | counter | `listener`, `transport`, `auth` | Target TCP events consumed by HTTP/3 shards |
 | `masque_tcp_relay_bytes_total` | counter | `listener`, `transport`, `auth` | Target TCP response bytes handed to HTTP/3 shards |

@@ -266,9 +266,67 @@ impl SendPacketBatch {
 
 pub(crate) struct QuicUdpSocket {
     socket: UdpSocket,
+    buffers: UdpSocketBuffers,
     udp_gso: bool,
     udp_gro: bool,
     reuseport_cid_steering: bool,
+}
+
+/// Receive/send buffer sizes in bytes. `bind_shared` takes setsockopt request
+/// units (zero preserves defaults); `buffers()` returns getsockopt readback
+/// (zero means unavailable), including Linux's doubled bookkeeping allowance.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UdpSocketBuffers {
+    pub(crate) recv: usize,
+    pub(crate) send: usize,
+}
+
+impl UdpSocketBuffers {
+    /// Configure only the listener socket, once at startup. Kernel caps can
+    /// clamp a successful setsockopt; read back both values instead of claiming
+    /// that the requested sizes took effect. Tuning failure is nonfatal.
+    fn configure(socket: &UdpSocket, recv: usize, send: usize) -> Self {
+        let socket = socket2::SockRef::from(socket);
+        for (direction, requested) in [("receive", recv), ("send", send)] {
+            if requested == 0 {
+                continue;
+            }
+            let result = if direction == "receive" {
+                socket.set_recv_buffer_size(requested)
+            } else {
+                socket.set_send_buffer_size(requested)
+            };
+            if let Err(error) = result {
+                tracing::warn!(direction, requested, %error, "QUIC UDP socket buffer request failed; retaining OS buffer");
+            }
+        }
+        let read = |direction, requested, result: io::Result<usize>| match result {
+            Ok(actual) => {
+                let capacity = if cfg!(target_os = "linux") {
+                    actual / 2
+                } else {
+                    actual
+                };
+                if requested > 0 && capacity < requested {
+                    tracing::warn!(
+                        direction,
+                        requested,
+                        actual,
+                        "QUIC UDP socket buffer below request; check OS socket buffer limits"
+                    );
+                }
+                actual
+            }
+            Err(error) => {
+                tracing::warn!(direction, %error, "QUIC UDP socket buffer readback unavailable");
+                0
+            }
+        };
+        Self {
+            recv: read("receive", recv, socket.recv_buffer_size()),
+            send: read("send", send, socket.send_buffer_size()),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -417,6 +475,7 @@ impl QuicUdpSocket {
         enable_gso: bool,
         enable_gro: bool,
         reuseport_shards: usize,
+        buffers: UdpSocketBuffers,
     ) -> io::Result<Self> {
         let (socket, reuseport_cid_steering) = if reuseport_shards > 1 {
             #[cfg(target_os = "linux")]
@@ -434,6 +493,8 @@ impl QuicUdpSocket {
         } else {
             (UdpSocket::bind(addr).await?, false)
         };
+
+        let buffers = UdpSocketBuffers::configure(&socket, buffers.recv, buffers.send);
 
         #[cfg(target_os = "linux")]
         let (udp_gso, udp_gro) = {
@@ -454,6 +515,7 @@ impl QuicUdpSocket {
 
         Ok(Self {
             socket,
+            buffers,
             udp_gso,
             udp_gro,
             reuseport_cid_steering,
@@ -462,6 +524,10 @@ impl QuicUdpSocket {
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub(crate) fn buffers(&self) -> UdpSocketBuffers {
+        self.buffers
     }
 
     pub(crate) fn udp_gso_enabled(&self) -> bool {
@@ -912,6 +978,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn socket_buffers_preserve_defaults_and_report_kernel_values() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw = socket2::SockRef::from(&socket);
+        let before = (
+            raw.recv_buffer_size().unwrap(),
+            raw.send_buffer_size().unwrap(),
+        );
+        let unchanged = UdpSocketBuffers::configure(&socket, 0, 0);
+        assert_eq!((unchanged.recv, unchanged.send), before);
+
+        let configured = UdpSocketBuffers::configure(&socket, 65536, 65536);
+        assert_eq!(configured.recv, raw.recv_buffer_size().unwrap());
+        assert_eq!(configured.send, raw.send_buffer_size().unwrap());
+        assert!(configured.recv >= 65536);
+        assert!(configured.send >= 65536);
+
+        // A cap/rejection must not prevent startup or report the request as
+        // effective. Exercise real OS limits, without assuming their values.
+        let large = UdpSocketBuffers::configure(&socket, 16 * 1024 * 1024, 0);
+        assert_eq!(large.recv, raw.recv_buffer_size().unwrap());
+        assert_eq!(large.send, configured.send);
+    }
+
+    #[tokio::test]
+    async fn bound_socket_applies_buffer_requests() {
+        let socket = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            false,
+            false,
+            1,
+            UdpSocketBuffers {
+                recv: 65536,
+                send: 65536,
+            },
+        )
+        .await
+        .unwrap();
+        let raw = socket2::SockRef::from(&socket.socket);
+        assert_eq!(socket.buffers().recv, raw.recv_buffer_size().unwrap());
+        assert_eq!(socket.buffers().send, raw.send_buffer_size().unwrap());
+        assert!(socket.buffers().recv >= 65536);
+        assert!(socket.buffers().send >= 65536);
+    }
+
     #[test]
     fn gso_groups_equal_segments_and_short_tail() {
         let target = "127.0.0.1:4433".parse().unwrap();
@@ -1033,10 +1145,16 @@ mod tests {
     async fn batched_socket_preserves_datagram_boundaries() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, 1)
-                .await
-                .unwrap();
+        let mut sender = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            true,
+            true,
+            1,
+            UdpSocketBuffers::default(),
+        )
+        .await
+        .unwrap();
 
         let mut batch = SendPacketBatch::new();
         batch.push(&[1; 1200], send_info(target), sender.udp_gso, 10_000);
@@ -1058,10 +1176,16 @@ mod tests {
     async fn sendmmsg_initializes_every_live_slot() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, 1)
-                .await
-                .unwrap();
+        let mut sender = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            false,
+            false,
+            1,
+            UdpSocketBuffers::default(),
+        )
+        .await
+        .unwrap();
 
         let mut batch = SendPacketBatch::new();
         for sequence in 0..MAX_BATCH_PACKETS {
@@ -1101,18 +1225,31 @@ mod tests {
         const SHARDS: usize = 4;
         const PACKETS_PER_HEADER: usize = 8;
 
-        let first =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, false, false, SHARDS)
-                .await
-                .unwrap();
+        let first = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            false,
+            false,
+            SHARDS,
+            UdpSocketBuffers::default(),
+        )
+        .await
+        .unwrap();
         let target = first.local_addr().unwrap();
 
         let mut shards = vec![first];
         for _ in 1..SHARDS {
             shards.push(
-                QuicUdpSocket::bind_shared(target, 1350, false, false, SHARDS)
-                    .await
-                    .unwrap(),
+                QuicUdpSocket::bind_shared(
+                    target,
+                    1350,
+                    false,
+                    false,
+                    SHARDS,
+                    UdpSocketBuffers::default(),
+                )
+                .await
+                .unwrap(),
             );
         }
         assert!(
@@ -1169,15 +1306,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn recvmmsg_and_gro_restore_logical_packets() {
-        let receiver =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, 1)
-                .await
-                .unwrap();
+        let receiver = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            true,
+            true,
+            1,
+            UdpSocketBuffers::default(),
+        )
+        .await
+        .unwrap();
         let target = receiver.local_addr().unwrap();
-        let mut sender =
-            QuicUdpSocket::bind_shared("127.0.0.1:0".parse().unwrap(), 1350, true, true, 1)
-                .await
-                .unwrap();
+        let mut sender = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            true,
+            true,
+            1,
+            UdpSocketBuffers::default(),
+        )
+        .await
+        .unwrap();
 
         let mut outgoing = SendPacketBatch::new();
         outgoing.push(&[1; 1200], send_info(target), sender.udp_gso, 10_000);

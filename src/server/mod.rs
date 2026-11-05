@@ -282,6 +282,10 @@ async fn open_quic_socket(
         config.quic.enable_udp_gso,
         config.quic.enable_udp_gro,
         reuseport_shards,
+        crate::net::quic::UdpSocketBuffers {
+            recv: config.quic.udp_recv_buffer_size,
+            send: config.quic.udp_send_buffer_size,
+        },
     )
     .await
     .with_context(|| format!("failed to bind listener {listen_addr}"))
@@ -1701,12 +1705,16 @@ impl Shard {
         let max_datagram_size =
             listener.effective_quic_max_datagram_size(config.quic.max_datagram_size);
         metrics.set_udp_offload_state(socket.udp_gso_enabled(), socket.udp_gro_enabled());
+        let buffers = socket.buffers();
+        metrics.set_udp_buffer_sizes(buffers.recv, buffers.send);
         info!(
             shard = index,
             listener_shard = listener_shard_index,
             addr = %bound_addr,
             udp_gso = socket.udp_gso_enabled(),
             udp_gro = socket.udp_gro_enabled(),
+            udp_recv_buffer_bytes = buffers.recv,
+            udp_send_buffer_bytes = buffers.send,
             max_datagram_size,
             reuseport_cid_steering = socket.reuseport_cid_steering_enabled(),
             "listening"
