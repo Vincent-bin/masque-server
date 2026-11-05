@@ -85,6 +85,32 @@ buffer-cap warnings. Experimental containers and networks were removed.
 The unmodified `scripts/e2e-test.sh` workflow also rebuilt the Docker images
 and passed all 12 checks with its standard configuration.
 
+## Target UDP GSO and CPU
+
+Three alternating-order rounds measured one HTTP/3 connection on an isolated
+Linux loopback host with four CPU cores available. Each case used one UDP
+payload size for ten seconds, a 512-request window, one server shard, 2 MiB
+socket-buffer requests and QUIC GSO enabled. The server and client shared the
+host. The only changed setting was target-side UDP GSO.
+
+| Payload | Target GSO | Goodput (Gbit/s) | Response shortfall | RTT p99 upper bound (ms) | Server CPU (% of one core) | CPU seconds per million replies |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 64 B | Off | 0.1379 | 0.1217% | 0.896 | 150.1% | 6.083 |
+| 64 B | On | 0.1393 | 0.1197% | 0.864 | 152.4% | 6.111 |
+| 1200 B | Off | 1.8036 | 0.1891% | 2.688 | 148.6% | 8.446 |
+| 1200 B | On | 1.9328 | 0.1468% | 2.560 | 137.3% | 7.315 |
+
+Values are medians of three runs. For 1200-byte payloads, observed goodput
+rose by about 7%, while server CPU seconds per million replies fell by about
+13%. The CPU figures account for the whole server process and include startup
+and the drain period. The target socket uses ordinary batching for 64-byte
+payloads, so their small differences should not be attributed to GSO.
+
+A separate traced run with QUIC GSO disabled and target UDP GSO enabled saw
+10,961 successful segmented `sendmmsg` calls and no errors; this confirms the
+target path used GSO. Tracing was excluded from the benchmark timings. These
+are local processing measurements and do not qualify a WAN target path.
+
 ## Reproduction
 
 Use `quic.udp_recv_buffer_size = 2097152` and
