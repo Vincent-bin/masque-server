@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.6 - 2026-11-05
+
 ### Added
 
 - Configure bounded receive and send buffers on each QUIC listener socket.
