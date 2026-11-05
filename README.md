@@ -116,6 +116,15 @@ To set up an external check for a single host or the designated fleet canary, ru
 `masque-ops configure-probe` on the administration machine. The guided setup
 tests the connection before saving its private local configuration.
 
+Linux HTTP/3 deployments can optionally enable QUIC UDP GSO to reduce packet
+processing overhead. It is disabled by default: compare it on and off over the
+actual external path before using it, because some virtual network paths drop
+GSO packets even when the kernel accepts the option. QUIC GSO and target UDP
+GSO are independent settings; test the traffic for each separately. See
+[QUIC socket performance and validation](docs/performance.md#quic-socket)
+and [QUIC configuration](docs/configuration.md#quic-and-udp). A successful
+connectivity probe alone does not establish throughput or packet-loss behavior.
+
 ## Quick start
 
 Build the server:

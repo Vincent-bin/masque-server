@@ -85,6 +85,88 @@ buffer-cap warnings. Experimental containers and networks were removed.
 The unmodified `scripts/e2e-test.sh` workflow also rebuilt the Docker images
 and passed all 12 checks with its standard configuration.
 
+## Target UDP GSO and CPU
+
+Three alternating-order rounds measured one HTTP/3 connection on an isolated
+Linux loopback host with four CPU cores available. Each case used one UDP
+payload size for ten seconds, a 512-request window, one server shard, 2 MiB
+socket-buffer requests and QUIC GSO enabled. The server and client shared the
+host. The only changed setting was target-side UDP GSO.
+
+| Payload | Target GSO | Goodput (Gbit/s) | Response shortfall | RTT p99 upper bound (ms) | Server CPU (% of one core) | CPU seconds per million replies |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 64 B | Off | 0.1379 | 0.1217% | 0.896 | 150.1% | 6.083 |
+| 64 B | On | 0.1393 | 0.1197% | 0.864 | 152.4% | 6.111 |
+| 1200 B | Off | 1.8036 | 0.1891% | 2.688 | 148.6% | 8.446 |
+| 1200 B | On | 1.9328 | 0.1468% | 2.560 | 137.3% | 7.315 |
+
+Values are medians of three runs. For 1200-byte payloads, observed goodput
+rose by about 7%, while server CPU seconds per million replies fell by about
+13%. The CPU figures account for the whole server process and include startup
+and the drain period. The target socket uses ordinary batching for 64-byte
+payloads, so their small differences should not be attributed to GSO.
+
+A separate traced run with QUIC GSO disabled and target UDP GSO enabled saw
+10,961 successful segmented `sendmmsg` calls and no errors; this confirms the
+target path used GSO. Tracing was excluded from the benchmark timings. These
+are local processing measurements and do not qualify a WAN target path.
+
+### LAN target egress
+
+A second three-round comparison used a UDP echo target on a separate machine
+on the local network. The benchmark client and server remained on the Linux
+host; each case used a single HTTP/3 connection, one shard, ten seconds,
+512 in-flight requests, QUIC GSO enabled and 2 MiB buffer requests. Only
+`udp_proxy.enable_udp_gso` changed. The echo target was a single-process
+Python server, which may limit throughput independently of the proxy.
+
+| Payload | Target GSO | Goodput (Gbit/s) | Response shortfall | RTT p99 upper bound (ms) | Server CPU (% of one core) | CPU seconds per million replies |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 64 B | Off | 0.0306 | 0.0002% | 9.728 | 99.2% | 17.498 |
+| 64 B | On | 0.0304 | 0.0002% | 9.728 | 98.4% | 17.122 |
+| 1200 B | Off | 0.5688 | 0.0212% | 9.728 | 122.0% | 20.975 |
+| 1200 B | On | 0.5670 | 0.0035% | 9.728 | 115.7% | 20.529 |
+
+Values are medians. In this workload throughput and the histogram's p99 bound
+were similar, while server CPU was lower in the GSO-on sample. These few runs
+are not sufficient to establish a general CPU improvement, and the LAN path
+is not a WAN test. CPU accounting includes startup and drain; normalizing by
+completed replies still leaves those fixed costs in the measurement.
+
+A separate traced 1200-byte LAN run kept QUIC GSO off and target GSO on: all
+11,586 observed segmented `sendmmsg` calls succeeded. Tracing was not used in
+the comparison runs.
+
+### Controlled DNS target
+
+A third test used a separate benchmark server and sent valid DNS requests
+through CONNECT-UDP to a configured public DNS destination. The client and
+server shared the Linux host; target egress used the host network. The
+controlled client sent 200 requests per second in bursts of ten, with three
+five-second runs per cell, and counted a reply only when its transaction ID
+matched and the DNS response code indicated success. QUIC GSO was enabled;
+only target UDP GSO changed. Socket-buffer requests were 2 MiB each.
+
+| Payload | Target GSO | Successful replies per run | RTT p99 upper bound (ms) | Server CPU (% of one core) |
+| ---: | --- | ---: | ---: | ---: |
+| 64 B | Off | 1000 / 1000 | 2.048 | 1.123% |
+| 64 B | On | 1000 / 1000 | 2.048 | 1.141% |
+| 512 B | Off | 1000 / 1000 | 2.304 | 1.167% |
+| 512 B | On | 1000 / 1000 | 2.176 | 1.139% |
+
+Values are medians of three runs. This deliberately rate-limited workload
+checks delivery, not maximum throughput or meaningful CPU efficiency: setup
+and drain are included in server CPU accounting, and the reported differences
+are small. A separate 512-byte trace with QUIC GSO off and target GSO on saw
+60 successful segmented `sendmmsg` calls and no errors. The configured DNS
+responder was not authenticated, and a network intermediary may have handled
+UDP port 53.
+
+A direct control using the same DNS query format returned a DNS format error
+for 1200-byte requests regardless of the proxy's GSO settings. Consequently,
+this test does not establish target-side GSO behavior for 1200-byte requests
+on that path; use the LAN result above for the tested 1200-byte workload.
+
 ## Reproduction
 
 Use `quic.udp_recv_buffer_size = 2097152` and

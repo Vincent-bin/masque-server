@@ -49,6 +49,15 @@ was installed globally.
    from a request to inspect, review, plan, benchmark, or diagnose.
 7. Report each host's resulting version and health. Stop on a failed canary,
    failed verification, partial rollout, or failed rollback.
+8. After a successful Linux HTTP/3 installation or upgrade, mention optional
+   QUIC UDP GSO. It defaults off and needs
+   on/off testing over the real external path; kernel support and a passing
+   connectivity probe do not establish performance or absence of packet loss.
+   Target UDP GSO is a separate setting and needs its own CONNECT-UDP test.
+   Refer to the [performance guide](https://github.com/Vincent-bin/masque-server/blob/main/docs/performance.md#quic-socket)
+   and [configuration guide](https://github.com/Vincent-bin/masque-server/blob/main/docs/configuration.md#quic-and-udp).
+   This is advice, not authorization or a supported remote configuration
+   operation; do not change settings during a release rollout.
 
 ## Safety boundaries
 
