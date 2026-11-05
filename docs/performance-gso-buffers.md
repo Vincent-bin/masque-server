@@ -137,6 +137,36 @@ A separate traced 1200-byte LAN run kept QUIC GSO off and target GSO on: all
 11,586 observed segmented `sendmmsg` calls succeeded. Tracing was not used in
 the comparison runs.
 
+### Controlled DNS target
+
+A third test used a separate benchmark server and sent valid DNS requests
+through CONNECT-UDP to a configured public DNS destination. The client and
+server shared the Linux host; target egress used the host network. The
+controlled client sent 200 requests per second in bursts of ten, with three
+five-second runs per cell, and counted a reply only when its transaction ID
+matched and the DNS response code indicated success. QUIC GSO was enabled;
+only target UDP GSO changed. Socket-buffer requests were 2 MiB each.
+
+| Payload | Target GSO | Successful replies per run | RTT p99 upper bound (ms) | Server CPU (% of one core) |
+| ---: | --- | ---: | ---: | ---: |
+| 64 B | Off | 1000 / 1000 | 2.048 | 1.123% |
+| 64 B | On | 1000 / 1000 | 2.048 | 1.141% |
+| 512 B | Off | 1000 / 1000 | 2.304 | 1.167% |
+| 512 B | On | 1000 / 1000 | 2.176 | 1.139% |
+
+Values are medians of three runs. This deliberately rate-limited workload
+checks delivery, not maximum throughput or meaningful CPU efficiency: setup
+and drain are included in server CPU accounting, and the reported differences
+are small. A separate 512-byte trace with QUIC GSO off and target GSO on saw
+60 successful segmented `sendmmsg` calls and no errors. The configured DNS
+responder was not authenticated, and a network intermediary may have handled
+UDP port 53.
+
+A direct control using the same DNS query format returned a DNS format error
+for 1200-byte requests regardless of the proxy's GSO settings. Consequently,
+this test does not establish target-side GSO behavior for 1200-byte requests
+on that path; use the LAN result above for the tested 1200-byte workload.
+
 ## Reproduction
 
 Use `quic.udp_recv_buffer_size = 2097152` and
