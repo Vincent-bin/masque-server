@@ -718,7 +718,7 @@ enable_udp_gso = false
 enable_udp_gro = true
 udp_recv_buffer_size = 2097152
 udp_send_buffer_size = 2097152
-cc_algorithm = "cubic"
+cc_algorithm = "bbr2"
 initial_congestion_window_packets = 32
 initial_max_data = 16777216
 initial_max_stream_data = 4194304
@@ -779,10 +779,12 @@ Important relationships:
   path that drops GSO aggregates; compare GSO on/off with identical buffers.
   Older binaries reject these new fields; retain a compatible configuration
   when planning a rollback to a release without socket-buffer tuning.
-- Supported congestion controllers are `cubic`, `reno`, and `bbr2`. CUBIC is
-  the current default. Paced output uses bounded packet groups; compare
-  controllers on the deployment's actual RTT and loss profile before changing
-  this setting.
+- Supported congestion controllers are `cubic`, `reno`, and `bbr2`. BBR2 is
+  the default. Paced output uses bounded packet groups; compare throughput,
+  latency, and loss on the deployment's actual path. An explicit controller is
+  preserved on upgrade. Older configurations that omit `cc_algorithm` adopt
+  the new default when upgraded; set `cc_algorithm = "cubic"` before upgrading
+  if the existing behavior must be retained.
 - `retry_mode = "adaptive"` accepts tokenless Initial packets below
   `retry_connection_threshold`, avoiding an extra low-load round trip. At or
   above the per-shard threshold, the server sends a stateless, authenticated
