@@ -31,6 +31,10 @@ was installed globally.
    do not copy private endpoints or credentials into conversation or source.
    If capabilities are unknown, explain the choices and ask the operator to
    select them. Do not claim compatibility from a format example alone.
+   Basic authentication failures always return an empty 404. Verify that the
+   peer sends credentials on its first request; the server does not issue a
+   password challenge. Preserve existing credentials during upgrades. A legacy
+   `stealth = false` setting no longer enables 407 responses.
 3. Run `validate`, then the read-only `status` command. If validation reports a
    missing local probe and the operator authorized tool installation, run this
    Skill's `scripts/install-probe.sh` with `MASQUE_VERSION` set to the exact

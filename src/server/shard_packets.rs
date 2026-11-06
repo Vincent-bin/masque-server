@@ -344,7 +344,11 @@ impl Shard {
                 );
 
                 if token.is_empty() && retry_required {
-                    let retry_token = self.shared.retry_tokens.mint(from, local, &hdr.dcid);
+                    let Ok(retry_token) = self.shared.retry_tokens.mint(from, local, &hdr.dcid)
+                    else {
+                        warn!("cannot seal QUIC Retry token");
+                        return;
+                    };
                     match quiche::retry(
                         &hdr.scid,
                         &hdr.dcid,
@@ -542,7 +546,6 @@ impl Shard {
                             metrics: &self.metrics,
                             config: &self.config,
                             auth: self.auth.as_deref(),
-                            stealth_auth: self.stealth_auth,
                         };
                         if let Some(pending) = Self::handle_request(
                             h3,
@@ -557,13 +560,7 @@ impl Shard {
                                     stream_id,
                                     "too many CONNECT requests awaiting authorization"
                                 );
-                                Self::send_auth_rejection(
-                                    h3,
-                                    &mut client.quic,
-                                    stream_id,
-                                    self.stealth_auth,
-                                    503,
-                                );
+                                Self::send_auth_rejection(h3, &mut client.quic, stream_id);
                             } else {
                                 let connect_udp =
                                     matches!(&pending.request, ConnectRequest::Udp { .. });

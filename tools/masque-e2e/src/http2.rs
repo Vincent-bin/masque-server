@@ -204,18 +204,14 @@ pub(super) fn test_auth_required(server_addr: &str, echo_addr: &str) -> Result<(
             false,
         )?;
         let response = response_with_timeout(response).await?;
-        if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        if response.status() != StatusCode::NOT_FOUND {
             bail!(
-                "expected HTTP/2 CONNECT-UDP status 407, got {}",
+                "expected HTTP/2 CONNECT-UDP status 404, got {}",
                 response.status()
             );
         }
-        if response.headers().get("proxy-authenticate")
-            != Some(&http::HeaderValue::from_static(
-                "Basic realm=\"masque\", charset=\"UTF-8\"",
-            ))
-        {
-            bail!("HTTP/2 407 response has no expected Proxy-Authenticate challenge");
+        if response.headers().get("proxy-authenticate").is_some() {
+            bail!("HTTP/2 authentication rejection advertised Proxy-Authenticate");
         }
         Ok(())
     })

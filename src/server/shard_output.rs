@@ -3,45 +3,14 @@
 use super::*;
 
 impl Shard {
-    /// Send an RFC 7617 Basic proxy-authentication challenge.
-    pub(super) fn send_proxy_auth_required(
-        h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
-        stream_id: u64,
-    ) {
-        let headers = [
-            quiche::h3::Header::new(b":status", b"407"),
-            quiche::h3::Header::new(
-                b"proxy-authenticate",
-                b"Basic realm=\"masque\", charset=\"UTF-8\"",
-            ),
-            quiche::h3::Header::new(b"content-length", b"0"),
-        ];
-
-        if let Err(e) = h3.send_response(quic, stream_id, &headers, true) {
-            warn!(stream_id, %e, "failed to send proxy authentication challenge");
-        }
-    }
-
-    /// Reject a request whose Basic credentials have not been verified.
-    ///
-    /// A stealth listener deliberately emits the same empty 404 as an
-    /// unsupported request. Ordinary listeners retain the challenge or the
-    /// overload status supplied by the caller.
+    /// Reject unverified Basic credentials with the same empty 404 as an
+    /// unsupported request, including when verification is overloaded.
     pub(super) fn send_auth_rejection(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
         stream_id: u64,
-        stealth: bool,
-        fallback_status: u16,
     ) {
-        if stealth {
-            Self::send_error_response(h3, quic, stream_id, 404);
-        } else if fallback_status == 407 {
-            Self::send_proxy_auth_required(h3, quic, stream_id);
-        } else {
-            Self::send_error_response(h3, quic, stream_id, fallback_status);
-        }
+        Self::send_error_response(h3, quic, stream_id, 404);
     }
 
     /// Send an HTTP error response.

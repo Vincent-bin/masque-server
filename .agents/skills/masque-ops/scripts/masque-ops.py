@@ -388,7 +388,7 @@ class BootstrapConfig:
     tls_cert_path: str
     tls_key_path: str
     basic_username: str | None = None
-    basic_stealth: bool = False
+    basic_stealth: bool = True
     basic_password_file: Path | None = None
     basic_client_endpoint: str | None = None
     basic_client_name: str | None = None
@@ -490,6 +490,7 @@ def initialize_inventory(
     proxy_password: str | None = None,
     add_host: bool = False,
     auth_mode: str = "basic",
+    basic_stealth: bool = True,
     transport: str = "http3",
     connect_ip: bool = False,
     cert_listen_port: int = 4443,
@@ -508,6 +509,8 @@ def initialize_inventory(
                 raise OpsError("SSH and proxy hosts must be hostnames or IP addresses")
     require_int(ssh_port, "SSH port", 1, 65535)
     require_int(listen_port, "proxy port", 1, 65535)
+    require_bool(basic_stealth, "Basic stealth mode")
+    basic_stealth = True  # Legacy input; Basic rejection is always an empty 404.
     if auth_mode not in {"basic", "client_cert", "dual"}:
         raise OpsError("authentication must be basic, client_cert or dual")
     if transport not in {"http2", "http3"}:
@@ -568,6 +571,7 @@ def initialize_inventory(
     secret_dir.mkdir(mode=0o700, exist_ok=True)
     password_path = secret_dir / f"bootstrap-{secrets.token_hex(12)}.password"
     client_path = secret_dir / f"client-{secrets.token_hex(12)}.json"
+    basic_username = "user-" + secrets.token_hex(12)
     if auth_mode in {"basic", "dual"}:
         ensure_secret_destination(password_path, "bootstrap password", allow_existing=False)
     if auth_mode in {"client_cert", "dual"}:
@@ -627,7 +631,8 @@ def initialize_inventory(
         *(['tls_mode = "self_signed"', f"tls_name = {q(endpoint_host)}", f"tls_ca_file = {q(ca_cert)}"] if self_signed else []),
     ])
     if auth_mode in {"basic", "dual"}:
-        lines.extend(['basic_username = "masque"', f"basic_password_file = {q(str(password_path))}"])
+        lines.extend([f"basic_username = {q(basic_username)}", f"basic_password_file = {q(str(password_path))}",
+                      f"basic_stealth = {'true' if basic_stealth else 'false'}"])
     if auth_mode in {"client_cert", "dual"}:
         if auth_mode == "dual":
             lines.append(f"cert_listen_port = {cert_listen_port}")
@@ -636,7 +641,7 @@ def initialize_inventory(
     if auth_mode == "client_cert":
         lines.append(f"client_config = {q(str(client_path))}")
     else:
-        lines.extend(['username = "masque"', f"password_file = {q(str(password_path))}"])
+        lines.extend([f"username = {q(basic_username)}", f"password_file = {q(str(password_path))}"])
     if connect_ip:
         lines.append("connect_ip = true")
     if skip_tcp:
@@ -994,6 +999,7 @@ def parse_bootstrap(
     elif "tls_name" in table or "tls_ca_file" in table:
         raise OpsError("bootstrap.tls_name and tls_ca_file require self_signed mode")
 
+    require_bool(table.get("basic_stealth", True), "bootstrap.basic_stealth")
     return BootstrapConfig(
         auth_mode=auth_mode,
         listen_port=listen_port,
@@ -1001,9 +1007,7 @@ def parse_bootstrap(
         tls_cert_path=cert_path,
         tls_key_path=key_path,
         basic_username=basic_username,
-        basic_stealth=require_bool(
-            table.get("basic_stealth", False), "bootstrap.basic_stealth"
-        ),
+        basic_stealth=True,
         basic_password_file=basic_password_file,
         basic_client_endpoint=basic_client_endpoint,
         basic_client_name=basic_client_name,
@@ -1509,7 +1513,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -nodes -days 365 -subj "/CN=masque-server" \
+    -nodes -days 365 -subj "/CN=$MASQUE_CERT_COMMON_NAME" \
     -addext "subjectAltName=$MASQUE_CERT_SAN" \
     -keyout "$MASQUE_KEY_PATH" -out "$MASQUE_CERT_PATH" >/dev/null 2>&1
 chmod 0600 "$MASQUE_KEY_PATH" "$MASQUE_CERT_PATH"
@@ -2278,7 +2282,7 @@ class FleetOperator:
                 {
                     "MASQUE_AUTH_USERNAME": bootstrap.basic_username,
                     "MASQUE_AUTH_PASSWORD": password,
-                    "MASQUE_BASIC_STEALTH": ("1" if bootstrap.basic_stealth else "0"),
+                    "MASQUE_BASIC_STEALTH": "1",  # Also select 404 on older installers.
                 }
             )
             if bootstrap.basic_client_endpoint is not None:
@@ -2423,6 +2427,9 @@ class FleetOperator:
             "MASQUE_CERT_PATH": bootstrap.tls_cert_path,
             "MASQUE_KEY_PATH": bootstrap.tls_key_path,
             "MASQUE_CERT_SAN": san,
+            # CN is limited to 64 characters; hostname/IP verification uses
+            # the complete SAN. Do not advertise a product name in the cert.
+            "MASQUE_CERT_COMMON_NAME": bootstrap.tls_name[:64],
         }
         payload = "\n".join(
             f"export {key}={shlex.quote(value)}" for key, value in values.items()

@@ -175,9 +175,8 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
 
-        /// Hide missing or invalid Basic credentials behind an ordinary 404.
-        /// The client must send authorization on its first CONNECT request.
-        #[arg(long, conflicts_with = "disable_auth")]
+        /// Legacy flag; Basic authentication failures always return 404.
+        #[arg(long, hide = true, conflicts_with = "disable_auth")]
         stealth: bool,
 
         /// Emit a ready-to-import client configuration while the plaintext

@@ -80,9 +80,8 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_VERSION` | Exact published version/tag instead of the latest stable release |
 | `MASQUE_AUTH_MODE` | `basic`, `client_cert`, or `dual` |
 | `MASQUE_TRANSPORT` | `http3` (default) or `http2` for freshly generated listeners |
-| `MASQUE_AUTH_USERNAME` | Basic username; defaults to `masque` |
+| `MASQUE_AUTH_USERNAME` | Basic username; randomly generated when omitted |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
-| `MASQUE_BASIC_STEALTH` | `1` to return an empty 404 instead of a Basic 407 challenge; default `0` |
 | `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables client configuration generation |
 | `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated client configuration |
 | `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret client output path; defaults to `/root/masque-surge.conf` when generation is enabled |

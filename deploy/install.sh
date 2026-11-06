@@ -27,7 +27,6 @@ GRAFANA_DASHBOARD_PATH=$MONITORING_DIR/grafana-dashboard.json
 AUTH_MODE=
 AUTH_USERNAME=
 AUTH_PASSWORD=
-BASIC_STEALTH=false
 GENERATED_PASSWORD=0
 CONFIG_CHANGED=0
 FRESH_CONFIG=0
@@ -336,34 +335,6 @@ choose_auth_mode() {
     AUTH_MODE=$(normalize_auth_mode "$requested_mode")
 }
 
-choose_basic_stealth() {
-    requested=${MASQUE_BASIC_STEALTH:-}
-    if [ -z "$requested" ]; then
-        if can_prompt; then
-            {
-                echo
-                echo "Basic stealth mode returns an ordinary 404 instead of a 407 challenge."
-                echo "Enable it only when clients send credentials on their first CONNECT."
-            } >/dev/tty
-            requested=$(prompt_value "Enable Basic stealth mode? (yes/no)" no)
-        else
-            requested=no
-        fi
-    fi
-
-    case "$requested" in
-        1|true|yes)
-            BASIC_STEALTH=true
-            ;;
-        0|false|no)
-            BASIC_STEALTH=false
-            ;;
-        *)
-            die "MASQUE_BASIC_STEALTH must be 0 or 1"
-            ;;
-    esac
-}
-
 # Report what the deployed configuration actually authenticates with.
 #
 # Taken from `check-config`, which validates and resolves the listeners the same
@@ -390,10 +361,11 @@ detect_existing_auth_mode() {
 generate_auth_credentials() {
     AUTH_USERNAME=${MASQUE_AUTH_USERNAME:-}
     if [ -z "$AUTH_USERNAME" ]; then
+        generated_username="user-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
         if can_prompt; then
-            AUTH_USERNAME=$(prompt_value "Basic authentication username" masque)
+            AUTH_USERNAME=$(prompt_value "Basic authentication username" "$generated_username")
         else
-            AUTH_USERNAME=masque
+            AUTH_USERNAME=$generated_username
         fi
     fi
     case "$AUTH_USERNAME" in
@@ -501,8 +473,11 @@ install_tls_material() {
         esac
         TLS_TEMP_DIR=$(mktemp -d /etc/masque/certs/.self-signed.XXXXXX)
         chmod 0700 "$TLS_TEMP_DIR"
+        # CN has a 64-character ASN.1 limit. Identity verification uses the
+        # complete SAN, including when a long DNS name needs a shorter CN.
+        tls_common_name=$(printf '%.64s' "$PUBLIC_HOST")
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-            -days 365 -subj /CN=masque -addext "subjectAltName=$tls_san" \
+            -days 365 -subj "/CN=$tls_common_name" -addext "subjectAltName=$tls_san" \
             -keyout "$TLS_TEMP_DIR/key.pem" -out "$TLS_TEMP_DIR/cert.pem" >/dev/null 2>&1 ||
             die "could not generate self-signed certificate; check the hostname or IP and OpenSSL version"
         cert_source=$TLS_TEMP_DIR/cert.pem
@@ -542,13 +517,11 @@ render_new_config() {
             sed \
                 -e "s|__MASQUE_AUTH_USERNAME__|$AUTH_USERNAME|" \
                 -e "s|__MASQUE_AUTH_PASSWORD_HASH__|$AUTH_PASSWORD_HASH|" \
-                -e "s|^stealth = false$|stealth = $BASIC_STEALTH|" \
                 "$PACKAGE_DIR/config/masque.toml" >"$CONFIG_TMP"
             ;;
         client_cert)
             sed \
                 -e 's|^mode = "basic"$|mode = "client_cert"|' \
-                -e '/^stealth = false$/d' \
                 -e '/^\[\[listeners\.auth\.users\]\]$/d' \
                 -e '/^username = "__MASQUE_AUTH_USERNAME__"$/d' \
                 -e '/^password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"$/d' \
@@ -988,9 +961,6 @@ install -d -o root -g masque -m 0750 /etc/masque/certs
 
 if [ "$FRESH_CONFIG" -eq 1 ]; then
     choose_auth_mode
-    if mode_uses_basic; then
-        choose_basic_stealth
-    fi
     install_tls_material 1
     if [ -z "$PUBLIC_HOST" ] && can_prompt; then
         PUBLIC_HOST=$(prompt_value "Public hostname or IP for connection summary (optional)" "")
@@ -1049,7 +1019,7 @@ report_fresh_access
 if [ "$PRINT_SECRETS" -eq 1 ] && [ "$CONFIG_CHANGED" -eq 1 ] && mode_uses_basic; then
     echo
     echo "Basic client credentials:"
-    echo "  Stealth mode: $BASIC_STEALTH"
+    echo "  Send credentials on the first CONNECT request; rejected requests return 404."
     echo "  Username: $AUTH_USERNAME"
     if [ "$GENERATED_PASSWORD" -eq 1 ]; then
         echo "  Password: $AUTH_PASSWORD"

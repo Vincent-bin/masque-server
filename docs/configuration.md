@@ -158,7 +158,7 @@ connect, and vice versa. To serve both kinds of client, define two listeners.
 | --- | --- |
 | `enabled` | Master switch. `false` disables authentication whatever `mode` says |
 | `mode` | `basic` (default) or `client_cert` |
-| `stealth` | `basic` only; use an empty `404` instead of a `407` challenge (default `false`) |
+| `stealth` | Legacy field, accepted but ignored; failed Basic authentication always returns an empty `404` |
 | `[[listeners.auth.users]]` | `basic` only; one or more accounts on this socket |
 | `users[].username` | Unique Basic username on this listener |
 | `users[].password_hash` | Argon2id PHC string |
@@ -183,7 +183,6 @@ shards = 1
 enabled = true
 mode = "basic"
 # Compatible clients must send Proxy-Authorization on their first request.
-stealth = true
 
 [[listeners.auth.users]]
 username = "proxy-user"
@@ -202,19 +201,20 @@ printf '%s' 'a-strong-password' | masque-server hash-password
 ```
 
 Clients send `Proxy-Authorization: Basic BASE64(user:password)` on each
-request. By default, missing, malformed, duplicated, or wrong credentials
-receive `407 Proxy Authentication Required`.
+request, including the first CONNECT. Missing, malformed, duplicated, unknown,
+or wrong credentials receive the same empty `404` as an unsupported request,
+without `Proxy-Authenticate`. Authentication capacity failures also use this
+response; metrics retain the internal failure reason.
 
-With `stealth = true`, every such authentication failure instead receives the
-same empty `404` as an unsupported request, with no `Proxy-Authenticate`
-header. The peer must send Basic authorization on its first CONNECT; a peer
-that waits for a 407 challenge must use the default setting. Changing `stealth` requires a restart;
-account changes remain reloadable with `SIGHUP`.
+This applies to both new and existing configurations. The legacy `stealth`
+field remains accepted, but neither `false` nor omission restores a 407
+challenge. Peers that only send credentials after a challenge must be configured
+to send them proactively. Account changes remain reloadable with `SIGHUP`.
 
-This option reduces the application-response fingerprint of an unauthenticated
-probe. It does not hide the listening QUIC/TLS service or imitate a real web
-site, and authentication timing is not deliberately equalized because doing so
-would turn malformed probes into Argon2 work.
+This removes the proxy authentication challenge from unauthenticated responses.
+QUIC/TLS handshakes and traffic patterns remain observable. Authentication timing
+is not deliberately equalized because doing so would turn malformed probes into
+Argon2 work.
 
 The server accepts at most 4,096 accounts on one listener and refuses to start
 if there are no users, usernames are duplicated, a username is empty or
@@ -621,7 +621,6 @@ add-listener options:
       --username <NAME>     Basic username
       --password-hash <PHC>  Argon2id hash, as printed by hash-password
       --password-stdin      Read the password from stdin and hash it here
-      --stealth            Return 404 instead of challenging failed Basic auth
       --emit-client surge   Emit the Basic credential in the selected format
       --client-endpoint <HOST:PORT>  Public endpoint written to that client config
       --client-name <NAME>  Optional proxy name

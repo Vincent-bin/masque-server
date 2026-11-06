@@ -270,7 +270,9 @@ all against a synthetic client that imitates this family. It runs anywhere.
 On Linux the same target also changes the peer IP, verifies migration cannot
 bypass `max_connections_per_ip`, proves long- and short-header CIDs select the
 intended SO_REUSEPORT socket, and confirms migrated connections do not enter
-the userspace cross-shard fallback.
+the userspace cross-shard fallback. Multi-shard tests run on a multi-threaded
+runtime and check that concurrent Initial copies reach one connection owner.
+A raw pre-TLS Retry probe checks encrypted tokens and fresh nonces.
 
 The general E2E client keeps an established CONNECT-UDP stream open while it
 replaces its UDP socket when `MASQUE_MIGRATION_CHECK=1`. Add
@@ -422,7 +424,7 @@ that, and all three were hit while qualifying this feature:
 | Client reports a different public key than enrollment printed | `config.json` and the `[[clients]]` block came from different runs. Re-enroll. |
 | `remote endpoint has a different public key than what we trust in config.json` | `tls.cert_path` changed after enrollment. Re-run enrollment, or pass `--insecure` to skip pinning while testing. |
 | HTTP 404 on the CONNECT | `cf-connect-ip` is missing from `ip_proxy.connect_protocols`, or `ip_proxy.enabled = false`. |
-| HTTP 407 | The server is in `auth.mode = "basic"`; these clients never send credentials. |
+| HTTP 404 on an expected supported endpoint | Verify the authentication mode: certificate-only clients do not send the Basic credentials required by a Basic listener. |
 | HTTP 503 | The dynamic address pool is exhausted, or `max_tunnels_per_connection` is reached. A pinned client is unaffected by pool exhaustion — its address is reserved at startup. |
 | Tunnel comes up, no traffic passes | Host forwarding or NAT is missing, or the TUN device failed to appear — check the server's startup warnings. |
 | In-tunnel traffic works, egress does not | The host's forwarding path, not the server. See [Egress testing needs an uncontended host](#egress-testing-needs-an-uncontended-host). |

@@ -332,7 +332,7 @@ fn adds_a_basic_listener_with_a_password_read_from_stdin() {
 }
 
 #[test]
-fn adds_a_stealth_basic_listener() {
+fn accepts_the_legacy_stealth_flag() {
     let fixture = Fixture::new(false);
     let output = fixture.user_command(
         "add-listener",
@@ -355,7 +355,35 @@ fn adds_a_stealth_basic_listener() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(fixture.config().listeners[1].auth.stealth_enabled());
-    assert!(fixture.text().contains("stealth = true"));
+    assert!(!fixture.text().contains("stealth ="));
+}
+
+#[test]
+fn new_basic_listeners_always_use_404() {
+    for options in [vec![], vec!["--stealth"]] {
+        let fixture = Fixture::new(false);
+        let original_stealth = fixture.config().listeners[0].auth.stealth;
+        let mut args = vec![
+            "--listen-addr",
+            "127.0.0.1:8466",
+            "--mode",
+            "basic",
+            "--username",
+            "phone",
+            "--password-stdin",
+            "--no-bind-check",
+        ];
+        args.extend(options);
+        let output = fixture.user_command("add-listener", &args, Some(b"listener-secret\n"));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = fixture.config();
+        assert!(config.listeners[1].auth.stealth_enabled());
+        assert_eq!(config.listeners[0].auth.stealth, original_stealth);
+    }
 }
 
 #[test]

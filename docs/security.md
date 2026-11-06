@@ -57,16 +57,22 @@ removed without changing every other client. Account edits become active on
 `SIGHUP`; existing tunnels remain, while later CONNECT requests use the new
 snapshot.
 
-A Basic listener may opt into `auth.stealth = true`. Missing, malformed,
-duplicated, unknown, or incorrect credentials then receive the same empty 404
-as an unsupported request instead of a 407 challenge. This removes an obvious
-HTTP authentication fingerprint and also hides authentication-overload status
-from an unauthenticated caller. It is response camouflage, not protocol
-obfuscation: QUIC/TLS handshakes, ALPN, packet sizes, timing, and the open port
-remain observable. The server deliberately keeps cheap malformed and unknown
-user rejection cheap instead of running dummy Argon2 work, so a determined
-observer may still distinguish timing classes. Clients must send credentials
-proactively; challenge-driven clients need the default `stealth = false`.
+Basic authentication failures always return the same empty 404 as an unsupported
+request. This covers missing, malformed, duplicated, unknown, or incorrect
+credentials and authentication capacity failures. No proxy authentication
+challenge is sent. Clients must send credentials proactively on their first
+CONNECT request; challenge-only clients need to change that behavior.
+
+Old configurations remain parseable, including `auth.stealth = false`, but this
+legacy field no longer changes the response. Internal metrics still distinguish
+authentication rejection and overload. The server keeps malformed and unknown
+user rejection cheap rather than running dummy Argon2 work, so timing classes
+remain observable. This policy does not hide QUIC/TLS handshakes, ALPN, packet
+sizes, timing, or the listening port.
+
+New installers and generated inventories choose a random username to avoid a
+guessable, shared product-name account. Existing or explicitly chosen usernames
+are preserved.
 
 With a listener's `auth.mode = "client_cert"` the cost profile is different: identity is
 established once during the handshake, by public key, so there is no per-request
@@ -117,12 +123,16 @@ limits, and monitoring for memory, CPU, file descriptors, authentication
 failures, connections, and datagram drops.
 
 HTTP/2 and HTTP/3 share a process-wide live-connection cap per canonical source
-IP. HTTP/3 additionally uses authenticated QUIC Retry tokens adaptively: once a
-shard reaches the configured threshold, a new source must prove it can receive
+IP. HTTP/3 additionally uses encrypted and authenticated QUIC Retry tokens
+adaptively: once a shard reaches the configured threshold, a new source must prove it can receive
 at its claimed address before the server allocates connection state. The token
 binds the source IP and listener but not the source port, so normal NAT remaps
 do not break it. Use `retry_mode = "always"` where spoofed floods are a primary
-risk; it costs one extra handshake round trip.
+risk; it costs one extra handshake round trip. AES-256-GCM protects the version,
+timestamp, address binding, and original CID under a process-local random key.
+A fresh random nonce protects tokens with identical contents; no extra padding
+or length randomization is added. Token length depends on the encoded fields;
+invalid, oversized, expired, or modified tokens are rejected before admission.
 
 An established HTTP/3 connection may move to a new peer IP or UDP port. quiche
 does not report the migration until PATH_CHALLENGE/PATH_RESPONSE proves return
@@ -135,6 +145,18 @@ Multi-shard Linux listeners reserve one of the 16 CID bytes for kernel socket
 selection; the other 15 bytes remain keyed or randomly generated, retaining
 120 bits of unpredictability. Failure to attach the selector changes only
 performance: the bounded userspace ownership map still routes valid packets.
+Connection migration and routable CIDs are ordinary QUIC mechanisms, not
+MASQUE-specific protocol markers. This CID layout is observable, but does not
+by itself identify MASQUE. The server retains CID steering without adding a
+custom wire encoding or padding solely to conceal it.
+
+Self-signed certificate generators use the requested hostname or IP as the
+subject and SAN, without a product label. Existing certificates are never
+silently replaced: changing one requires updating any client certificate pins.
+These measures remove explicit implementation identifiers, not all traffic
+fingerprints. TLS/QUIC versions and parameters, HTTP extended-CONNECT and
+datagram SETTINGS, an empty-404-only endpoint, and traffic patterns can still
+help classify the service. Required protocol capabilities remain advertised.
 
 The optional operational endpoint has no authentication and therefore accepts
 only loopback addresses. It must stay host-local: use a local collector or a

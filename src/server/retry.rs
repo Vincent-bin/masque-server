@@ -1,4 +1,4 @@
-//! Authenticated QUIC Retry tokens.
+//! Opaque, authenticated QUIC Retry tokens.
 //!
 //! Tokens are intentionally process-local: a fresh key on restart invalidates
 //! outstanding tokens, which live for only a few seconds and carry no session
@@ -8,26 +8,34 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
-use ring::hmac;
+use ring::{aead, error::Unspecified, rand::SecureRandom};
 
 use crate::config::QuicRetryMode;
 
 const TOKEN_VERSION: u8 = 1;
-const TAG_LEN: usize = 32;
+const NONCE_LEN: usize = aead::NONCE_LEN;
+const TAG_LEN: usize = 16;
+// Bound the encoded version, timestamp, source IP, listener IP/port/scope,
+// and length-prefixed original CID. Encrypt the fields without extra padding.
+const MIN_BODY_LEN: usize = 1 + 8 + (1 + 4) + (1 + 4 + 2 + 4) + 1 + 1;
+const MAX_BODY_LEN: usize = 1 + 8 + (1 + 16) + (1 + 16 + 2 + 4) + 1 + quiche::MAX_CONN_ID_LEN;
+const MIN_TOKEN_LEN: usize = NONCE_LEN + MIN_BODY_LEN + TAG_LEN;
+const MAX_TOKEN_LEN: usize = NONCE_LEN + MAX_BODY_LEN + TAG_LEN;
+const TOKEN_CONTEXT: &[u8] = b"quic retry address validation";
 
 pub(super) struct RetryTokenCodec {
-    key: hmac::Key,
+    key: aead::LessSafeKey,
     epoch: Instant,
     ttl: Duration,
 }
 
 impl RetryTokenCodec {
-    pub(super) fn new(key: hmac::Key, ttl: Duration) -> Self {
-        Self {
-            key,
+    pub(super) fn new(key: &[u8], ttl: Duration) -> Result<Self, Unspecified> {
+        Ok(Self {
+            key: aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_256_GCM, key)?),
             epoch: Instant::now(),
             ttl,
-        }
+        })
     }
 
     pub(super) fn mint(
@@ -35,17 +43,28 @@ impl RetryTokenCodec {
         source: SocketAddr,
         local: SocketAddr,
         original_dcid: &quiche::ConnectionId<'_>,
-    ) -> Vec<u8> {
-        let mut token = Vec::with_capacity(112);
-        token.push(TOKEN_VERSION);
-        token.extend_from_slice(&self.epoch.elapsed().as_secs().to_be_bytes());
-        encode_ip(canonical_ip(source.ip()), &mut token);
-        encode_socket(canonical_socket(local), &mut token);
-        token.push(original_dcid.len() as u8);
-        token.extend_from_slice(original_dcid);
-        let tag = hmac::sign(&self.key, &token);
-        token.extend_from_slice(tag.as_ref());
-        token
+    ) -> Result<Vec<u8>, Unspecified> {
+        if !(1..=quiche::MAX_CONN_ID_LEN).contains(&original_dcid.len()) {
+            return Err(Unspecified);
+        }
+        let mut nonce = [0; NONCE_LEN];
+        ring::rand::SystemRandom::new().fill(&mut nonce)?;
+        let mut body = Vec::with_capacity(MAX_BODY_LEN + TAG_LEN);
+        body.push(TOKEN_VERSION);
+        body.extend_from_slice(&self.epoch.elapsed().as_secs().to_be_bytes());
+        encode_ip(canonical_ip(source.ip()), &mut body);
+        encode_socket(canonical_socket(local), &mut body);
+        body.push(original_dcid.len() as u8);
+        body.extend_from_slice(original_dcid);
+        self.key.seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(TOKEN_CONTEXT),
+            &mut body,
+        )?;
+        let mut token = Vec::with_capacity(NONCE_LEN + body.len());
+        token.extend_from_slice(&nonce);
+        token.extend_from_slice(&body);
+        Ok(token)
     }
 
     pub(super) fn validate(
@@ -64,11 +83,21 @@ impl RetryTokenCodec {
         token: &[u8],
         now: u64,
     ) -> Option<quiche::ConnectionId<'static>> {
-        if token.len() <= TAG_LEN {
+        // Bound unauthenticated allocation and decryption before inspecting
+        // any fields. No version, timestamp, address, or CID is sent in clear.
+        if !(MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&token.len()) {
             return None;
         }
-        let (body, tag) = token.split_at(token.len() - TAG_LEN);
-        hmac::verify(&self.key, body, tag).ok()?;
+        let nonce: [u8; NONCE_LEN] = token[..NONCE_LEN].try_into().ok()?;
+        let mut ciphertext = token[NONCE_LEN..].to_vec();
+        let body = self
+            .key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(TOKEN_CONTEXT),
+                &mut ciphertext,
+            )
+            .ok()?;
 
         let mut cursor = 0usize;
         if *take(body, &mut cursor, 1)?.first()? != TOKEN_VERSION {
@@ -192,7 +221,7 @@ mod tests {
     use super::*;
 
     fn codec(ttl: Duration) -> RetryTokenCodec {
-        RetryTokenCodec::new(hmac::Key::new(hmac::HMAC_SHA256, &[0x42; 32]), ttl)
+        RetryTokenCodec::new(&[0x42; 32], ttl).unwrap()
     }
 
     #[test]
@@ -201,7 +230,7 @@ mod tests {
         let source = "192.0.2.10:12345".parse().unwrap();
         let local = "[2001:db8::1]:443".parse().unwrap();
         let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
-        let token = codec.mint(source, local, &odcid);
+        let token = codec.mint(source, local, &odcid).unwrap();
         assert_eq!(codec.validate(source, local, &token).unwrap(), odcid);
     }
 
@@ -211,7 +240,7 @@ mod tests {
         let source = "192.0.2.10:12345".parse().unwrap();
         let local = "192.0.2.20:443".parse().unwrap();
         let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
-        let token = codec.mint(source, local, &odcid);
+        let token = codec.mint(source, local, &odcid).unwrap();
 
         assert!(
             codec
@@ -231,7 +260,7 @@ mod tests {
         let source = "192.0.2.10:12345".parse().unwrap();
         let local = "192.0.2.20:443".parse().unwrap();
         let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
-        let mut token = codec.mint(source, local, &odcid);
+        let mut token = codec.mint(source, local, &odcid).unwrap();
         assert!(
             codec
                 .validate(source, "192.0.2.20:8443".parse().unwrap(), &token)
@@ -248,7 +277,7 @@ mod tests {
         let local = "[fe80::1%2]:443".parse().unwrap();
         let other_scope = "[fe80::1%3]:443".parse().unwrap();
         let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
-        let token = codec.mint(source, local, &odcid);
+        let token = codec.mint(source, local, &odcid).unwrap();
 
         assert!(codec.validate(source, local, &token).is_some());
         assert!(codec.validate(source, other_scope, &token).is_none());
@@ -260,10 +289,111 @@ mod tests {
         let source = "192.0.2.10:12345".parse().unwrap();
         let local = "192.0.2.20:443".parse().unwrap();
         let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
-        let token = codec.mint(source, local, &odcid);
+        let token = codec.mint(source, local, &odcid).unwrap();
 
         assert!(codec.validate_at(source, local, &token, 30).is_some());
         assert!(codec.validate_at(source, local, &token, 31).is_none());
+    }
+
+    #[test]
+    fn tokens_encrypt_bindings_with_fresh_nonces() {
+        let codec = codec(Duration::from_secs(30));
+        let source = "[2001:db8::1234]:23456".parse().unwrap();
+        let local = "[2001:db8::5678]:443".parse().unwrap();
+        let odcid = quiche::ConnectionId::from_ref(b"public-cid-sentinel!");
+        let mut nonces = std::collections::HashSet::new();
+        let mut lengths = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let token = codec.mint(source, local, &odcid).unwrap();
+            assert!((MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&token.len()));
+            assert!(nonces.insert(token[..NONCE_LEN].to_vec()));
+            lengths.insert(token.len());
+            assert!(
+                !token
+                    .windows(odcid.len())
+                    .any(|value| value == odcid.as_ref())
+            );
+            assert_eq!(codec.validate(source, local, &token).unwrap(), odcid);
+        }
+        assert_eq!(lengths.len(), 1, "token size follows its encoded fields");
+    }
+
+    #[test]
+    fn token_bounds_cover_address_families_and_cid_lengths() {
+        let codec = codec(Duration::from_secs(30));
+        let sources = ["192.0.2.10:12345", "[2001:db8::10]:12345"];
+        let listeners = ["192.0.2.20:443", "[2001:db8::20]:443"];
+        let mut shortest = usize::MAX;
+        let mut longest = 0;
+        for source in sources {
+            for local in listeners {
+                for len in 1..=quiche::MAX_CONN_ID_LEN {
+                    let source = source.parse().unwrap();
+                    let local = local.parse().unwrap();
+                    let odcid = quiche::ConnectionId::from_vec(vec![0x42; len]);
+                    let token = codec.mint(source, local, &odcid).unwrap();
+                    assert_eq!(codec.validate(source, local, &token).unwrap(), odcid);
+                    shortest = shortest.min(token.len());
+                    longest = longest.max(token.len());
+                }
+            }
+        }
+        assert_eq!(shortest, MIN_TOKEN_LEN);
+        assert_eq!(longest, MAX_TOKEN_LEN);
+    }
+
+    #[test]
+    fn tampering_truncation_append_and_wrong_key_are_rejected() {
+        let codec = codec(Duration::from_secs(30));
+        let source = "192.0.2.10:12345".parse().unwrap();
+        let local = "192.0.2.20:443".parse().unwrap();
+        let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
+        let token = codec.mint(source, local, &odcid).unwrap();
+        for index in 0..token.len() {
+            let mut changed = token.clone();
+            changed[index] ^= 1;
+            assert!(codec.validate(source, local, &changed).is_none());
+            assert!(codec.validate(source, local, &token[..index]).is_none());
+        }
+        let mut appended = token.clone();
+        appended.push(0);
+        assert!(codec.validate(source, local, &appended).is_none());
+        let other = RetryTokenCodec::new(&[0x24; 32], Duration::from_secs(30)).unwrap();
+        assert!(other.validate(source, local, &token).is_none());
+        assert!(
+            codec
+                .validate(source, local, &[0; MAX_TOKEN_LEN + 1])
+                .is_none()
+        );
+        assert!(
+            codec
+                .mint(source, local, &quiche::ConnectionId::from_ref(b""))
+                .is_err()
+        );
+        assert!(
+            codec
+                .mint(source, local, &quiche::ConnectionId::from_ref(&[0; 21]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn encrypted_tokens_keep_ipv4_mapped_address_equivalence() {
+        let codec = codec(Duration::from_secs(30));
+        let source = "[::ffff:192.0.2.10]:12345".parse().unwrap();
+        let local = "[::ffff:192.0.2.20]:443".parse().unwrap();
+        let odcid = quiche::ConnectionId::from_ref(b"original-dcid");
+        let token = codec.mint(source, local, &odcid).unwrap();
+        assert_eq!(
+            codec
+                .validate(
+                    "192.0.2.10:54321".parse().unwrap(),
+                    "192.0.2.20:443".parse().unwrap(),
+                    &token
+                )
+                .unwrap(),
+            odcid
+        );
     }
 
     #[test]

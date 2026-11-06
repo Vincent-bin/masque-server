@@ -72,7 +72,7 @@ pub struct AddListener {
     pub client_output: Option<BasicClientOutput>,
     /// Write `enabled = false`, for a listener on a trusted network.
     pub disable_auth: bool,
-    /// Hide failed Basic authentication behind an ordinary 404 response.
+    /// Legacy flag; Basic authentication failures always return 404.
     pub stealth: bool,
     /// Do not try to bind the new address before writing it.
     pub no_bind_check: bool,
@@ -245,7 +245,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
                 AuthSection {
                     enabled: true,
                     mode,
-                    stealth: request.stealth,
+                    stealth: false,
                     username: String::new(),
                     password_hash: String::new(),
                     users: vec![BasicUser {
@@ -932,9 +932,6 @@ pub fn listener_toml_block(listener: &ListenerSection) -> String {
     match listener.auth.mode {
         AuthMode::Basic => {
             block.push_str("mode = \"basic\"\n");
-            if listener.auth.stealth {
-                block.push_str("stealth = true\n");
-            }
             for (username, password_hash) in effective_basic_users(&listener.auth) {
                 block.push_str("\n[[listeners.auth.users]]\n");
                 block.push_str(&format!("username = {}\n", toml_string(username)));

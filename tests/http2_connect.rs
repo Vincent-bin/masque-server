@@ -447,11 +447,8 @@ async fn basic_auth_challenges_missing_credentials_and_accepts_valid_credentials
         .send_request(connect_request(target_addr), true)
         .unwrap();
     let response = response.await.unwrap();
-    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-    assert_eq!(
-        response.headers()["proxy-authenticate"],
-        "Basic realm=\"masque\", charset=\"UTF-8\""
-    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.headers().get("proxy-authenticate").is_none());
 
     client = client.ready().await.unwrap();
     let mut request = connect_request(target_addr);
@@ -507,7 +504,7 @@ async fn basic_auth_challenges_missing_credentials_and_accepts_valid_credentials
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stealth_basic_auth_uses_404_and_accepts_proactive_credentials() {
+async fn basic_auth_rejections_match_unknown_paths_and_accept_proactive_credentials() {
     let files = TestFiles::new();
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
@@ -521,7 +518,7 @@ async fn stealth_basic_auth_uses_404_and_accepts_proactive_credentials() {
     let mut config = http2_config(&files);
     config.listeners[0].auth.enabled = true;
     config.listeners[0].auth.mode = AuthMode::Basic;
-    config.listeners[0].auth.stealth = true;
+    config.listeners[0].auth.stealth = false; // Legacy input cannot restore a challenge.
     config.listeners[0].auth.users = vec![BasicUser {
         username: "alice".into(),
         password_hash: masque::auth::hash_password(b"alice-secret").unwrap(),
@@ -535,21 +532,50 @@ async fn stealth_basic_auth_uses_404_and_accepts_proactive_credentials() {
     let response = response.await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(response.headers().get("proxy-authenticate").is_none());
+    assert!(response.headers().get("server").is_none());
+    assert!(response.headers().get("proxy-status").is_none());
+
+    let rejection_headers = response.headers().clone();
+    assert!(response.into_body().data().await.is_none());
 
     client = client.ready().await.unwrap();
-    let mut request = connect_request(target_addr);
-    request.headers_mut().insert(
-        "proxy-authorization",
-        format!("Basic {}", STANDARD.encode("alice:wrong"))
-            .parse()
-            .unwrap(),
-    );
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{server_addr}/not-found"))
+        .body(())
+        .unwrap();
     let (response, _) = client.send_request(request, true).unwrap();
     let response = response.await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert!(response.headers().get("proxy-authenticate").is_none());
+    assert_eq!(response.headers(), &rejection_headers);
+    assert!(response.into_body().data().await.is_none());
 
-    client = client.ready().await.unwrap();
+    let wrong = format!("Basic {}", STANDARD.encode("alice:wrong"));
+    let unknown = format!("Basic {}", STANDARD.encode("unknown:secret"));
+    let valid = format!("Basic {}", STANDARD.encode("alice:alice-secret"));
+    for values in [
+        vec![wrong.as_str()],
+        vec![unknown.as_str()],
+        vec!["invalid"],
+        vec![valid.as_str(), valid.as_str()],
+    ] {
+        client = client.ready().await.unwrap();
+        let mut request = connect_request(target_addr);
+        for value in values {
+            request
+                .headers_mut()
+                .append("proxy-authorization", value.parse().unwrap());
+        }
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers(), &rejection_headers);
+        assert!(response.into_body().data().await.is_none());
+    }
+
+    drop(client);
+    driver.abort();
+    let (mut client, driver) = connect_h2(server_addr).await;
     let mut request = connect_request(target_addr);
     request.headers_mut().insert(
         "proxy-authorization",
@@ -984,9 +1010,7 @@ async fn basic_users_reload_on_an_established_http2_connection() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if basic_connect_status(&client, "alice", "old-secret").await
-            == StatusCode::PROXY_AUTHENTICATION_REQUIRED
-        {
+        if basic_connect_status(&client, "alice", "old-secret").await == StatusCode::NOT_FOUND {
             break;
         }
         assert!(

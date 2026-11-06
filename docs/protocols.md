@@ -28,20 +28,18 @@ Proxy-Authorization: Basic BASE64(username:password)
 
 The server validates syntax, looks up the username in that listener's account
 set, and snapshots only the matching Argon2id hash before scheduling password
-verification. Missing or invalid credentials normally return:
+verification. Missing, malformed, duplicated, or invalid credentials return the
+same empty response as an unsupported request:
 
 ```text
-:status: 407
-proxy-authenticate: Basic realm="masque", charset="UTF-8"
+:status: 404
+content-length: 0
 ```
 
-Authentication is per request, so one authenticated tunnel does not authorize
-later streams that omit the header.
-
-When that listener sets `auth.stealth = true`, the failure response is instead
-an empty `404` without `proxy-authenticate`. Correct credentials must therefore
-arrive on the first CONNECT request. This changes only the unauthenticated
-response, not successful proxy protocol behavior.
+The server does not send `Proxy-Authenticate`. Correct credentials must arrive
+on the first CONNECT request. Authentication is per request, so one authorized
+tunnel does not authorize later streams that omit the header. The legacy
+`auth.stealth` field cannot re-enable a proxy authentication challenge.
 
 With a listener's `auth.mode = "client_cert"` there is no per-request step: the client is
 identified once, from its TLS client certificate, during the TLS handshake. An
@@ -112,8 +110,8 @@ IPv6 colons, and decimal protocol numbers from 0 through 255. Malformed scopes
 are rejected with `400`; valid non-wildcard scopes are rejected with `501`
 because the forwarding path does not yet enforce per-request scope. Neither
 failure allocates addresses or installs routes. Failure responses remain empty;
-unauthenticated requests still use the listener's existing `407` or stealth
-`404` response, without exposing URI validation results.
+unauthenticated requests receive an empty `404`, without exposing URI validation
+results.
 
 The configured `cf-connect-ip` compatibility dialect retains its deployed URI
 behavior. See [URI template configuration](configuration.md#connect-ip) for the
@@ -169,8 +167,7 @@ head-of-line block unrelated IP packets after loss.
 | `200` | Tunnel established |
 | `400` | Malformed headers, authority, URI, datagram, or capsule |
 | `403` | Target rejected by policy or proxy type disabled |
-| `404` | Unsupported CONNECT endpoint, or failed Basic authentication with `auth.stealth = true` |
-| `407` | Proxy credentials missing or invalid on a default Basic listener |
+| `404` | Unsupported request, or missing, invalid, or unverified Basic credentials |
 | `429` / `503` | Per-connection or global setup capacity exhausted |
 | `501` | Valid CONNECT-IP target or protocol scope is not implemented |
 | `502` | DNS, target socket, or upstream TCP setup failed |
