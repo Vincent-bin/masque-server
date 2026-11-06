@@ -7,6 +7,33 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.9 - 2026-11-06
+
+### Fixed
+
+- Reject malformed global TCP and UDP target CIDRs during configuration
+  validation and before startup, including rules for disabled proxies. Invalid
+  allow or deny entries are no longer silently ignored; correct them before
+  upgrading.
+
+### Added
+
+- Expose `/readyz/connect-ip` and CONNECT-IP enabled, available, and ready
+  metrics. They describe startup capability and process readiness, not runtime
+  TUN I/O, host forwarding, firewall rules, or external reachability.
+- Add `ip_proxy.require_tun` to stop startup when an enabled IP proxy cannot
+  create its TUN device. It defaults to `false`, preserving best-effort startup
+  and independent TCP/UDP operation.
+
+### Changed
+
+- Normalize benchmark CPU use by completed payload bytes and UDP responses,
+  with guards for incomplete samples, workload changes, and control drift.
+- Extend HTTP/3 load testing to bounded multi-stream workloads with a shared
+  per-connection window and rate, plus measurement-phase markers. Document the
+  scheduling measurements and their limits; these changes do not establish a
+  production throughput improvement.
+
 ## 0.14.8 - 2026-11-06
 
 ### Fixed
