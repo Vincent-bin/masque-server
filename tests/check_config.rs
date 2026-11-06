@@ -141,6 +141,29 @@ fn packaged_config_uses_the_current_listener_schema() {
 }
 
 #[test]
+fn legacy_stealth_flag_does_not_enable_authentication() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let text = config_text(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert_path,
+        &key_path,
+        "bbr2",
+    );
+    for transport in [
+        masque::config::ListenerTransport::Http2,
+        masque::config::ListenerTransport::Http3,
+    ] {
+        let mut config = masque::config::parse_toml(&text).unwrap();
+        config.listeners[0].transport = transport;
+        config.listeners[0].auth.stealth = true;
+        masque::server::validate_config(&config).unwrap();
+        assert!(!config.listeners[0].auth.basic_enabled());
+        assert!(!config.listeners[0].auth.stealth_enabled());
+    }
+}
+
+#[test]
 fn check_config_validates_without_binding_the_listen_port() {
     let dir = TempDir::new();
     let (cert_path, key_path) = write_server_identity(dir.path());

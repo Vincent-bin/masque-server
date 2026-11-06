@@ -2371,15 +2371,6 @@ mod tests {
         assert!(super::active_client_registry(&config, true).is_err());
     }
 
-    #[test]
-    fn legacy_stealth_flag_does_not_enable_authentication() {
-        let mut config = ServerConfig::default();
-        config.listeners[0].auth.enabled = false;
-        config.listeners[0].auth.stealth = true;
-        assert!(super::validate_server_config(&config).is_ok());
-        assert!(!config.listeners[0].auth.stealth_enabled());
-    }
-
     /// The roster belongs to the server, so one certificate listener among
     /// several is enough to make it load — and to keep reload available.
     #[test]
