@@ -42,6 +42,10 @@ use masque::server::Server;
 #[path = "client_cert_connect_ip/ip_uri.rs"]
 mod ip_uri;
 
+#[cfg(target_os = "linux")]
+#[path = "client_cert_connect_ip/ip_fragments.rs"]
+mod ip_fragments;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CLIENT_IPV4: &str = "10.89.0.2";
 const CLIENT_IPV6: &str = "fd00:abcd::2";

@@ -73,8 +73,9 @@ pub fn dst_addr(packet: &[u8]) -> Result<IpAddr, ParseError> {
 
 /// A destination ACL must not be bypassed by a later source-routing hop.
 /// Reject IPv4 source-route options and IPv6 routing headers, including those
-/// after extension/fragment headers. Ordinary transport packets take a short
-/// fixed path; extension traversal is bounded by the packet length.
+/// after extension headers in initial/atomic fragments. Noninitial fragment
+/// payload is opaque. Ordinary transport packets take a short fixed path;
+/// extension traversal is bounded by the packet length.
 pub(crate) fn has_safe_routing(packet: &[u8]) -> bool {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => {
@@ -116,6 +117,15 @@ pub(crate) fn has_safe_routing(packet: &[u8]) -> bool {
                 let Some(header) = packet.get(offset..).filter(|header| header.len() >= 8) else {
                     return false;
                 };
+                if next == 44 && u16::from_be_bytes([header[2], header[3]]) & 0xfff8 != 0 {
+                    // RFC 8200 section 4.5: only offset zero contains the
+                    // post-fragment header chain. Later fragments contain
+                    // opaque data, and their Next Header is not used for
+                    // reassembly. Every fragment's preceding headers have
+                    // already been checked; the mandatory first fragment
+                    // must pass the full chain check before reaching TUN.
+                    return true;
+                }
                 let length = match next {
                     44 => 8,
                     51 => (usize::from(header[1]) + 2) * 4,
@@ -466,6 +476,84 @@ mod tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    fn ipv6_fragment(next: u8, offset_and_flags: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        packet[6] = 44;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        packet[24..40].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+        packet[40] = next;
+        packet[42..44].copy_from_slice(&offset_and_flags.to_be_bytes());
+        packet[44..48].copy_from_slice(&123u32.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn ipv6_fragmented_destination_options_accept_all_fragments() {
+        // Fragment -> Destination Options -> UDP. Only the first fragment
+        // contains the options and UDP headers; the later fragments are data.
+        let mut first_payload = vec![17, 0, 0, 0, 0, 0, 0, 0];
+        first_payload.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0, 27, 0, 1]);
+        first_payload.extend_from_slice(&[0xab; 8]);
+        let fragments = [
+            ipv6_fragment(60, 1, &first_payload),
+            ipv6_fragment(60, 24 | 1, &[43, 255, 0, 0, 0, 0, 0, 0]),
+            ipv6_fragment(60, 32, &[0xab; 3]),
+        ];
+        for (index, fragment) in fragments.iter().enumerate() {
+            assert!(has_safe_routing(fragment), "fragment {index} was rejected");
+        }
+    }
+
+    #[test]
+    fn ipv6_noninitial_fragment_payload_is_opaque() {
+        // RFC 8200 section 4.5 uses only offset zero's Next Header value for
+        // reassembly. Later fragments may even carry a different value.
+        for next in [0, 17, 43, 44, 51, 60] {
+            for offset_and_flags in [8, 9, 0xfff8, 0xfff9] {
+                for payload in [&[43, 255, 0, 0, 0, 0, 0, 0][..], &[0xab; 3][..]] {
+                    assert!(has_safe_routing(&ipv6_fragment(
+                        next,
+                        offset_and_flags,
+                        payload
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_initial_and_atomic_fragments_still_reject_routing_headers() {
+        for flags in [0, 1] {
+            assert!(!has_safe_routing(&ipv6_fragment(43, flags, &[0; 8])));
+            for next in [0, 51, 60] {
+                let mut extension = vec![0; 16];
+                extension[0] = 43;
+                assert!(!has_safe_routing(&ipv6_fragment(next, flags, &extension)));
+                extension[0] = 17;
+                assert!(has_safe_routing(&ipv6_fragment(next, flags, &extension)));
+                assert!(!has_safe_routing(&ipv6_fragment(next, flags, &[17; 7])));
+            }
+        }
+        // Per-fragment headers must still be checked on every fragment.
+        let mut packet = ipv6_fragment(17, 8, &[0; 8]);
+        packet[6] = 60;
+        packet.splice(40..40, [43, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(!has_safe_routing(&packet));
+    }
+
+    #[test]
+    fn ipv6_truncated_fragment_headers_are_rejected() {
+        let packet = ipv6_fragment(17, 8, &[]);
+        for length in 40..48 {
+            assert!(!has_safe_routing(&packet[..length]));
+        }
+    }
+
     #[test]
     fn source_routes_cannot_hide_the_final_destination() {
         let mut v4 = vec![0; 28];

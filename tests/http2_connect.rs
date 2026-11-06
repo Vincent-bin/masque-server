@@ -30,6 +30,10 @@ use masque::server::Server;
 #[path = "http2_connect/ip_uri.rs"]
 mod ip_uri;
 
+#[cfg(target_os = "linux")]
+#[path = "http2_connect/ip_fragments.rs"]
+mod ip_fragments;
+
 #[path = "http2_connect/timeouts.rs"]
 mod timeouts;
 

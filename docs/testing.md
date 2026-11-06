@@ -113,6 +113,21 @@ certificates. It tests real H2/H3 IPv4/IPv6 round trips, default private denies,
 explicit private access and policy independence, without changing host routes.
 It does not replace Docker packaging checks.
 
+For IPv6 fragmentation regressions, place the compiled Linux integration test
+executables under the names `http2_connect` and `client_cert_connect_ip` in
+`MASQUE_TEST_BIN_DIR`, then run:
+
+```sh
+sudo MASQUE_TEST_BIN_DIR=/absolute/path/to/test-executables tests/connect-ip-fragments.sh
+```
+
+Each suite runs in a fresh network namespace with TUN offload enabled and
+disabled. The tests send out-of-order IPv6 fragments with Destination Options
+after the Fragment header, then verify the exact UDP payload at the target
+after kernel reassembly. They cover HTTP/2 capsules, HTTP/3 capsules, and
+HTTP/3 native DATAGRAMs. These privileged tests are explicitly ignored by
+ordinary workspace test runs.
+
 The Docker script creates development certificates, builds the server and E2E client,
 starts an echo target, grants the server container `NET_ADMIN` and TUN access,
 runs the suite, and removes the Compose network and volumes.
