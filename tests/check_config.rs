@@ -124,14 +124,20 @@ fn packaged_config_uses_the_current_listener_schema() {
     assert_eq!(config.listeners.len(), 1);
     assert_eq!(config.listeners[0].listen_addr.to_string(), "0.0.0.0:443");
     assert!(config.listeners[0].auth.basic_enabled());
-    assert!(!config.listeners[0].auth.stealth_enabled());
+    assert!(config.listeners[0].auth.stealth_enabled());
     assert_eq!(config.listeners[0].auth.users.len(), 1);
     assert!(config.listeners[0].auth.username.is_empty());
     assert!(config.listeners[0].auth.password_hash.is_empty());
 
-    let stealth = text.replacen("stealth = false", "stealth = true", 1);
-    let config = masque::config::parse_toml(&stealth).unwrap();
-    assert!(config.listeners[0].auth.stealth_enabled());
+    for legacy_value in ["true", "false"] {
+        let legacy = text.replacen(
+            "[listeners.auth]",
+            &format!("[listeners.auth]\nstealth = {legacy_value}"),
+            1,
+        );
+        let config = masque::config::parse_toml(&legacy).unwrap();
+        assert!(config.listeners[0].auth.stealth_enabled());
+    }
 }
 
 #[test]

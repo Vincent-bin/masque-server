@@ -133,7 +133,7 @@ can require TUN creation at startup with `ip_proxy.require_tun = true`.
 | `src/server/http2/support.rs` | Shared H2 flow-control, activity, and metrics lifecycle helpers |
 | `src/server/request.rs` | CONNECT classification, auth precheck, and authorized dispatch |
 | `src/server/authentication.rs` | Bounded Argon2 scheduling, cancellation, and request resumption |
-| `src/server/retry.rs` | Authenticated QUIC Retry token encoding and admission policy |
+| `src/server/retry.rs` | Encrypted, authenticated QUIC Retry tokens and admission policy |
 | `src/admission.rs` | Process-wide per-source connection and authentication guards |
 | `src/connection.rs` | Per-client QUIC/H3 state and deferred sends |
 | `src/metrics.rs` | Low-cardinality atomic counters and Prometheus rendering |

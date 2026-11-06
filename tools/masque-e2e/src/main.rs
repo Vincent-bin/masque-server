@@ -2050,14 +2050,14 @@ fn test_standard_connect_auth_required(server_addr: &str, echo_addr: &str) -> Re
     let headers = connect_tcp_headers_without_auth(echo_addr);
     client.send_request(&headers, false)?;
     let (_, status, response_headers) = client.poll_response_headers(Duration::from_secs(5))?;
-    if status != 407 {
-        bail!("expected 407 for unauthenticated standard CONNECT, got {status}");
+    if status != 404 {
+        bail!("expected 404 for unauthenticated standard CONNECT, got {status}");
     }
-    if !response_headers
+    if response_headers
         .iter()
         .any(|header| header.name() == b"proxy-authenticate")
     {
-        bail!("standard CONNECT 407 missing Proxy-Authenticate");
+        bail!("unauthenticated standard CONNECT advertised Proxy-Authenticate");
     }
     Ok(())
 }
@@ -2129,22 +2129,18 @@ fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
     client.send_request(&headers, false)?;
 
     let (_, status, response_headers) = client.poll_response_headers(Duration::from_secs(5))?;
-    if status != 407 {
-        bail!("expected 407, got {status}");
+    if status != 404 {
+        bail!("expected 404, got {status}");
     }
 
-    let challenge = response_headers
+    if response_headers
         .iter()
-        .find(|header| header.name() == b"proxy-authenticate")
-        .context("407 response missing Proxy-Authenticate")?;
-    if challenge.value() != b"Basic realm=\"masque\", charset=\"UTF-8\"" {
-        bail!(
-            "unexpected Proxy-Authenticate challenge: {}",
-            String::from_utf8_lossy(challenge.value())
-        );
+        .any(|header| header.name() == b"proxy-authenticate")
+    {
+        bail!("unauthenticated CONNECT-UDP advertised Proxy-Authenticate");
     }
 
-    info!("unauthenticated CONNECT-UDP correctly rejected with 407");
+    info!("unauthenticated CONNECT-UDP correctly rejected with 404");
     Ok(())
 }
 

@@ -537,7 +537,7 @@ mod tests {
             assert!(!json.contains(secret), "bundle leaked {secret}");
         }
         assert!(json.contains("\"basic_user_count\": 1"));
-        assert!(json.contains("\"stealth\": false"));
+        assert!(json.contains("\"stealth\": true"));
         assert!(json.contains("\"registered_client_count\": 1"));
     }
 }

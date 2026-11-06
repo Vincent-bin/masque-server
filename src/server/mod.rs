@@ -264,7 +264,6 @@ fn config_reload_settings(
                 listen_addr: listener.listen_addr,
                 transport: listener.transport,
                 auth: ReloadAuthKind::from(&listener.auth),
-                stealth: listener.auth.stealth_enabled(),
             })
             .collect(),
     })
@@ -427,9 +426,10 @@ impl Server {
             next_conn_index: AtomicU64::new(0),
             conn_id_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes[..32]),
             retry_tokens: retry::RetryTokenCodec::new(
-                ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes[32..]),
+                &key_bytes[32..],
                 Duration::from_secs(config.quic.retry_token_ttl_secs),
-            ),
+            )
+            .map_err(|_| anyhow::anyhow!("failed to create Retry token encryption key"))?,
             source_admissions: SourceAdmissionLimiter::new(config.server.max_connections_per_ip),
             auth_source_admissions: SourceAdmissionLimiter::new(
                 config.server.max_pending_auth_per_ip,
@@ -980,11 +980,10 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
         if startup.listen_addr != current.listen_addr
             || startup.transport != current.transport
             || startup.auth != current_auth
-            || startup.stealth != current.auth.stealth_enabled()
         {
             anyhow::bail!(
-                "refusing to reload listener {}: address, transport, order, authentication \
-                 mode, or stealth setting changed; restart the service to apply trust-boundary \
+                "refusing to reload listener {}: address, transport, order, or authentication \
+                 mode changed; restart the service to apply trust-boundary \
                  changes",
                 index + 1
             );
@@ -1475,7 +1474,6 @@ struct ReloadListener {
     listen_addr: SocketAddr,
     transport: ListenerTransport,
     auth: ReloadAuthKind,
-    stealth: bool,
 }
 
 /// State every shard shares.
@@ -1642,8 +1640,6 @@ struct Shard {
     /// key. The initial CID stays on the one-lookup hot path above.
     connection_id_aliases: FxHashMap<quiche::ConnectionId<'static>, quiche::ConnectionId<'static>>,
     auth: Option<Arc<SharedBasicAuthenticator>>,
-    /// Whether failed Basic authorization uses the ordinary empty 404.
-    stealth_auth: bool,
     /// Set when clients authenticate with a certificate instead of credentials.
     ///
     /// The TLS context already refuses unregistered keys, so this exists to
@@ -1764,7 +1760,6 @@ impl Shard {
         } else {
             None
         };
-        let stealth_auth = listener.auth.stealth_enabled();
 
         let quic_config = build_quic_config(
             &config,
@@ -1804,7 +1799,6 @@ impl Shard {
             connections: FxHashMap::default(),
             connection_id_aliases: FxHashMap::default(),
             auth,
-            stealth_auth,
             client_certs,
             tcp_policy,
             udp_policy,
@@ -2378,21 +2372,12 @@ mod tests {
     }
 
     #[test]
-    fn stealth_auth_requires_an_enabled_basic_listener() {
+    fn legacy_stealth_flag_does_not_enable_authentication() {
         let mut config = ServerConfig::default();
         config.listeners[0].auth.enabled = false;
         config.listeners[0].auth.stealth = true;
-
-        let error = match super::validate_server_config(&config) {
-            Ok(_) => panic!("stealth authentication was accepted without Basic auth"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("auth.stealth requires enabled Basic authentication"),
-            "unexpected diagnostic: {error:#}"
-        );
+        assert!(super::validate_server_config(&config).is_ok());
+        assert!(!config.listeners[0].auth.stealth_enabled());
     }
 
     /// The roster belongs to the server, so one certificate listener among
@@ -2424,12 +2409,6 @@ mod tests {
         let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
         assert!(!reload.client_cert_enabled);
         assert_eq!(reload.tls, config.tls);
-        assert!(!reload.listeners[0].stealth);
-
-        config.listeners[0].auth.stealth = true;
-        let reload = super::config_reload_settings(&config, Some(path.clone())).unwrap();
-        assert!(reload.listeners[0].stealth);
-        config.listeners[0].auth.stealth = false;
 
         config.listeners[0].auth.mode = AuthMode::ClientCert;
         config.ip_proxy.enabled = false;

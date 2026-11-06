@@ -132,7 +132,6 @@ pub(super) struct RequestContext<'a> {
     pub(super) metrics: &'a crate::metrics::ShardMetrics,
     pub(super) config: &'a ServerConfig,
     pub(super) auth: Option<&'a SharedBasicAuthenticator>,
-    pub(super) stealth_auth: bool,
 }
 
 impl Shard {
@@ -195,7 +194,7 @@ impl Shard {
             // deliberately slow enough that it must not run on this thread.
             if duplicate_proxy_authorization {
                 warn!(stream_id, "duplicate proxy credentials");
-                Self::send_auth_rejection(h3, quic, stream_id, context.stealth_auth, 407);
+                Self::send_auth_rejection(h3, quic, stream_id);
                 return None;
             }
             match auth.precheck(proxy_authorization) {
@@ -207,7 +206,7 @@ impl Shard {
                 }
                 AuthPrecheck::Rejected => {
                     warn!(stream_id, "proxy authentication failed");
-                    Self::send_auth_rejection(h3, quic, stream_id, context.stealth_auth, 407);
+                    Self::send_auth_rejection(h3, quic, stream_id);
                     return None;
                 }
                 AuthPrecheck::NeedsVerify {

@@ -15,7 +15,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "$CERT_DIR/server.key.pkcs8" \
     -out "$CERT_DIR/server.crt" \
     -days 365 -nodes \
-    -subj "/CN=masque-server" \
+    -subj "/CN=localhost" \
     -addext "subjectAltName=DNS:server,DNS:localhost,IP:127.0.0.1"
 
 # Convert PKCS#8 key to SEC1/traditional EC format (required by BoringSSL/quiche).

@@ -256,7 +256,7 @@ async fn handle_request(
 
     // Match HTTP/3's ordering: a recognized proxy request authenticates before
     // target parsing or transport-specific validation. This keeps malformed
-    // requests from using status differences to bypass the 407 boundary.
+    // requests from using status differences to bypass the authentication boundary.
     let kind = match request_handling::prepare(&request, recognized, &context.config) {
         Ok(kind) => kind,
         Err(status) => {

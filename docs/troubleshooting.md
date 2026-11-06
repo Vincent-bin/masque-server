@@ -139,9 +139,9 @@ Useful result codes include:
 
 | Code | Meaning |
 | --- | --- |
-| `AUTH_REJECTED` | The server returned 407; select the correct Basic listener and credential |
+| `AUTH_REJECTED` | A legacy or external server returned 407; verify the Basic listener and credential |
 | `TARGET_POLICY_DENIED` | The configured allow/deny policy rejected the probe target |
-| `PROTOCOL_REJECTED` | The listener does not expose the requested CONNECT protocol |
+| `PROTOCOL_REJECTED` | HTTP 404: verify credentials, endpoint and CONNECT support; this response does not distinguish authentication failure from an unsupported request |
 | `TARGET_CONNECT_FAILED` | The proxy was reached, but target connection failed (HTTP 502) |
 | `TLS_PIN_MISMATCH` | Enrollment JSON pins a different server key |
 | `DNS_FAKE_IP_DETECTED` | Local DNS returned a synthetic address; retry with `--resolve` |

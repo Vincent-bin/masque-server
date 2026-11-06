@@ -137,6 +137,10 @@ PATH="$TEST_TMP/access-bin:$PATH" MASQUE_TLS_MODE=self_signed \
     die "fresh self-signed installation failed"
 openssl x509 -in /etc/masque/certs/server.crt -noout -ext subjectAltName |
     grep -q 'DNS:proxy.example.com' || die "self-signed certificate SAN is missing"
+openssl x509 -in /etc/masque/certs/server.crt -noout -subject -nameopt RFC2253 |
+    grep -qx 'subject=CN=proxy.example.com' || die "self-signed subject does not match the endpoint"
+! grep -q '^stealth = ' "$CONFIG_PATH" || die "new config must not expose a redundant authentication response option"
+grep -Eq '^username = "user-[0-9a-f]{24}"$' "$CONFIG_PATH" || die "fresh username must be randomly generated"
 [ "$(stat -c '%a' /etc/masque/certs/server.key)" = 640 ] ||
     die "self-signed private key permissions are incorrect"
 grep -q 'Socket: present (ownership and external reachability not verified)' "$TEST_TMP/self-signed.log" ||
@@ -151,6 +155,7 @@ MASQUE_START_SERVICE=0 python3 tests/installer-interactive.py "$PACKAGE_DIR/inst
     die "interactive self-signed installation failed"
 grep -q '^transport = "http2"$' "$CONFIG_PATH" ||
     die "interactive transport selection was not saved"
+! grep -q '^stealth = ' "$CONFIG_PATH" || die "new config must not expose a redundant authentication response option"
 rm -f -- "$CONFIG_PATH" /etc/masque/certs/server.crt /etc/masque/certs/server.key
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
@@ -233,7 +238,6 @@ DUAL_SURGE_CONFIG=$TEST_TMP/dual-surge.conf
 MASQUE_AUTH_MODE=dual \
     MASQUE_AUTH_USERNAME=proxy-user \
     MASQUE_AUTH_PASSWORD=a-strong-password \
-    MASQUE_BASIC_STEALTH=1 \
     MASQUE_LISTEN_PORT=8449 \
     MASQUE_CERT_LISTEN_PORT=8450 \
     MASQUE_CLIENT_NAME=laptop \
@@ -260,8 +264,8 @@ grep -q '^listen_addr = "0.0.0.0:8449"$' "$CONFIG_PATH" ||
     die "the Basic listener did not take MASQUE_LISTEN_PORT"
 grep -q '^listen_addr = "0.0.0.0:8450"$' "$CONFIG_PATH" ||
     die "the certificate listener did not take MASQUE_CERT_LISTEN_PORT"
-grep -q '^stealth = true$' "$CONFIG_PATH" ||
-    die "the Basic listener did not enable MASQUE_BASIC_STEALTH"
+! grep -q '^stealth = ' "$CONFIG_PATH" ||
+    die "new config must not expose a redundant authentication response option"
 # [server] contains only process-wide limits; listeners name every socket.
 grep -q '^\[server\]$' "$CONFIG_PATH" ||
     die "the [server] section disappeared from the dual configuration"

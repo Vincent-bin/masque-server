@@ -17,7 +17,7 @@ a staging environment.
 - HTTP/3 over UDP for performance, plus HTTP/2 Extended CONNECT and the
   `cf-connect-ip` CONNECT-IP dialect over TCP/TLS as compatibility fallbacks
 - Multiple HTTP Basic accounts per listener with Argon2id password
-  verification and optional 404 response camouflage, or TLS client-certificate
+  verification and empty 404 responses for rejected requests, or TLS client-certificate
   authentication against a public-key roster
 - Multiple listeners in one process, each with its own Basic or client-certificate
   authentication mode while sharing proxy policies, client roster, and TUN state
@@ -158,11 +158,11 @@ identity remains active.
 
 Authentication is fail-closed. In `basic` mode the server refuses to start until
 at least one uniquely named account with a valid Argon2id hash is configured.
-A Basic listener may set `stealth = true` to return an ordinary empty 404 instead
-of advertising a 407 challenge to unauthenticated probes. This requires peers to
-send Basic authorization on their first CONNECT request. See
-[Authentication](docs/configuration.md#authentication) for the compatibility
-and security limits of this option.
+Missing or invalid Basic credentials receive the same empty 404 as an unsupported
+request, without a proxy authentication challenge. Peers must send Basic
+authorization on their first CONNECT request. See
+[Authentication](docs/configuration.md#authentication) for compatibility and
+security limits.
 
 Alternatively, set `mode = "client_cert"` in `[listeners.auth]` to authenticate
 clients during the TLS handshake. Generate each client's P-256 key and

@@ -335,9 +335,6 @@ pub(super) fn validate_server_config(
     // the listener it came from or it cannot be found in a multi-listener file.
     for plan in &listeners {
         let addr = plan.listener.listen_addr;
-        if plan.listener.auth.stealth && !plan.listener.auth.basic_enabled() {
-            anyhow::bail!("listener {addr} auth.stealth requires enabled Basic authentication");
-        }
         if plan.listener.auth.basic_enabled() {
             BasicAuthenticator::from_section(&plan.listener.auth)
                 .with_context(|| format!("listener {addr}"))?;

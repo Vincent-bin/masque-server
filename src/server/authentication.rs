@@ -137,13 +137,7 @@ impl Shard {
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
                         if let Some(h3) = &mut client.h3 {
-                            Self::send_auth_rejection(
-                                h3,
-                                &mut client.quic,
-                                stream_id,
-                                self.stealth_auth,
-                                503,
-                            );
+                            Self::send_auth_rejection(h3, &mut client.quic, stream_id);
                         }
                     }
                     continue;
@@ -157,13 +151,7 @@ impl Shard {
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
                         if let Some(h3) = &mut client.h3 {
-                            Self::send_auth_rejection(
-                                h3,
-                                &mut client.quic,
-                                stream_id,
-                                self.stealth_auth,
-                                503,
-                            );
+                            Self::send_auth_rejection(h3, &mut client.quic, stream_id);
                         }
                     }
                     continue;
@@ -252,7 +240,7 @@ impl Shard {
 
             if !authorized {
                 warn!(stream_id, "proxy authentication failed");
-                Self::send_auth_rejection(h3, &mut client.quic, stream_id, self.stealth_auth, 407);
+                Self::send_auth_rejection(h3, &mut client.quic, stream_id);
                 return;
             }
 
@@ -266,7 +254,6 @@ impl Shard {
                 metrics: &self.metrics,
                 config: &self.config,
                 auth: self.auth.as_deref(),
-                stealth_auth: self.stealth_auth,
             };
             Self::dispatch_connect(
                 h3,

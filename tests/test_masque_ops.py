@@ -403,6 +403,9 @@ class InventoryTests(unittest.TestCase):
         host = ops.load_inventory(path).hosts[0]
         self.assertEqual(host.bootstrap.tls_mode, "self_signed")
         self.assertEqual(host.bootstrap.tls_name, "proxy.example.com")
+        self.assertTrue(host.bootstrap.basic_stealth)
+        self.assertRegex(host.bootstrap.basic_username, r"^user-[0-9a-f]{24}$")
+        self.assertEqual(host.probe.username, host.bootstrap.basic_username)
         self.assertEqual(host.probe.ca_cert, host.bootstrap.tls_ca_file)
         self.assertFalse(host.bootstrap.tls_ca_file.exists())
         self.assertIn(host.probe.ca_cert, ops.FleetOperator._bootstrap_missing_probe_credentials(host))
@@ -413,6 +416,18 @@ class InventoryTests(unittest.TestCase):
              mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(ops.main(["--inventory", str(path), "--json", "validate"]), 0)
         self.assertTrue(json.loads(output.getvalue())["valid"])
+
+    def test_legacy_inventory_cannot_reenable_basic_challenges(self) -> None:
+        path = self.root / "fleet.toml"
+        ops.initialize_inventory(
+            path, ssh_host="203.0.113.10", endpoint_host="proxy.example.com",
+            basic_stealth=False,
+        )
+        self.assertIn("basic_stealth = true", path.read_text())
+        original = path.read_text()
+        for setting in ["basic_stealth = false\n", ""]:
+            path.write_text(original.replace("basic_stealth = true\n", setting))
+            self.assertTrue(ops.load_inventory(path).hosts[0].bootstrap.basic_stealth)
 
     def test_initialize_client_certificate_and_dual_authentication(self) -> None:
         for mode in ("client_cert", "dual"):
@@ -434,6 +449,7 @@ class InventoryTests(unittest.TestCase):
                     self.assertEqual(result["password"], "not_used")
                 else:
                     self.assertTrue(host.bootstrap.verify_dual)
+                    self.assertTrue(host.bootstrap.basic_stealth)
                     self.assertEqual(host.probe.password_file, host.bootstrap.basic_password_file)
                     self.assertEqual(host.probe.ca_cert, host.bootstrap.tls_ca_file)
                     self.assertNotEqual(host.bootstrap.client_endpoint, host.probe.endpoint)
@@ -449,7 +465,7 @@ class InventoryTests(unittest.TestCase):
         certificate = directory / "fullchain.pem"
         private_key = directory / "privkey.pem"
         env = dict(ops.os.environ, MASQUE_CERT_PATH=str(certificate), MASQUE_KEY_PATH=str(private_key),
-                   MASQUE_CERT_NAME="proxy.example.com", MASQUE_CERT_SAN="DNS:proxy.example.com")
+                   MASQUE_CERT_COMMON_NAME="proxy.example.com", MASQUE_CERT_SAN="DNS:proxy.example.com")
         completed = subprocess.run(["sh", "-s"], input=ops.SELF_SIGNED_CERT_SCRIPT,
                                    text=True, capture_output=True, env=env, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -457,6 +473,11 @@ class InventoryTests(unittest.TestCase):
         verify = subprocess.run(["openssl", "verify", "-CAfile", str(certificate), "-verify_hostname",
                                  "proxy.example.com", str(certificate)], capture_output=True, text=True)
         self.assertEqual(verify.returncode, 0, verify.stderr)
+        identity = subprocess.run(["openssl", "x509", "-in", str(certificate), "-noout",
+                                   "-subject", "-issuer", "-nameopt", "RFC2253"],
+                                  capture_output=True, text=True, check=True).stdout
+        self.assertEqual(identity.splitlines(), ["subject=CN=proxy.example.com",
+                                                "issuer=CN=proxy.example.com"])
         original = certificate.read_bytes()
         second = subprocess.run(["sh", "-s"], input=ops.SELF_SIGNED_CERT_SCRIPT,
                                 text=True, capture_output=True, env=env, check=False)

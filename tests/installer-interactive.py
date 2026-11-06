@@ -9,7 +9,6 @@ import time
 
 prompts = [
     (b"Authentication mode", b"1\n"),
-    (b"Enable Basic stealth mode?", b"no\n"),
     (b"Certificate choice", b"1\n"),
     (b"Public hostname or IP for certificate", b"proxy.example.com\n"),
     (b"Basic authentication username", b"\n"),

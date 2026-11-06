@@ -13,7 +13,7 @@ pub fn ensure_success_status(status: u16, target: &str) -> Result<(), ProbeFailu
         )),
         404 => Err(ProbeFailure::new(
             "PROTOCOL_REJECTED",
-            "server returned HTTP 404 for the requested CONNECT protocol",
+            "server returned HTTP 404; verify credentials, endpoint and CONNECT support (the response does not distinguish them)",
         )),
         502 => Err(ProbeFailure::new(
             "TARGET_CONNECT_FAILED",

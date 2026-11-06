@@ -188,10 +188,14 @@ fn spawn_server(config: ServerConfig) -> Vec<SocketAddr> {
 fn spawn_server_with_observability(config: ServerConfig) -> (Vec<SocketAddr>, Option<SocketAddr>) {
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let mut builder = if config.listeners.iter().any(|listener| listener.shards > 1) {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(4);
+            builder
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
+        let runtime = builder.enable_all().build().unwrap();
         runtime.block_on(async move {
             match Server::bind(config).await {
                 Ok(mut server) => {
@@ -726,6 +730,10 @@ struct Fixture {
 /// Start a server that knows one client, pinned to fixed addresses, and mint a
 /// second unregistered key pair to test rejection with.
 fn fixture_with_retry(tag: &str, retry_mode: QuicRetryMode) -> Fixture {
+    fixture_with_retry_and_shards(tag, retry_mode, 1)
+}
+
+fn fixture_with_retry_and_shards(tag: &str, retry_mode: QuicRetryMode, shards: usize) -> Fixture {
     let dir = TempDir::new(tag);
 
     let server_key = p256_key();
@@ -764,6 +772,7 @@ fn fixture_with_retry(tag: &str, retry_mode: QuicRetryMode) -> Fixture {
         }],
     );
     config.quic.retry_mode = retry_mode;
+    config.listeners[0].shards = shards;
     let peer = spawn_server(config)[0];
 
     Fixture {
@@ -1006,7 +1015,7 @@ fn warm_basic_cache_is_revoked_on_an_established_http3_connection() {
             client
                 .response_status(stream, Duration::from_secs(5))
                 .unwrap(),
-            407
+            404
         );
     }
     std::fs::write(&config_path, render("new-secret")).unwrap();
@@ -1019,7 +1028,7 @@ fn warm_basic_cache_is_revoked_on_an_established_http3_connection() {
         if client
             .response_status(stream, Duration::from_secs(5))
             .unwrap()
-            == 407
+            == 404
         {
             break;
         }
@@ -1394,6 +1403,40 @@ fn quic_retry_always_completes_a_real_handshake() {
             .unwrap(),
         200
     );
+}
+
+/// Retry tokens are observable before TLS authentication. The token must
+/// encrypt its address binding and original CID using a fresh nonce.
+#[test]
+fn unauthenticated_retry_packets_have_encrypted_tokens() {
+    let shards = if cfg!(target_os = "linux") { 4 } else { 1 };
+    let fixture = fixture_with_retry_and_shards("retry-wire", QuicRetryMode::Always, shards);
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut nonces = std::collections::HashSet::new();
+    for sequence in 0..64u8 {
+        let mut initial = [0u8; 1200];
+        initial[0] = 0xc0;
+        initial[1..5].copy_from_slice(&quiche::PROTOCOL_VERSION.to_be_bytes());
+        initial[5] = 16;
+        initial[6..22].fill(sequence);
+        initial[22] = 8;
+        initial[23..31].copy_from_slice(b"testpeer");
+        // Empty token, then a two-byte varint covering the remaining packet.
+        initial[32..34].copy_from_slice(&(0x4000u16 | (1200 - 34)).to_be_bytes());
+        socket.send_to(&initial, fixture.peer).unwrap();
+        let mut reply = [0u8; 1500];
+        let size = socket.recv(&mut reply).unwrap();
+        let header = quiche::Header::from_slice(&mut reply[..size], 16).unwrap();
+        assert_eq!(header.ty, quiche::Type::Retry);
+        assert_eq!(header.scid.len(), 16);
+        let token = header.token.unwrap();
+        assert_eq!(token.len(), 70, "IPv4 bindings and a 16-byte original CID");
+        assert!(nonces.insert(token[..12].to_vec()));
+        assert!(!token.windows(16).any(|bytes| bytes == &initial[6..22]));
+    }
 }
 
 /// A real ticket issued by the production TLS context must not allow the
@@ -2174,12 +2217,18 @@ fn a_listener_enforces_only_its_own_authentication_mode() {
     client.handshake(Duration::from_secs(5)).unwrap();
     client.init_h3().unwrap();
     let stream_id = client.send_connect_ip("connect-ip").unwrap();
-    assert_eq!(
-        client
-            .response_status(stream_id, Duration::from_secs(5))
-            .unwrap(),
-        407,
-        "the Basic listener must still demand credentials"
+    let headers = client
+        .response_headers(stream_id, Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == b":status" && value == b"404")
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|(name, _)| name != b"proxy-authenticate")
     );
 
     // Certificate listener, same anonymous client: refused during the
@@ -2200,12 +2249,12 @@ fn a_listener_enforces_only_its_own_authentication_mode() {
     );
 }
 
-/// Surge sends Basic authorization proactively on every CONNECT, so hiding
+/// Clients may send Basic authorization proactively on every CONNECT. Hiding
 /// the challenge must preserve a successful first request while making all
 /// unauthenticated failures indistinguishable from the ordinary H3 404.
 #[test]
-fn stealth_basic_listener_hides_the_challenge_and_accepts_first_request_credentials() {
-    let fixture = dual_fixture_with_stealth("dual-stealth", true);
+fn basic_rejections_match_unknown_paths_and_accept_first_request_credentials() {
+    let fixture = dual_fixture_with_stealth("dual-rejection", false);
     let mut client = Client::connect_anonymous(fixture.basic_peer).unwrap();
     client.handshake(Duration::from_secs(5)).unwrap();
     client.init_h3().unwrap();
@@ -2222,27 +2271,75 @@ fn stealth_basic_listener_hides_the_challenge_and_accepts_first_request_credenti
         Some(b"404".as_slice())
     );
     assert!(
+        headers.iter().all(|(name, _)| ![
+            b"proxy-authenticate".as_slice(),
+            b"server",
+            b"proxy-status"
+        ]
+        .contains(&name.as_slice())),
+        "a rejection must not advertise Basic authentication"
+    );
+
+    let unknown_request = [
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":path", b"/not-found"),
+    ];
+    let stream_id = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &unknown_request, true)
+        .unwrap();
+    assert_eq!(
+        client
+            .response_headers(stream_id, Duration::from_secs(5))
+            .unwrap(),
         headers
-            .iter()
-            .all(|(name, _)| name != b"proxy-authenticate"),
-        "a stealth response must not advertise Basic authentication"
     );
 
     let wrong = format!(
         "Basic {}",
         STANDARD.encode(format!("{BASIC_USERNAME}:wrong"))
     );
+    let unknown = format!("Basic {}", STANDARD.encode("unknown:secret"));
+    for value in [wrong.as_str(), unknown.as_str(), "invalid"] {
+        let stream_id = client
+            .send_connect_ip_with_credentials("connect-ip", Some(value))
+            .unwrap();
+        assert_eq!(
+            client
+                .response_headers(stream_id, Duration::from_secs(5))
+                .unwrap(),
+            headers
+        );
+    }
+    let duplicate_request = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/*/*/"),
+        quiche::h3::Header::new(b"proxy-authorization", fixture.credentials.as_bytes()),
+        quiche::h3::Header::new(b"proxy-authorization", fixture.credentials.as_bytes()),
+    ];
     let stream_id = client
-        .send_connect_ip_with_credentials("connect-ip", Some(&wrong))
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &duplicate_request, true)
         .unwrap();
     assert_eq!(
         client
-            .response_status(stream_id, Duration::from_secs(5))
+            .response_headers(stream_id, Duration::from_secs(5))
             .unwrap(),
-        404,
-        "wrong credentials must use the same camouflage response"
+        headers
     );
 
+    let mut client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
     let stream_id = client
         .send_connect_ip_with_credentials("connect-ip", Some(&fixture.credentials))
         .unwrap();
@@ -2428,6 +2525,74 @@ fn client_source_ip_migrates_without_reconnecting() {
     assert!(!client.quic.is_closed());
 }
 
+/// CID steering must deliver concurrent copies of an Initial from different
+/// source ports to one socket, producing only one live connection.
+#[cfg(target_os = "linux")]
+#[test]
+fn concurrent_initial_copies_reach_only_one_shard_owner() {
+    let dir = TempDir::new("initial-owner-race");
+    let key = p256_key();
+    let (cert, key_path) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("localhost")),
+    );
+    let mut config = server_config(cert, key_path, ephemeral_addr(), Vec::new());
+    config.listeners[0].auth = AuthSection {
+        enabled: false,
+        ..Default::default()
+    };
+    config.listeners[0].shards = 4;
+    config.quic.retry_mode = QuicRetryMode::Off;
+    config.ip_proxy.enabled = false;
+    config.observability.listen_addr = Some(ephemeral_addr());
+    let (listeners, observability) = spawn_server_with_observability(config);
+    let peer = listeners[0];
+    let observability = observability.unwrap();
+
+    for expected in 1..=8 {
+        let mut client = Client::connect_anonymous(peer).unwrap();
+        let mut initial = [0u8; 1350];
+        let (len, _) = client.quic.send(&mut initial).unwrap();
+        let initial = &initial[..len];
+        let sockets: Vec<_> = (0..16)
+            .map(|_| UdpSocket::bind(ephemeral_addr()).unwrap())
+            .collect();
+        let barrier = std::sync::Barrier::new(sockets.len());
+        std::thread::scope(|scope| {
+            for socket in &sockets {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    socket.send_to(initial, peer).unwrap();
+                });
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while metric_total(
+            &scrape_metrics(observability),
+            "masque_connections_accepted_total{",
+        ) < expected
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Initial did not create a connection"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the other receive queues drain before checking for duplicates.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            metric_total(
+                &scrape_metrics(observability),
+                "masque_connections_accepted_total{"
+            ),
+            expected
+        );
+    }
+}
+
 /// Linux steers every server-issued destination CID to its owning reuseport
 /// socket. Source-port migration must therefore stay on the connection's
 /// shard instead of paying the userspace cross-shard forwarding cost.
@@ -2472,6 +2637,14 @@ fn migrated_connections_stay_on_reuseport_owner() {
         client.handshake(Duration::from_secs(5)).unwrap();
         client.migrate_source(Duration::from_secs(5)).unwrap();
         assert!(!client.quic.is_closed());
+        client.init_h3().unwrap();
+        let stream_id = client.send_connect_ip("connect-ip").unwrap();
+        assert_eq!(
+            client
+                .response_status(stream_id, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
     }
 
     let metrics = scrape_metrics(observability);

@@ -7,6 +7,22 @@ pre-1.0.
 
 ## Unreleased
 
+### Changed
+
+- Encrypt QUIC Retry token contents with AES-256-GCM and a random nonce.
+  Address binding, expiration, and tamper rejection remain.
+- Remove project names from newly generated self-signed certificate subjects.
+  Existing certificates are preserved.
+- Generate random default Basic usernames for new installations and
+  inventories instead of sharing a product-name account. Existing accounts
+  and explicitly chosen installer usernames remain unchanged.
+- Return the same empty 404 for all failed Basic authentication and unsupported
+  requests on HTTP/2 and HTTP/3. Remove proxy authentication challenges and
+  installer response-mode choices. Legacy `auth.stealth` fields remain accepted
+  but no longer change the response; clients must send credentials on the first
+  CONNECT request, including after an upgrade. Authentication failure and
+  overload remain distinguishable through internal metrics.
+
 ## 0.14.10 - 2026-11-06
 
 ### Fixed

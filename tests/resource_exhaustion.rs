@@ -439,18 +439,16 @@ async fn hostile_inputs_stay_inside_cpu_memory_and_fd_bounds() {
                 .status()
         });
     }
-    let mut unauthorized = 0;
-    let mut overloaded = 0;
+    let mut rejected = 0;
     while let Some(result) = attempts.join_next().await {
         match result.unwrap() {
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED => unauthorized += 1,
-            StatusCode::SERVICE_UNAVAILABLE => overloaded += 1,
+            StatusCode::NOT_FOUND => rejected += 1,
             status => panic!("unexpected bad-password response {status}"),
         }
         peak_fds = peak_fds.max(process_fd_count(pid));
         peak_rss = peak_rss.max(process_rss_bytes(pid));
     }
-    assert!(unauthorized > 0 && overloaded > 0);
+    assert_eq!(rejected, BAD_PASSWORD_ATTEMPTS);
     let cpu_ticks = process_cpu_ticks(pid) - cpu_before;
     assert!(
         cpu_ticks <= clock_ticks_per_second() * 5,
@@ -468,6 +466,13 @@ async fn hostile_inputs_stay_inside_cpu_memory_and_fd_bounds() {
             &metrics,
             "masque_auth_attempts_total",
             &[&basic_label, "result=\"overloaded\""]
+        ) > 0
+    );
+    assert!(
+        metric_sum(
+            &metrics,
+            "masque_auth_attempts_total",
+            &[&basic_label, "result=\"failure\""]
         ) > 0
     );
     drop(client);
@@ -563,7 +568,7 @@ async fn hostile_inputs_stay_inside_cpu_memory_and_fd_bounds() {
     );
 
     eprintln!(
-        "resource-pressure summary: bad-password unauthorized={unauthorized} overloaded={overloaded} cpu_ticks={cpu_ticks}; fd baseline={baseline_fds} peak={peak_fds} limit={fd_budget}; RSS baseline={baseline_rss} peak={peak_rss} delta={rss_delta} limit={} bytes; admitted_tunnels={MAX_TUNNELS_PER_CONNECTION} datagrams_per_tunnel={DATAGRAMS_PER_TUNNEL}",
+        "resource-pressure summary: bad-password rejected_404={rejected} cpu_ticks={cpu_ticks}; fd baseline={baseline_fds} peak={peak_fds} limit={fd_budget}; RSS baseline={baseline_rss} peak={peak_rss} delta={rss_delta} limit={} bytes; admitted_tunnels={MAX_TUNNELS_PER_CONNECTION} datagrams_per_tunnel={DATAGRAMS_PER_TUNNEL}",
         rss_delta_limit_mib * 1024 * 1024
     );
 }
