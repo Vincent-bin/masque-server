@@ -351,12 +351,38 @@ struct ThroughputStats {
 
 enum EchoPath<'a> {
     Udp,
+    UdpStreams {
+        streams: &'a [u64],
+        pps: u64,
+    },
     Ip(IpEchoTarget),
     Mixed {
         download: Option<&'a mut MixedDownload>,
         tcp_client: Option<&'a mut Client>,
         pps: u64,
     },
+}
+
+/// A single sequence space keeps the window bounded across all streams.
+/// Recompute ownership on replies so a response on the wrong tunnel cannot
+/// complete an outstanding request, without adding a per-response scan.
+fn echo_stream(stream: u64, streams: Option<&[u64]>, sequence: u64) -> u64 {
+    streams.map_or(stream, |streams| {
+        streams[(sequence % streams.len() as u64) as usize]
+    })
+}
+
+fn validate_load_streams(streams: usize, active: usize, pps: usize) -> Result<()> {
+    if !(1..=100).contains(&streams) {
+        bail!("MASQUE_LOAD_STREAMS_PER_CONN must be in 1..=100");
+    }
+    if active == 0 || active > streams {
+        bail!("MASQUE_LOAD_ACTIVE_STREAMS_PER_CONN must be in 1..=streams");
+    }
+    if pps > 1_000_000 {
+        bail!("MASQUE_LOAD_PPS_PER_CONN must not exceed 1000000");
+    }
+    Ok(())
 }
 
 struct MixedDownload {
@@ -932,8 +958,8 @@ impl Client {
         }
     }
 
-    /// Saturate one CONNECT-UDP tunnel with a bounded number of in-flight
-    /// echo requests, including a bounded histogram of completed-request RTTs.
+    /// Drive an aggregate bounded window of echo requests, optionally over
+    /// multiple UDP streams, with a bounded histogram of completed-request RTTs.
     fn run_echo_throughput(
         &mut self,
         stream_id: u64,
@@ -952,14 +978,18 @@ impl Client {
         let deadline = started + duration;
         let drain_deadline = deadline + expiry;
         let mut payload = vec![0x5a; payload_size];
-        let (ip_target, mut download, mut tcp_client, pps) = match path {
-            EchoPath::Ip(target) => (Some(target), None, None, 0),
+        let (ip_target, mut download, mut tcp_client, pps, udp_streams) = match path {
+            EchoPath::Ip(target) => (Some(target), None, None, 0, None),
             EchoPath::Mixed {
                 download,
                 tcp_client,
                 pps,
-            } => (None, download, tcp_client, pps),
-            EchoPath::Udp => (None, None, None, 0),
+            } => (None, download, tcp_client, pps, None),
+            EchoPath::Udp => (None, None, None, 0, None),
+            EchoPath::UdpStreams { streams, pps } => {
+                anyhow::ensure!(!streams.is_empty(), "load streams must not be empty");
+                (None, None, None, pps, Some(streams))
+            }
         };
         let sequence_offset = if let Some(target) = ip_target {
             payload = build_udp_in_ipv4(
@@ -997,7 +1027,8 @@ impl Client {
             while now < deadline && in_flight.len() < window && sent < due {
                 payload[sequence_offset..sequence_offset + 8]
                     .copy_from_slice(&next_sequence.to_be_bytes());
-                masque::datagram::encode_payload_into(stream_id, &payload, &mut encoded)
+                let request_stream = echo_stream(stream_id, udp_streams, next_sequence);
+                masque::datagram::encode_payload_into(request_stream, &payload, &mut encoded)
                     .map_err(|e| anyhow::anyhow!("encode datagram: {e}"))?;
 
                 match self.quic.dgram_send(&encoded) {
@@ -1042,9 +1073,6 @@ impl Client {
                 };
                 let dgram = masque::datagram::decode_ref(&dgram_buf[..len])
                     .map_err(|e| anyhow::anyhow!("decode dgram: {e}"))?;
-                if dgram.stream_id != stream_id {
-                    continue;
-                }
                 let response = if let Some(target) = ip_target {
                     let Some(response) = ip_echo_payload(dgram.payload, target) else {
                         continue;
@@ -1057,6 +1085,10 @@ impl Client {
                     continue;
                 }
                 let sequence = u64::from_be_bytes(response[..8].try_into().unwrap());
+                let expected_stream = echo_stream(stream_id, udp_streams, sequence);
+                if dgram.stream_id != expected_stream {
+                    continue;
+                }
                 if let Some(sent_at) = in_flight.remove_sent_at(&sequence) {
                     received += 1;
                     rtt.record(received_at.saturating_duration_since(sent_at));
@@ -1530,18 +1562,31 @@ fn connect_tcp_headers(target_authority: &str) -> Result<Vec<quiche::h3::Header>
 }
 
 fn connect_udp_tunnel(server_addr: &str, echo_addr: &str) -> Result<(Client, u64)> {
+    let (client, streams) = connect_udp_tunnels(server_addr, echo_addr, 1)?;
+    Ok((client, streams[0]))
+}
+
+fn connect_udp_tunnels(
+    server_addr: &str,
+    echo_addr: &str,
+    streams: usize,
+) -> Result<(Client, Vec<u64>)> {
     let mut client = Client::connect(server_addr)?;
     client.handshake()?;
     client.init_h3()?;
     let (echo_host, echo_port) = echo_addr.rsplit_once(':').context("bad ECHO_SERVER_ADDR")?;
     let headers = connect_udp_headers(server_addr, echo_host, echo_port)?;
-    let stream_id = client.send_request(&headers, false)?;
-    let (_, status) = client.poll_response(Duration::from_secs(5))?;
-    if status != 200 {
-        bail!("expected 200, got {status}");
+    let mut stream_ids = Vec::with_capacity(streams);
+    for _ in 0..streams {
+        let stream_id = client.send_request(&headers, false)?;
+        let (response_stream, status) = client.poll_response(Duration::from_secs(5))?;
+        if response_stream != stream_id || status != 200 {
+            bail!("expected 200 for stream {stream_id}, got {status} on {response_stream}");
+        }
+        stream_ids.push(stream_id);
     }
     std::thread::sleep(Duration::from_millis(100));
-    Ok((client, stream_id))
+    Ok((client, stream_ids))
 }
 
 fn benchmark_http3_mixed(server_addr: &str, echo_addr: &str) -> Result<()> {
@@ -2103,7 +2148,7 @@ fn test_proxy_auth_required(server_addr: &str, echo_addr: &str) -> Result<()> {
     Ok(())
 }
 
-/// Saturating multi-connection load generator.
+/// Multi-connection load generator with optional aggregate rate limiting.
 ///
 /// The single-connection benchmark cannot show anything about how work is
 /// spread across cores: one QUIC connection is handled by one event loop no
@@ -2117,11 +2162,15 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
     const MAX_LOAD_EXPIRY_MS: usize = 60_000;
 
     let conns = env_usize("MASQUE_LOAD_CONNS", 32)?;
+    let streams = env_usize("MASQUE_LOAD_STREAMS_PER_CONN", 1)?;
+    let active_streams = env_usize("MASQUE_LOAD_ACTIVE_STREAMS_PER_CONN", streams)?;
+    let pps = env_usize("MASQUE_LOAD_PPS_PER_CONN", 0)?;
     let duration_secs = env_usize("MASQUE_LOAD_DURATION_SECS", 10)?;
     let payload_size = env_usize("MASQUE_LOAD_PAYLOAD", 1200)?;
     let window = env_usize("MASQUE_LOAD_WINDOW", 16)?;
     let expiry_ms = env_usize("MASQUE_LOAD_EXPIRY_MS", 1_000)?;
 
+    validate_load_streams(streams, active_streams, pps)?;
     if conns == 0 || duration_secs == 0 || window == 0 || expiry_ms == 0 {
         bail!("load connections, duration, window, and expiry must be non-zero");
     }
@@ -2148,7 +2197,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
 
     println!(
         "Load test: {conns} connections, {duration_secs}s, {payload_size}B payload, \
-         window {window}/conn, expiry {expiry_ms}ms"
+         window {window}/conn, expiry {expiry_ms}ms, {active_streams}/{streams} active streams/conn, {pps} pps/conn (0=unlimited)"
     );
 
     #[derive(Debug)]
@@ -2183,7 +2232,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             // Establish the tunnel before the barrier so every connection is
             // pushing traffic during the same measurement window.
             let setup_started = Instant::now();
-            let tunnel = connect_udp_tunnel(&server_addr, &echo_addr);
+            let tunnel = connect_udp_tunnels(&server_addr, &echo_addr, streams);
             let setup = setup_started.elapsed();
 
             // A failed setup still participates in both barriers, otherwise
@@ -2191,7 +2240,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             ready.wait();
             start.wait();
 
-            let (mut client, stream_id) = match tunnel {
+            let (mut client, stream_ids) = match tunnel {
                 Ok(tunnel) => tunnel,
                 Err(error) => return WorkerOutcome::SetupFailed(format!("{error:#}")),
             };
@@ -2201,12 +2250,15 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             // a second implementation silently changing pacing, draining, or
             // expiry semantics.
             match client.run_echo_throughput(
-                stream_id,
+                stream_ids[0],
                 payload_size,
                 duration,
                 window,
                 expiry,
-                EchoPath::Udp,
+                EchoPath::UdpStreams {
+                    streams: &stream_ids[..active_streams],
+                    pps: pps as u64,
+                },
             ) {
                 Ok(throughput) => {
                     WorkerOutcome::Finished(Box::new(WorkerStats { setup, throughput }))
@@ -2221,6 +2273,8 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
 
     ready.wait();
     let setup_batch = setup_batch_started.elapsed();
+    println!("LOAD_PHASE phase=measurement_start");
+    std::io::stdout().flush()?;
     start.wait();
 
     let mut setup_latencies = Vec::with_capacity(conns);
@@ -2254,6 +2308,9 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
             }
         }
     }
+
+    println!("LOAD_PHASE phase=measurement_end");
+    std::io::stdout().flush()?;
 
     // Only workers that returned a measured setup duration definitely
     // established a tunnel. A panic is not assumed to have happened after
@@ -2299,7 +2356,7 @@ fn load_test(server_addr: &str, echo_addr: &str) -> Result<()> {
         goodput * 2.0
     );
     println!(
-        "LOAD_RESULT connections={conns} established={established} duration_secs={duration_secs} \
+        "LOAD_RESULT transport=http3 connections={conns} established={established} streams_per_connection={streams} active_streams_per_connection={active_streams} requested_pps_per_connection={pps} duration_secs={duration_secs} \
 payload_bytes={payload_size} window={window} expiry_ms={expiry_ms} tx_packets={sent} \
 rx_packets={received} \
 tx_pps={tx_pps:.3} rx_pps={rx_pps:.3} app_goodput_gbps={goodput:.6} \
@@ -3209,6 +3266,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_load_stream_options_are_bounded() {
+        assert!(validate_load_streams(1, 1, 0).is_ok());
+        assert!(validate_load_streams(100, 100, 1_000_000).is_ok());
+        assert!(validate_load_streams(0, 0, 0).is_err());
+        assert!(validate_load_streams(101, 1, 0).is_err());
+        assert!(validate_load_streams(1, 1, 1_000_001).is_err());
+        assert!(validate_load_streams(64, 1, 0).is_ok());
+        assert!(validate_load_streams(64, 0, 0).is_err());
+        assert!(validate_load_streams(1, 2, 0).is_err());
+    }
+
+    #[test]
+    fn udp_load_routes_sequences_round_robin_and_checks_response_owner() {
+        let streams = [0, 4, 8];
+        assert_eq!(echo_stream(16, None, 9), 16);
+        for sequence in 0..30 {
+            assert_eq!(
+                echo_stream(99, Some(&streams), sequence),
+                (sequence % 3) * 4
+            );
+        }
+        assert_eq!(echo_stream(99, Some(&[12]), u64::MAX), 12);
+    }
 
     #[test]
     fn connect_ip_benchmark_accepts_only_expected_udp_echoes() {

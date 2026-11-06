@@ -133,6 +133,11 @@ not establish a throughput improvement on a path with spare CPU capacity.
 
 ### Target UDP sockets
 
+The [multi-tunnel scheduling investigation](performance-udp-tunnels.md) compares
+one active tunnel, many idle tunnels, and many active tunnels without changing
+the aggregate offered window. Its results do not justify a production scheduler
+change.
+
 Client bursts are staged per tunnel during one shard iteration and submitted
 with a direct `SYS_sendmmsg`. Target responses are drained with
 `SYS_recvmmsg`. On non-Linux systems, Tokio sends and receives individual

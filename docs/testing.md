@@ -127,7 +127,8 @@ scripts/network-bench.sh
 ```
 
 The `smoke`, `tcp`, and `udp` modes support `http2`, `http3`, and `both`.
-Multi-connection `load` mode is currently HTTP/3-only. Machine consumers should
+`load` supports both transports, with the distinct window and rate semantics
+described below. Machine consumers should
 read `UDP_RESULT`, `TCP_DOWNLOAD_RESULT`, and `TCP_DOWNLOAD_SUMMARY` and retain
 their explicit `transport` field.
 
@@ -161,6 +162,35 @@ MASQUE_LOAD_PAYLOAD=1200 \
 MASQUE_LOAD_WINDOW=256 \
 scripts/network-bench.sh
 ```
+
+For HTTP/3 multi-tunnel scheduling comparisons, keep one connection and an
+aggregate window while changing the number of CONNECT-UDP streams:
+
+```sh
+MASQUE_BENCH_MODE=load MASQUE_BENCH_TRANSPORT=http3 \
+MASQUE_BENCH_SHARDS=1 MASQUE_LOAD_CONNS=1 \
+MASQUE_LOAD_STREAMS_PER_CONN=64 MASQUE_LOAD_PPS_PER_CONN=30000 \
+MASQUE_LOAD_PAYLOAD=64 MASQUE_LOAD_WINDOW=256 \
+MASQUE_LOAD_DURATION_SECS=10 scripts/network-bench.sh
+```
+
+`MASQUE_LOAD_STREAMS_PER_CONN` defaults to 1 and is bounded to 100 on HTTP/3.
+`MASQUE_LOAD_ACTIVE_STREAMS_PER_CONN` defaults to all opened streams; set it
+to 1 with 64 opened streams to isolate the cost of idle tunnels.
+Requests use round-robin active streams and one bounded in-flight window per
+connection, so adding streams does not multiply offered concurrency.
+`MASQUE_LOAD_PPS_PER_CONN` is the aggregate target rate for one HTTP/3
+connection; 0 (the default) saturates it. Run both a fixed aggregate rate and
+saturation, with 64-byte and 1200-byte payloads and alternating repetitions.
+The fixed rate is a target, not a guarantee: inspect actual sent/received counts.
+
+HTTP/3 `LOAD_PHASE` start/end records bracket the synchronized traffic and
+response-drain interval after all connection/tunnel setups have completed.
+They do not themselves measure CPU. A process sampler can use them to exclude
+setup cost; disclose its resolution and that the end includes draining.
+The whole-process `SERVER_RESOURCE_RESULT` still includes setup and shutdown.
+HTTP/2's separate `MASQUE_LOAD_PPS_PER_STREAM` and per-stream window have
+different semantics; do not equate them with the HTTP/3 aggregate controls.
 
 Treat `LOAD_RESULT` as the stable machine-readable record. A valid comparison
 keeps payload, duration, window, expiry, shards, CPU placement, and offload
