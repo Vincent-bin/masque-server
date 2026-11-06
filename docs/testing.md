@@ -42,7 +42,7 @@ the exact environment and commands.
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
 | Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, mixed authentication, and live HTTP/3 TLS reload/rollback |
 | HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT variants, multiple Basic accounts, both authentication modes, and credential/TLS reload rollback without dropping an established connection |
-| End-user probe | `cargo test -p masque-probe` | Basic/certificate authentication over H2/H3 with live TCP CONNECT and CONNECT-UDP echo round trips, CONNECT-IP negotiation/address assignment, and stable result/error handling on Linux and macOS |
+| End-user probe | `cargo test -p masque-probe` | Basic/certificate authentication over H2/H3 with live TCP payload and CONNECT-UDP echo round trips, explicit CONNECT-IP setup-only and forwarding-failure checks, and stable result/error handling on Linux and macOS |
 | Observability assets | `cargo test --test monitoring_assets` | Prometheus metric references and importable Grafana JSON |
 | Service shutdown | `tests/systemd-shutdown.sh` | Real SIGTERM/SIGINT handling and every-shard drain; Linux exercises two shards |
 | Config and host diagnostics | `cargo test --test check_config` | `check-config` accepts what a server accepts; `doctor` remains read-only; support bundles omit credential/identity sentinels |
@@ -100,7 +100,20 @@ forwarding/offload, capabilities, or systemd.
 scripts/e2e-test.sh
 ```
 
-The script creates development certificates, builds the server and E2E client,
+For focused IP policy and probe coverage without Docker, run on a disposable
+Linux host with the release binaries in `MASQUE_TEST_BIN_DIR`:
+
+```sh
+sudo MASQUE_TEST_BIN_DIR=/absolute/path/to/binaries tests/connect-ip-policy.sh
+sudo MASQUE_TEST_BIN_DIR=/absolute/path/to/binaries MASQUE_IP_TEST_TUN_OFFLOAD=0 tests/connect-ip-policy.sh
+```
+
+This uses an ephemeral network namespace, synthetic echo targets and temporary
+certificates. It tests real H2/H3 IPv4/IPv6 round trips, default private denies,
+explicit private access and policy independence, without changing host routes.
+It does not replace Docker packaging checks.
+
+The Docker script creates development certificates, builds the server and E2E client,
 starts an echo target, grants the server container `NET_ADMIN` and TUN access,
 runs the suite, and removes the Compose network and volumes.
 
@@ -197,6 +210,20 @@ keeps payload, duration, window, expiry, shards, CPU placement, and offload
 settings fixed, and compares both goodput and response shortfall.
 
 See [Performance](performance.md) for methodology and reporting requirements.
+
+## Resource and configuration regressions
+
+The HTTP/2 `security` tests withhold all or part of the initial CONNECT-IP receive
+window, verify timeout resets, and reuse both the address and tunnel slot.
+HTTP/2 and HTTP/3 tests count each early Basic rejection and each password failure
+once while retaining empty 404 responses. Scheduler tests compare replacements,
+cancellation and expiry against a reference queue and exercise 100,000 deadline
+changes for one connection with constant storage.
+
+`check_config` starts a real process and queries its private status socket before
+and after successful/failed SIGHUP and restart. It checks that policy changes
+still need restart after credential reload, dead processes cannot report applied
+state, and raw credentials and paths never cross the socket.
 
 ## HTTP/2 lifecycle deadlines
 

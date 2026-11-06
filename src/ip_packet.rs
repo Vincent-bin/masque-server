@@ -71,6 +71,67 @@ pub fn dst_addr(packet: &[u8]) -> Result<IpAddr, ParseError> {
     addr_at(packet, 16, 24)
 }
 
+/// A destination ACL must not be bypassed by a later source-routing hop.
+/// Reject IPv4 source-route options and IPv6 routing headers, including those
+/// after extension/fragment headers. Ordinary transport packets take a short
+/// fixed path; extension traversal is bounded by the packet length.
+pub(crate) fn has_safe_routing(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => {
+            let header_len = usize::from(packet[0] & 15) * 4;
+            if header_len < 20 || packet.len() < header_len {
+                return false;
+            }
+            let mut offset = 20;
+            while offset < header_len {
+                match packet[offset] {
+                    0 => break,
+                    1 => {
+                        offset += 1;
+                        continue;
+                    }
+                    131 | 137 => return false,
+                    _ => {}
+                }
+                let Some(&length) = packet.get(offset + 1) else {
+                    return false;
+                };
+                if length < 2 || offset + usize::from(length) > header_len {
+                    return false;
+                }
+                offset += usize::from(length);
+            }
+            true
+        }
+        Some(6) if packet.len() >= 40 => {
+            let mut next = packet[6];
+            let mut offset = 40;
+            loop {
+                if next == 43 {
+                    return false;
+                }
+                if !matches!(next, 0 | 60 | 44 | 51) {
+                    return true;
+                }
+                let Some(header) = packet.get(offset..).filter(|header| header.len() >= 8) else {
+                    return false;
+                };
+                let length = match next {
+                    44 => 8,
+                    51 => (usize::from(header[1]) + 2) * 4,
+                    _ => (usize::from(header[1]) + 1) * 8,
+                };
+                if length > header.len() {
+                    return false;
+                }
+                next = header[0];
+                offset += length;
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Read the address at `v4_offset` (IPv4) or `v6_offset` (IPv6), after the
 /// same header validation `parse` performs.
 #[inline]
@@ -399,5 +460,42 @@ mod tests {
                 "dst mismatch for {pkt:02x?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    #[test]
+    fn source_routes_cannot_hide_the_final_destination() {
+        let mut v4 = vec![0; 28];
+        v4[0] = 0x45;
+        assert!(has_safe_routing(&v4));
+        v4[0] = 0x47;
+        for kind in [131, 137] {
+            v4[20] = kind;
+            v4[21] = 7;
+            assert!(!has_safe_routing(&v4));
+        }
+        v4[20] = 1;
+        v4[21] = 0;
+        assert!(has_safe_routing(&v4));
+        let mut v6 = vec![0; 64];
+        v6[0] = 0x60;
+        v6[6] = 17;
+        assert!(has_safe_routing(&v6));
+        for extension in [0, 60, 44, 51] {
+            v6[6] = extension;
+            v6[40] = 43;
+            assert!(!has_safe_routing(&v6));
+            v6[40] = 17;
+            assert!(has_safe_routing(&v6));
+        }
+        v6[6] = 43;
+        assert!(!has_safe_routing(&v6));
+        v6[6] = 60;
+        v6[41] = 255;
+        assert!(!has_safe_routing(&v6));
+        assert!(!has_safe_routing(&[]));
     }
 }

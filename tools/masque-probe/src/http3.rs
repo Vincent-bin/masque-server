@@ -12,6 +12,7 @@ use crate::credentials::Credentials;
 use crate::endpoint::{Authority, encode_path_segment};
 use crate::protocol::{ensure_success_status, udp_probe_payload, validate_udp_probe_response};
 use crate::report::ProbeFailure;
+use crate::{TcpMode, tcp_payload::TcpExchange};
 
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 
@@ -144,6 +145,7 @@ impl Session {
         &mut self,
         target: &Authority,
         credentials: &Credentials,
+        mode: TcpMode,
     ) -> Result<String, ProbeFailure> {
         let mut headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
@@ -153,7 +155,48 @@ impl Session {
         let stream = self.send_request(&headers)?;
         let status = self.poll_status(stream)?;
         ensure_success_status(status, &target.original)?;
-        Ok(format!("CONNECT to {} returned HTTP 200", target.original))
+        let mut exchange = TcpExchange::new(&target.host, mode)?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            self.send_body_all(stream, &exchange.outgoing(), deadline)?;
+            if exchange.complete() {
+                let _ = self
+                    .quic
+                    .stream_shutdown(stream, quiche::Shutdown::Read, 0x10c);
+                let _ = self
+                    .quic
+                    .stream_shutdown(stream, quiche::Shutdown::Write, 0x10c);
+                self.flush()?;
+                return Ok(format!(
+                    "CONNECT to {} verified a {mode:?} payload round trip",
+                    target.original
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(ProbeFailure::new(
+                    "TCP_RESPONSE_TIMEOUT",
+                    "CONNECT opened but TCP payload validation timed out",
+                ));
+            }
+            self.poll_events(None)?;
+            let mut buffer = [0; 16 * 1024];
+            match self.h3.recv_body(&mut self.quic, stream, &mut buffer) {
+                Ok(0) => {
+                    return Err(ProbeFailure::new(
+                        "TCP_RESPONSE_INVALID",
+                        "TCP tunnel ended before payload validation",
+                    ));
+                }
+                Ok(length) => exchange.receive(&buffer[..length])?,
+                Err(quiche::h3::Error::Done) => self.drive(deadline)?,
+                Err(_) => {
+                    return Err(ProbeFailure::new(
+                        "TCP_RESPONSE_INVALID",
+                        "TCP tunnel reset before payload validation",
+                    ));
+                }
+            }
+        }
     }
 
     pub fn probe_udp(
@@ -203,7 +246,12 @@ impl Session {
         ))
     }
 
-    pub fn probe_connect_ip(&mut self, credentials: &Credentials) -> Result<String, ProbeFailure> {
+    pub fn probe_connect_ip(
+        &mut self,
+        credentials: &Credentials,
+        target: Option<SocketAddr>,
+        dns: bool,
+    ) -> Result<String, ProbeFailure> {
         let mut headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", b"connect-ip"),
@@ -227,10 +275,69 @@ impl Session {
                 "CONNECT-IP returned 200 but no ADDRESS_ASSIGN capsule",
             ));
         };
+        let Some(target) = target else {
+            return Ok(format!(
+                "CONNECT-IP assigned {} address(es); packet forwarding NOT verified",
+                addresses.len()
+            ));
+        };
+        let exchange = crate::ip_payload::IpExchange::new(addresses, target, dns)?;
+        let datagram = masque::datagram::encode_payload(stream, &exchange.packet())
+            .map_err(|_| ProbeFailure::new("HTTP_DATAGRAM_ERROR", "cannot encode IP packet"))?;
+        self.quic
+            .dgram_send(&datagram)
+            .map_err(|_| ProbeFailure::new("HTTP_DATAGRAM_ERROR", "cannot queue IP packet"))?;
+        self.flush()?;
+        let packet = self.recv_datagram(stream).map_err(|failure| {
+            if failure.code == "UDP_RESPONSE_TIMEOUT" {
+                ProbeFailure::new(
+                    "CONNECT_IP_RESPONSE_TIMEOUT",
+                    "CONNECT-IP opened but no IP packet returned",
+                )
+            } else {
+                failure
+            }
+        })?;
+        exchange.validate(&packet)?;
+        let _ = self
+            .quic
+            .stream_shutdown(stream, quiche::Shutdown::Read, 0x10c);
+        let _ = self
+            .quic
+            .stream_shutdown(stream, quiche::Shutdown::Write, 0x10c);
+        self.flush()?;
         Ok(format!(
-            "CONNECT-IP assigned {} address(es); run server-side doctor to verify forwarding/NAT",
-            addresses.len()
+            "CONNECT-IP verified an IP/UDP round trip to {target}"
         ))
+    }
+
+    fn send_body_all(
+        &mut self,
+        stream: u64,
+        mut bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), ProbeFailure> {
+        while !bytes.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(ProbeFailure::new(
+                    "TCP_RESPONSE_TIMEOUT",
+                    "TCP request flow control timed out",
+                ));
+            }
+            match self.h3.send_body(&mut self.quic, stream, bytes, false) {
+                Ok(length) if length > 0 => bytes = &bytes[length..],
+                Ok(_) | Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                    self.drive(deadline)?
+                }
+                Err(_) => {
+                    return Err(ProbeFailure::new(
+                        "HTTP3_STREAM_CLOSED",
+                        "cannot send TCP request payload",
+                    ));
+                }
+            }
+        }
+        self.flush()
     }
 
     fn wait_for_capabilities(&mut self) -> Result<(), ProbeFailure> {
@@ -357,20 +464,44 @@ impl Session {
         let mut decoder = CapsuleDecoder::new();
         let mut frames = Vec::new();
         let mut buffer = [0_u8; 4096];
+        let mut received = 0;
         loop {
             self.poll_events(None)?;
             loop {
                 match self.h3.recv_body(&mut self.quic, stream, &mut buffer) {
-                    Ok(length) => match decoder.decode(&buffer[..length]) {
-                        Ok(mut decoded) => frames.append(&mut decoded),
-                        Err(DecodeError::Incomplete) => {}
-                        Err(error) => {
+                    Ok(0) => {
+                        return Err(ProbeFailure::new(
+                            "CAPSULE_ERROR",
+                            "CONNECT-IP stream ended before address assignment",
+                        ));
+                    }
+                    Ok(length) => {
+                        received += length;
+                        if received > 64 * 1024 || Instant::now() >= deadline {
                             return Err(ProbeFailure::new(
                                 "CAPSULE_ERROR",
-                                format!("decode CONNECT-IP capsule: {error:?}"),
+                                "CONNECT-IP setup exceeded probe limits",
                             ));
                         }
-                    },
+                        match decoder.decode(&buffer[..length]) {
+                            Ok(mut decoded) => {
+                                frames.append(&mut decoded);
+                                if frames
+                                    .iter()
+                                    .any(|frame| matches!(frame, CapsuleFrame::AddressAssign(_)))
+                                {
+                                    return Ok(frames);
+                                }
+                            }
+                            Err(DecodeError::Incomplete) => {}
+                            Err(error) => {
+                                return Err(ProbeFailure::new(
+                                    "CAPSULE_ERROR",
+                                    format!("decode CONNECT-IP capsule: {error:?}"),
+                                ));
+                            }
+                        }
+                    }
                     Err(quiche::h3::Error::Done) => break,
                     Err(error) => {
                         return Err(ProbeFailure::new(

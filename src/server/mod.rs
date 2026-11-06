@@ -341,6 +341,15 @@ async fn bind_first_listener_socket(
 }
 
 impl Server {
+    /// Start an owner-only local status socket. Failure does not affect proxy listeners.
+    #[cfg(unix)]
+    pub async fn start_local_status(
+        &self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<crate::runtime_status::StatusServer> {
+        crate::runtime_status::start(path, Arc::clone(&self.shared.loaded_config)).await
+    }
+
     /// Create a new server bound to the configured address.
     pub async fn bind(config: ServerConfig) -> anyhow::Result<Self> {
         Self::bind_with_reload(config, None).await
@@ -414,9 +423,20 @@ impl Server {
         // socket requests client certificates changes its trust boundary.
         // Capture that startup state while still allowing the shared server
         // identity and an already-active client roster to be replaced.
+        let loaded_config = Arc::new(crate::runtime_status::LoadedConfig::new(
+            &config,
+            config_path.as_deref(),
+            tls.fingerprint(),
+        )?);
         let config_reload = config_reload_settings(&config, config_path);
 
         let shared = Arc::new(Shared {
+            loaded_config,
+            ip_policy: TargetPolicy::new(
+                &config.ip_proxy.allow_targets,
+                &config.ip_proxy.deny_targets,
+            )
+            .context("ip_proxy")?,
             resolver: ResolverBudget::default(),
             address_pool: Mutex::new(address_pool),
             routing_table: RwLock::new(RoutingTable::new()),
@@ -999,6 +1019,9 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
     }
     let tls_identity =
         tls::TlsIdentity::load(&reload.tls).context("failed to load replacement TLS identity")?;
+    let loaded_config = shared
+        .loaded_config
+        .prepare_reload(&config, tls_identity.fingerprint())?;
 
     let registry = if reload.client_cert_enabled {
         let any_client_cert = any_client_cert_listener(&config);
@@ -1050,6 +1073,7 @@ fn reload_configuration(shared: &Shared) -> anyhow::Result<ReloadOutcome> {
         (shared.clients.replace(registry), count)
     });
     let tls_generation = shared.tls.replace(tls_identity);
+    shared.loaded_config.commit_reload(loaded_config);
     Ok(ReloadOutcome {
         tls_generation,
         roster,
@@ -1478,11 +1502,15 @@ struct ReloadListener {
 
 /// State every shard shares.
 ///
-/// None of it is on the per-packet path: the pool and routing table are touched
+/// The immutable IP destination policy is read on client packet ingress.
+/// Mutable pool and routing state is touched
 /// only when a CONNECT-IP tunnel opens or closes or when a TUN packet needs an
 /// owner, and the ownership maps only when a connection is created or
 /// destroyed, or one of its connection IDs is published or retired.
 struct Shared {
+    loaded_config: Arc<crate::runtime_status::LoadedConfig>,
+    /// Immutable destination ACL, shared by both CONNECT-IP transports.
+    ip_policy: TargetPolicy,
     resolver: ResolverBudget,
     address_pool: Mutex<AddressPool>,
     routing_table: RwLock<RoutingTable>,
@@ -2168,6 +2196,7 @@ impl Shard {
                 let id = id.clone();
 
                 if let Some(client) = self.connections.remove(&id) {
+                    self.timers.cancel(client.index);
                     info!(?id, "connection closed");
                     for tunnel in client.ip_tunnels.values() {
                         self.shared
@@ -2238,6 +2267,12 @@ impl Shard {
             }
         }
     }
+}
+
+pub(crate) fn runtime_tls_fingerprint(
+    config: &crate::config::TlsSection,
+) -> anyhow::Result<[u8; 32]> {
+    Ok(tls::TlsIdentity::load(config)?.fingerprint())
 }
 
 #[cfg(test)]

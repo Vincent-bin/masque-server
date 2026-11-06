@@ -164,12 +164,26 @@ pub(super) async fn serve(
     }
     let response = response.body(())?;
     let mut send = respond.send_response(response, false)?;
-    send_data(
-        &mut send,
-        Bytes::from(encode_ip_setup_capsules(&addresses)),
-        false,
+    // Initial control DATA is flow controlled too. A peer with a zero (or
+    // insufficient) window must not retain a lease and admission slot forever
+    // before the relay's inactivity timer starts. Cancellation drops the lease.
+    let _metrics = TunnelMetricsGuard::new(Arc::clone(&context.metrics), 2);
+    match tokio::time::timeout(
+        Duration::from_secs(context.config.server.idle_timeout_secs),
+        send_data(
+            &mut send,
+            Bytes::from(encode_ip_setup_capsules(&addresses)),
+            false,
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            send.send_reset(Reason::CANCEL);
+            return Ok(());
+        }
+    }
 
     info!(
         stream_id,
@@ -177,7 +191,6 @@ pub(super) async fn serve(
         capsule_mode = ?capsule_mode,
         "CONNECT-IP tunnel established"
     );
-    let _metrics = TunnelMetricsGuard::new(Arc::clone(&context.metrics), 2);
     let activity = Arc::new(Activity::new());
     let idle = wait_until_idle(
         Arc::clone(&activity),
@@ -254,15 +267,21 @@ pub(super) async fn serve(
                     );
                     continue;
                 }
-                let source = match ip_packet::src_addr(packet) {
-                    Ok(source) => source,
+                let header = match ip_packet::parse(packet) {
+                    Ok(header) => header,
                     Err(error) => {
                         debug!(stream_id, %error, "invalid IP header in HTTP/2 client packet");
                         continue;
                     }
                 };
-                if !addresses.contains(&source) {
-                    debug!(stream_id, %source, "spoofed HTTP/2 source address, dropping");
+                if !addresses.contains(&header.src) {
+                    debug!(stream_id, source = %header.src, "spoofed HTTP/2 source address, dropping");
+                    continue;
+                }
+                if !context.shared.ip_policy.is_allowed(header.dst)
+                    || !ip_packet::has_safe_routing(packet)
+                {
+                    debug!(stream_id, "CONNECT-IP destination policy denied packet");
                     continue;
                 }
 

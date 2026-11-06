@@ -240,7 +240,7 @@ pub(super) fn validate_server_config(
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
 
-    // Validate both global policies before any listener binds or TUN setup.
+    // Validate all global policies before any listener binds or TUN setup.
     // Check disabled proxies too, so a malformed deny cannot be enabled later.
     TargetPolicy::new(
         &config.tcp_proxy.allow_targets,
@@ -252,6 +252,11 @@ pub(super) fn validate_server_config(
         &config.udp_proxy.deny_targets,
     )
     .context("udp_proxy")?;
+    TargetPolicy::new(
+        &config.ip_proxy.allow_targets,
+        &config.ip_proxy.deny_targets,
+    )
+    .context("ip_proxy")?;
 
     if !(1..=MAX_CONFIGURED_CONNECTIONS).contains(&config.server.max_connections) {
         anyhow::bail!(

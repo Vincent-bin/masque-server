@@ -16,7 +16,7 @@ change, and server/probe versions when known. Use generic host roles in reports.
 | --- | --- | --- |
 | Fleet `validate` and `status` | Inventory validation and reported service, version, configuration and certificate state | End-to-end traffic or root cause |
 | Bounded fleet `diagnose` | Filtered, time-relevant service diagnostics | Complete history or absence of sensitive client/destination metadata |
-| Local `check-config` and `status` | Whether the selected on-disk configuration validates and the reported local service/reload state | A live bind, the configuration previously loaded by a running process, or external connectivity |
+| Local `check-config` and `status` | Disk validity; `status` also compares loaded configuration when its private live socket is available | External connectivity; loaded state when status says `unknown` |
 | Local `doctor` | Read-only evidence of CONNECT-IP host prerequisites | A successful forwarding path or the correctness of all firewall and network state |
 | Client-side `masque-probe --json` | Results for the checks actually run from that client path, including selected transport, warning/failure codes and duration | Unselected or skipped transports, every client network, or CONNECT-IP packet forwarding from negotiation alone |
 | Local `support-bundle` | Structured snapshot of a valid configuration, service metadata, and diagnostic result levels | Invalid configurations, logs, actual traffic, or end-to-end success |
@@ -91,12 +91,21 @@ listener.
 
 After the handshake, the default checks perform:
 
-- upstream TCP CONNECT establishment to `example.com:443`;
+- TCP CONNECT to `example.com:443` followed by a verified target TLS handshake;
 - CONNECT-UDP to `1.1.1.1:53` with a real DNS query and matching response; and
-- CONNECT-IP negotiation/address assignment only when `--connect-ip` is set.
+- when `--connect-ip` is set, address assignment and an IP/UDP DNS round trip to
+  `1.1.1.1:53` inside the tunnel (no local TUN or raw-socket privileges needed).
 
 Use `--tcp-target` or `--udp-target` when server policy intentionally blocks the
-defaults. `--udp-mode echo` is available for a controlled UDP echo target.
+defaults. `--tcp-mode echo` and `--udp-mode echo` require controlled echo
+targets. TCP echo validates a random payload; the default `--tcp-mode tls`
+validates the target certificate using platform roots independently of proxy
+`--ca-cert` / `--insecure`. An HTTP 200 with no forwarded data now fails.
+For CONNECT-IP use `--ip-target IP:PORT` and optionally `--ip-mode echo`.
+`--ip-setup-only --connect-ip` explicitly checks negotiation only and reports
+`CONNECT_IP_SETUP_ONLY` as a warning. Only `CONNECT_IP_ROUND_TRIP` establishes
+packet forwarding to the tested destination. A firewall, ACL or routing issue
+can make setup succeed while the packet check fails.
 `--skip-tcp` and `--skip-udp` isolate one protocol without treating the skipped
 check as a failure.
 
@@ -140,6 +149,9 @@ Useful result codes include:
 | Code | Meaning |
 | --- | --- |
 | `AUTH_REJECTED` | A legacy or external server returned 407; verify the Basic listener and credential |
+| `TCP_RESPONSE_TIMEOUT` / `TCP_RESPONSE_INVALID` | CONNECT opened but target data did not pass validation |
+| `TCP_TLS_FAILED` | Target TLS handshake or target certificate validation failed inside CONNECT |
+| `CONNECT_IP_RESPONSE_TIMEOUT` / `CONNECT_IP_RESPONSE_INVALID` | CONNECT-IP opened but the inner IP/UDP response did not pass validation |
 | `TARGET_POLICY_DENIED` | The configured allow/deny policy rejected the probe target |
 | `PROTOCOL_REJECTED` | HTTP 404: verify credentials, endpoint and CONNECT support; this response does not distinguish authentication failure from an unsupported request |
 | `TARGET_CONNECT_FAILED` | The proxy was reached, but target connection failed (HTTP 502) |

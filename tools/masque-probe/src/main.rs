@@ -3,8 +3,10 @@ mod endpoint;
 mod http2;
 mod http3;
 mod identity;
+mod ip_payload;
 mod protocol;
 mod report;
+mod tcp_payload;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -60,6 +62,10 @@ struct Cli {
     #[arg(long, default_value = "example.com:443", conflicts_with = "skip_tcp")]
     tcp_target: String,
 
+    /// TCP payload validation: verified TLS handshake (default) or random echo.
+    #[arg(long, value_enum, default_value_t = TcpMode::Tls, conflicts_with = "skip_tcp")]
+    tcp_mode: TcpMode,
+
     /// Skip the standard CONNECT target check.
     #[arg(long)]
     skip_tcp: bool,
@@ -76,9 +82,21 @@ struct Cli {
     #[arg(long)]
     skip_udp: bool,
 
-    /// Also check CONNECT-IP negotiation and address assignment.
+    /// Check CONNECT-IP address assignment and an IP/UDP packet round trip.
     #[arg(long)]
     connect_ip: bool,
+
+    /// Inner IP/UDP destination (literal IP:port); defaults to a public DNS resolver.
+    #[arg(long, default_value = "1.1.1.1:53", requires = "connect_ip")]
+    ip_target: std::net::SocketAddr,
+
+    /// Inner UDP validation: DNS query or random echo payload.
+    #[arg(long, value_enum, default_value_t = UdpMode::Dns, requires = "connect_ip")]
+    ip_mode: UdpMode,
+
+    /// Check only CONNECT-IP setup; explicitly does not verify packet forwarding.
+    #[arg(long, requires = "connect_ip")]
+    ip_setup_only: bool,
 
     /// Per-stage timeout in seconds.
     #[arg(
@@ -109,6 +127,12 @@ enum Transport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TcpMode {
+    Tls,
+    Echo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum UdpMode {
     Dns,
     Echo,
@@ -134,10 +158,11 @@ impl ActiveSession {
         &mut self,
         target: &Authority,
         credentials: &Credentials,
+        mode: TcpMode,
     ) -> Result<String, ProbeFailure> {
         match self {
-            Self::Http3(session) => session.probe_tcp(target, credentials),
-            Self::Http2(session) => session.probe_tcp(target, credentials),
+            Self::Http3(session) => session.probe_tcp(target, credentials, mode),
+            Self::Http2(session) => session.probe_tcp(target, credentials, mode),
         }
     }
 
@@ -157,10 +182,19 @@ impl ActiveSession {
         }
     }
 
-    fn probe_connect_ip(&mut self, credentials: &Credentials) -> Result<String, ProbeFailure> {
+    fn probe_connect_ip(
+        &mut self,
+        credentials: &Credentials,
+        target: Option<std::net::SocketAddr>,
+        mode: UdpMode,
+    ) -> Result<String, ProbeFailure> {
         match self {
-            Self::Http3(session) => session.probe_connect_ip(credentials),
-            Self::Http2(session) => session.probe_connect_ip(credentials),
+            Self::Http3(session) => {
+                session.probe_connect_ip(credentials, target, mode == UdpMode::Dns)
+            }
+            Self::Http2(session) => {
+                session.probe_connect_ip(credentials, target, mode == UdpMode::Dns)
+            }
         }
     }
 }
@@ -326,7 +360,7 @@ fn run_probe(cli: &Cli) -> ProbeReport {
             &cli.tcp_target,
             &credentials,
             &mut report,
-            |target, credentials| session.probe_tcp(target, credentials),
+            |target, credentials| session.probe_tcp(target, credentials, cli.tcp_mode),
         );
     }
 
@@ -347,10 +381,20 @@ fn run_probe(cli: &Cli) -> ProbeReport {
 
     if cli.connect_ip {
         let started = Instant::now();
-        match session.probe_connect_ip(&credentials) {
+        match session.probe_connect_ip(
+            &credentials,
+            (!cli.ip_setup_only).then_some(cli.ip_target),
+            cli.ip_mode,
+        ) {
+            Ok(detail) if cli.ip_setup_only => report.checks.push(CheckResult::warning(
+                "connect_ip",
+                "CONNECT_IP_SETUP_ONLY",
+                detail,
+                started,
+            )),
             Ok(detail) => report.checks.push(CheckResult::pass(
                 "connect_ip",
-                "CONNECT_IP_READY",
+                "CONNECT_IP_ROUND_TRIP",
                 detail,
                 started,
             )),
@@ -361,7 +405,7 @@ fn run_probe(cli: &Cli) -> ProbeReport {
     } else {
         report.checks.push(CheckResult::skipped(
             "connect_ip",
-            "not requested; pass --connect-ip to check negotiation",
+            "not requested; pass --connect-ip to verify packet forwarding",
         ));
     }
 
@@ -486,9 +530,16 @@ fn run_target_check(
         }
     };
     match run(&target, credentials) {
-        Ok(detail) => report
-            .checks
-            .push(CheckResult::pass(name, "ROUND_TRIP_OK", detail, started)),
+        Ok(detail) => report.checks.push(CheckResult::pass(
+            name,
+            if name == "connect_tcp" {
+                "TCP_PAYLOAD_OK"
+            } else {
+                "ROUND_TRIP_OK"
+            },
+            detail,
+            started,
+        )),
         Err(failure) => report
             .checks
             .push(CheckResult::fail(name, failure, started)),

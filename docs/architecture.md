@@ -149,7 +149,8 @@ can require TUN creation at startup with `ip_proxy.require_tun = true`.
 | `src/server/capsules.rs` | Bounded HTTP/3 DATAGRAM capsule input/output |
 | `src/capsule/` | Capsule Protocol encoding and incremental decoding |
 | `src/datagram.rs` | HTTP Datagram framing and Context ID handling |
-| `src/scheduler.rs` | Dirty-connection and deadline scheduling |
+| `src/scheduler.rs` | Dirty-connection scheduling and one replaceable deadline per connection |
+| `src/runtime_status.rs` | Private local socket and keyed loaded-configuration fingerprints |
 | `src/auth.rs` | Basic credential parsing and Argon2id verification |
 | `src/policy.rs` | CIDR target allow/deny decisions |
 | `src/tun.rs` | Linux TUN creation and offloaded packet batches |

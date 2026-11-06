@@ -627,6 +627,28 @@ class InventoryTests(unittest.TestCase):
             ops.configure_probe(inventory, inventory.hosts[0], {}, None, runner)
         runner.run.assert_not_called()
 
+    def test_ip_probe_requires_packet_evidence_and_forwards_payload_options(self) -> None:
+        path = self.write_inventory('[hosts.probe]\nendpoint = "proxy.example:443"\nconnect_ip = true\ntcp_mode = "echo"\nip_target = "198.51.100.1:9999"\nip_mode = "echo"')
+        host = ops.load_inventory(path).hosts[0]
+        runner = ops.ProbeRunner("masque-probe", self.root)
+        for code, verified in [("CONNECT_IP_READY", False), ("CONNECT_IP_SETUP_ONLY", False), ("CONNECT_IP_ROUND_TRIP", True)]:
+            report = {"success": True, "selected_transport": "http3", "checks": [{"name": "connect_ip", "status": "pass", "code": code}]}
+            completed = subprocess.CompletedProcess([], 0, json.dumps(report).encode(), b"")
+            with mock.patch.object(runner, "preflight"), mock.patch.object(runner, "resolve_binary", return_value="masque-probe"), mock.patch.object(ops.subprocess, "run", return_value=completed) as run:
+                if verified:
+                    self.assertTrue(runner.run(host)["connect_ip_forwarding_verified"])
+                else:
+                    with self.assertRaisesRegex(ops.OpsError, "forwarding was not verified"):
+                        runner.run(host)
+                command = run.call_args.args[0]
+                self.assertIn("--tcp-mode", command)
+                self.assertIn("--ip-target", command)
+                self.assertIn("--ip-mode", command)
+                if not verified:
+                    setup = ops.dataclasses.replace(host, probe=ops.dataclasses.replace(host.probe, ip_setup_only=True))
+                    self.assertFalse(runner.run(setup)["connect_ip_forwarding_verified"])
+                    self.assertIn("--ip-setup-only", run.call_args.args[0])
+
     def test_probe_setup_cli_uses_existing_private_credentials_without_disclosure(self) -> None:
         path = self.write_inventory()
         path.write_text(path.read_text().replace("canary = true", "canary = false"))

@@ -1387,3 +1387,6 @@ async fn http2_malformed_address_requests_reset_only_the_request_stream() {
     server_task.abort();
     driver.abort();
 }
+
+#[path = "http2_connect/security.rs"]
+mod security;

@@ -3,15 +3,23 @@
 use libfuzzer_sys::fuzz_target;
 use masque::capsule::decoder::CapsuleDecoder;
 
+// Include the canonical parser so its crate-private routing guard is exercised
+// without exposing a server-internal API just for the fuzz harness.
+#[path = "../../src/ip_packet.rs"]
+mod ip_packet;
+
 fuzz_target!(|data: &[u8]| {
     let _ = masque::varint::decode(data);
     if let Ok(datagram) = masque::datagram::decode_ref(data) {
         assert!(datagram.stream_id <= masque::varint::MAX_VALUE);
         assert!(datagram.stream_id.is_multiple_of(4));
     }
-    let _ = masque::ip_packet::parse(data);
-    let _ = masque::ip_packet::src_addr(data);
-    let _ = masque::ip_packet::dst_addr(data);
+    let parsed = ip_packet::parse(data);
+    let _ = ip_packet::src_addr(data);
+    let _ = ip_packet::dst_addr(data);
+    if ip_packet::has_safe_routing(data) {
+        assert!(parsed.is_ok());
+    }
 
     // Exercise the incremental state machine across different split points,
     // not only the one-shot parser path.

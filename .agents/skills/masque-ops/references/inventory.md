@@ -99,3 +99,10 @@ never placed in the process arguments or parsed by `masque-ops`. Certificate
 authentication uses `client_config`. A rollout normally requires a probe for
 the sole host or canary unless the operator explicitly accepts the weaker
 `--allow-no-probe` check.
+
+Probe data checks use a target TLS handshake by default (`tcp_mode = "tls"`),
+or random TCP echo with `tcp_mode = "echo"`. `connect_ip = true` requires an
+inner IP/UDP round trip; `ip_target` and `ip_mode = "dns" | "echo"` select the
+destination and payload. `ip_setup_only = true` explicitly requests negotiation
+only and cannot establish forwarding. Upgrade the probe binary with the
+operations bundle; old `CONNECT_IP_READY` reports are not forwarding evidence.

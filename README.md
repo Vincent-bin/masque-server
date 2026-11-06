@@ -36,11 +36,12 @@ a staging environment.
 - Atomic `SIGHUP` reload of the full TLS certificate chain, Basic account sets,
   and certificate roster without dropping established tunnels; active roster
   updates disconnect only revoked certificate clients
-- Read-only `status` for local service, configuration, certificate, and reload feedback
+- Read-only `status` for local service and loaded configuration, including pending
+  reload/restart changes through an owner-only local socket
 - Read-only `doctor` checks for CONNECT-IP TUN, forwarding, route, firewall,
   and NAT prerequisites without modifying the host
 - A packaged client-side `masque-probe` that verifies TLS, authentication,
-  CONNECT-TCP, CONNECT-UDP, and optional CONNECT-IP over HTTP/3 or HTTP/2
+  TCP payloads, UDP responses, and optional IP packet round trips over HTTP/3 or HTTP/2
 - Credential-safe client configuration generation and a redacted JSON support
   bundle for reproducible troubleshooting
 - Per-listener QUIC packet ceilings for mixed direct and low-MTU relay endpoints

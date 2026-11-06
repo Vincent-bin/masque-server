@@ -92,16 +92,25 @@ impl Shard {
                     continue;
                 }
 
-                // Check IP tunnels — validate source and forward to TUN.
+                // Check IP tunnels — validate source and destination before TUN.
                 if let Some(tunnel) = client.ip_tunnels.get_mut(&dgram.stream_id) {
                     // Validate source address.
-                    match ip_packet::src_addr(dgram.payload) {
-                        Ok(src) => {
-                            if !tunnel.owns_address(&src) {
+                    match ip_packet::parse(dgram.payload) {
+                        Ok(header) => {
+                            if !tunnel.owns_address(&header.src) {
                                 debug!(
                                     stream_id = dgram.stream_id,
-                                    %src,
+                                    source = %header.src,
                                     "spoofed source address, dropping"
+                                );
+                                continue;
+                            }
+                            if !self.shared.ip_policy.is_allowed(header.dst)
+                                || !ip_packet::has_safe_routing(dgram.payload)
+                            {
+                                debug!(
+                                    stream_id = dgram.stream_id,
+                                    "CONNECT-IP destination policy denied packet"
                                 );
                                 continue;
                             }

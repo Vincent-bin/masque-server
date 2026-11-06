@@ -5,9 +5,7 @@ use super::*;
 impl Shard {
     /// Mark every connection whose deadline has arrived as needing servicing.
     ///
-    /// A deadline that moved later leaves its earlier entry in the queue, so an
-    /// entry only counts when it still matches the deadline the connection
-    /// holds. Anything else is a superseded entry and is dropped.
+    /// There is at most one queued deadline per live connection.
     pub(super) fn expire_connection_timers(&mut self, now: Instant) {
         let connections = &mut self.connections;
         let conn_by_index = &self.conn_by_index;
@@ -33,16 +31,17 @@ impl Shard {
     /// Queue this connection's next wakeup, if it changed.
     ///
     /// An unchanged deadline already has a live entry in the queue, so leaving
-    /// it alone keeps the queue from growing once per drive on idle-ish
-    /// connections.
-    pub(super) fn reschedule(client: &mut ClientConnection, timers: &mut TimerQueue, now: Instant) {
-        let deadline = client.next_deadline(now);
+    /// it alone avoids unnecessary heap updates.
+    pub(super) fn reschedule(client: &mut ClientConnection, timers: &mut TimerQueue) {
+        let deadline = client.next_deadline();
         if client.scheduled_deadline == deadline {
             return;
         }
         client.scheduled_deadline = deadline;
         if let Some(at) = deadline {
             timers.schedule(client.index, at);
+        } else {
+            timers.cancel(client.index);
         }
     }
 

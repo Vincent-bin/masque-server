@@ -193,6 +193,7 @@ impl Shard {
             // configured user reaches the password hash, and that is
             // deliberately slow enough that it must not run on this thread.
             if duplicate_proxy_authorization {
+                context.metrics.record_auth_failure();
                 warn!(stream_id, "duplicate proxy credentials");
                 Self::send_auth_rejection(h3, quic, stream_id);
                 return None;
@@ -205,6 +206,7 @@ impl Shard {
                     return None;
                 }
                 AuthPrecheck::Rejected => {
+                    context.metrics.record_auth_failure();
                     warn!(stream_id, "proxy authentication failed");
                     Self::send_auth_rejection(h3, quic, stream_id);
                     return None;

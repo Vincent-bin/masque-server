@@ -27,6 +27,10 @@ struct Cli {
     #[arg(short, long, default_value = "masque.toml")]
     config: PathBuf,
 
+    /// Owner-only local socket for live configuration status. Its parent must be 0700.
+    #[arg(long, default_value = "/run/masque/status.sock")]
+    status_socket: PathBuf,
+
     /// TLS certificate path.
     #[arg(long)]
     cert: Option<PathBuf>,
@@ -479,7 +483,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if matches!(cli.command, Some(Command::Status)) {
-        return support::print_status(&cli.config, cli.cert.as_deref(), cli.key.as_deref());
+        return support::print_status(
+            &cli.config,
+            cli.cert.as_deref(),
+            cli.key.as_deref(),
+            &cli.status_socket,
+        )
+        .await;
     }
     if matches!(cli.command, Some(Command::HashPassword)) {
         let mut password = Zeroizing::new(String::new());
@@ -867,6 +877,16 @@ async fn main() -> anyhow::Result<()> {
     // disk is reloadable; defaults have no file to re-read.
     let reload_path = cli.config.exists().then_some(cli.config);
     let mut server = Server::bind_with_reload(cfg, reload_path).await?;
+    #[cfg(unix)]
+    let _status = match server.start_local_status(&cli.status_socket).await {
+        Ok(status) => Some(status),
+        Err(_) => {
+            warn!(
+                "local runtime status unavailable; configure an owner-only socket directory to enable it"
+            );
+            None
+        }
+    };
     server.run().await
 }
 
