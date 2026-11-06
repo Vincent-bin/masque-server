@@ -7,6 +7,29 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.10 - 2026-11-06
+
+### Fixed
+
+- Validate standard CONNECT-IP requests against the complete configured URI
+  template on HTTP/2 and HTTP/3. Malformed scope returns an empty `400`;
+  valid non-wildcard scope returns an empty `501` instead of silently opening
+  an unrestricted tunnel. Scoped forwarding remains unsupported.
+- Update the bundled probe and E2E client to use the default full-tunnel URI,
+  `/.well-known/masque/ip/*/*/`. Standard clients must match the configured
+  template; existing `cf-connect-ip` request compatibility is preserved.
+- Validate CONNECT-IP address and route control fields, with bounded parsing,
+  request tracking, and response queues. Invalid controls affect only their
+  stream and cannot change server leases, routes, or source-address checks.
+
+### Added
+
+- Handle CONNECT-IP `ADDRESS_REQUEST` on both transports, preserving request
+  IDs and existing assignments while explicitly rejecting unavailable
+  addresses and delegated prefixes. Address requests do not expand access.
+- Exercise CONNECT-IP negotiation and address assignment in the bundled
+  probe's Basic and certificate authentication tests over both transports.
+
 ## 0.14.9 - 2026-11-06
 
 ### Fixed
