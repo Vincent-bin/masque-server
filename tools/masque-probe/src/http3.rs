@@ -209,7 +209,7 @@ impl Session {
             quiche::h3::Header::new(b":protocol", b"connect-ip"),
             quiche::h3::Header::new(b":scheme", b"https"),
             quiche::h3::Header::new(b":authority", self.authority.as_bytes()),
-            quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/"),
+            quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/*/*/"),
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
         ];
         append_auth(&mut headers, credentials);

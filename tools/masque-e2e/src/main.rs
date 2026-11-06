@@ -2765,15 +2765,19 @@ fn test_non_connect_404(server_addr: &str, _echo_addr: &str) -> Result<()> {
 // CONNECT-IP helpers
 // ---------------------------------------------------------------------------
 
-fn connect_ip_headers(server_addr: &str) -> Result<Vec<quiche::h3::Header>> {
-    let mut headers = vec![
+fn connect_ip_headers_without_auth(server_addr: &str) -> Vec<quiche::h3::Header> {
+    vec![
         quiche::h3::Header::new(b":method", b"CONNECT"),
         quiche::h3::Header::new(b":protocol", b"connect-ip"),
         quiche::h3::Header::new(b":scheme", b"https"),
         quiche::h3::Header::new(b":authority", server_addr.as_bytes()),
-        quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/"),
+        quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/*/*/"),
         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-    ];
+    ]
+}
+
+fn connect_ip_headers(server_addr: &str) -> Result<Vec<quiche::h3::Header>> {
+    let mut headers = connect_ip_headers_without_auth(server_addr);
     append_proxy_authorization(&mut headers)?;
     Ok(headers)
 }
@@ -3266,6 +3270,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_ip_headers_use_valid_full_tunnel_uri() {
+        use quiche::h3::NameValue as _;
+
+        let headers = connect_ip_headers_without_auth("localhost:4433");
+        let path = headers
+            .iter()
+            .find(|header| header.name() == b":path")
+            .unwrap();
+        assert_eq!(path.value(), b"/.well-known/masque/ip/*/*/");
+        let target = masque::uri::parse_ip_path(
+            std::str::from_utf8(path.value()).unwrap(),
+            &masque::config::ServerConfig::default()
+                .ip_proxy
+                .uri_template,
+        )
+        .unwrap();
+        assert_eq!(target.target, None);
+        assert_eq!(target.ipproto, None);
+    }
 
     #[test]
     fn udp_load_stream_options_are_bounded() {
