@@ -553,7 +553,7 @@ mod tests {
     use super::*;
 
     fn loopback_policy() -> TargetPolicy {
-        TargetPolicy::new(&["127.0.0.0/8".into()], &[])
+        TargetPolicy::new(&["127.0.0.0/8".into()], &[]).unwrap()
     }
 
     #[tokio::test]

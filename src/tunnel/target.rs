@@ -146,6 +146,7 @@ mod tests {
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
         )
+        .unwrap()
     }
 
     #[tokio::test]

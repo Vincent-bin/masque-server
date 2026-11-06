@@ -116,7 +116,7 @@ listen_addr = "127.0.0.1:9090"
 
 Only IPv4/IPv6 loopback addresses are accepted; wildcard and public addresses
 fail validation because the endpoint intentionally has no authentication. It
-serves `/healthz`, `/readyz`, and Prometheus `/metrics`. `check-config` prints
+serves `/healthz`, `/readyz`, `/readyz/connect-ip`, and Prometheus `/metrics`. `check-config` prints
 the resolved address and paths when enabled. See
 [Observability](observability.md) for metrics, alerts, and Grafana setup.
 
@@ -425,6 +425,12 @@ Omit `allow_targets` or `allow_ports` to inherit that dimension from the global
 policy. An explicit empty list denies every target in that dimension.
 `deny_targets` adds to the global denies. Every resolved address must pass both
 policies. Invalid CIDRs and port zero are rejected by `check-config`.
+
+Global `tcp_proxy` and `udp_proxy` allow/deny lists also require valid IPv4 or
+IPv6 CIDRs. Startup and `check-config` reject any malformed entry, including
+entries in a disabled proxy, and report the section, field, and zero-based
+entry index. An invalid deny rule is never silently skipped. Empty allow lists
+still deny all targets; empty deny lists add no exclusions.
 These tables do not govern CONNECT-IP forwarding. Restart after editing them.
 
 Use one HTTP/3 shard until a benchmark shows one event loop is CPU-bound.
@@ -931,6 +937,7 @@ a loss and throughput A/B test.
 ```toml
 [ip_proxy]
 enabled = true
+require_tun = false
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
 connect_protocols = ["connect-ip", "cf-connect-ip"]
 tun_name = "masque0"
@@ -963,6 +970,22 @@ Startup reads only the hard `/dev/net/tun` and forwarding prerequisites and
 reminds the operator to run `doctor`; it deliberately does not execute firewall
 utilities from the capability-bearing daemon. A failed startup check is logged
 without taking CONNECT and CONNECT-UDP down with optional CONNECT-IP egress.
+
+`require_tun = true` changes device-creation failure into a fatal startup error,
+before proxy listeners bind. It applies only when `enabled = true`; the default
+`false` preserves best-effort startup for existing mixed-service deployments.
+`check-config` remains side-effect-free and does not prove that a TUN can be
+created. These settings require a restart, not SIGHUP.
+
+Use `/readyz/connect-ip` to require local CONNECT-IP capability in a deployment
+probe. It returns `503` if CONNECT-IP is disabled, no usable protocol or IP
+pool is configured, TUN creation failed, or the process is not ready.
+`/readyz` and systemd readiness still report listener/process readiness, so
+optional CONNECT-IP failure does not take working CONNECT/CONNECT-UDP services
+offline. Capability metrics are described in [Observability](observability.md).
+Neither this endpoint nor `require_tun` verifies runtime TUN I/O, host
+forwarding, firewall, NAT, routing, or end-to-end reachability. Continue to use
+`doctor` and an external traffic probe for those checks.
 
 ## Validation and upgrades
 

@@ -62,13 +62,14 @@ pub struct TargetPolicy {
 impl TargetPolicy {
     /// Create a policy from string CIDR lists.
     ///
-    /// Invalid CIDRs are logged and skipped.
-    pub fn new(allow: &[String], deny: &[String]) -> Self {
-        Self {
-            allow: parse_cidrs(allow),
-            deny: parse_cidrs(deny),
+    /// Reject the entire policy if any entry is not a valid CIDR. In
+    /// particular, silently dropping a deny rule could permit its targets.
+    pub fn new(allow: &[String], deny: &[String]) -> anyhow::Result<Self> {
+        Ok(Self {
+            allow: parse_cidrs(allow, "allow_targets")?,
+            deny: parse_cidrs(deny, "deny_targets")?,
             restrictions: None,
-        }
+        })
     }
 
     pub(crate) fn with_restrictions(mut self, restrictions: Option<TargetRestrictions>) -> Self {
@@ -131,16 +132,15 @@ impl TargetPolicy {
     }
 }
 
-fn parse_cidrs(strings: &[String]) -> Vec<IpNet> {
+fn parse_cidrs(strings: &[String], field: &str) -> anyhow::Result<Vec<IpNet>> {
     strings
         .iter()
-        .filter_map(|s| {
-            s.parse::<IpNet>().ok().or_else(|| {
-                tracing::warn!(cidr = %s, "invalid CIDR in policy, skipping");
-                None
-            })
+        .enumerate()
+        .map(|(index, rule)| {
+            rule.parse::<IpNet>()
+                .map(canonical_net)
+                .with_context(|| format!("{field}[{index}]: invalid target CIDR {rule:?}"))
         })
-        .map(canonical_net)
         .collect()
 }
 
@@ -204,6 +204,7 @@ mod tests {
             &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             &deny.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
+        .unwrap()
     }
 
     // ── Basic allow/deny ──────────────────────────────────────────────
@@ -361,9 +362,27 @@ mod tests {
     // ── Invalid CIDR handling ─────────────────────────────────────────
 
     #[test]
-    fn invalid_cidr_skipped() {
-        let p = policy(&["not-a-cidr", "0.0.0.0/0"], &["also-bad"]);
-        // The valid "0.0.0.0/0" should still work
-        assert!(p.is_allowed(Ipv4Addr::new(8, 8, 8, 8).into()));
+    fn invalid_cidr_rejects_the_entire_policy() {
+        for invalid in [
+            "not-a-cidr",
+            "192.0.2.0/33",
+            "2001:db8::/129",
+            "192.0.2.1",
+            "",
+        ] {
+            for field in ["allow_targets", "deny_targets"] {
+                let valid = vec!["0.0.0.0/0".into(), "::/0".into()];
+                let mixed = vec!["192.0.2.0/24".into(), invalid.into()];
+                let result = if field == "allow_targets" {
+                    TargetPolicy::new(&mixed, &valid)
+                } else {
+                    TargetPolicy::new(&valid, &mixed)
+                };
+                let error = result.err().expect("invalid policy must be rejected");
+                let message = error.to_string();
+                assert!(message.contains(&format!("{field}[1]")), "{message}");
+                assert!(message.contains(&format!("{invalid:?}")), "{message}");
+            }
+        }
     }
 }

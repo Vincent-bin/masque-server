@@ -392,6 +392,9 @@ pub struct TcpProxySection {
 #[serde(default, deny_unknown_fields)]
 pub struct IpProxySection {
     pub enabled: bool,
+    /// Fail startup if enabled CONNECT-IP cannot create its TUN device.
+    /// Defaults to best-effort so CONNECT and CONNECT-UDP can still run.
+    pub require_tun: bool,
     pub uri_template: String,
     /// Accepted `:protocol` values for an Extended CONNECT IP request.
     ///
@@ -576,6 +579,7 @@ impl Default for IpProxySection {
     fn default() -> Self {
         Self {
             enabled: true,
+            require_tun: false,
             uri_template: "/.well-known/masque/ip/{target}/{ipproto}/".into(),
             connect_protocols: vec!["connect-ip".into(), "cf-connect-ip".into()],
             tun_name: "masque0".into(),
@@ -636,6 +640,7 @@ enabled = false
         assert!(cfg.udp_proxy.enabled);
         assert_eq!(cfg.udp_proxy.connect_timeout_secs, 10);
         assert!(cfg.ip_proxy.enabled);
+        assert!(!cfg.ip_proxy.require_tun);
         assert_eq!(cfg.ip_proxy.tun_mtu, 1280);
         assert_eq!(cfg.observability.listen_addr, None);
         // Cloudflare's non-standard identifier is accepted out of the box; an
@@ -1051,6 +1056,7 @@ deny_targets = []
             r#"
 [ip_proxy]
 enabled = false
+require_tun = true
 tun_name = "tun7"
 tun_mtu = 1400
 ipv4_pool = "172.16.0.0/12"
@@ -1058,6 +1064,7 @@ ipv6_pool = "fd01::/64"
 "#,
         );
         assert!(!cfg.ip_proxy.enabled);
+        assert!(cfg.ip_proxy.require_tun);
         assert_eq!(cfg.ip_proxy.tun_name, "tun7");
         assert_eq!(cfg.ip_proxy.tun_mtu, 1400);
         assert_eq!(cfg.ip_proxy.ipv4_pool, "172.16.0.0/12");

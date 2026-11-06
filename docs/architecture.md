@@ -106,7 +106,10 @@ Prometheus requests. Shards update fixed atomic counters in batches and never
 format metrics or acquire the scrape-side listener-list lock. systemd readiness
 uses the lifecycle state plus one heartbeat store per shard per second: ready
 after every socket is bound, not ready when a shard is stale or as soon as the
-bounded drain begins. The packaged watchdog uses the same liveness decision.
+bounded drain begins. The packaged watchdog uses the same liveness decision. CONNECT-IP capability
+is reported separately by `/readyz/connect-ip` and its metrics: best-effort TUN
+failure does not make working CONNECT/CONNECT-UDP listeners unready. Operators
+can require TUN creation at startup with `ip_proxy.require_tun = true`.
 
 ## Source layout
 

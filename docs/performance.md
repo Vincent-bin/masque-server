@@ -133,6 +133,11 @@ not establish a throughput improvement on a path with spare CPU capacity.
 
 ### Target UDP sockets
 
+The [multi-tunnel scheduling investigation](performance-udp-tunnels.md) compares
+one active tunnel, many idle tunnels, and many active tunnels without changing
+the aggregate offered window. Its results do not justify a production scheduler
+change.
+
 Client bursts are staged per tunnel during one shard iteration and submitted
 with a direct `SYS_sendmmsg`. Target responses are drained with
 `SYS_recvmmsg`. On non-Linux systems, Tokio sends and receives individual
@@ -637,8 +642,35 @@ hostnames, addresses, credentials, and executable paths. Per-run logs remain
 in private subdirectories. Server CPU seconds and peak RSS come from `wait4`
 for only the temporary server; they exclude the client and target processes.
 Resource accounting covers the whole case, including startup and direct-control
-intervals. CPU percentage can exceed 100% for multiple busy cores. Compare
-resource usage only alongside equivalent completed traffic.
+intervals. CPU percentage can exceed 100% for multiple busy cores. Total CPU
+seconds remain available for capacity planning, but are not a regression gate:
+a fixed-duration run may use more CPU simply because it completes more traffic.
+
+Report schema version 2 adds per-run `cpu_secs_per_gib` (CPU seconds per GiB of
+completed proxy application payload) and, for UDP/load cases,
+`cpu_secs_per_million_responses`. UDP bytes are the sum of `rx_packets` times
+`payload_bytes`; TCP bytes sum the actual `body_bytes` of each proxy download.
+Direct-control traffic, sequential RTT probes, and loaded-RTT histograms are
+excluded from these work denominators. An echo payload is counted once, not
+once per relay direction. Normalization happens before calculating medians,
+so CPU and completed work stay paired within each run. Raw and normalized
+metrics retain sample counts, medians, and ranges.
+
+These are **whole-case CPU costs per completed bulk work**, not isolated hot-path
+costs: startup, authentication, warm-up, probe traffic, direct-control intervals,
+and shutdown are still charged to CPU. Use identical settings and longer runs
+to reduce fixed overhead, or measure a bounded steady-state interval separately
+when investigating per-packet scheduling costs.
+
+CPU comparisons require matching payload/sample identities and stable completed
+traffic proportions (UDP response shares or TCP byte shares), using the same
+percentage tolerance as other metrics. A changed mix, missing/zero work, missing
+samples, or a noisy/drifting direct control makes the CPU comparison
+`inconclusive`. Increased UDP response shortfall cannot qualify as a CPU
+improvement. The fixed-size load cases allow total completed work to differ:
+more traffic with proportionally more CPU is unchanged efficiency, while higher
+CPU per completed unit is still a regression. Peak RSS remains a separate
+absolute resource comparison.
 The report is checkpointed after every successful workload; `complete = false`
 identifies an interrupted or failed matrix.
 

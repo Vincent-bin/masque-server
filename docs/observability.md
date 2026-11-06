@@ -20,11 +20,20 @@ through a firewall rule or unauthenticated reverse proxy.
 | --- | --- | --- |
 | `/healthz` | `200 ok` | The process and operational HTTP task are alive |
 | `/readyz` | `200 ready` | All proxy sockets are bound and every listener worker heartbeat is current |
+| `/readyz/connect-ip` | `200 ready` | Local CONNECT-IP capability is available and `/readyz` is ready |
 | `/metrics` | `200` | Prometheus text exposition |
 
 `/readyz` returns `503` before readiness, when any proxy worker has made no
 event-loop progress for five seconds, and as soon as graceful shutdown starts.
 `/healthz` and `/metrics` remain available during the bounded drain.
+
+`/readyz/connect-ip` also requires `ip_proxy.enabled`, at least one usable
+accepted protocol and nonempty IP pool, and successful TUN creation. Disabled or degraded
+CONNECT-IP returns `503` even when `/readyz` returns `200` for working CONNECT
+and CONNECT-UDP listeners. TUN availability is a startup snapshot, not a runtime
+I/O or host-egress check. Use `doctor` and an external traffic probe to verify
+forwarding, routing, firewall, NAT, and end-to-end service. Opt into
+`ip_proxy.require_tun = true` to fail startup on TUN creation errors.
 Only `GET` and `HEAD` are accepted, requests time out after two seconds, request
 headers are capped at 8 KiB, and concurrency is bounded.
 
@@ -89,6 +98,9 @@ All metric names start with `masque_`.
 | --- | --- | --- | --- |
 | `masque_build_info` | gauge | `version` | Running build version |
 | `masque_server_ready` | gauge | — | `1` while ready, `0` while starting or draining |
+| `masque_connect_ip_enabled` | gauge | — | `1` when `ip_proxy.enabled` is true |
+| `masque_connect_ip_available` | gauge | — | Startup TUN capability with an enabled protocol and IP pool, independent of lifecycle readiness |
+| `masque_connect_ip_ready` | gauge | — | Local CONNECT-IP capability plus current process readiness; same as `/readyz/connect-ip` |
 | `masque_process_start_time_seconds` | gauge | — | Process start as a Unix timestamp |
 | `masque_process_uptime_seconds` | gauge | — | Current process uptime |
 | `masque_listener_shards` | gauge | `listener`, `transport`, `auth` | Event-loop workers assigned to the listener |

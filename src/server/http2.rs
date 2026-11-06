@@ -97,11 +97,13 @@ impl Http2Listener {
                 &config.tcp_proxy.allow_targets,
                 &config.tcp_proxy.deny_targets,
             )
+            .context("tcp_proxy")?
             .with_restrictions(listener.tcp_targets),
             udp_policy: TargetPolicy::new(
                 &config.udp_proxy.allow_targets,
                 &config.udp_proxy.deny_targets,
             )
+            .context("udp_proxy")?
             .with_restrictions(listener.udp_targets),
             connection_slots: Arc::new(Semaphore::new(config.server.max_connections)),
             config,

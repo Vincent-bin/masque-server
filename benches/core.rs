@@ -232,7 +232,7 @@ fn main() {
     ]
     .map(str::to_owned)
     .to_vec();
-    let policy = TargetPolicy::new(&allow, &deny);
+    let policy = TargetPolicy::new(&allow, &deny).unwrap();
     let public_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
     bench("policy/check-8-deny-rules", None, || {
         policy.is_allowed(black_box(public_ip))

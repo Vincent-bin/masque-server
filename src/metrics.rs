@@ -21,6 +21,8 @@ const SHARD_STALE_AFTER: Duration = Duration::from_secs(5);
 pub(crate) struct Metrics {
     enabled: bool,
     ready: AtomicBool,
+    connect_ip_enabled: bool,
+    connect_ip_available: bool,
     started: Instant,
     start_time_seconds: u64,
     listeners: RwLock<Vec<ListenerMetrics>>,
@@ -36,6 +38,8 @@ impl Metrics {
         Self {
             enabled,
             ready: AtomicBool::new(false),
+            connect_ip_enabled: false,
+            connect_ip_available: false,
             started: Instant::now(),
             start_time_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -48,6 +52,22 @@ impl Metrics {
             roster_reload_failure: AtomicU64::new(0),
             forced_shutdowns: AtomicU64::new(0),
         }
+    }
+
+    /// Record immutable startup capability, independently of process readiness.
+    /// Host routing, firewall, and external reachability are not probed here.
+    pub(crate) fn with_connect_ip(mut self, enabled: bool, available: bool) -> Self {
+        self.connect_ip_enabled = enabled;
+        self.connect_ip_available = enabled && available;
+        self
+    }
+
+    pub(crate) fn is_connect_ip_ready(&self) -> bool {
+        self.is_connect_ip_ready_at(self.elapsed_millis())
+    }
+
+    fn is_connect_ip_ready_at(&self, now_millis: u64) -> bool {
+        self.connect_ip_available && self.is_ready_at(now_millis)
     }
 
     /// Register a listener after an ephemeral port, if any, has been resolved.
@@ -172,6 +192,27 @@ impl Metrics {
             "gauge",
         );
         writeln!(out, "masque_server_ready {}", u8::from(self.is_ready())).unwrap();
+
+        for (name, help, value) in [
+            (
+                "masque_connect_ip_enabled",
+                "Whether CONNECT-IP is enabled in configuration.",
+                self.connect_ip_enabled,
+            ),
+            (
+                "masque_connect_ip_available",
+                "Whether startup created a TUN with an enabled IP pool and accepted protocol.",
+                self.connect_ip_available,
+            ),
+            (
+                "masque_connect_ip_ready",
+                "Whether local CONNECT-IP capability is available and the server is ready; not an egress probe.",
+                self.is_connect_ip_ready(),
+            ),
+        ] {
+            metric_header(&mut out, name, help, "gauge");
+            writeln!(out, "{name} {}", u8::from(value)).unwrap();
+        }
 
         metric_header(
             &mut out,
@@ -1407,6 +1448,54 @@ mod tests {
 
         shards[0].record_heartbeat(registered_at + stale_after + 1, Duration::ZERO);
         assert!(metrics.is_ready_at(registered_at + stale_after + 1));
+    }
+
+    #[test]
+    fn connect_ip_capability_does_not_override_process_readiness() {
+        for (enabled, available) in [(false, false), (false, true), (true, false), (true, true)] {
+            let metrics = Metrics::new(false).with_connect_ip(enabled, available);
+            assert!(!metrics.is_connect_ip_ready());
+            metrics.set_ready(true);
+            assert!(metrics.is_ready());
+            assert_eq!(metrics.is_connect_ip_ready(), enabled && available);
+            let rendered = metrics.render();
+            assert!(rendered.contains(&format!(
+                "masque_connect_ip_enabled {}\n",
+                u8::from(enabled)
+            )));
+            assert!(rendered.contains(&format!(
+                "masque_connect_ip_available {}\n",
+                u8::from(enabled && available)
+            )));
+            assert!(rendered.contains(&format!(
+                "masque_connect_ip_ready {}\n",
+                u8::from(enabled && available)
+            )));
+            metrics.begin_shutdown();
+            assert!(!metrics.is_connect_ip_ready());
+        }
+    }
+
+    #[test]
+    fn connect_ip_readiness_follows_worker_heartbeats_for_both_transports() {
+        for transport in ["http2", "http3"] {
+            let metrics = Metrics::new(false).with_connect_ip(true, true);
+            let shards = metrics.register_listener(
+                "127.0.0.1:8449".parse().unwrap(),
+                transport,
+                "disabled",
+                1,
+                false,
+                false,
+            );
+            let registered_at = shards[0].last_heartbeat_millis.load(RELAXED);
+            let stale_at = registered_at + SHARD_STALE_AFTER.as_millis() as u64 + 1;
+            metrics.set_ready(true);
+            assert!(metrics.is_connect_ip_ready_at(registered_at));
+            assert!(!metrics.is_connect_ip_ready_at(stale_at));
+            shards[0].record_heartbeat(stale_at, Duration::ZERO);
+            assert!(metrics.is_connect_ip_ready_at(stale_at));
+        }
     }
 
     #[test]

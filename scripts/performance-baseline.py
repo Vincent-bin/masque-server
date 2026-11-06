@@ -115,20 +115,129 @@ def identity(record):
     return (record["type"], *(record.get(key) for key in IDENTITY))
 
 
+def work_records(records):
+    """Bulk work done by the proxy, never direct controls or duplicate RTT counts."""
+    return [r for r in records if r["type"] in ("LOAD_RESULT", "TCP_DOWNLOAD_RESULT")
+            or (r["type"] == "UDP_RESULT" and r.get("path") == "masque")]
+
+
+def normalize_resources(records):
+    # Normalize each run before taking medians. Dividing independent CPU/work
+    # medians loses the correlation between work completed and CPU consumed.
+    records = [dict(r) for r in records]
+    for record in records:
+        # Recompute derived values when consuming a previously normalized report.
+        for field in ("completed_payload_bytes", "completed_responses", "cpu_secs_per_gib",
+                      "cpu_secs_per_million_responses", "completed_work_share_pct"):
+            record.pop(field, None)
+    resources = [r for r in records if r["type"] == "SERVER_RESOURCE_RESULT"]
+    work = work_records(records)
+    if len(resources) != 1 or not work or "cpu_secs" not in resources[0]:
+        return records
+    if len({identity(r) for r in work}) != len(work):
+        return records  # Duplicate records must not inflate completed work.
+    tcp = all(r["type"] == "TCP_DOWNLOAD_RESULT" for r in work)
+    if not tcp and any(r["type"] == "TCP_DOWNLOAD_RESULT" for r in work):
+        return records  # A mixed TCP/UDP denominator is not comparable.
+    units = [r.get("body_bytes" if tcp else "rx_packets", 0) for r in work]
+    sizes = [1 if tcp else r.get("payload_bytes", 0) for r in work]
+    if any(value <= 0 for value in [*units, *sizes]):
+        return records  # Missing/zero work must not become zero CPU cost.
+    completed_bytes = sum(count * size for count, size in zip(units, sizes))
+    resource = resources[0]
+    resource["completed_payload_bytes"] = completed_bytes
+    resource["cpu_secs_per_gib"] = resource["cpu_secs"] * 1024**3 / completed_bytes
+    if not tcp:
+        resource["completed_responses"] = sum(units)
+        resource["cpu_secs_per_million_responses"] = resource["cpu_secs"] * 1e6 / sum(units)
+    for record, count in zip(work, units):
+        record["completed_work_share_pct"] = count * 100 / sum(units)
+    return records
+
+
+def variable(metric, threshold):
+    return metric["median"] == 0 or (metric["max"] - metric["min"]) / metric["median"] * 100 > threshold
+
+
+def cpu_work_context(candidate, reference, by_key, threshold):
+    """Require the same traffic mix and carry its quality/control caveats to CPU."""
+    case = candidate["case"]
+    work = {label: {identity(r): r for r in work_records(by_key.values())
+                    if r["case"] == case and r["label"] == label}
+            for label in ("reference", "candidate")}
+    reasons = []
+    quality_loss = 0
+    direct_drift = False
+    if not work["reference"] or work["reference"].keys() != work["candidate"].keys():
+        return ["incomparable_workload"], quality_loss, direct_drift
+    for key, a in work["reference"].items():
+        b = work["candidate"][key]
+        shares = [r["metrics"].get("completed_work_share_pct") for r in (a, b)]
+        if any(share is None for share in shares):
+            reasons.append("missing_or_zero_completed_work")
+        else:
+            if any(share["samples"] != r["samples"] for share, r in zip(shares, (a, b))):
+                reasons.append("incomplete_work_samples")
+            if any(variable(share, threshold) for share in shares):
+                reasons.append("high_workload_mix_variability")
+            if shares[0]["median"] == 0 or abs(shares[1]["median"] / shares[0]["median"] - 1) * 100 > threshold:
+                reasons.append("workload_mix_drift")
+        if a["samples"] != reference["samples"] or b["samples"] != candidate["samples"]:
+            reasons.append("incomplete_work_samples")
+        # The runner holds these settings fixed. Also check them when comparing
+        # existing records so different connection/window setups cannot qualify.
+        for field in ("connections", "streams_per_connection", "active_streams_per_connection",
+                      "window", "expiry_ms", "requested_pps_per_connection"):
+            av, bv = a["metrics"].get(field), b["metrics"].get(field)
+            if (av is None) != (bv is None) or (av and (av["min"] != av["max"] or av != bv)):
+                reasons.append("incomparable_workload")
+        if a["type"] in ("UDP_RESULT", "LOAD_RESULT"):
+            av, bv = [r["metrics"].get("response_shortfall_pct") for r in (a, b)]
+            if av is None or bv is None:
+                reasons.append("missing_traffic_quality")
+            else:
+                if av["samples"] != a["samples"] or bv["samples"] != b["samples"]:
+                    reasons.append("incomplete_work_samples")
+                quality_loss = max(quality_loss, bv["median"] - av["median"])
+        direct_key = None
+        direct_metric = None
+        if a["type"] == "UDP_RESULT":
+            direct_key = ("UDP_RESULT", a.get("transport"), "direct", a.get("payload_bytes"), None)
+            direct_metric = "app_goodput_gbps"
+        elif a["type"] == "TCP_DOWNLOAD_RESULT":
+            direct_key = ("DIRECT_TCP_DOWNLOAD_RESULT", a.get("transport"), None, None, a.get("sample"))
+            direct_metric = "transfer_mbps"
+        if direct_key:
+            controls = [by_key.get((case, label, direct_key)) for label in ("reference", "candidate")]
+            values = [r["metrics"].get(direct_metric) if r else None for r in controls]
+            if any(value is None for value in values):
+                reasons.append("missing_direct_control")
+            else:
+                if any(value["samples"] != resource["samples"]
+                       for value, resource in zip(values, (reference, candidate))):
+                    reasons.append("incomplete_direct_control")
+                direct_drift |= values[0]["median"] == 0 or abs(values[1]["median"] / values[0]["median"] - 1) * 100 > threshold
+                if any(variable(value, threshold) for value in values):
+                    reasons.append("high_direct_control_variability")
+    return list(dict.fromkeys(reasons)), quality_loss, direct_drift
+
+
 def aggregate(runs):
     grouped = defaultdict(list)
     for run in runs:
-        for record in run["records"]:
+        for record in normalize_resources(run["records"]):
             grouped[(run["case"], run["label"], identity(record))].append(record)
     result = []
     for (case, label, _), records in grouped.items():
         first = records[0]
         metrics = {}
-        for key, value in first.items():
-            if key in IDENTITY or key == "type" or isinstance(value, bool):
+        for key in dict.fromkeys(k for r in records for k in r):
+            if key in IDENTITY or key == "type":
                 continue
-            values = [r[key] for r in records]
-            metrics[key] = {"median": statistics.median(values), "min": min(values), "max": max(values)}
+            values = [r[key] for r in records if key in r and not isinstance(r[key], bool)]
+            if values:
+                metrics[key] = {"median": statistics.median(values), "min": min(values), "max": max(values),
+                                "samples": len(values)}
         result.append({"case": case, "label": label, "type": first["type"],
                        **{k: first[k] for k in IDENTITY if k in first},
                        "samples": len(records), "metrics": metrics})
@@ -151,8 +260,11 @@ def compare(aggregates, threshold, shortfall_tolerance):
             "UDP_LATENCY_RESULT": {"rtt_p95_us": "lower", "rtt_p99_us": "lower"},
             "UDP_LOAD_LATENCY_RESULT": {"load_rtt_p95_us_upper": "lower", "load_rtt_p99_us_upper": "lower"},
             "TCP_DOWNLOAD_SUMMARY": {"masque_transfer_mbps_median": "higher"},
-            "SERVER_RESOURCE_RESULT": {"cpu_secs": "lower", "peak_rss_bytes": "lower"},
+            "SERVER_RESOURCE_RESULT": {"cpu_secs_per_gib": "lower", "peak_rss_bytes": "lower"},
         }.get(candidate["type"], {})
+        if candidate["type"] == "SERVER_RESOURCE_RESULT" and any(
+                r["case"] == candidate["case"] and r["type"] in ("UDP_RESULT", "LOAD_RESULT") for r in aggregates):
+            metrics["cpu_secs_per_million_responses"] = "lower"
         insufficient = min(candidate["samples"], reference["samples"]) < 3
         quality_loss = (candidate["metrics"].get("response_shortfall_pct", {}).get("median", 0)
                         - reference["metrics"].get("response_shortfall_pct", {}).get("median", 0))
@@ -180,23 +292,32 @@ def compare(aggregates, threshold, shortfall_tolerance):
                 b = direct_b["metrics"].get(direct_metric, {}).get("median", 0)
                 direct_drift = a == 0 or abs(b / a - 1) * 100 > threshold
         for metric, direction in metrics.items():
-            if metric not in candidate["metrics"] or metric not in reference["metrics"]:
+            normalized_cpu = metric.startswith("cpu_secs_per_")
+            a, b = reference["metrics"].get(metric), candidate["metrics"].get(metric)
+            if not normalized_cpu and (a is None or b is None):
                 continue
-            a, b = reference["metrics"][metric], candidate["metrics"][metric]
-            change = (b["median"] / a["median"] - 1) * 100 if a["median"] else None
-            noisy = any(v["median"] == 0 or (v["max"] - v["min"]) / v["median"] * 100 > threshold for v in (a, b))
+            change = (b["median"] / a["median"] - 1) * 100 if a and b and a["median"] else None
+            noisy = any(variable(v, threshold) for v in (a, b) if v)
             reasons = []
+            metric_quality_loss, metric_direct_drift = quality_loss, direct_drift
+            if normalized_cpu:
+                reasons, metric_quality_loss, metric_direct_drift = cpu_work_context(candidate, reference, by_key, threshold)
+                if not a or not b:
+                    reasons.append("missing_or_zero_completed_work")
+                elif a["samples"] != reference["samples"] or b["samples"] != candidate["samples"]:
+                    reasons.append("incomplete_work_samples")
             if insufficient:
                 reasons.append("insufficient_samples")
-            if change is None:
+            if a and a["median"] == 0:
                 reasons.append("zero_reference")
             if noisy:
                 reasons.append("high_variability")
-            if direct_drift:
+            if metric_direct_drift:
                 reasons.append("direct_control_drift")
+            reasons = list(dict.fromkeys(reasons))
             if reasons:
                 status = "inconclusive"
-            elif quality_loss > shortfall_tolerance:
+            elif metric_quality_loss > shortfall_tolerance:
                 status = "regression"
             else:
                 benefit = change if direction == "higher" else -change
@@ -204,7 +325,7 @@ def compare(aggregates, threshold, shortfall_tolerance):
             comparisons.append({"case": candidate["case"], "type": candidate["type"],
                                 **{k: candidate[k] for k in IDENTITY if k in candidate},
                                 "metric": metric, "change_pct": change, "status": status,
-                                "shortfall_increase_pp": quality_loss, "direct_baseline_drift": direct_drift,
+                                "shortfall_increase_pp": metric_quality_loss, "direct_baseline_drift": metric_direct_drift,
                                 "insufficient_samples": insufficient, "noisy": noisy,
                                 "inconclusive_reasons": reasons})
     return comparisons
@@ -249,7 +370,7 @@ def execute(case, label, server, bin_dir, directory, args):
         raise ValueError("benchmark workload failed; inspect the private run log")
     records = parse_records(log_path.read_text())
     validate_records(records, case)
-    return {"case": case["name"], "label": label, "records": records}
+    return {"case": case["name"], "label": label, "records": normalize_resources(records)}
 
 
 def main():
@@ -309,7 +430,7 @@ def main():
     labels = ["reference", "candidate"] if has_reference else ["candidate"]
     workloads = cases(args.profile)
     report = {
-        "schema_version": 1, "platform": {"os": sys.platform, "arch": platform.machine()},
+        "schema_version": 2, "platform": {"os": sys.platform, "arch": platform.machine()},
         "server_sha256": {label: hashlib.sha256(path.read_bytes()).hexdigest() for label, path in servers.items()},
         "client_sha256": hashlib.sha256((bin_dir / "masque-e2e").read_bytes()).hexdigest(),
         "config": {key: getattr(args, key) for key in ("rounds", "duration", "window", "expiry_ms", "rtt_samples", "connections", "tcp_bytes", "cc", "reference_cc", "regression_pct", "shortfall_tolerance_pp")},

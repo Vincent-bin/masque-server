@@ -100,6 +100,218 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual({c["mode"] for c in workloads}, {"udp", "tcp", "load"})
 
 
+def resource_runs(mode="udp", candidate_cpu=2, candidate_work=1000, rounds=3):
+    runs = []
+    for round_number in range(rounds):
+        for label in ("reference", "candidate"):
+            cpu = candidate_cpu if label == "candidate" else 2
+            count = candidate_work if label == "candidate" else 1000
+            records = [{"type": "SERVER_RESOURCE_RESULT", "cpu_secs": cpu, "peak_rss_bytes": 1024}]
+            if mode == "udp":
+                for size in (64, 1200):
+                    for path in ("masque", "direct"):
+                        records.append({"type": "UDP_RESULT", "path": path, "transport": "http3",
+                                        "payload_bytes": size, "rx_packets": count if path == "masque" else 5000,
+                                        "app_goodput_gbps": 1, "response_shortfall_pct": 0})
+            elif mode == "load":
+                records.append({"type": "LOAD_RESULT", "payload_bytes": 1200, "rx_packets": count,
+                                "connections": 8, "window": 256, "expiry_ms": 1000,
+                                "response_shortfall_pct": 0})
+            else:
+                for sample in (1, 2):
+                    records.append({"type": "TCP_DOWNLOAD_RESULT", "transport": "http2",
+                                    "sample": sample, "body_bytes": count, "transfer_mbps": 1})
+                    records.append({"type": "DIRECT_TCP_DOWNLOAD_RESULT", "transport": "http2",
+                                    "sample": sample, "body_bytes": 999999, "transfer_mbps": 1})
+            runs.append({"round": round_number, "case": mode, "label": label, "records": records})
+    return runs
+
+
+class CpuEfficiencyTests(unittest.TestCase):
+    def comparisons(self, runs):
+        return [c for c in baseline.compare(baseline.aggregate(runs), 10, 1)
+                if c["metric"].startswith("cpu_secs_per_")]
+
+    def assert_cpu_status(self, runs, status, reason=None):
+        results = self.comparisons(runs)
+        self.assertTrue(results)
+        for result in results:
+            self.assertEqual(result["status"], status, result)
+            if reason:
+                self.assertIn(reason, result["inconclusive_reasons"])
+        return results
+
+    def test_more_work_with_proportional_cpu_is_not_a_regression(self):
+        for mode in ("udp", "load", "tcp"):
+            with self.subTest(mode=mode):
+                runs = resource_runs(mode, candidate_cpu=4, candidate_work=2000)
+                self.assert_cpu_status(runs, "unchanged")
+                aggregates = baseline.aggregate(runs)
+                resource = next(r for r in aggregates if r["label"] == "candidate" and r["type"] == "SERVER_RESOURCE_RESULT")
+                self.assertEqual(resource["metrics"]["cpu_secs"]["median"], 4)
+                self.assertNotIn("cpu_secs", {r["metric"] for r in baseline.compare(aggregates, 10, 1)})
+
+    def test_per_work_changes_still_detect_real_regressions_and_improvements(self):
+        for mode in ("udp", "load", "tcp"):
+            with self.subTest(mode=mode):
+                self.assert_cpu_status(resource_runs(mode, candidate_cpu=3), "regression")
+                self.assert_cpu_status(resource_runs(mode, candidate_cpu=1), "improvement")
+                # Lower total CPU cannot hide an even larger fall in work.
+                self.assert_cpu_status(resource_runs(mode, candidate_cpu=1.5, candidate_work=500), "regression")
+
+    def test_completed_proxy_work_excludes_direct_and_latency_records(self):
+        for mode, expected_bytes, expected_packets in (("udp", 1264000, 2000), ("load", 1200000, 1000), ("tcp", 2000, None)):
+            with self.subTest(mode=mode):
+                records = resource_runs(mode)[0]["records"]
+                records.extend([
+                    {"type": "UDP_LATENCY_RESULT", "path": "masque", "payload_bytes": 64, "samples": 100},
+                    {"type": "UDP_LOAD_LATENCY_RESULT", "path": "masque", "payload_bytes": 1200, "load_rtt_samples": 1000},
+                    {"type": "TCP_DOWNLOAD_SUMMARY", "samples": 2},
+                ])
+                normalized = baseline.normalize_resources(records)
+                resource = normalized[0]
+                self.assertEqual(resource["completed_payload_bytes"], expected_bytes)
+                self.assertEqual(resource["cpu_secs_per_gib"], 2 * 1024**3 / expected_bytes)
+                self.assertEqual(resource.get("completed_responses"), expected_packets)
+                self.assertEqual(normalized, baseline.normalize_resources(normalized))
+                self.assertNotIn("completed_payload_bytes", records[0])
+
+    def test_normalize_each_run_before_aggregation(self):
+        runs = resource_runs("load")
+        # Median(CPU)/median(work) = 4/100, but median(CPU/work) = .02.
+        for run, cpu, work in zip(runs[::2], (2, 4, 100), (100, 10, 10000)):
+            run["records"][0]["cpu_secs"] = cpu
+            run["records"][1]["rx_packets"] = work
+        resource = next(r for r in baseline.aggregate(runs) if r["label"] == "reference" and r["type"] == "SERVER_RESOURCE_RESULT")
+        self.assertAlmostEqual(resource["metrics"]["cpu_secs_per_million_responses"]["median"], 20000)
+
+    def test_missing_zero_or_partial_work_is_inconclusive(self):
+        for mode in ("udp", "load", "tcp"):
+            with self.subTest(mode=mode):
+                self.assert_cpu_status(resource_runs(mode, candidate_work=0), "inconclusive", "missing_or_zero_completed_work")
+                runs = resource_runs(mode)
+                for record in baseline.work_records(runs[-1]["records"]):
+                    record.pop("body_bytes" if mode == "tcp" else "rx_packets")
+                self.assert_cpu_status(runs, "inconclusive", "incomplete_work_samples")
+
+    def test_absent_traffic_is_not_a_successful_cpu_comparison(self):
+        runs = resource_runs()
+        for run in runs:
+            run["records"] = run["records"][:1]
+        self.assert_cpu_status(runs, "inconclusive", "incomparable_workload")
+
+    def test_more_shortfall_cannot_qualify_as_cpu_improvement(self):
+        for mode in ("udp", "load"):
+            runs = resource_runs(mode, candidate_cpu=1)
+            for run in runs:
+                if run["label"] == "candidate":
+                    baseline.work_records(run["records"])[0]["response_shortfall_pct"] = 5
+            results = self.assert_cpu_status(runs, "regression")
+            self.assertTrue(all(c["shortfall_increase_pp"] == 5 for c in results))
+
+    def test_cpu_comparison_inherits_direct_control_drift(self):
+        for mode in ("udp", "tcp"):
+            runs = resource_runs(mode, candidate_cpu=1)
+            for run in runs:
+                if run["label"] == "candidate":
+                    for record in run["records"]:
+                        if record.get("path") == "direct":
+                            record["app_goodput_gbps"] = 0.7
+                        if record["type"] == "DIRECT_TCP_DOWNLOAD_RESULT":
+                            record["transfer_mbps"] = 0.7
+            results = self.assert_cpu_status(runs, "inconclusive", "direct_control_drift")
+            self.assertTrue(all(c["direct_baseline_drift"] for c in results))
+
+    def test_missing_direct_control_is_inconclusive(self):
+        runs = resource_runs("tcp")
+        for run in runs:
+            run["records"] = [r for r in run["records"] if r["type"] != "DIRECT_TCP_DOWNLOAD_RESULT"]
+        self.assert_cpu_status(runs, "inconclusive", "missing_direct_control")
+
+    def test_changed_payload_mix_does_not_qualify_as_cpu_improvement(self):
+        runs = resource_runs(candidate_cpu=1)
+        for run in runs:
+            if run["label"] == "candidate":
+                baseline.work_records(run["records"])[0]["rx_packets"] *= 2
+        self.assert_cpu_status(runs, "inconclusive", "workload_mix_drift")
+
+    def test_noisy_payload_mix_and_changed_connection_count_are_inconclusive(self):
+        runs = resource_runs()
+        baseline.work_records(runs[-1]["records"])[0]["rx_packets"] *= 2
+        self.assert_cpu_status(runs, "inconclusive", "high_workload_mix_variability")
+        runs = resource_runs("load")
+        for run in runs:
+            if run["label"] == "candidate":
+                baseline.work_records(run["records"])[0]["connections"] = 16
+        self.assert_cpu_status(runs, "inconclusive", "incomparable_workload")
+
+    def test_duplicate_work_and_stale_derived_metrics_cannot_hide_missing_work(self):
+        runs = resource_runs("load")
+        for run in runs:
+            run["records"] = baseline.normalize_resources(run["records"])
+        runs[-1]["records"][1]["rx_packets"] = 0
+        self.assert_cpu_status(runs, "inconclusive", "incomplete_work_samples")
+        runs = resource_runs("load")
+        runs[-1]["records"].append(dict(runs[-1]["records"][1]))
+        self.assert_cpu_status(runs, "inconclusive", "incomplete_work_samples")
+
+    def test_missing_quality_or_direct_samples_are_inconclusive(self):
+        runs = resource_runs("load")
+        baseline.work_records(runs[-1]["records"])[0].pop("response_shortfall_pct")
+        self.assert_cpu_status(runs, "inconclusive", "incomplete_work_samples")
+        runs = resource_runs()
+        direct = next(r for r in runs[-1]["records"] if r.get("path") == "direct")
+        direct.pop("app_goodput_gbps")
+        self.assert_cpu_status(runs, "inconclusive", "incomplete_direct_control")
+
+    def test_changed_rate_setting_is_inconclusive(self):
+        runs = resource_runs("load")
+        for run in runs:
+            baseline.work_records(run["records"])[0]["requested_pps_per_connection"] = 1000 if run["label"] == "reference" else 2000
+        self.assert_cpu_status(runs, "inconclusive", "incomparable_workload")
+
+    def test_active_stream_topology_must_match_even_when_opened_streams_match(self):
+        for candidate_active in (1, None):
+            with self.subTest(candidate_active=candidate_active):
+                runs = resource_runs("load", candidate_cpu=1)
+                for run in runs:
+                    load = baseline.work_records(run["records"])[0]
+                    load.update(transport="http3", streams_per_connection=64)
+                    if run["label"] == "reference":
+                        load["active_streams_per_connection"] = 64
+                    elif candidate_active is not None:
+                        load["active_streams_per_connection"] = candidate_active
+                self.assert_cpu_status(runs, "inconclusive", "incomparable_workload")
+
+    def test_matching_active_stream_topology_preserves_efficiency_comparison(self):
+        runs = resource_runs("load", candidate_cpu=4, candidate_work=2000)
+        for run in runs:
+            load = baseline.work_records(run["records"])[0]
+            load.update(transport="http3", streams_per_connection=64,
+                        active_streams_per_connection=1, requested_pps_per_connection=20000)
+        self.assert_cpu_status(runs, "unchanged")
+
+    def test_load_phase_markers_do_not_become_completed_work(self):
+        records = baseline.parse_records(
+            "LOAD_PHASE phase=measurement_start\n"
+            "LOAD_RESULT transport=http3 connections=1 established=1 "
+            "streams_per_connection=64 active_streams_per_connection=1 "
+            "requested_pps_per_connection=20000 payload_bytes=1200 rx_packets=1000\n"
+            "LOAD_PHASE phase=measurement_end\n"
+            "SERVER_RESOURCE_RESULT cpu_secs=2 peak_rss_bytes=1024\n"
+        )
+        self.assertEqual(len(records), 2)
+        resource = baseline.normalize_resources(records)[1]
+        self.assertEqual(resource["completed_responses"], 1000)
+        self.assertEqual(resource["completed_payload_bytes"], 1200000)
+
+    def test_one_round_and_noisy_normalized_cpu_are_inconclusive(self):
+        self.assert_cpu_status(resource_runs(rounds=1), "inconclusive", "insufficient_samples")
+        runs = resource_runs()
+        runs[-1]["records"][0]["cpu_secs"] = 20
+        self.assert_cpu_status(runs, "inconclusive", "high_variability")
+
+
 class ProcessAccountingTests(unittest.TestCase):
     def command(self, directory, code):
         return [sys.executable, str(ROOT / "scripts/bench-process.py"),

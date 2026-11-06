@@ -190,6 +190,17 @@ async fn serve_connection(mut stream: TcpStream, metrics: Arc<Metrics>) -> std::
             )
             .await
         }
+        "/readyz/connect-ip" => {
+            let ready = metrics.is_connect_ip_ready();
+            write_response(
+                &mut stream,
+                if ready { 200 } else { 503 },
+                "text/plain; charset=utf-8",
+                if ready { "ready\n" } else { "not ready\n" },
+                head,
+            )
+            .await
+        }
         "/metrics" => {
             let body = metrics.render();
             write_response(
@@ -310,6 +321,41 @@ mod tests {
         assert!(scrape.contains("masque_server_ready 1"));
 
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_ip_probe_distinguishes_disabled_degraded_and_ready() {
+        for (enabled, available) in [(false, false), (true, false), (true, true)] {
+            let metrics = Arc::new(Metrics::new(true).with_connect_ip(enabled, available));
+            let server =
+                ObservabilityServer::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&metrics))
+                    .await
+                    .unwrap();
+            let addr = server.local_addr().unwrap();
+            let task = server.spawn();
+            let probe = "GET /readyz/connect-ip?probe=1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let response = request(addr, probe).await;
+            assert!(response.starts_with("HTTP/1.1 503 "));
+
+            metrics.set_ready(true);
+            let process = request(addr, "GET /readyz HTTP/1.0\r\n\r\n").await;
+            assert!(process.starts_with("HTTP/1.1 200 "));
+            let response = request(addr, probe).await;
+            let status = if available {
+                "HTTP/1.1 200 "
+            } else {
+                "HTTP/1.1 503 "
+            };
+            assert!(response.starts_with(status), "{response}");
+            let head = request(addr, "HEAD /readyz/connect-ip HTTP/1.0\r\n\r\n").await;
+            assert!(head.starts_with(status));
+            assert!(head.ends_with("\r\n\r\n"));
+
+            metrics.begin_shutdown();
+            let response = request(addr, probe).await;
+            assert!(response.starts_with("HTTP/1.1 503 "));
+            task.abort();
+        }
     }
 
     #[tokio::test]
