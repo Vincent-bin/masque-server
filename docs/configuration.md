@@ -87,7 +87,7 @@ max_tunnels_per_connection = 100
 
 | Key | Meaning |
 | --- | --- |
-| `idle_timeout_secs` | Inactive tunnel lifetime |
+| `idle_timeout_secs` | Inactive tunnel lifetime; also the lifetime of an HTTP/2 connection with no active requests |
 | `max_connections` | Per-HTTP/3-shard or per-HTTP/2-listener connection cap; `1..1000000` |
 | `max_connections_per_ip` | Process-wide live H2 + H3 connections from one source IP; `1..65536` |
 | `max_pending_auth_per_ip` | Process-wide running + queued Basic/Argon2 checks from one source; `1..256` |
@@ -95,6 +95,14 @@ max_tunnels_per_connection = 100
 
 This section contains process-wide connection limits only. Socket addresses and
 shard counts belong to [`[[listeners]]`](#listeners).
+
+HTTP/2 bounds TLS and H2 preface handshakes independently to 10 seconds each.
+After H2 establishment, a connection with no request tasks expires after
+`idle_timeout_secs`. The clock restarts when the last request finishes; active
+tunnels retain their protocol-specific inactivity rules, including the
+120-second minimum for UDP. Connection-level PING traffic does not extend the
+empty-connection lifetime. Timeout shutdown sends GOAWAY and permits at most
+5 additional seconds for a blocked transport flush.
 
 ## Observability
 

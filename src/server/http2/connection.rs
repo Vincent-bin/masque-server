@@ -2,6 +2,7 @@
 
 use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use h2::Reason;
@@ -17,7 +18,7 @@ use super::auth::{self, Authorization};
 use super::request::{self as request_handling, RequestKind};
 use super::support::{ConnectionMetricsGuard, send_error};
 use super::{
-    ConnectionContext, DRAIN_TIMEOUT, HEARTBEAT_INTERVAL, TLS_HANDSHAKE_TIMEOUT, ip, tcp, udp,
+    ConnectionContext, DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, ip, tcp, udp,
 };
 use crate::admission::SourceAdmission;
 use crate::client_identity::ClientIdentity;
@@ -37,7 +38,7 @@ pub(super) async fn serve(
         debug!(%peer, %error, "failed to disable Nagle on HTTP/2 connection");
     }
     let tls = match tokio::time::timeout(
-        TLS_HANDSHAKE_TIMEOUT,
+        HANDSHAKE_TIMEOUT,
         tokio_boring::accept(&context.acceptor, stream),
     )
     .await
@@ -88,10 +89,15 @@ pub(super) async fn serve(
         .max_send_buffer_size(h2.max_send_buffer_size)
         .data_frame_budget(h2.data_frame_budget);
 
-    let mut connection = match builder.handshake(tls).await {
-        Ok(connection) => connection,
-        Err(error) => {
+    let mut connection = match tokio::time::timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await
+    {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
             debug!(%peer, %error, "HTTP/2 handshake failed");
+            return;
+        }
+        Err(_) => {
+            debug!(%peer, "HTTP/2 handshake timed out");
             return;
         }
     };
@@ -108,6 +114,13 @@ pub(super) async fn serve(
     let mut requests = JoinSet::new();
     let mut draining = false;
     let mut drain_deadline = None;
+    let idle_timeout = Duration::from_secs(context.config.server.idle_timeout_secs);
+    // Only a connection without request tasks is idle. Tunnel tasks enforce
+    // their own protocol-specific inactivity rules; a connection-age timer
+    // would cut off healthy long-lived tunnels (including quiet UDP tunnels).
+    // An unrepresentably distant deadline is effectively disabled, rather
+    // than panicking on a very large configured duration.
+    let mut idle_deadline = tokio::time::Instant::now().checked_add(idle_timeout);
     let mut roster_sweep = tokio::time::interval_at(
         tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
         HEARTBEAT_INTERVAL,
@@ -150,14 +163,32 @@ pub(super) async fn serve(
                 requests.abort_all();
                 break;
             }
+            _ = async {
+                match idle_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => pending::<()>().await,
+                }
+            }, if !draining && requests.is_empty() => {
+                debug!(%peer, "idle HTTP/2 connection timed out");
+                draining = true;
+                drain_deadline = Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+                // No application tasks remain. Flush a final GOAWAY without
+                // needing a PING acknowledgement from an idle or hostile peer.
+                // Keep polling below, but bound even a blocked transport flush.
+                connection.abrupt_shutdown(Reason::NO_ERROR);
+            }
             joined = requests.join_next(), if !requests.is_empty() => {
                 if let Some(Err(error)) = joined {
                     warn!(%peer, %error, "HTTP/2 request task panicked");
+                }
+                if requests.is_empty() {
+                    idle_deadline = tokio::time::Instant::now().checked_add(idle_timeout);
                 }
             }
             accepted = connection.accept() => {
                 match accepted {
                     Some(Ok((request, respond))) if !draining => {
+                        idle_deadline = None;
                         requests.spawn(handle_request(
                             request,
                             respond,
