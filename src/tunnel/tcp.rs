@@ -36,6 +36,32 @@ pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 256 * 1024;
 // one chunk would never be satisfiable and the reader would hang forever.
 const _: () = assert!(MAX_BUFFERED_RESPONSE_BYTES >= TCP_READ_CHUNK_SIZE);
 
+/// Whole read buffers remain bounded even when reads return tiny fragments.
+const TCP_READ_BUFFERS: usize = MAX_BUFFERED_RESPONSE_BYTES / TCP_READ_CHUNK_SIZE;
+
+/// The final `Bytes` owner returns its pool slot without blocking the shard.
+/// A slot travels with the buffer until the last clone is dropped, bounding
+/// allocations even when the event loop retains response fragments.
+struct TcpReadChunk {
+    buffer: BytesMut,
+    recycle: mpsc::Sender<Option<BytesMut>>,
+}
+
+impl AsRef<[u8]> for TcpReadChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer
+    }
+}
+
+impl Drop for TcpReadChunk {
+    fn drop(&mut self) {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.clear();
+        // Receiver teardown or a full pool simply frees this allocation.
+        let _ = self.recycle.try_send(Some(buffer));
+    }
+}
+
 pub enum TcpRelayEvent {
     ConnectResult {
         connection_index: u64,
@@ -211,10 +237,16 @@ impl TcpTunnel {
         let reader_credit = Arc::clone(&response_credit);
 
         let reader_task = tokio::spawn(async move {
-            // One backing allocation is split into `Bytes` chunks that share
-            // it, so handing a chunk to the event loop costs no copy.
-            let mut buffer = BytesMut::with_capacity(TCP_READ_CHUNK_SIZE);
+            let (recycle_tx, mut recycle_rx) = mpsc::channel(TCP_READ_BUFFERS);
+            // Empty slots defer allocation until traffic needs them. A slot is
+            // returned only after its previous chunk has no remaining owners.
+            for _ in 0..TCP_READ_BUFFERS {
+                recycle_tx.try_send(None).expect("empty read buffer pool");
+            }
             loop {
+                let Some(recycled) = recycle_rx.recv().await else {
+                    return;
+                };
                 // Reserve the whole chunk up front: the read is then bounded by
                 // the budget rather than by the event loop acknowledging the
                 // previous chunk. Unused reservation is returned below.
@@ -227,10 +259,10 @@ impl TcpTunnel {
                 };
                 reservation.forget();
 
-                buffer.reserve(TCP_READ_CHUNK_SIZE);
-                // `reserve` may hand back more spare capacity than asked for,
-                // and `read_buf` fills whatever is spare. Cap the read at the
-                // reservation so the credit accounting below cannot underflow.
+                let mut buffer =
+                    recycled.unwrap_or_else(|| BytesMut::with_capacity(TCP_READ_CHUNK_SIZE));
+                // Recycled allocations are empty and have a whole chunk of
+                // capacity. Limit the read to its reserved byte budget.
                 let read = (&mut reader)
                     .take(TCP_READ_CHUNK_SIZE as u64)
                     .read_buf(&mut buffer)
@@ -251,7 +283,10 @@ impl TcpTunnel {
                         // Only the bytes actually read stay reserved; the event
                         // loop returns them as it writes them to HTTP/3.
                         reader_credit.add_permits(TCP_READ_CHUNK_SIZE - len);
-                        let data = buffer.split_to(len).freeze();
+                        let data = Bytes::from_owner(TcpReadChunk {
+                            buffer,
+                            recycle: recycle_tx.clone(),
+                        });
                         if event_tx
                             .send(TcpRelayEvent::Data {
                                 connection_index,
@@ -605,6 +640,80 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, (ipv4, ipv4));
+    }
+
+    #[tokio::test]
+    async fn read_buffer_recycles_only_after_last_reference() {
+        let (recycle, mut recycled) = mpsc::channel(1);
+        let mut buffer = BytesMut::with_capacity(TCP_READ_CHUNK_SIZE);
+        buffer.extend_from_slice(b"payload");
+        let address = buffer.as_ptr();
+        let data = Bytes::from_owner(TcpReadChunk { buffer, recycle });
+        let retained = data.slice(1..);
+        drop(data);
+        assert_eq!(&retained[..], b"ayload");
+        assert!(recycled.try_recv().is_err());
+        drop(retained);
+        let buffer = recycled.try_recv().unwrap().unwrap();
+        assert!(buffer.is_empty());
+        assert!(buffer.capacity() >= TCP_READ_CHUNK_SIZE);
+        assert_eq!(buffer.as_ptr(), address);
+    }
+
+    #[tokio::test]
+    async fn reader_waits_for_a_reusable_buffer_after_partial_writes() {
+        async fn next_data(receiver: &mut mpsc::Receiver<TcpRelayEvent>) -> Bytes {
+            match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("target read must make progress")
+                .expect("reader must remain alive")
+            {
+                TcpRelayEvent::Data { data, .. } => data,
+                _ => panic!("expected target data"),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, upstream) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (mut upstream, _) = upstream.unwrap();
+        let writer = tokio::spawn(async move {
+            upstream
+                .write_all(&vec![0x5a; MAX_BUFFERED_RESPONSE_BYTES * 2])
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (events, mut receiver) = mpsc::channel(TCP_READ_BUFFERS * 2);
+        let mut tunnel = TcpTunnel::from_stream(0, 0, address, client.unwrap(), events);
+        for _ in 0..TCP_READ_BUFFERS {
+            let data = next_data(&mut receiver).await;
+            assert!(data.iter().all(|byte| *byte == 0x5a));
+            assert!(tunnel.queue_response(data));
+        }
+
+        let first = tunnel.front_response().unwrap();
+        let first_len = first.data.len();
+        let first_address = first.data.as_ptr();
+        tunnel.advance_response(first_len - 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err(),
+            "partial consumption must not release a buffer still in use"
+        );
+        tunnel.advance_response(1);
+        let data = next_data(&mut receiver).await;
+        assert_eq!(data.as_ptr(), first_address);
+        assert!(data.iter().all(|byte| *byte == 0x5a));
+
+        // A response may outlive reader teardown. Its final drop must remain
+        // safe even though the pool receiver has disappeared.
+        drop(tunnel);
+        tokio::task::yield_now().await;
+        assert!(data.iter().all(|byte| *byte == 0x5a));
+        drop(data);
+        writer.abort();
     }
 
     #[test]

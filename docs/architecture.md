@@ -138,6 +138,7 @@ bounded drain begins. The packaged watchdog uses the same liveness decision.
 | `src/systemd.rs` | Dependency-free systemd readiness and watchdog notification |
 | `src/net/quic.rs` | QUIC UDP receive/send batching, GSO/GRO, and portable fallbacks |
 | `src/net/target_udp.rs` | Batched target UDP I/O, GSO, and truncation detection |
+| `src/net/timer.rs` | Per-shard Linux deadline timer and portable Tokio fallback |
 | `src/tunnel/tcp.rs` | TCP connection setup and bounded bidirectional relay |
 | `src/tunnel/udp.rs` | Per-target CONNECT-UDP state and send staging |
 | `src/tunnel/ip.rs` | CONNECT-IP assignment and activity state |
@@ -194,7 +195,7 @@ applicable tests using the [change matrix](testing.md#select-checks-for-a-change
 | Queues and buffers remain bounded; UDP overload may drop instead of growing without limit | Queue limits in `src/server/mod.rs`, `src/tunnel/udp.rs`, and `src/net/`; `tests/resource_exhaustion.rs` and the Linux pressure checks in [Testing](testing.md#scheduled-verification) |
 | TCP flow control provides backpressure | `src/tunnel/tcp.rs` and `src/server/http2/tcp.rs`; transport integration tests in `tests/http2_connect.rs` and Docker E2E |
 | Configuration validation and reload fail safely | `src/config.rs`, `validate_server_config` in `src/server/validation.rs` and `reload_configuration` in `src/server/mod.rs`; `tests/check_config.rs`, `tests/http2_connect.rs`, and `tests/client_cert_connect_ip.rs` |
-| Linux fast paths have portable boundaries | `src/net/quic.rs`, `src/net/target_udp.rs`, and `src/tun.rs`; Linux-specific and macOS coverage are distinguished in [Testing](testing.md#linux-specific-checks) |
+| Linux fast paths have portable boundaries | `src/net/quic.rs`, `src/net/target_udp.rs`, `src/net/timer.rs`, and `src/tun.rs`; Linux-specific and macOS coverage are distinguished in [Testing](testing.md#linux-specific-checks) |
 
 ## Event loop
 

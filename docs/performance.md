@@ -101,18 +101,35 @@ destination and segment size. With UDP GSO, one message contains multiple
 segments; `sendmmsg` submits multiple messages in one kernel entry.
 
 The batch is constrained by quiche's `send_quantum()` and pacing metadata.
-To account for millisecond timer resolution, packets may be sent up to 1 ms
-before the time supplied by quiche. This trades a bounded burst for fewer timer
-wakeups; it is not kernel-precision pacing.
+Each HTTP/3 shard can use one nonblocking Linux deadline timer for TCP-only
+connections. UDP, IP, and mixed connections retain Tokio deadlines. Other
+platforms, or failure to create or use the Linux timer, also retain Tokio. A
+failed timer closes its descriptor and stays disabled for the shard's lifetime.
+
+Timer precision and batching are independent: every connection retains a 1 ms
+pacing horizon. Packets may be released up to that far before quiche's requested
+time, trading a bounded burst for fewer wakeups. A precise wakeup does not
+guarantee precise packet departure under load.
 
 Paced output retains at most 64 packets and 128 KiB of payload per connection.
 The event loop wakes for the first queued deadline and releases packets through
 one millisecond beyond the current time. Prefetch is bounded to roughly that
-window, with one extra packet retained for the next deadline. The queue reuses packet buffers under a separate 128 KiB spare-buffer
-budget and is discarded when a connection closes. This lets per-packet pacers
-such as BBR2 prepare a bounded burst instead of serializing only one packet per
-timer wakeup. BBR2 is the default controller; explicitly select CUBIC if the
-workload performs better with it.
+window, with one extra packet retained for the next deadline. The queue reuses
+packet buffers under a separate 128 KiB spare-buffer budget and is discarded
+when a connection closes. BBR2 is the default controller; explicitly select
+CUBIC if the workload performs better with it.
+
+HTTP/3 TCP target reads reuse up to four 64 KiB buffers per tunnel. Empty pool
+slots allocate only when traffic needs them; the final response owner returns
+its buffer without blocking the shard. Partial consumption releases byte credit
+but keeps the buffer occupied until its final reference is dropped. This bounds
+both buffered payload and whole read allocations, including fragmented reads.
+The pool is private to a tunnel and is discarded on teardown.
+
+Compare cold and steady throughput, CPU per transferred byte, and mixed
+TCP/UDP latency. The [TCP deadline and buffer reuse measurements](performance-tcp-deadlines.md)
+record the tested variants and limitations; lower allocation cost alone does
+not establish a throughput improvement on a path with spare CPU capacity.
 
 ### Target UDP sockets
 
