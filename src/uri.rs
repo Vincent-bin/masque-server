@@ -3,6 +3,10 @@
 // CONNECT-UDP: /.well-known/masque/udp/{target_host}/{target_port}/
 // CONNECT-IP:  /.well-known/masque/ip/{target}/{ipproto}/
 
+mod connect_ip;
+
+pub use connect_ip::{parse_ip_path, validate_ip_template};
+
 /// Parsed CONNECT-UDP target from the URI path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpTarget {
@@ -33,6 +37,10 @@ pub enum UriError {
     InvalidPort(String),
     /// Invalid IP protocol number.
     InvalidProtocol(String),
+    /// Invalid CONNECT-IP target or non-canonical IP prefix.
+    InvalidTarget,
+    /// Unsupported or ambiguous CONNECT-IP URI template.
+    InvalidTemplate,
 }
 
 impl std::fmt::Display for UriError {
@@ -46,6 +54,8 @@ impl std::fmt::Display for UriError {
             }
             UriError::InvalidPort(s) => write!(f, "invalid port: {s}"),
             UriError::InvalidProtocol(s) => write!(f, "invalid protocol: {s}"),
+            UriError::InvalidTarget => write!(f, "invalid IP target"),
+            UriError::InvalidTemplate => write!(f, "unsupported CONNECT-IP URI template"),
         }
     }
 }
@@ -158,33 +168,6 @@ pub fn parse_connect_authority(authority: &str) -> Result<TcpTarget, UriError> {
         host: host.into(),
         port,
     })
-}
-
-/// Parse a CONNECT-IP URI path.
-///
-/// Both `{target}` and `{ipproto}` are optional per RFC 9484.
-pub fn parse_ip_path(path: &str, template: &str) -> Result<IpTarget, UriError> {
-    let ip_prefix = extract_prefix(template);
-
-    let rest = path
-        .strip_prefix(&ip_prefix)
-        .ok_or(UriError::PathMismatch)?;
-
-    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-
-    let target = segments.first().map(|s| percent_decode(s));
-    let ipproto = match segments.get(1) {
-        Some(&"*") | None => None,
-        Some(s) => {
-            let decoded = percent_decode(s);
-            let proto: u8 = decoded
-                .parse()
-                .map_err(|_| UriError::InvalidProtocol(decoded.clone()))?;
-            Some(proto)
-        }
-    };
-
-    Ok(IpTarget { target, ipproto })
 }
 
 /// Extract the static prefix from a URI template (everything before the first `{`).
@@ -331,14 +314,18 @@ mod tests {
     #[test]
     fn parse_ip_full_vpn_mode() {
         // No target, no ipproto → full VPN tunnel
-        let target = parse_ip_path("/.well-known/masque/ip/", IP_TEMPLATE).unwrap();
+        let target = parse_ip_path("/.well-known/masque/ip/*/*/", IP_TEMPLATE).unwrap();
         assert_eq!(target.target, None);
         assert_eq!(target.ipproto, None);
     }
 
     #[test]
     fn parse_ip_with_target() {
-        let target = parse_ip_path("/.well-known/masque/ip/192.0.2.0/", IP_TEMPLATE).unwrap();
+        let target = parse_ip_path(
+            "/.well-known/masque/ip/192.0.2.0/",
+            "/.well-known/masque/ip/{target}/",
+        )
+        .unwrap();
         assert_eq!(target.target, Some("192.0.2.0".into()));
         assert_eq!(target.ipproto, None);
     }

@@ -30,6 +30,17 @@ fuzz_target!(|data: &[u8]| {
         if datagrams.decode(chunk).is_err() { break; }
     }
 
+    let mut ip = masque::capsule::ip::IpCapsules::new(64 * 1024);
+    let mut requests = masque::capsule::ip::AddressRequests::default();
+    for chunk in data.chunks(chunk_size) {
+        let Ok(frames) = ip.decode(chunk) else { break; };
+        for frame in frames {
+            if let masque::capsule::CapsuleFrame::AddressRequest(addresses) = frame {
+                let _ = requests.respond(&addresses, &[]);
+            }
+        }
+    }
+
     if let Ok(text) = std::str::from_utf8(data) {
         let _ = masque::uri::parse_connect_authority(text);
         let _ = masque::uri::parse_udp_path(
@@ -40,5 +51,12 @@ fuzz_target!(|data: &[u8]| {
             text,
             "/.well-known/masque/ip/{target}/{ipproto}/",
         );
+        let _ = masque::uri::parse_ip_path(text, "/vpn{?target,ipproto}");
+        let _ = masque::uri::validate_ip_template(text);
+        // An operator-provided template and a client-provided URI are separate
+        // inputs. Exercise their interaction as well as each parser alone.
+        if let Some((template, path)) = text.split_once('\n') {
+            let _ = masque::uri::parse_ip_path(path, template);
+        }
     }
 });

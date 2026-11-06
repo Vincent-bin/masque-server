@@ -152,7 +152,10 @@ async fn spawn_server_with_udp_policy(
         config.udp_proxy.allow_targets = vec!["0.0.0.0/0".into()];
         config.udp_proxy.deny_targets = vec!["127.0.0.0/8".into()];
     }
-    config.ip_proxy.enabled = false;
+    // Exercise CONNECT-IP negotiation without creating a host network device.
+    config.ip_proxy.enabled = true;
+    config.ip_proxy.require_tun = false;
+    config.ip_proxy.tun_name = "invalid/tun/name".into();
 
     let mut server = Server::bind(config).await.unwrap();
     let address = server.listen_addrs()[0];
@@ -188,7 +191,10 @@ async fn spawn_certificate_server(
     config.udp_proxy.enabled = true;
     config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
     config.udp_proxy.deny_targets.clear();
-    config.ip_proxy.enabled = false;
+    // Exercise CONNECT-IP negotiation without creating a host network device.
+    config.ip_proxy.enabled = true;
+    config.ip_proxy.require_tun = false;
+    config.ip_proxy.tun_name = "invalid/tun/name".into();
 
     let mut server = Server::bind(config).await.unwrap();
     let address = server.listen_addrs()[0];
@@ -214,6 +220,7 @@ fn run_probe(endpoint: SocketAddr, target: SocketAddr, transport: &str) -> std::
             &target.to_string(),
             "--udp-mode",
             "echo",
+            "--connect-ip",
             "--json",
         ])
         .stdin(Stdio::piped())
@@ -241,9 +248,18 @@ fn assert_probe_passed(output: std::process::Output, transport: &str) {
     assert_eq!(report["success"], true);
     assert_eq!(report["selected_transport"], transport);
     let checks = report["checks"].as_array().unwrap();
-    for name in ["connect_tcp", "connect_udp"] {
+    for name in ["connect_tcp", "connect_udp", "connect_ip"] {
         let check = checks.iter().find(|check| check["name"] == name).unwrap();
         assert_eq!(check["status"], "pass");
+        if name == "connect_ip" {
+            assert_eq!(check["code"], "CONNECT_IP_READY");
+            assert!(
+                check["detail"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("CONNECT-IP assigned 2 address(es);")
+            );
+        }
     }
 }
 
@@ -266,29 +282,33 @@ fn run_certificate_probe(
             &target.to_string(),
             "--udp-mode",
             "echo",
+            "--connect-ip",
             "--json",
         ])
         .output()
         .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn released_probe_checks_basic_http2_and_http3_end_to_end() {
+async fn check_basic_probe(transport: &str, configured: ListenerTransport) {
     let tls = TempTls::new();
     let (target, tcp_echo, udp_echo) = spawn_echo().await;
+    let (endpoint, server) = spawn_server(&tls, configured).await;
+    let output = tokio::task::block_in_place(|| run_probe(endpoint, target, transport));
+    assert_probe_passed(output, transport);
 
-    for (transport, configured) in [
-        ("http3", ListenerTransport::Http3),
-        ("http2", ListenerTransport::Http2),
-    ] {
-        let (endpoint, server) = spawn_server(&tls, configured).await;
-        let output = tokio::task::block_in_place(|| run_probe(endpoint, target, transport));
-        assert_probe_passed(output, transport);
-        server.abort();
-    }
-
+    server.abort();
     tcp_echo.abort();
     udp_echo.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_probe_checks_basic_http2_end_to_end() {
+    check_basic_probe("http2", ListenerTransport::Http2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_probe_checks_basic_http3_end_to_end() {
+    check_basic_probe("http3", ListenerTransport::Http3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -316,8 +336,7 @@ async fn http3_udp_policy_failure_is_returned_instead_of_an_early_200() {
     udp_echo.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn released_probe_checks_certificate_http2_and_http3_end_to_end() {
+async fn check_certificate_probe(transport: &str, configured: ListenerTransport) {
     let tls = TempTls::new();
     let pair = masque::enroll::generate_client_key().unwrap();
     let server_key = masque::enroll::server_public_key_pem(&tls.cert).unwrap();
@@ -332,20 +351,25 @@ async fn released_probe_checks_certificate_http2_and_http3_end_to_end() {
     std::fs::write(&enrollment_path, enrollment).unwrap();
     let (target, tcp_echo, udp_echo) = spawn_echo().await;
 
-    for (transport, configured) in [
-        ("http3", ListenerTransport::Http3),
-        ("http2", ListenerTransport::Http2),
-    ] {
-        let (endpoint, server) =
-            spawn_certificate_server(&tls, configured, pair.public_key_b64.clone()).await;
-        let output = tokio::task::block_in_place(|| {
-            run_certificate_probe(endpoint, target, transport, &enrollment_path)
-        });
-        assert_probe_passed(output, transport);
-        server.abort();
-    }
+    let (endpoint, server) =
+        spawn_certificate_server(&tls, configured, pair.public_key_b64.clone()).await;
+    let output = tokio::task::block_in_place(|| {
+        run_certificate_probe(endpoint, target, transport, &enrollment_path)
+    });
+    assert_probe_passed(output, transport);
 
+    server.abort();
     tcp_echo.abort();
     udp_echo.abort();
     std::fs::remove_file(enrollment_path).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_probe_checks_certificate_http2_end_to_end() {
+    check_certificate_probe("http2", ListenerTransport::Http2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_probe_checks_certificate_http3_end_to_end() {
+    check_certificate_probe("http3", ListenerTransport::Http3).await;
 }

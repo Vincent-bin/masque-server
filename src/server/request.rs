@@ -14,9 +14,17 @@ use super::Shard;
 /// The target of a CONNECT request, held while its credentials are verified.
 #[derive(Debug)]
 pub(super) enum ConnectRequest {
-    Tcp { authority: String },
-    Udp { path: String },
-    Ip,
+    Tcp {
+        authority: String,
+    },
+    Udp {
+        path: String,
+    },
+    Ip {
+        path: String,
+        standard: bool,
+        valid_pseudo_headers: bool,
+    },
 }
 
 /// A prechecked CONNECT request whose password still has to be verified.
@@ -68,6 +76,7 @@ pub(super) fn classify_connect_request(
     protocol: &[u8],
     authority: &[u8],
     path: &[u8],
+    scheme: &[u8],
     config: &ServerConfig,
 ) -> Option<ConnectRequest> {
     if method != b"CONNECT" {
@@ -85,10 +94,37 @@ pub(super) fn classify_connect_request(
     } else if config.ip_proxy.enabled
         && accepts_connect_ip(&config.ip_proxy.connect_protocols, protocol)
     {
-        Some(ConnectRequest::Ip)
+        Some(ConnectRequest::Ip {
+            path: String::from_utf8_lossy(path).into_owned(),
+            standard: protocol == b"connect-ip",
+            valid_pseudo_headers: !authority.is_empty() && !scheme.is_empty() && !path.is_empty(),
+        })
     } else {
         None
     }
+}
+
+/// Validate only after authentication, before address allocation or a 2xx.
+/// No current data path enforces per-request destination/protocol scope, so
+/// accepting a scoped URI would incorrectly establish an unrestricted tunnel.
+pub(super) fn prepare_connect_ip(
+    path: &str,
+    standard: bool,
+    valid_pseudo_headers: bool,
+    config: &ServerConfig,
+) -> Result<(), u16> {
+    if !standard {
+        // Preserve deployed cf-connect-ip and explicitly configured aliases.
+        return Ok(());
+    }
+    if !valid_pseudo_headers {
+        return Err(400);
+    }
+    let scope = uri::parse_ip_path(path, &config.ip_proxy.uri_template).map_err(|_| 400u16)?;
+    if scope.target.is_some() || scope.ipproto.is_some() {
+        return Err(501);
+    }
+    Ok(())
 }
 
 /// Shared request dependencies passed together to keep dispatch APIs focused.
@@ -113,6 +149,7 @@ impl Shard {
         // copying each one into an owned String.
         let mut method: &[u8] = b"";
         let mut path: &[u8] = b"";
+        let mut scheme: &[u8] = b"";
         let mut protocol: &[u8] = b"";
         let mut authority: &[u8] = b"";
         let mut proxy_authorization: Option<&[u8]> = None;
@@ -122,6 +159,7 @@ impl Shard {
             match header.name() {
                 b":method" => method = header.value(),
                 b":path" => path = header.value(),
+                b":scheme" => scheme = header.value(),
                 b":protocol" => protocol = header.value(),
                 b":authority" => authority = header.value(),
                 b"proxy-authorization" => {
@@ -145,7 +183,7 @@ impl Shard {
         // or allocating any tunnel resources. Duplicate credentials are
         // rejected rather than choosing one ambiguously.
         if let Some(request) =
-            classify_connect_request(method, protocol, authority, path, context.config)
+            classify_connect_request(method, protocol, authority, path, scheme, context.config)
         {
             let Some(auth) = context.auth else {
                 Self::dispatch_connect(h3, quic, stream_id, &request, context, pending);
@@ -226,7 +264,17 @@ impl Shard {
                     &mut pending.udp,
                 );
             }
-            ConnectRequest::Ip => {
+            ConnectRequest::Ip {
+                path,
+                standard,
+                valid_pseudo_headers,
+            } => {
+                if let Err(status) =
+                    prepare_connect_ip(path, *standard, *valid_pseudo_headers, context.config)
+                {
+                    Self::send_error_response(h3, quic, stream_id, status);
+                    return;
+                }
                 // Address allocation can fail (pool exhaustion, bad fixed
                 // lease), so defer the response with the setup. Sending 200
                 // here would make a later 503 both illegal and invisible to

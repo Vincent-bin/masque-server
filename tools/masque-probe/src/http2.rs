@@ -369,7 +369,7 @@ impl Connection {
         &mut self,
         credentials: &Credentials,
     ) -> Result<String, ProbeFailure> {
-        let uri = format!("https://{}/.well-known/masque/ip/", self.authority)
+        let uri = format!("https://{}/.well-known/masque/ip/*/*/", self.authority)
             .parse::<http::Uri>()
             .map_err(|error| {
                 ProbeFailure::new("INVALID_ENDPOINT", format!("build CONNECT-IP URI: {error}"))

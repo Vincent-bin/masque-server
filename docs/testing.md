@@ -42,7 +42,7 @@ the exact environment and commands.
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
 | Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, mixed authentication, and live HTTP/3 TLS reload/rollback |
 | HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT variants, multiple Basic accounts, both authentication modes, and credential/TLS reload rollback without dropping an established connection |
-| End-user probe | `cargo test -p masque-probe` | Basic/certificate authentication over H2/H3 with live TCP CONNECT and CONNECT-UDP echo round trips, plus stable result/error handling on Linux and macOS |
+| End-user probe | `cargo test -p masque-probe` | Basic/certificate authentication over H2/H3 with live TCP CONNECT and CONNECT-UDP echo round trips, CONNECT-IP negotiation/address assignment, and stable result/error handling on Linux and macOS |
 | Observability assets | `cargo test --test monitoring_assets` | Prometheus metric references and importable Grafana JSON |
 | Service shutdown | `tests/systemd-shutdown.sh` | Real SIGTERM/SIGINT handling and every-shard drain; Linux exercises two shards |
 | Config and host diagnostics | `cargo test --test check_config` | `check-config` accepts what a server accepts; `doctor` remains read-only; support bundles omit credential/identity sentinels |

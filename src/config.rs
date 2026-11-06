@@ -395,6 +395,9 @@ pub struct IpProxySection {
     /// Fail startup if enabled CONNECT-IP cannot create its TUN device.
     /// Defaults to best-effort so CONNECT and CONNECT-UDP can still run.
     pub require_tun: bool,
+    /// Server-side path/query template for standard `connect-ip` requests.
+    /// Whole-segment scope variables and explicit/optional query variables
+    /// are supported; `cf-connect-ip` retains its deployed URI behavior.
     pub uri_template: String,
     /// Accepted `:protocol` values for an Extended CONNECT IP request.
     ///

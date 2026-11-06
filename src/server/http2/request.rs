@@ -3,7 +3,7 @@
 use http::header::{HeaderName, HeaderValue};
 use http::{Request, StatusCode};
 
-use super::super::request::{ConnectRequest, classify_connect_request};
+use super::super::request::{ConnectRequest, classify_connect_request, prepare_connect_ip};
 use super::ip::IpCapsuleMode;
 use crate::config::ServerConfig;
 use crate::uri::{self, TcpTarget, UdpTarget};
@@ -51,11 +51,22 @@ pub(super) fn recognize(
         .uri()
         .authority()
         .map_or("", |authority| authority.as_str());
+    // CONNECT-IP must match its complete configured URI. Keep the existing
+    // CONNECT-UDP path-only interpretation outside that stricter scope check.
+    let path = if effective_protocol == "connect-udp" {
+        request.uri().path()
+    } else {
+        request
+            .uri()
+            .path_and_query()
+            .map_or("", |path| path.as_str())
+    };
     let connect = classify_connect_request(
         request.method().as_str().as_bytes(),
         effective_protocol.as_bytes(),
         authority.as_bytes(),
-        request.uri().path().as_bytes(),
+        path.as_bytes(),
+        request.uri().scheme_str().unwrap_or("").as_bytes(),
         config,
     )?;
     Some(RecognizedRequest {
@@ -82,7 +93,11 @@ pub(super) fn prepare(
                 .map(RequestKind::Udp)
                 .map_err(|_| StatusCode::BAD_REQUEST)
         }
-        ConnectRequest::Ip => {
+        ConnectRequest::Ip {
+            path,
+            standard,
+            valid_pseudo_headers,
+        } => {
             if recognized.cloudflare_capsules {
                 if recognized.duplicate_cloudflare_protocol {
                     return Err(StatusCode::BAD_REQUEST);
@@ -92,6 +107,8 @@ pub(super) fn prepare(
             if !uses_capsule_protocol(request) {
                 return Err(StatusCode::BAD_REQUEST);
             }
+            prepare_connect_ip(&path, standard, valid_pseudo_headers, config)
+                .map_err(|status| StatusCode::from_u16(status).expect("valid IP request status"))?;
             Ok(RequestKind::Ip(IpCapsuleMode::Standard))
         }
     }

@@ -493,6 +493,17 @@ pub(super) fn validate_server_config(
         );
     }
 
+    if config.ip_proxy.enabled
+        && config
+            .ip_proxy
+            .connect_protocols
+            .iter()
+            .any(|p| p == "connect-ip")
+    {
+        crate::uri::validate_ip_template(&config.ip_proxy.uri_template)
+            .context("invalid ip_proxy.uri_template")?;
+    }
+
     let mut address_pool = AddressPool::new(&config.ip_proxy.ipv4_pool, &config.ip_proxy.ipv6_pool)
         .map_err(|e| anyhow::anyhow!("address pool: {e}"))?;
 

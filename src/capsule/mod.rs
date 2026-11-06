@@ -10,6 +10,7 @@
 pub mod datagram;
 pub mod decoder;
 pub mod encoder;
+pub mod ip;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

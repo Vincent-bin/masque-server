@@ -893,3 +893,41 @@ async fn connect_ip_strict_startup_and_best_effort_apply_to_both_transports() {
         task.abort();
     }
 }
+
+#[test]
+fn check_config_validates_standard_ip_uri_templates_without_affecting_legacy_only_configs() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let base = config_text(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert_path,
+        &key_path,
+        "cubic",
+    );
+    let path = dir.path().join("masque.toml");
+    for (protocols, template, succeeds) in [
+        ("[\"connect-ip\"]", "/vpn{?target,ipproto}", true),
+        ("[\"connect-ip\"]", "/vpn", true),
+        ("[\"connect-ip\"]", "/vpn/{target}/{target}", false),
+        ("[\"connect-ip\"]", "/vpn/{+target}", false),
+        ("[\"cf-connect-ip\"]", "/vpn/{+target}", true),
+    ] {
+        let text = base.replace("[ip_proxy]\nenabled = false", &format!("[ip_proxy]\nenabled = true\nconnect_protocols = {protocols}\nuri_template = {template:?}"));
+        std::fs::write(&path, text).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+            .arg("--config")
+            .arg(&path)
+            .arg("check-config")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{template}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !succeeds {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("ip_proxy.uri_template"));
+        }
+    }
+}

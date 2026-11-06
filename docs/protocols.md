@@ -104,10 +104,22 @@ stream fallback carries CONNECT-IP packets over HTTP/2.
 
 ## CONNECT-IP
 
-The request contains a `:protocol` from `ip_proxy.connect_protocols` — the
-registered `connect-ip`, or Cloudflare's `cf-connect-ip` — and follows the
-configured URI template. A successful setup assigns addresses and returns `200`,
-followed by:
+Standard requests use `:protocol = connect-ip` and match the complete configured
+path/query template after authentication. The default full-tunnel URI is
+`/.well-known/masque/ip/*/*/`. Decoded `target` and `ipproto` values are validated
+according to RFC 9484, including prefix lengths, zero host bits, percent-encoded
+IPv6 colons, and decimal protocol numbers from 0 through 255. Malformed scopes
+are rejected with `400`; valid non-wildcard scopes are rejected with `501`
+because the forwarding path does not yet enforce per-request scope. Neither
+failure allocates addresses or installs routes. Failure responses remain empty;
+unauthenticated requests still use the listener's existing `407` or stealth
+`404` response, without exposing URI validation results.
+
+The configured `cf-connect-ip` compatibility dialect retains its deployed URI
+behavior. See [URI template configuration](configuration.md#connect-ip) for the
+supported template forms and the compatibility boundary.
+
+A successful setup assigns addresses and returns `200`, followed by:
 
 - `ADDRESS_ASSIGN` capsules for assigned IPv4 and IPv6 addresses; and
 - `ROUTE_ADVERTISEMENT` capsules for reachable prefixes.
@@ -118,6 +130,26 @@ addresses and nothing from the pool. Reconnection may briefly overlap a stale
 connection carrying the same enrolled key; the newest tunnel atomically takes
 over the return route, while reference-counted leases keep later cleanup from
 freeing an address that is still live.
+
+Both transports answer `ADDRESS_REQUEST` with a matching Request ID for every
+entry. Requests for an already leased host address, or an unspecified address
+of an available family with `/32` or `/128`, confirm that lease. Requests for
+other addresses, unavailable families, or delegated prefixes receive the RFC 9484
+all-zero `/32` or `/128` rejection. Each reply retains the complete existing
+address assignment, and rejections are not repeated in later replies. Client
+`ADDRESS_ASSIGN` and `ROUTE_ADVERTISEMENT` capsules never change the server's
+leases, routing table, or source-address checks.
+
+Control values are limited to 16 KiB; each IP stream accepts at most 1,024 unique
+address Request IDs over its lifetime. Empty requests, zero or reused IDs,
+invalid address/prefix fields, truncated controls, and resource-limit violations
+reset only the affected stream using the existing generic protocol error.
+Control replies share bounded output handling and survive fragmented input,
+small receive windows, and a clean request FIN. HTTP/3 retains its shared
+64-buffer per-stream and 256-buffer per-connection output ceilings; overflowing
+either resets only the requesting stream rather than growing the queue.
+Initial unsolicited assignments and Cloudflare's context-free HTTP/2 packet
+format remain supported.
 
 IP packets use HTTP Datagrams with Context ID `0`. HTTP/3 sends them as QUIC
 DATAGRAM frames; HTTP/2 sends the same payload inside DATAGRAM capsules on the
@@ -140,6 +172,7 @@ head-of-line block unrelated IP packets after loss.
 | `404` | Unsupported CONNECT endpoint, or failed Basic authentication with `auth.stealth = true` |
 | `407` | Proxy credentials missing or invalid on a default Basic listener |
 | `429` / `503` | Per-connection or global setup capacity exhausted |
+| `501` | Valid CONNECT-IP target or protocol scope is not implemented |
 | `502` | DNS, target socket, or upstream TCP setup failed |
 
 Once a tunnel is established, relay errors normally reset that stream rather

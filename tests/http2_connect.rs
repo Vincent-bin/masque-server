@@ -27,6 +27,9 @@ use masque::capsule::{CapsuleFrame, IpAddress, encoder};
 use masque::config::{AuthMode, BasicUser, ClientEntry, ListenerTransport, ServerConfig};
 use masque::server::Server;
 
+#[path = "http2_connect/ip_uri.rs"]
+mod ip_uri;
+
 #[path = "http2_connect/timeouts.rs"]
 mod timeouts;
 
@@ -1158,4 +1161,205 @@ async fn http2_tls_identity_reloads_without_dropping_existing_connections() {
     after_failure_driver.abort();
     established_driver.abort();
     server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_address_requests_match_ids_preserve_leases_and_drain_before_fin() {
+    use masque::capsule::AssignedAddress;
+
+    let files = TestFiles::new();
+    let mut config = http2_config(&files);
+    config.ip_proxy.enabled = true;
+    let (server_addr, server_task) = spawn_http2_config(config).await;
+    let (mut client, driver) = connect_h2(server_addr).await;
+    for protocol in ["connect-ip", "cf-connect-ip", "legacy"] {
+        let request = if protocol == "legacy" {
+            cloudflare_h2_connect_ip_request()
+        } else {
+            connect_ip_request(protocol)
+        };
+        let (response, mut request_body) = client.send_request(request, false).unwrap();
+        let (setup, mut body) = read_connect_ip_setup(response.await.unwrap()).await;
+        let CapsuleFrame::AddressAssign(lease) = &setup[0] else {
+            panic!("missing lease")
+        };
+        let ipv4 = lease
+            .iter()
+            .find(|entry| matches!(entry.ip, IpAddress::V4(_)))
+            .unwrap();
+        let ipv6 = lease
+            .iter()
+            .find(|entry| matches!(entry.ip, IpAddress::V6(_)))
+            .unwrap();
+        let mut burst = Vec::new();
+        for request_id in 100..116 {
+            encoder::encode(
+                &CapsuleFrame::AddressRequest(vec![AssignedAddress {
+                    request_id,
+                    ip: ipv4.ip.clone(),
+                    prefix_len: 32,
+                }]),
+                &mut burst,
+            );
+        }
+        request_body.send_data(Bytes::from(burst), false).unwrap();
+        let mut burst_decoder = CapsuleDecoder::new();
+        let mut replies = Vec::new();
+        while replies.len() < 16 {
+            let data = tokio::time::timeout(Duration::from_secs(3), body.data())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            body.flow_control().release_capacity(data.len()).unwrap();
+            replies.extend(burst_decoder.decode(&data).unwrap());
+        }
+        for (reply, id) in replies.into_iter().zip(100..116) {
+            let CapsuleFrame::AddressAssign(addresses) = reply else {
+                panic!("missing burst assignment")
+            };
+            assert!(
+                addresses
+                    .iter()
+                    .any(|entry| entry.request_id == id && entry.ip == ipv4.ip)
+            );
+        }
+        let mut decoder = CapsuleDecoder::new();
+        for (id, ip, prefix_len, finish) in [
+            (
+                42,
+                IpAddress::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                32,
+                false,
+            ),
+            (1, IpAddress::V4("192.0.2.99".parse().unwrap()), 32, false),
+            (7, ipv6.ip.clone(), 128, true),
+        ] {
+            let request = CapsuleFrame::AddressRequest(vec![AssignedAddress {
+                request_id: id,
+                ip,
+                prefix_len,
+            }]);
+            let mut wire = Vec::new();
+            encoder::encode(&request, &mut wire);
+            request_body
+                .send_data(Bytes::copy_from_slice(&wire[..3]), false)
+                .unwrap();
+            request_body
+                .send_data(Bytes::copy_from_slice(&wire[3..]), finish)
+                .unwrap();
+            let reply = loop {
+                let data = tokio::time::timeout(Duration::from_secs(3), body.data())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                body.flow_control().release_capacity(data.len()).unwrap();
+                let frames = decoder.decode(&data).unwrap();
+                if let Some(frame) = frames.into_iter().next() {
+                    break frame;
+                }
+            };
+            let CapsuleFrame::AddressAssign(assigned) = reply else {
+                panic!("missing assignment")
+            };
+            let response = assigned
+                .iter()
+                .find(|entry| entry.request_id == id)
+                .unwrap();
+            let expected = match id {
+                42 => ipv4.ip.clone(),
+                1 => IpAddress::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                _ => ipv6.ip.clone(),
+            };
+            assert_eq!(response.ip, expected);
+            assert_eq!(response.prefix_len, prefix_len);
+            for entry in lease {
+                assert!(assigned.iter().any(|assigned| assigned.ip == entry.ip));
+            }
+            if id == 7 {
+                assert!(assigned.iter().all(|entry| entry.request_id != 1));
+            }
+        }
+        // A request carrying END_STREAM still gets its complete response first.
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(3), body.data())
+                .await
+                .unwrap();
+            match next {
+                None => break,
+                Some(data) => assert!(data.unwrap().is_empty()),
+            }
+        }
+    }
+    server_task.abort();
+    driver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_malformed_address_requests_reset_only_the_request_stream() {
+    use masque::capsule::{AssignedAddress, ip::MAX_ADDRESS_REQUEST_SIZE};
+
+    let files = TestFiles::new();
+    let mut config = http2_config(&files);
+    config.ip_proxy.enabled = true;
+    let (server_addr, server_task) = spawn_http2_config(config).await;
+    let (mut client, driver) = connect_h2(server_addr).await;
+    let mut invalid = vec![vec![2, 0], vec![2, 1, 1], vec![2, 7, 0, 4, 0, 0, 0, 0, 32]];
+    let request = AssignedAddress {
+        request_id: 1,
+        ip: IpAddress::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        prefix_len: 32,
+    };
+    let mut duplicate = Vec::new();
+    encoder::encode(
+        &CapsuleFrame::AddressRequest(vec![request.clone(), request.clone()]),
+        &mut duplicate,
+    );
+    invalid.push(duplicate);
+    let mut reused = Vec::new();
+    encoder::encode(
+        &CapsuleFrame::AddressRequest(vec![request.clone()]),
+        &mut reused,
+    );
+    encoder::encode(&CapsuleFrame::AddressRequest(vec![request]), &mut reused);
+    invalid.push(reused);
+    let mut oversized = vec![2];
+    masque::varint::encode_to_vec(MAX_ADDRESS_REQUEST_SIZE as u64 + 1, &mut oversized).unwrap();
+    invalid.push(oversized);
+    invalid.push(vec![2, 7, 1, 4, 192, 0, 2, 1, 24]);
+    invalid.push(vec![2, 7, 1, 4, 0, 0, 0, 0, 33]);
+    invalid.push(vec![3, 10, 4, 192, 0, 2, 2, 192, 0, 2, 1, 0]);
+    invalid.push(vec![
+        3, 20, 4, 192, 0, 2, 0, 192, 0, 2, 2, 0, 4, 192, 0, 2, 2, 192, 0, 2, 3, 0,
+    ]);
+    for wire in invalid {
+        let (response, mut request_body) = client
+            .send_request(connect_ip_request("connect-ip"), false)
+            .unwrap();
+        let (_, mut body) = read_connect_ip_setup(response.await.unwrap()).await;
+        request_body.send_data(Bytes::from(wire), true).unwrap();
+        loop {
+            let data = tokio::time::timeout(Duration::from_secs(3), body.data())
+                .await
+                .unwrap()
+                .expect("invalid capsule ended without reset");
+            match data {
+                Err(error) => {
+                    assert_eq!(error.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+                    break;
+                }
+                Ok(data) => body.flow_control().release_capacity(data.len()).unwrap(),
+            }
+        }
+    }
+    // Every malformed request was isolated, and leases are usable again.
+    let (response, mut request_body) = client
+        .send_request(connect_ip_request("connect-ip"), false)
+        .unwrap();
+    let (setup, _) = read_connect_ip_setup(response.await.unwrap()).await;
+    assert_eq!(setup.len(), 2);
+    request_body.send_data(Bytes::new(), true).unwrap();
+    server_task.abort();
+    driver.abort();
 }

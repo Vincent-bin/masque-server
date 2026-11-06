@@ -953,6 +953,35 @@ ipv6_pool = "fd00:abcd::/64"
 `cf-connect-proto`. Both identifiers are accepted by default. Narrow the list
 to `["connect-ip"]` to accept only standards-compliant clients.
 
+`uri_template` is the server-side **path and query** template, not an absolute
+URL. Standard `connect-ip` requests must match it completely, including any
+trailing slash. The default full-tunnel request is
+`/.well-known/masque/ip/*/*/`. A template variable that is present cannot be
+empty; a variable omitted from the template means wildcard. Percent-encoded
+wildcards (`%2A`) are also accepted.
+
+Supported forms are literal paths, whole path segments `{target}` and
+`{ipproto}`, literal or variable query values (for example,
+`/vpn?t={target}&i={ipproto}`), and a final optional query expansion such as
+`/vpn{?target,ipproto}` or `/vpn?user=bob{&target,ipproto}`. Each variable and query
+parameter name may occur only once. Unknown request parameters, duplicate
+parameters, extra path segments, unsupported template operators, and ambiguous
+templates are rejected. `check-config` validates this syntax when standard
+`connect-ip` is enabled. This is a supported subset of RFC 6570, not a
+general-purpose URI Template implementation.
+
+The current forwarding path supports only unscoped full tunnels. Valid
+non-wildcard `target` or `ipproto` requests return an empty `501` after
+authentication rather than silently creating an unrestricted tunnel. Malformed
+scope values return an empty `400`. Requests are rejected before DNS, address
+allocation, or route installation. Existing authentication, source-address
+checks, pool restrictions, and host firewall requirements still apply.
+
+The deployed `cf-connect-ip` dialect retains its existing path behavior,
+including the HTTP/3 `/` path and HTTP/2 authority-only request. Its path is not
+interpreted as a standard scoped URI. Restrict `connect_protocols` to
+`["connect-ip"]` when only standard URI semantics are wanted.
+
 CONNECT-IP is Linux-only. Pools must not overlap host, container, VPN, or
 upstream networks. The host is responsible for routing, forwarding, firewall,
 and optional NAT outside the process. Disable the entire section when full IP
