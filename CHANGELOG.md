@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.11 - 2026-11-06
+
 ### Changed
 
 - Encrypt QUIC Retry token contents with AES-256-GCM and a random nonce.
