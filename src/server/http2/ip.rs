@@ -18,7 +18,7 @@ use super::super::{
 use super::ConnectionContext;
 use super::request::CAPSULE_PROTOCOL;
 use super::support::{Activity, TunnelMetricsGuard, send_data, send_error, wait_until_idle};
-use crate::capsule::decoder::CapsuleDecoder;
+use crate::capsule::ip::{AddressRequests, IpCapsules, MAX_ADDRESS_REQUEST_IDS};
 use crate::capsule::{CapsuleFrame, encoder};
 use crate::client_identity::ClientIdentity;
 use crate::ip_packet;
@@ -28,7 +28,12 @@ use crate::varint;
 
 const MAX_TUN_QUEUE_PACKETS: usize = 256;
 const RESPONSE_BATCH_SIZE: usize = 64 * 1024;
-const MAX_CONTROL_CAPSULE_SIZE: usize = 64 * 1024;
+// Every nonempty request consumes at least one of 1,024 lifetime IDs.
+// One response costs <=26 bytes per ID, <=26 bytes for the two leased host
+// addresses, and <=9 framing bytes. All lifetime replies therefore total less
+// than 64 KiB, plus bounded channel overhead. Allow a complete valid burst
+// without requiring the writer to be polled between input capsules.
+const MAX_CONTROL_RESPONSES: usize = MAX_ADDRESS_REQUEST_IDS;
 
 /// CONNECT-IP has two HTTP/2 wire shapes in active use.
 ///
@@ -180,10 +185,16 @@ pub(super) async fn serve(
     );
     tokio::pin!(idle);
 
-    let context_bytes = usize::from(capsule_mode == IpCapsuleMode::Standard);
-    let mut decoder = CapsuleDecoder::with_max_capsule_size(
-        MAX_CONTROL_CAPSULE_SIZE.max(max_ip_packet.saturating_add(context_bytes)),
-    );
+    // QUIC varints may use up to eight bytes even for Context ID zero.
+    let context_bytes = if capsule_mode == IpCapsuleMode::Standard {
+        8
+    } else {
+        0
+    };
+    let mut decoder = IpCapsules::new((64 * 1024).max(max_ip_packet.saturating_add(context_bytes)));
+    let mut address_requests = AddressRequests::default();
+    let (control_sender, mut control_receiver) = mpsc::channel(MAX_CONTROL_RESPONSES);
+    let mut control_sender = Some(control_sender);
     let mut tun_send = TunSendBatch::new();
     let mut response_capsules = Vec::with_capacity(RESPONSE_BATCH_SIZE);
 
@@ -201,9 +212,10 @@ pub(super) async fn serve(
     let client_to_tun = async {
         loop {
             let Some(chunk) = body.data().await else {
-                if decoder.buffered() != 0 {
+                if decoder.is_partial() {
                     anyhow::bail!("request ended with a truncated CONNECT-IP capsule");
                 }
+                control_sender.take();
                 return Ok::<_, anyhow::Error>(());
             };
             let chunk = chunk?;
@@ -211,11 +223,24 @@ pub(super) async fn serve(
             body.flow_control().release_capacity(chunk.len())?;
 
             for frame in frames {
-                let CapsuleFrame::Datagram(payload) = frame else {
-                    // ADDRESS_* and ROUTE_ADVERTISEMENT are valid on this
-                    // stream but do not alter the server's local lease or
-                    // source-spoofing boundary.
-                    continue;
+                let payload = match frame {
+                    CapsuleFrame::Datagram(payload) => payload,
+                    CapsuleFrame::AddressRequest(requests) => {
+                        let reply = address_requests.respond(&requests, &addresses)?;
+                        let mut output = Vec::new();
+                        encoder::encode(&reply, &mut output);
+                        // Never block request consumption behind a peer that
+                        // withholds response credit. Excess control output
+                        // resets this stream instead of growing a retry queue.
+                        control_sender
+                            .as_ref()
+                            .unwrap()
+                            .try_send(Bytes::from(output))
+                            .map_err(|_| anyhow::anyhow!("CONNECT-IP control queue full"))?;
+                        activity.touch();
+                        continue;
+                    }
+                    _ => continue,
                 };
                 let Some(packet) = capsule_mode.decode_packet(&payload)? else {
                     continue;
@@ -259,8 +284,18 @@ pub(super) async fn serve(
 
     let tun_to_client = async {
         loop {
-            let Some(packet) = return_packets.recv().await else {
-                anyhow::bail!("HTTP/2 TUN return path closed");
+            let packet = tokio::select! {
+                biased;
+                control = control_receiver.recv() => {
+                    let Some(control) = control else {
+                        return Ok::<_, anyhow::Error>(());
+                    };
+                    send_data(&mut send, control, false).await?;
+                    continue;
+                }
+                packet = return_packets.recv() => {
+                    packet.ok_or_else(|| anyhow::anyhow!("HTTP/2 TUN return path closed"))?
+                }
             };
             response_capsules.clear();
             if packet.len() <= max_ip_packet {
@@ -289,11 +324,9 @@ pub(super) async fn serve(
     };
 
     let relay = {
-        tokio::pin!(client_to_tun);
-        tokio::pin!(tun_to_client);
+        let both = async { tokio::try_join!(client_to_tun, tun_to_client) };
         tokio::select! {
-            result = &mut client_to_tun => result.map(|()| Completion::ClientClosed),
-            result = &mut tun_to_client => result.map(|()| Completion::ClientClosed),
+            result = both => result.map(|_| Completion::ClientClosed),
             _ = &mut idle => Ok(Completion::Idle),
         }
     };

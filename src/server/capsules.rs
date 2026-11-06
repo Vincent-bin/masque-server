@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 
 use super::{Shard, Shared};
+use crate::capsule::CapsuleFrame;
 use crate::capsule::datagram::DatagramCapsules;
+use crate::capsule::decoder::DecodeError;
+use crate::capsule::ip::{AddressRequests, IpCapsules};
 use crate::connection::ClientConnection;
 use crate::{capsule, varint};
 
@@ -15,8 +18,37 @@ const MAX_RECEIVED_PACKETS: usize = 64;
 const MAX_RECEIVED_BYTES: usize = 256 * 1024;
 pub(super) const MAX_UDP_PAYLOAD: usize = 65_527;
 
+enum StreamDecoder {
+    Datagram(DatagramCapsules),
+    Ip(IpCapsules),
+}
+
+impl StreamDecoder {
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<CapsuleFrame>, DecodeError> {
+        match self {
+            Self::Datagram(decoder) => {
+                let mut frames = Vec::new();
+                decoder.decode_with(data, |_, value| {
+                    frames.push(CapsuleFrame::Datagram(value));
+                    Ok(())
+                })?;
+                Ok(frames)
+            }
+            Self::Ip(decoder) => decoder.decode(data),
+        }
+    }
+
+    fn is_partial(&self) -> bool {
+        match self {
+            Self::Datagram(decoder) => decoder.is_partial(),
+            Self::Ip(decoder) => decoder.is_partial(),
+        }
+    }
+}
+
 pub(crate) struct CapsuleStream {
-    decoder: DatagramCapsules,
+    decoder: StreamDecoder,
+    address_requests: Option<AddressRequests>,
     send: VecDeque<Vec<u8>>,
     offset: usize,
     bytes: usize,
@@ -24,12 +56,21 @@ pub(crate) struct CapsuleStream {
 }
 
 impl CapsuleStream {
+    pub(super) fn new_ip(max_payload: usize) -> Self {
+        Self {
+            decoder: StreamDecoder::Ip(IpCapsules::new(max_payload + 8)),
+            address_requests: Some(AddressRequests::default()),
+            ..Self::new(max_payload)
+        }
+    }
+
     pub(super) fn has_partial_output(&self) -> bool {
         self.offset != 0
     }
     pub(super) fn new(max_payload: usize) -> Self {
         Self {
-            decoder: DatagramCapsules::new(max_payload + 8),
+            decoder: StreamDecoder::Datagram(DatagramCapsules::new(max_payload + 8)),
+            address_requests: None,
             send: VecDeque::new(),
             offset: 0,
             bytes: 0,
@@ -148,16 +189,20 @@ impl Shard {
                     client.capsule_readable.insert(stream_id);
                     continue;
                 }
-                let Some(stream) = client.capsule_streams.get_mut(&stream_id) else {
+                if !client.capsule_streams.contains_key(&stream_id) {
                     continue;
-                };
-                let Some(h3) = client.h3.as_mut() else {
+                }
+                if client.h3.is_none() {
                     continue;
-                };
+                }
                 let mut input = [0; 16 * 1024];
                 let mut failed = false;
                 loop {
-                    let count = match h3.recv_body(&mut client.quic, stream_id, &mut input) {
+                    let count = match client.h3.as_mut().unwrap().recv_body(
+                        &mut client.quic,
+                        stream_id,
+                        &mut input,
+                    ) {
                         Ok(0) | Err(quiche::h3::Error::Done) => break,
                         Ok(count) => count,
                         Err(_) => {
@@ -165,6 +210,8 @@ impl Shard {
                             break;
                         }
                     };
+                    let stream = client.capsule_streams.get_mut(&stream_id).unwrap();
+                    let max_payload = stream.max_payload;
                     let packets = match stream.decoder.decode(&input[..count]) {
                         Ok(packets) => packets,
                         Err(_) => {
@@ -172,14 +219,44 @@ impl Shard {
                             break;
                         }
                     };
-                    for payload in packets {
+                    for frame in packets {
+                        let payload = match frame {
+                            CapsuleFrame::Datagram(payload) => payload,
+                            CapsuleFrame::AddressRequest(requests) => {
+                                let Some(tunnel) = client.ip_tunnels.get_mut(&stream_id) else {
+                                    failed = true;
+                                    break;
+                                };
+                                let reply = client
+                                    .capsule_streams
+                                    .get_mut(&stream_id)
+                                    .unwrap()
+                                    .address_requests
+                                    .as_mut()
+                                    .unwrap()
+                                    .respond(&requests, &tunnel.assigned_addrs);
+                                let Ok(reply) = reply else {
+                                    failed = true;
+                                    break;
+                                };
+                                tunnel.last_activity = std::time::Instant::now();
+                                let mut output = Vec::new();
+                                capsule::encoder::encode(&reply, &mut output);
+                                if !client.queue_capsule_bytes(stream_id, output) {
+                                    failed = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            _ => continue,
+                        };
                         let Ok((context, context_len)) = varint::decode(&payload) else {
                             continue;
                         };
                         if context != 0 {
                             continue;
                         }
-                        if payload.len() - context_len > stream.max_payload {
+                        if payload.len() - context_len > max_payload {
                             failed = true;
                             break;
                         }
@@ -202,8 +279,15 @@ impl Shard {
                     }
                 }
                 if client.quic.stream_finished(stream_id) {
-                    failed |= stream.decoder.is_partial();
-                    client.finished_capsules.push(stream_id);
+                    failed |= client
+                        .capsule_streams
+                        .get(&stream_id)
+                        .unwrap()
+                        .decoder
+                        .is_partial();
+                    if !client.finished_capsules.contains(&stream_id) {
+                        client.finished_capsules.push(stream_id);
+                    }
                 }
                 if failed {
                     Self::close_capsule_stream(&self.shared, client, stream_id, true);
@@ -220,7 +304,19 @@ impl Shard {
             let Some(client) = self.connections.get_mut(id) else {
                 continue;
             };
-            while let Some(stream_id) = client.finished_capsules.pop() {
+            for stream_id in std::mem::take(&mut client.finished_capsules) {
+                // A complete request immediately followed by FIN still needs
+                // its response, including across a small peer receive window.
+                if client
+                    .capsule_streams
+                    .get(&stream_id)
+                    .is_some_and(|stream| {
+                        matches!(stream.decoder, StreamDecoder::Ip(_)) && !stream.send.is_empty()
+                    })
+                {
+                    client.finished_capsules.push(stream_id);
+                    continue;
+                }
                 Self::close_capsule_stream(&self.shared, client, stream_id, false);
             }
         }

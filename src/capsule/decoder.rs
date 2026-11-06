@@ -136,7 +136,10 @@ fn try_decode_one(
 }
 
 /// Interpret the capsule value bytes based on the type.
-fn parse_capsule_value(capsule_type: u64, value: &[u8]) -> Result<CapsuleFrame, DecodeError> {
+pub(super) fn parse_capsule_value(
+    capsule_type: u64,
+    value: &[u8],
+) -> Result<CapsuleFrame, DecodeError> {
     match capsule_type {
         CAPSULE_DATAGRAM => Ok(CapsuleFrame::Datagram(value.to_vec())),
 
@@ -146,7 +149,7 @@ fn parse_capsule_value(capsule_type: u64, value: &[u8]) -> Result<CapsuleFrame, 
         }
 
         CAPSULE_ADDRESS_REQUEST => {
-            let addrs = parse_assigned_addresses(value)?;
+            let addrs = parse_requested_addresses(value)?;
             Ok(CapsuleFrame::AddressRequest(addrs))
         }
 
@@ -160,6 +163,20 @@ fn parse_capsule_value(capsule_type: u64, value: &[u8]) -> Result<CapsuleFrame, 
             value: value.to_vec(),
         }),
     }
+}
+
+/// Parse an ADDRESS_REQUEST and its request-specific field constraints.
+fn parse_requested_addresses(value: &[u8]) -> Result<Vec<RequestedAddress>, DecodeError> {
+    let addresses = parse_assigned_addresses(value)?;
+    if addresses.is_empty() {
+        return Err(DecodeError::Malformed("empty ADDRESS_REQUEST".into()));
+    }
+    if addresses.iter().any(|address| address.request_id == 0) {
+        return Err(DecodeError::Malformed(
+            "zero ADDRESS_REQUEST identifier".into(),
+        ));
+    }
+    Ok(addresses)
 }
 
 /// Parse ADDRESS_ASSIGN / ADDRESS_REQUEST value.
@@ -204,6 +221,20 @@ fn parse_assigned_addresses(mut buf: &[u8]) -> Result<Vec<AssignedAddress>, Deco
         let prefix_len = buf[0];
         buf = &buf[1..];
 
+        let valid_prefix = match ip {
+            IpAddress::V4(ip) => {
+                prefix_len <= 32
+                    && (prefix_len == 32 || u32::from(ip) & (u32::MAX >> prefix_len) == 0)
+            }
+            IpAddress::V6(ip) => {
+                prefix_len <= 128
+                    && (prefix_len == 128 || u128::from(ip) & (u128::MAX >> prefix_len) == 0)
+            }
+        };
+        if !valid_prefix {
+            return Err(DecodeError::Malformed("invalid address prefix".into()));
+        }
+
         addrs.push(AssignedAddress {
             request_id,
             ip,
@@ -217,6 +248,7 @@ fn parse_assigned_addresses(mut buf: &[u8]) -> Result<Vec<AssignedAddress>, Deco
 /// Parse ROUTE_ADVERTISEMENT value.
 fn parse_address_ranges(mut buf: &[u8]) -> Result<Vec<IpAddressRange>, DecodeError> {
     let mut ranges = Vec::new();
+    let mut previous = None;
 
     while !buf.is_empty() {
         if buf.is_empty() {
@@ -257,6 +289,27 @@ fn parse_address_ranges(mut buf: &[u8]) -> Result<Vec<IpAddressRange>, DecodeErr
         }
         let ip_protocol = buf[0];
         buf = &buf[1..];
+
+        let (start_value, end_value) = match (&start, &end) {
+            (IpAddress::V4(start), IpAddress::V4(end)) => {
+                (u128::from(u32::from(*start)), u128::from(u32::from(*end)))
+            }
+            (IpAddress::V6(start), IpAddress::V6(end)) => (u128::from(*start), u128::from(*end)),
+            _ => unreachable!("range endpoints use the same wire IP version"),
+        };
+        // RFC 9484 section 4.7.3 orders ranges by version, protocol,
+        // then disjoint addresses. Comparing adjacent entries is sufficient.
+        if start_value > end_value
+            || previous.is_some_and(|(version, protocol, end)| {
+                (version, protocol) > (ip_version, ip_protocol)
+                    || ((version, protocol) == (ip_version, ip_protocol) && end >= start_value)
+            })
+        {
+            return Err(DecodeError::Malformed(
+                "invalid route range ordering".into(),
+            ));
+        }
+        previous = Some((ip_version, ip_protocol, end_value));
 
         ranges.push(IpAddressRange {
             start,
@@ -393,7 +446,7 @@ mod tests {
         let original = CapsuleFrame::AddressAssign(vec![
             AssignedAddress {
                 request_id: 1,
-                ip: IpAddress::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                ip: IpAddress::V4(Ipv4Addr::new(10, 0, 0, 0)),
                 prefix_len: 24,
             },
             AssignedAddress {

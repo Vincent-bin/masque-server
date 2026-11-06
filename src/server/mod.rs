@@ -1249,9 +1249,10 @@ fn connect_ip_capability(config: &ServerConfig, tun_available: bool) -> bool {
                     protocol.as_bytes(),
                     b"",
                     b"",
+                    b"",
                     config
                 ),
-                Some(ConnectRequest::Ip)
+                Some(ConnectRequest::Ip { .. })
             )
         })
 }

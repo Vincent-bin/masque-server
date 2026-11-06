@@ -1,7 +1,9 @@
 //! Incremental DATAGRAM capsule reader. Other capsule values are skipped.
 
-use super::CAPSULE_DATAGRAM;
 use super::decoder::DecodeError;
+use super::{
+    CAPSULE_ADDRESS_ASSIGN, CAPSULE_ADDRESS_REQUEST, CAPSULE_DATAGRAM, CAPSULE_ROUTE_ADVERTISEMENT,
+};
 use crate::varint;
 
 /// A bounded DATAGRAM decoder that skips other capsule values without buffering.
@@ -11,6 +13,8 @@ pub struct DatagramCapsules {
     remaining: u64,
     value: Option<Vec<u8>>,
     limit: usize,
+    control_limit: Option<usize>,
+    kind: u64,
 }
 
 impl DatagramCapsules {
@@ -22,6 +26,15 @@ impl DatagramCapsules {
             remaining: 0,
             value: None,
             limit,
+            control_limit: None,
+            kind: CAPSULE_DATAGRAM,
+        }
+    }
+
+    pub(super) fn with_ip_controls(limit: usize, control_limit: usize) -> Self {
+        Self {
+            control_limit: Some(control_limit),
+            ..Self::new(limit)
         }
     }
 
@@ -31,8 +44,20 @@ impl DatagramCapsules {
     }
 
     /// Feed a stream chunk and return complete HTTP Datagram payloads.
-    pub fn decode(&mut self, mut data: &[u8]) -> Result<Vec<Vec<u8>>, DecodeError> {
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DecodeError> {
         let mut datagrams = Vec::new();
+        self.decode_with(data, |_, value| {
+            datagrams.push(value);
+            Ok(())
+        })?;
+        Ok(datagrams)
+    }
+
+    pub(crate) fn decode_with(
+        &mut self,
+        mut data: &[u8],
+        mut receive: impl FnMut(u64, Vec<u8>) -> Result<(), DecodeError>,
+    ) -> Result<(), DecodeError> {
         while !data.is_empty() {
             if self.remaining == 0 {
                 self.header[self.header_len] = data[0];
@@ -47,12 +72,17 @@ impl DatagramCapsules {
                 };
                 self.header_len = 0;
                 self.remaining = length;
-                self.value = if kind == CAPSULE_DATAGRAM {
-                    if length > self.limit as u64 {
-                        return Err(DecodeError::TooLarge {
-                            length,
-                            max: self.limit,
-                        });
+                self.kind = kind;
+                let limit = match kind {
+                    CAPSULE_DATAGRAM => Some(self.limit),
+                    CAPSULE_ADDRESS_ASSIGN
+                    | CAPSULE_ADDRESS_REQUEST
+                    | CAPSULE_ROUTE_ADVERTISEMENT => self.control_limit,
+                    _ => None,
+                };
+                self.value = if let Some(limit) = limit {
+                    if length > limit as u64 {
+                        return Err(DecodeError::TooLarge { length, max: limit });
                     }
                     Some(Vec::with_capacity(length as usize))
                 } else {
@@ -61,7 +91,7 @@ impl DatagramCapsules {
                 if length == 0
                     && let Some(value) = self.value.take()
                 {
-                    datagrams.push(value);
+                    receive(self.kind, value)?;
                 }
                 continue;
             }
@@ -74,10 +104,10 @@ impl DatagramCapsules {
             if self.remaining == 0
                 && let Some(value) = self.value.take()
             {
-                datagrams.push(value);
+                receive(self.kind, value)?;
             }
         }
-        Ok(datagrams)
+        Ok(())
     }
 }
 

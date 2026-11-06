@@ -39,6 +39,9 @@ use masque::config::{
 use masque::datagram::DatagramHeader;
 use masque::server::Server;
 
+#[path = "client_cert_connect_ip/ip_uri.rs"]
+mod ip_uri;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CLIENT_IPV4: &str = "10.89.0.2";
 const CLIENT_IPV6: &str = "fd00:abcd::2";
@@ -587,7 +590,7 @@ impl Client {
         panic!("stream {stream_id} was not reset");
     }
 
-    /// Send the CONNECT-IP request exactly as Cloudflare's clients send it.
+    /// Send standard CONNECT-IP or the deployed Cloudflare request shape.
     fn send_connect_ip(&mut self, protocol: &str) -> anyhow::Result<u64> {
         self.send_connect_ip_with_credentials(protocol, None)
     }
@@ -598,12 +601,26 @@ impl Client {
         protocol: &str,
         credentials: Option<&str>,
     ) -> anyhow::Result<u64> {
+        let path = if protocol == "connect-ip" {
+            "/.well-known/masque/ip/*/*/"
+        } else {
+            "/"
+        };
+        self.send_connect_ip_path(protocol, path, credentials)
+    }
+
+    fn send_connect_ip_path(
+        &mut self,
+        protocol: &str,
+        path: &str,
+        credentials: Option<&str>,
+    ) -> anyhow::Result<u64> {
         let mut headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", protocol.as_bytes()),
             quiche::h3::Header::new(b":scheme", b"https"),
             quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
             // These clients send an empty User-Agent, which has to survive
             // QPACK and the server's header scan.
@@ -2754,4 +2771,181 @@ fn client_without_a_certificate_is_refused() {
         client.wait_for_close(Duration::from_secs(5)),
         "a client with no certificate must not keep a usable connection"
     );
+}
+
+#[test]
+fn http3_address_requests_match_ids_without_expanding_pinned_leases() {
+    use masque::capsule::{AssignedAddress, encoder};
+    let fixture = fixture("ip-address-requests");
+    for native_datagrams in [false, true] {
+        let mut client = Client::connect_with_transport(
+            fixture.peer,
+            Some((&fixture.client_cert, &fixture.client_key)),
+            None,
+            false,
+            "127.0.0.1".parse().unwrap(),
+            native_datagrams,
+            64,
+        )
+        .unwrap();
+        client.handshake(Duration::from_secs(5)).unwrap();
+        client.init_h3().unwrap();
+        for protocol in ["connect-ip", "cf-connect-ip"] {
+            let stream = client.send_connect_ip(protocol).unwrap();
+            assert_eq!(
+                client
+                    .response_status(stream, Duration::from_secs(5))
+                    .unwrap(),
+                200
+            );
+            let setup = client.capsules(stream, 2, Duration::from_secs(5));
+            assert_eq!(setup.len(), 2);
+            for (id, ip, prefix_len, expected, finish) in [
+                (42, "0.0.0.0", 32, CLIENT_IPV4, false),
+                (1, "192.0.2.99", 32, "0.0.0.0", false),
+                (2, "0.0.0.0", 24, "0.0.0.0", false),
+                (7, "::", 128, CLIENT_IPV6, true),
+            ] {
+                let ip = match ip.parse::<std::net::IpAddr>().unwrap() {
+                    std::net::IpAddr::V4(ip) => IpAddress::V4(ip),
+                    std::net::IpAddr::V6(ip) => IpAddress::V6(ip),
+                };
+                let mut wire = Vec::new();
+                encoder::encode(
+                    &CapsuleFrame::AddressRequest(vec![AssignedAddress {
+                        request_id: id,
+                        ip,
+                        prefix_len,
+                    }]),
+                    &mut wire,
+                );
+                client
+                    .h3
+                    .as_mut()
+                    .unwrap()
+                    .send_body(&mut client.quic, stream, &wire[..3], false)
+                    .unwrap();
+                client.flush().unwrap();
+                client.drive().unwrap();
+                client
+                    .h3
+                    .as_mut()
+                    .unwrap()
+                    .send_body(&mut client.quic, stream, &wire[3..], finish)
+                    .unwrap();
+                client.flush().unwrap();
+                let replies = client.capsules(stream, 1, Duration::from_secs(5));
+                let [CapsuleFrame::AddressAssign(assigned)] = replies.as_slice() else {
+                    panic!("missing reply: {replies:?}")
+                };
+                let reply = assigned
+                    .iter()
+                    .find(|entry| entry.request_id == id)
+                    .unwrap();
+                let expected = match expected.parse::<std::net::IpAddr>().unwrap() {
+                    std::net::IpAddr::V4(ip) => IpAddress::V4(ip),
+                    std::net::IpAddr::V6(ip) => IpAddress::V6(ip),
+                };
+                assert_eq!(reply.ip, expected);
+                assert_eq!(reply.prefix_len, if id == 7 { 128 } else { 32 });
+                assert!(
+                    assigned
+                        .iter()
+                        .any(|entry| entry.ip == IpAddress::V4(CLIENT_IPV4.parse().unwrap()))
+                );
+                assert!(
+                    assigned
+                        .iter()
+                        .any(|entry| entry.ip == IpAddress::V6(CLIENT_IPV6.parse().unwrap()))
+                );
+                assert!(
+                    assigned
+                        .iter()
+                        .all(|entry| entry.request_id == id || entry.request_id == 0)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn http3_malformed_address_requests_reset_only_the_request_stream() {
+    use masque::capsule::{AssignedAddress, encoder, ip::MAX_ADDRESS_REQUEST_SIZE};
+    let fixture = fixture("ip-invalid-address-requests");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let request = AssignedAddress {
+        request_id: 1,
+        ip: IpAddress::V4(Ipv4Addr::UNSPECIFIED),
+        prefix_len: 32,
+    };
+    let mut invalid = vec![vec![2, 0], vec![2, 1, 1], vec![2, 7, 0, 4, 0, 0, 0, 0, 32]];
+    let mut duplicate = Vec::new();
+    encoder::encode(
+        &CapsuleFrame::AddressRequest(vec![request.clone(), request.clone()]),
+        &mut duplicate,
+    );
+    invalid.push(duplicate);
+    let mut reused = Vec::new();
+    encoder::encode(
+        &CapsuleFrame::AddressRequest(vec![request.clone()]),
+        &mut reused,
+    );
+    encoder::encode(&CapsuleFrame::AddressRequest(vec![request]), &mut reused);
+    invalid.push(reused);
+    let mut oversized = vec![2];
+    masque::varint::encode_to_vec(MAX_ADDRESS_REQUEST_SIZE as u64 + 1, &mut oversized).unwrap();
+    invalid.push(oversized);
+    invalid.push(vec![2, 7, 1, 4, 192, 0, 2, 1, 24]);
+    invalid.push(vec![2, 7, 1, 4, 0, 0, 0, 0, 33]);
+    invalid.push(vec![3, 10, 4, 192, 0, 2, 2, 192, 0, 2, 1, 0]);
+    invalid.push(vec![
+        3, 20, 4, 192, 0, 2, 0, 192, 0, 2, 2, 0, 4, 192, 0, 2, 2, 192, 0, 2, 3, 0,
+    ]);
+    // Control replies use the existing 64-packet per-stream output budget.
+    // Overload must reset only this stream, then release its pinned leases.
+    let mut burst = Vec::new();
+    for request_id in 1..=65 {
+        encoder::encode(
+            &CapsuleFrame::AddressRequest(vec![AssignedAddress {
+                request_id,
+                ip: IpAddress::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_len: 32,
+            }]),
+            &mut burst,
+        );
+    }
+    invalid.push(burst);
+    for wire in invalid {
+        let stream = client.send_connect_ip("connect-ip").unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        assert_eq!(client.capsules(stream, 2, Duration::from_secs(5)).len(), 2);
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &wire, true)
+            .unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            client.stream_reset(stream),
+            quiche::h3::WireErrorCode::MessageError as u64
+        );
+        assert!(client.quic.peer_error().is_none());
+    }
+    let stream = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert_eq!(client.capsules(stream, 2, Duration::from_secs(5)).len(), 2);
 }

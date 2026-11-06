@@ -201,6 +201,9 @@ require_tun = false
 # forwarding, routes, firewall rules, or NAT. After startup, inspect those
 # operator-managed prerequisites with:
 #   masque-server --config /etc/masque/masque.toml doctor
+# Standard connect-ip matches this complete path/query template. Full tunnels
+# use /.well-known/masque/ip/*/*/. Scoped requests are rejected (501), not
+# silently widened; cf-connect-ip keeps its deployed path behavior.
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
 # Accepted `:protocol` values. RFC 9484 registers "connect-ip"; Cloudflare's
 # endpoint uses "cf-connect-ip" and clients built against it send only that.

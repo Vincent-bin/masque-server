@@ -232,7 +232,7 @@ impl Shard {
         let capsules = encode_ip_setup_capsules(&addresses);
         client
             .capsule_streams
-            .insert(stream_id, capsules::CapsuleStream::new(max_payload));
+            .insert(stream_id, capsules::CapsuleStream::new_ip(max_payload));
         client.ip_tunnels.insert(stream_id, tunnel);
         if !client.queue_capsule_bytes(stream_id, capsules) {
             Self::teardown_ip_tunnel(shared, client, stream_id, conn_idx);
