@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.8 - 2026-11-06
+
+### Fixed
+
+- Bound the HTTP/2 preface handshake to 10 seconds, independently of the
+  existing TLS handshake deadline, so stalled peers release their connection
+  and source admission slots.
+- Close established HTTP/2 connections with no active requests after
+  `server.idle_timeout_secs`. The idle clock restarts when the final request
+  finishes or is cancelled; active tunnels retain their existing inactivity
+  rules, including the UDP 120-second minimum. Idle shutdown sends GOAWAY
+  without requiring a PING acknowledgement and bounds a blocked flush to
+  five additional seconds.
+
 ## 0.14.7 - 2026-11-06
 
 ### Changed
