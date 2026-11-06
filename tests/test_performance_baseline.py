@@ -270,6 +270,41 @@ class CpuEfficiencyTests(unittest.TestCase):
             baseline.work_records(run["records"])[0]["requested_pps_per_connection"] = 1000 if run["label"] == "reference" else 2000
         self.assert_cpu_status(runs, "inconclusive", "incomparable_workload")
 
+    def test_active_stream_topology_must_match_even_when_opened_streams_match(self):
+        for candidate_active in (1, None):
+            with self.subTest(candidate_active=candidate_active):
+                runs = resource_runs("load", candidate_cpu=1)
+                for run in runs:
+                    load = baseline.work_records(run["records"])[0]
+                    load.update(transport="http3", streams_per_connection=64)
+                    if run["label"] == "reference":
+                        load["active_streams_per_connection"] = 64
+                    elif candidate_active is not None:
+                        load["active_streams_per_connection"] = candidate_active
+                self.assert_cpu_status(runs, "inconclusive", "incomparable_workload")
+
+    def test_matching_active_stream_topology_preserves_efficiency_comparison(self):
+        runs = resource_runs("load", candidate_cpu=4, candidate_work=2000)
+        for run in runs:
+            load = baseline.work_records(run["records"])[0]
+            load.update(transport="http3", streams_per_connection=64,
+                        active_streams_per_connection=1, requested_pps_per_connection=20000)
+        self.assert_cpu_status(runs, "unchanged")
+
+    def test_load_phase_markers_do_not_become_completed_work(self):
+        records = baseline.parse_records(
+            "LOAD_PHASE phase=measurement_start\n"
+            "LOAD_RESULT transport=http3 connections=1 established=1 "
+            "streams_per_connection=64 active_streams_per_connection=1 "
+            "requested_pps_per_connection=20000 payload_bytes=1200 rx_packets=1000\n"
+            "LOAD_PHASE phase=measurement_end\n"
+            "SERVER_RESOURCE_RESULT cpu_secs=2 peak_rss_bytes=1024\n"
+        )
+        self.assertEqual(len(records), 2)
+        resource = baseline.normalize_resources(records)[1]
+        self.assertEqual(resource["completed_responses"], 1000)
+        self.assertEqual(resource["completed_payload_bytes"], 1200000)
+
     def test_one_round_and_noisy_normalized_cpu_are_inconclusive(self):
         self.assert_cpu_status(resource_runs(rounds=1), "inconclusive", "insufficient_samples")
         runs = resource_runs()

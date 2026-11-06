@@ -186,7 +186,8 @@ def cpu_work_context(candidate, reference, by_key, threshold):
             reasons.append("incomplete_work_samples")
         # The runner holds these settings fixed. Also check them when comparing
         # existing records so different connection/window setups cannot qualify.
-        for field in ("connections", "streams_per_connection", "window", "expiry_ms", "requested_pps_per_connection"):
+        for field in ("connections", "streams_per_connection", "active_streams_per_connection",
+                      "window", "expiry_ms", "requested_pps_per_connection"):
             av, bv = a["metrics"].get(field), b["metrics"].get(field)
             if (av is None) != (bv is None) or (av and (av["min"] != av["max"] or av != bv)):
                 reasons.append("incomparable_workload")
