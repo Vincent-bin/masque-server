@@ -2,6 +2,7 @@
 # Keep this above the client's keepalive period. VPN-style MASQUE clients
 # commonly default to 30s, and matching that exactly makes a quiet tunnel race
 # its own keepalive against the timeout.
+# Also closes HTTP/2 connections with no active requests or tunnels.
 idle_timeout_secs = 60
 max_connections = 10000
 # Shared by HTTP/2 and HTTP/3. IPv4-mapped IPv6 addresses use the IPv4 count.

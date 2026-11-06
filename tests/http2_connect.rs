@@ -27,6 +27,9 @@ use masque::capsule::{CapsuleFrame, IpAddress, encoder};
 use masque::config::{AuthMode, BasicUser, ClientEntry, ListenerTransport, ServerConfig};
 use masque::server::Server;
 
+#[path = "http2_connect/timeouts.rs"]
+mod timeouts;
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
 static SIGHUP_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =

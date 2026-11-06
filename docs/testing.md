@@ -168,6 +168,31 @@ settings fixed, and compares both goodput and response shortfall.
 
 See [Performance](performance.md) for methodology and reporting requirements.
 
+## HTTP/2 lifecycle deadlines
+
+`tests/http2_connect/timeouts.rs` adds real TLS/socket checks for connection
+admission and idle cleanup. The ordinary HTTP/2 suite verifies the 10-second
+TLS and H2 preface deadlines for peers sending no or incomplete handshake
+bytes. Established connections with no requests, or after a completed request,
+expire with `server.idle_timeout_secs = 1`. Tests allow 2 seconds of scheduler
+slack and check both listener and process-wide source admission caps.
+
+```sh
+cargo test --test http2_connect timeouts:: -- --nocapture
+```
+
+Each deadline regression verifies the connection gauge returns to zero and a
+replacement connection works. Idle cases complete an H2 PING round trip before
+waiting, so they cannot accidentally test an unfinished handshake. Additional
+checks keep a TCP tunnel alive with traffic and a UDP tunnel alive without
+traffic, proving connection age does not override per-tunnel inactivity rules.
+Closing the final UDP stream starts a fresh connection idle interval, while
+completing a second request must not interrupt that UDP tunnel.
+Cancellation of the final tunnel also permits idle cleanup. Raw H2 peers that
+never acknowledge SETTINGS or PING, or send only a partial initial SETTINGS
+frame, cannot hold an empty connection open.
+`HTTP2_TIMEOUT` output records measured deadlines and admission recovery.
+
 ## Scheduled verification
 
 The weekly and manually dispatchable `Scheduled verification` workflow keeps

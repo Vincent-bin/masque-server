@@ -45,6 +45,8 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
+    /// Inactive tunnel lifetime, and the lifetime of an HTTP/2 connection
+    /// with no active requests. UDP tunnels keep their 120-second minimum.
     pub idle_timeout_secs: u64,
     pub max_connections: usize,
     /// Process-wide cap for live HTTP/2 and HTTP/3 connections admitted from

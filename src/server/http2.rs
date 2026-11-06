@@ -34,7 +34,9 @@ use crate::metrics::{Metrics, ShardMetrics};
 use crate::policy::TargetPolicy;
 use crate::tunnel::resolver::TargetResolver;
 
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// Bound both phases independently: completing TLS must not let a peer retain
+// its socket and admission slots without sending the H2 preface.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
