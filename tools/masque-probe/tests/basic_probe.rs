@@ -403,7 +403,10 @@ fn run_payload_probe(
             "--insecure",
             "--json",
             "--timeout",
-            "1",
+            // Authentication and CONNECT setup share the runner with other
+            // tests. Give them enough time to reach the payload stage under
+            // CI load; the tested silent payload must still time out.
+            "5",
         ])
         .args(options)
         .stdin(Stdio::piped())
@@ -435,7 +438,8 @@ async fn accepted_connect_without_matching_payload_fails_on_both_transports() {
                 let received = stream.read(&mut request).await.unwrap();
                 assert!(received > 0, "must send real payload after CONNECT 200");
                 if silent {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    // Stay silent longer than the probe's per-stage deadline.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 } else {
                     stream.write_all(b"not-the-request").await.unwrap();
                 }
@@ -466,7 +470,8 @@ async fn accepted_connect_without_matching_payload_fails_on_both_transports() {
                     "TCP_RESPONSE_TIMEOUT"
                 } else {
                     "TCP_RESPONSE_INVALID"
-                }
+                },
+                "transport={transport:?}, silent={silent}"
             );
             origin.abort();
         }
@@ -502,7 +507,10 @@ async fn ip_assignment_without_forwarding_is_not_success_on_either_transport() {
             .find(|check| check["name"] == "connect_ip")
             .unwrap();
         assert_eq!(check["status"], "fail");
-        assert_eq!(check["code"], "CONNECT_IP_RESPONSE_TIMEOUT");
+        assert_eq!(
+            check["code"], "CONNECT_IP_RESPONSE_TIMEOUT",
+            "transport={transport:?}"
+        );
         server.abort();
     }
 }
