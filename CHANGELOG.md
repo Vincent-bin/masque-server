@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.12 - 2026-11-07
+
 ### Fixed
 
 - Bound HTTP/2 CONNECT-IP initial control delivery by the idle timeout. Zero or
