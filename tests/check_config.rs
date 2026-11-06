@@ -1,7 +1,7 @@
 //! The installer depends on `check-config` being a complete, side-effect-free
 //! preflight for an already deployed configuration.
 
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -164,6 +164,109 @@ fn check_config_validates_without_binding_the_listen_port() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("configuration is compatible"));
+}
+
+#[test]
+fn global_target_policies_reject_invalid_cidrs_before_check_or_startup() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    // Hold both transport ports so a regression cannot leave a server running.
+    // The error must identify the invalid policy, not reach the socket bind.
+    let occupied_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let occupied_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    for (transport, addr) in [
+        ("http3", occupied_udp.local_addr().unwrap()),
+        ("http2", occupied_tcp.local_addr().unwrap()),
+    ] {
+        let base = config_text(addr, &cert_path, &key_path, "cubic").replace(
+            "[[listeners]]",
+            &format!("[[listeners]]\ntransport = \"{transport}\""),
+        );
+        for section in ["tcp_proxy", "udp_proxy"] {
+            for field in ["allow_targets", "deny_targets"] {
+                for enabled in [true, false] {
+                    for invalid in ["not-a-cidr", "192.0.2.0/33", "2001:db8::/129"] {
+                        std::fs::write(
+                            &config_path,
+                            format!(
+                                "{base}\n[{section}]\nenabled = {enabled}\n\
+                                 {field} = [\"192.0.2.0/24\", \"{invalid}\"]\n"
+                            ),
+                        )
+                        .unwrap();
+                        for check_only in [true, false] {
+                            let mut command = Command::new(env!("CARGO_BIN_EXE_masque-server"));
+                            command.arg("--config").arg(&config_path);
+                            if check_only {
+                                command.arg("check-config");
+                            }
+                            let output = command.output().unwrap();
+                            let error = String::from_utf8_lossy(&output.stderr);
+                            assert!(
+                                !output.status.success(),
+                                "{transport} {section}.{field} accepted {invalid}"
+                            );
+                            for expected in [section, &format!("{field}[1]"), invalid] {
+                                assert!(
+                                    error.contains(expected),
+                                    "{transport} {section}.{field} enabled={enabled} \
+                                     check_only={check_only}: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn global_target_policies_accept_valid_and_empty_cidr_lists() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    for transport in ["http2", "http3"] {
+        let base = config_text(
+            "127.0.0.1:0".parse().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        )
+        .replace(
+            "[[listeners]]",
+            &format!("[[listeners]]\ntransport = \"{transport}\""),
+        );
+        for (allow, deny) in [
+            ("[]", "[]"),
+            (r#"["0.0.0.0/0", "::/0"]"#, "[]"),
+            (
+                r#"["192.0.2.0/24", "2001:db8::/32", "::ffff:198.51.100.0/120"]"#,
+                r#"["192.0.2.1/32", "2001:db8::1/128", "::ffff:198.51.100.1/128"]"#,
+            ),
+        ] {
+            std::fs::write(
+                &config_path,
+                format!(
+                    "{base}\n[tcp_proxy]\nallow_targets = {allow}\ndeny_targets = {deny}\n\
+                     [udp_proxy]\nallow_targets = {allow}\ndeny_targets = {deny}\n"
+                ),
+            )
+            .unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+                .arg("--config")
+                .arg(&config_path)
+                .arg("check-config")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{transport} allow={allow} deny={deny}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 #[test]

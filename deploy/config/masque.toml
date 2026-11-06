@@ -153,6 +153,8 @@ retry_mode = "adaptive"
 retry_connection_threshold = 64
 retry_token_ttl_secs = 30
 
+# TCP/UDP allow_targets and deny_targets require valid IPv4/IPv6 CIDRs.
+# Invalid entries fail startup and check-config, even if the proxy is disabled.
 [tcp_proxy]
 enabled = true
 connect_timeout_secs = 10

@@ -6,8 +6,8 @@ use super::*;
 /// device.
 ///
 /// Keeping this as the single startup-validation path means `check-config`
-/// and a real server start reject the same authentication, TLS, QUIC, and
-/// address-pool mistakes.
+/// and a real server start reject the same authentication, TLS, QUIC,
+/// target-policy, and address-pool mistakes.
 pub(super) struct ValidatedServerConfig {
     pub(super) clients: ClientRegistry,
     pub(super) tls: Arc<tls::SharedTlsIdentity>,
@@ -239,6 +239,19 @@ pub(super) fn validate_server_config(
 ) -> anyhow::Result<ValidatedServerConfig> {
     let listeners = plan_listeners(config)?;
     let any_client_cert = any_client_cert_listener(config);
+
+    // Validate both global policies before any listener binds or TUN setup.
+    // Check disabled proxies too, so a malformed deny cannot be enabled later.
+    TargetPolicy::new(
+        &config.tcp_proxy.allow_targets,
+        &config.tcp_proxy.deny_targets,
+    )
+    .context("tcp_proxy")?;
+    TargetPolicy::new(
+        &config.udp_proxy.allow_targets,
+        &config.udp_proxy.deny_targets,
+    )
+    .context("udp_proxy")?;
 
     if !(1..=MAX_CONFIGURED_CONNECTIONS).contains(&config.server.max_connections) {
         anyhow::bail!(

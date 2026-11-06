@@ -425,6 +425,12 @@ Omit `allow_targets` or `allow_ports` to inherit that dimension from the global
 policy. An explicit empty list denies every target in that dimension.
 `deny_targets` adds to the global denies. Every resolved address must pass both
 policies. Invalid CIDRs and port zero are rejected by `check-config`.
+
+Global `tcp_proxy` and `udp_proxy` allow/deny lists also require valid IPv4 or
+IPv6 CIDRs. Startup and `check-config` reject any malformed entry, including
+entries in a disabled proxy, and report the section, field, and zero-based
+entry index. An invalid deny rule is never silently skipped. Empty allow lists
+still deny all targets; empty deny lists add no exclusions.
 These tables do not govern CONNECT-IP forwarding. Restart after editing them.
 
 Use one HTTP/3 shard until a benchmark shows one event loop is CPU-bound.

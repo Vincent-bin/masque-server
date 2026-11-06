@@ -1740,12 +1740,14 @@ impl Shard {
             &config.tcp_proxy.allow_targets,
             &config.tcp_proxy.deny_targets,
         )
+        .context("tcp_proxy")?
         .with_restrictions(listener.tcp_targets);
 
         let udp_policy = TargetPolicy::new(
             &config.udp_proxy.allow_targets,
             &config.udp_proxy.deny_targets,
         )
+        .context("udp_proxy")?
         .with_restrictions(listener.udp_targets);
 
         let (udp_response_tx, udp_response_rx) = mpsc::channel(UDP_RESPONSE_QUEUE_CAPACITY);
