@@ -7,11 +7,23 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.7 - 2026-11-06
+
 ### Changed
 
 - Use BBR2 as the default QUIC congestion controller. Explicit controller
   selections remain unchanged; older configurations that omit the setting
   adopt BBR2 after upgrading and can pin `cubic` to retain prior behavior.
+- Use a reusable Linux deadline timer for HTTP/3 TCP-only connections while
+  retaining the one-millisecond send batching horizon. Other traffic and
+  platforms retain the portable timer; a timer failure permanently selects
+  that fallback for the affected shard.
+- Reuse up to four lazily allocated 64 KiB TCP read buffers per HTTP/3 tunnel.
+  Buffers return to the pool only after their final response reference is
+  dropped, preserving backpressure and bounded allocations during partial writes.
+- Record controlled and external-path throughput, CPU, UDP, and mixed-traffic
+  measurements. Short-download gains are primarily at startup; sustained
+  throughput improvements are not established.
 
 ## 0.14.6 - 2026-11-05
 
