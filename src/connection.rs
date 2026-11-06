@@ -88,7 +88,7 @@ pub(crate) struct DeferredSend {
 
 const MAX_DEFERRED_PACKETS: usize = 64;
 const MAX_DEFERRED_BYTES: usize = 128 * 1024;
-/// Match the granularity of the event-loop timer. Packets may be released at
+/// Keep batching independent of timer precision. Packets may be released at
 /// most this far ahead of quiche's desired time to amortize timer wakeups.
 pub(crate) const PACING_HORIZON: std::time::Duration = std::time::Duration::from_millis(1);
 
@@ -365,6 +365,13 @@ impl ClientConnection {
             + self.udp_tunnels.len()
             + self.ip_tunnels.len()
             + self.pending_ip_responses.len()
+    }
+
+    /// Use finer deadline wakeups only for TCP-only connections. A pending
+    /// non-TCP setup or authentication retains ordinary datagram scheduling.
+    pub(crate) fn uses_precise_tcp_pacing(&self) -> bool {
+        let tcp = self.tcp_tunnels.len() + self.pending_tcp_tunnels.len();
+        tcp != 0 && tcp == self.tunnel_count() && self.awaiting_auth.is_empty()
     }
 
     /// Publish tunnel gauges once after this connection's event-loop work.

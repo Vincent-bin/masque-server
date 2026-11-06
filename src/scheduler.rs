@@ -88,8 +88,10 @@ impl TimerQueue {
     ///
     /// A stale entry only makes the loop wake early and find nothing to do, so
     /// it costs an iteration rather than correctness.
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.heap.peek().map(|Reverse(timer)| timer.at)
+    pub(crate) fn next_wakeup(&self) -> Option<(u64, Instant)> {
+        self.heap
+            .peek()
+            .map(|Reverse(timer)| (timer.index, timer.at))
     }
 
     /// Pop every entry due at `now`, passing each `(index, deadline)` to
@@ -175,15 +177,15 @@ mod tests {
     fn timer_queue_reports_earliest_deadline() {
         let now = Instant::now();
         let mut timers = TimerQueue::default();
-        assert_eq!(timers.next_deadline(), None);
+        assert_eq!(timers.next_wakeup(), None);
 
         timers.schedule(1, now + Duration::from_millis(50));
         timers.schedule(2, now + Duration::from_millis(10));
         timers.schedule(3, now + Duration::from_millis(30));
 
         assert_eq!(
-            timers.next_deadline(),
-            Some(now + Duration::from_millis(10))
+            timers.next_wakeup(),
+            Some((2, now + Duration::from_millis(10)))
         );
     }
 
@@ -204,8 +206,8 @@ mod tests {
         // The future entry is untouched.
         assert_eq!(timers.len(), 1);
         assert_eq!(
-            timers.next_deadline(),
-            Some(now + Duration::from_millis(50))
+            timers.next_wakeup(),
+            Some((3, now + Duration::from_millis(50)))
         );
     }
 

@@ -58,6 +58,7 @@ use crate::net::quic::{
 #[cfg(target_os = "linux")]
 use crate::net::target_udp;
 use crate::net::target_udp::TargetRecvBatch;
+use crate::net::timer::DeadlineTimer;
 use crate::observability::ObservabilityServer;
 use crate::policy::TargetPolicy;
 use crate::routing::{RoutingTable, TunnelOwner};
@@ -1821,6 +1822,7 @@ impl Shard {
         // The connections serviced in the current round. Held across
         // iterations so its allocation is reused.
         let mut serviced: Vec<u64> = Vec::new();
+        let mut deadline_timer = DeadlineTimer::new();
 
         loop {
             self.dirty.end_round();
@@ -1835,15 +1837,27 @@ impl Shard {
             // Wake for the earliest connection deadline rather than scanning
             // every connection for it. The idle sweep and, during shutdown, the
             // drain deadline bound how long the loop can sit idle.
-            let now = Instant::now();
-            let mut next_wakeup = next_idle_sweep.saturating_duration_since(now);
-            if let Some(deadline) = self.timers.next_deadline() {
-                next_wakeup = next_wakeup.min(deadline.saturating_duration_since(now));
+            let mut next_wakeup = next_idle_sweep;
+            let mut precise_wakeup = false;
+            if let Some((index, deadline)) = self.timers.next_wakeup()
+                && deadline <= next_wakeup
+            {
+                next_wakeup = deadline;
+                precise_wakeup = self
+                    .conn_by_index
+                    .get(&index)
+                    .and_then(|id| self.connections.get(id))
+                    .is_some_and(|client| {
+                        client.uses_precise_tcp_pacing()
+                            && client.deferred_send.deadline().is_some()
+                    });
             }
-            if let Some(deadline) = drain_deadline {
-                next_wakeup = next_wakeup.min(deadline.saturating_duration_since(now));
+            if let Some(deadline) = drain_deadline
+                && deadline < next_wakeup
+            {
+                next_wakeup = deadline;
+                precise_wakeup = false;
             }
-            let timeout = Some(next_wakeup);
 
             // Wait for a packet, signal, or timeout.
             enum Event {
@@ -1863,8 +1877,7 @@ impl Shard {
                 Timeout,
             }
 
-            let event = if let Some(timeout) = timeout {
-                tokio::select! {
+            let event = tokio::select! {
                     _ = shutdown.wait_for(|requested| *requested), if !shutting_down => {
                         Event::Shutdown
                     }
@@ -1894,15 +1907,12 @@ impl Shard {
                     outcome = self.auth_rx.recv(), if !shutting_down => {
                         Event::AuthDone(outcome)
                     }
-                    result = tokio::time::timeout(
-                        timeout, self.socket.recv_batch(&mut recv_batch)
+                    result = deadline_timer.timeout_at(
+                        next_wakeup, precise_wakeup, self.socket.recv_batch(&mut recv_batch)
                     ) => match result {
-                        Ok(r) => Event::PacketBatch(r),
-                        Err(_) => Event::Timeout,
+                        Some(result) => Event::PacketBatch(result),
+                        None => Event::Timeout,
                     },
-                }
-            } else {
-                Event::PacketBatch(self.socket.recv_batch(&mut recv_batch).await)
             };
 
             match event {
