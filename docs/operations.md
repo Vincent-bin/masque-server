@@ -214,7 +214,14 @@ The interface option affects HTTP/3 only. See `configure-probe --help`.
 If the test fails, the inventory is unchanged and any newly entered password
 file is removed. Check the listener, credentials and network path, then rerun
 the command. Default TCP and UDP targets must be allowed by server policy;
-CONNECT-IP negotiation is optional and does not test packet forwarding.
+CONNECT-IP is optional and now checks an inner IP/UDP round trip. Set
+`tcp_mode = "echo"` for a controlled TCP echo target; otherwise TCP validates a
+target TLS handshake. IP probes accept `ip_target = "198.51.100.10:9999"` and
+`ip_mode = "echo"` for a controlled destination. `ip_setup_only = true` explicitly
+limits CONNECT-IP to negotiation and does not verify forwarding. These options
+are also available on `configure-probe`. Upgrade the probe binary together with
+the operations bundle; an old negotiation-only result cannot satisfy a required
+CONNECT-IP forwarding check.
 
 ## Deploy and roll back
 

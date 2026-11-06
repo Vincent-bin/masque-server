@@ -16,6 +16,7 @@ use crate::credentials::Credentials;
 use crate::endpoint::{Authority, encode_path_segment};
 use crate::protocol::{ensure_success_status, udp_probe_payload, validate_udp_probe_response};
 use crate::report::ProbeFailure;
+use crate::{TcpMode, tcp_payload::TcpExchange};
 
 const INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const INITIAL_CONNECTION_WINDOW: u32 = 8 * 1024 * 1024;
@@ -65,12 +66,13 @@ impl Session {
         &mut self,
         target: &Authority,
         credentials: &Credentials,
+        mode: TcpMode,
     ) -> Result<String, ProbeFailure> {
         let Self {
             runtime,
             connection,
         } = self;
-        runtime.block_on(connection.probe_tcp(target, credentials))
+        runtime.block_on(connection.probe_tcp(target, credentials, mode))
     }
 
     pub fn probe_udp(
@@ -86,12 +88,17 @@ impl Session {
         runtime.block_on(connection.probe_udp(target, credentials, dns))
     }
 
-    pub fn probe_connect_ip(&mut self, credentials: &Credentials) -> Result<String, ProbeFailure> {
+    pub fn probe_connect_ip(
+        &mut self,
+        credentials: &Credentials,
+        target: Option<SocketAddr>,
+        dns: bool,
+    ) -> Result<String, ProbeFailure> {
         let Self {
             runtime,
             connection,
         } = self;
-        runtime.block_on(connection.probe_connect_ip(credentials))
+        runtime.block_on(connection.probe_connect_ip(credentials, target, dns))
     }
 }
 
@@ -286,6 +293,7 @@ impl Connection {
         &mut self,
         target: &Authority,
         credentials: &Credentials,
+        mode: TcpMode,
     ) -> Result<String, ProbeFailure> {
         let uri = http::Uri::builder()
             .authority(target.original.as_str())
@@ -303,12 +311,61 @@ impl Connection {
             .map_err(|error| ProbeFailure::new("HTTP2_REQUEST_ERROR", error.to_string()))?;
         append_auth(&mut request, credentials)?;
         let mut sender = self.ready_sender().await?;
-        let (response, _) = sender.send_request(request, false).map_err(|error| {
-            ProbeFailure::new("HTTP2_REQUEST_ERROR", format!("send CONNECT: {error}"))
-        })?;
+        let (response, mut request_body) =
+            sender.send_request(request, false).map_err(|error| {
+                ProbeFailure::new("HTTP2_REQUEST_ERROR", format!("send CONNECT: {error}"))
+            })?;
         let response = response_with_timeout(response, self.timeout).await?;
         ensure_success_status(response.status().as_u16(), &target.original)?;
-        Ok(format!("CONNECT to {} returned HTTP 200", target.original))
+        let mut response_body = response.into_body();
+        let mut exchange = TcpExchange::new(&target.host, mode)?;
+        let result = tokio::time::timeout(self.timeout, async {
+            loop {
+                let outgoing = exchange.outgoing();
+                send_data_all(&mut request_body, Bytes::from(outgoing), false).await?;
+                if exchange.complete() {
+                    return Ok(());
+                }
+                let data = response_body
+                    .data()
+                    .await
+                    .ok_or_else(|| {
+                        ProbeFailure::new(
+                            "TCP_RESPONSE_INVALID",
+                            "TCP tunnel ended before payload validation",
+                        )
+                    })?
+                    .map_err(|_| {
+                        ProbeFailure::new(
+                            "TCP_RESPONSE_INVALID",
+                            "TCP tunnel reset before payload validation",
+                        )
+                    })?;
+                response_body
+                    .flow_control()
+                    .release_capacity(data.len())
+                    .map_err(|_| {
+                        ProbeFailure::new(
+                            "HTTP2_FLOW_CONTROL_ERROR",
+                            "cannot release TCP receive capacity",
+                        )
+                    })?;
+                exchange.receive(&data)?;
+            }
+        })
+        .await
+        .map_err(|_| {
+            ProbeFailure::new(
+                "TCP_RESPONSE_TIMEOUT",
+                "CONNECT opened but TCP payload validation timed out",
+            )
+        })?;
+        request_body.send_reset(h2::Reason::CANCEL);
+        result?;
+        Ok(format!(
+            "CONNECT to {} verified a {mode:?} payload round trip",
+            target.original
+        ))
     }
 
     async fn probe_udp(
@@ -355,8 +412,17 @@ impl Connection {
         let request = udp_probe_payload(dns);
         let mut capsule = Vec::with_capacity(request.len() + 16);
         masque::capsule::encoder::encode_datagram_context_zero(&request, &mut capsule);
-        send_data_all(&mut request_body, Bytes::from(capsule), false).await?;
-        let payload = recv_datagram_payload(&mut response_body, self.timeout).await?;
+        tokio::time::timeout(
+            self.timeout,
+            send_data_all(&mut request_body, Bytes::from(capsule), false),
+        )
+        .await
+        .map_err(|_| {
+            ProbeFailure::new("UDP_RESPONSE_TIMEOUT", "UDP request flow control timed out")
+        })??;
+        let payload =
+            recv_datagram_payload(&mut response_body, &mut CapsuleDecoder::new(), self.timeout)
+                .await?;
         validate_udp_probe_response(&payload, &request, dns)?;
         Ok(format!(
             "CONNECT-UDP to {} returned a matching {} response",
@@ -368,6 +434,8 @@ impl Connection {
     async fn probe_connect_ip(
         &mut self,
         credentials: &Credentials,
+        target: Option<SocketAddr>,
+        dns: bool,
     ) -> Result<String, ProbeFailure> {
         let uri = format!("https://{}/.well-known/masque/ip/*/*/", self.authority)
             .parse::<http::Uri>()
@@ -385,14 +453,50 @@ impl Connection {
             .insert(h2::ext::Protocol::from_static("connect-ip"));
         append_auth(&mut request, credentials)?;
         let mut sender = self.ready_sender().await?;
-        let (response, _) = sender.send_request(request, false).map_err(|error| {
-            ProbeFailure::new("HTTP2_REQUEST_ERROR", format!("send CONNECT-IP: {error}"))
-        })?;
+        let (response, mut request_body) =
+            sender.send_request(request, false).map_err(|error| {
+                ProbeFailure::new("HTTP2_REQUEST_ERROR", format!("send CONNECT-IP: {error}"))
+            })?;
         let response = response_with_timeout(response, self.timeout).await?;
         ensure_success_status(response.status().as_u16(), "CONNECT-IP")?;
-        let addresses = recv_assigned_addresses(response.into_body(), self.timeout).await?;
+        let mut body = response.into_body();
+        let mut decoder = CapsuleDecoder::new();
+        let addresses = recv_assigned_addresses(&mut body, &mut decoder, self.timeout).await?;
+        let Some(target) = target else {
+            request_body.send_reset(h2::Reason::CANCEL);
+            return Ok(format!(
+                "CONNECT-IP assigned {} address(es); packet forwarding NOT verified",
+                addresses.len()
+            ));
+        };
+        let exchange = crate::ip_payload::IpExchange::new(&addresses, target, dns)?;
+        let mut capsule = Vec::new();
+        masque::capsule::encoder::encode_datagram_context_zero(&exchange.packet(), &mut capsule);
+        let result = tokio::time::timeout(self.timeout, async {
+            send_data_all(&mut request_body, Bytes::from(capsule), false).await?;
+            let packet = recv_datagram_payload(&mut body, &mut decoder, self.timeout).await?;
+            exchange.validate(&packet)
+        })
+        .await
+        .map_err(|_| {
+            ProbeFailure::new(
+                "CONNECT_IP_RESPONSE_TIMEOUT",
+                "CONNECT-IP opened but no matching IP packet returned",
+            )
+        })?;
+        request_body.send_reset(h2::Reason::CANCEL);
+        result.map_err(|failure| {
+            if failure.code == "UDP_RESPONSE_TIMEOUT" {
+                ProbeFailure::new(
+                    "CONNECT_IP_RESPONSE_TIMEOUT",
+                    "CONNECT-IP opened but no matching IP packet returned",
+                )
+            } else {
+                failure
+            }
+        })?;
         Ok(format!(
-            "CONNECT-IP assigned {addresses} address(es); run server-side doctor to verify forwarding/NAT"
+            "CONNECT-IP verified an IP/UDP round trip to {target}"
         ))
     }
 }
@@ -464,10 +568,10 @@ async fn send_data_all(
 
 async fn recv_datagram_payload(
     stream: &mut h2::RecvStream,
+    decoder: &mut CapsuleDecoder,
     timeout: Duration,
 ) -> Result<Vec<u8>, ProbeFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut decoder = CapsuleDecoder::new();
     loop {
         let chunk = tokio::time::timeout_at(deadline, stream.data())
             .await
@@ -515,11 +619,11 @@ async fn recv_datagram_payload(
 }
 
 async fn recv_assigned_addresses(
-    mut stream: h2::RecvStream,
+    stream: &mut h2::RecvStream,
+    decoder: &mut CapsuleDecoder,
     timeout: Duration,
-) -> Result<usize, ProbeFailure> {
+) -> Result<Vec<masque::capsule::AssignedAddress>, ProbeFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut decoder = CapsuleDecoder::new();
     loop {
         let chunk = tokio::time::timeout_at(deadline, stream.data())
             .await
@@ -556,7 +660,7 @@ async fn recv_assigned_addresses(
             if let CapsuleFrame::AddressAssign(addresses) = frame
                 && !addresses.is_empty()
             {
-                return Ok(addresses.len());
+                return Ok(addresses);
             }
         }
     }

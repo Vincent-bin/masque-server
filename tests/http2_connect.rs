@@ -30,6 +30,10 @@ use masque::server::Server;
 #[path = "http2_connect/ip_uri.rs"]
 mod ip_uri;
 
+#[cfg(target_os = "linux")]
+#[path = "http2_connect/ip_fragments.rs"]
+mod ip_fragments;
+
 #[path = "http2_connect/timeouts.rs"]
 mod timeouts;
 
@@ -1387,3 +1391,6 @@ async fn http2_malformed_address_requests_reset_only_the_request_stream() {
     server_task.abort();
     driver.abort();
 }
+
+#[path = "http2_connect/security.rs"]
+mod security;

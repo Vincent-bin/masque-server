@@ -185,9 +185,23 @@ and the latest recognizable reload outcome in the current systemd invocation.
 It reads up to 500 journal records and needs permission to access the journal.
 If systemd, the invocation ID, logs, or a matching record are unavailable, the
 reload result is `unknown`; it is never inferred from `systemctl reload` alone.
-The on-disk configuration may have changed since the last reload or restart,
-and successful reloads cover only TLS identity and active credentials, not
-listener or other settings. Use the journal for details:
+The packaged service also creates an owner-only `/run/masque/status.sock`.
+`status` reads a live snapshot through that local Unix socket and reports each
+section as `applied`, `reload required`, or `restart required`. The process
+publishes only keyed fingerprints, never raw configuration or credentials.
+TLS identity evidence is derived from the certificate chain actually loaded.
+A successful credential/TLS reload updates only those sections; edited policies
+remain `restart required`. Failed reloads preserve the previous evidence.
+
+The socket is mode 0600 in a mode-0700 runtime directory; use sudo or the service
+account. Custom invocations can set `--status-socket` on the server and status
+command to a path in an existing owner-only directory. Use the same configuration
+and TLS overrides. Missing/inaccessible sockets, stopped processes, different
+versions or a different selected file give `loaded configuration: unknown`.
+Socket failure does not prevent the proxy from running. This is a point-in-time
+comparison of loaded settings, not proof that a kernel offload activated or
+that a network/client path works. Use `doctor`, runtime diagnostics and an
+external probe for those checks. Use the journal for details:
 
 ```sh
 sudo systemctl reload masque

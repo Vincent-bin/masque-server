@@ -1,11 +1,11 @@
 // Configuration loading — TOML file + CLI overrides.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Top-level server configuration.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
@@ -42,7 +42,7 @@ pub struct ServerConfig {
     pub listeners: Vec<ListenerSection>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
     /// Inactive tunnel lifetime, and the lifetime of an HTTP/2 connection
@@ -58,7 +58,7 @@ pub struct ServerSection {
     pub max_tunnels_per_connection: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TlsSection {
     pub cert_path: PathBuf,
@@ -66,7 +66,7 @@ pub struct TlsSection {
 }
 
 /// How clients prove who they are.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     /// RFC 7617 `Proxy-Authorization: Basic`, verified per request.
@@ -81,7 +81,7 @@ pub enum AuthMode {
 ///
 /// HTTP/3 listens on UDP and remains the default. HTTP/2 listens on TCP/TLS
 /// and carries HTTP Datagrams through reliable DATAGRAM capsules.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerTransport {
     #[default]
@@ -91,7 +91,7 @@ pub enum ListenerTransport {
 
 /// When an HTTP/3 listener validates a client's address before allocating
 /// connection state.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicRetryMode {
     /// Accept tokenless Initial packets until the configured live-state
@@ -114,7 +114,7 @@ impl ListenerTransport {
     }
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthSection {
     /// Master switch. `false` disables authentication whatever `mode` says.
@@ -136,7 +136,7 @@ pub struct AuthSection {
 }
 
 /// One Basic-auth principal.
-#[derive(Clone, Default, Deserialize, PartialEq)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BasicUser {
     pub username: String,
@@ -201,7 +201,7 @@ impl AuthSection {
 /// `listen_addr` has no default on purpose: an omitted address would otherwise
 /// silently become `0.0.0.0:443` and collide with whichever listener meant to
 /// take that port.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerSection {
     pub listen_addr: SocketAddr,
@@ -230,7 +230,7 @@ pub struct ListenerSection {
 }
 
 /// Additional restrictions on a listener's globally permitted destinations.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TargetRestrictionSection {
     pub allow_targets: Option<Vec<String>>,
@@ -265,7 +265,7 @@ impl ResolvedListener {
 /// This replaces the vendor enrollment API for self-hosted setups: the
 /// operator generates a key pair, records its public key here, and hands the
 /// private key to the client out of band.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientEntry {
     /// Label used in logs. Optional, but makes the logs readable.
@@ -285,7 +285,7 @@ pub struct ClientEntry {
     pub ipv6: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuicSection {
     pub max_datagram_size: usize,
@@ -340,7 +340,7 @@ pub struct QuicSection {
 }
 
 /// HTTP/2 flow-control and resource limits.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Http2Section {
     /// Receive credit advertised for each request stream.
@@ -364,7 +364,7 @@ pub struct Http2Section {
     pub max_datagram_size: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct UdpProxySection {
     pub enabled: bool,
@@ -379,7 +379,7 @@ pub struct UdpProxySection {
     pub enable_udp_gso: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TcpProxySection {
     pub enabled: bool,
@@ -388,10 +388,13 @@ pub struct TcpProxySection {
     pub deny_targets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct IpProxySection {
     pub enabled: bool,
+    /// Destination policy for client IP packets, independent of TCP/UDP proxies.
+    pub allow_targets: Vec<String>,
+    pub deny_targets: Vec<String>,
     /// Fail startup if enabled CONNECT-IP cannot create its TUN device.
     /// Defaults to best-effort so CONNECT and CONNECT-UDP can still run.
     pub require_tun: bool,
@@ -423,7 +426,7 @@ pub struct IpProxySection {
 /// authentication layer of their own, so validation permits only a loopback
 /// address. Operators can use a local Prometheus agent or an SSH tunnel when a
 /// collector does not run on the same host.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilitySection {
     pub listen_addr: Option<SocketAddr>,
@@ -552,7 +555,7 @@ impl Default for UdpProxySection {
             connect_timeout_secs: 10,
             uri_template: "/.well-known/masque/udp/{target_host}/{target_port}/".into(),
             allow_targets: vec!["0.0.0.0/0".into()],
-            deny_targets: vec!["127.0.0.0/8".into(), "10.0.0.0/8".into(), "::1/128".into()],
+            deny_targets: default_deny_targets(),
             enable_udp_gso: false,
         }
     }
@@ -564,16 +567,7 @@ impl Default for TcpProxySection {
             enabled: true,
             connect_timeout_secs: 10,
             allow_targets: vec!["0.0.0.0/0".into(), "::/0".into()],
-            deny_targets: vec![
-                "127.0.0.0/8".into(),
-                "10.0.0.0/8".into(),
-                "169.254.0.0/16".into(),
-                "172.16.0.0/12".into(),
-                "192.168.0.0/16".into(),
-                "::1/128".into(),
-                "fc00::/7".into(),
-                "fe80::/10".into(),
-            ],
+            deny_targets: default_deny_targets(),
         }
     }
 }
@@ -582,6 +576,8 @@ impl Default for IpProxySection {
     fn default() -> Self {
         Self {
             enabled: true,
+            allow_targets: vec!["0.0.0.0/0".into(), "::/0".into()],
+            deny_targets: default_deny_targets(),
             require_tun: false,
             uri_template: "/.well-known/masque/ip/{target}/{ipproto}/".into(),
             connect_protocols: vec!["connect-ip".into(), "cf-connect-ip".into()],
@@ -592,6 +588,22 @@ impl Default for IpProxySection {
             ipv6_pool: "fd00:abcd::/64".into(),
         }
     }
+}
+
+fn default_deny_targets() -> Vec<String> {
+    [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// Parse a TOML string into a [`ServerConfig`].
@@ -1123,7 +1135,7 @@ deny_targets = [
 enabled = true
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
 allow_targets = ["0.0.0.0/0"]
-deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
+deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10"]
 
 [ip_proxy]
 enabled = true
@@ -1182,5 +1194,78 @@ unknown_field = 42
 "#
         );
         assert!(parse_toml(&toml).is_err());
+    }
+}
+
+#[cfg(test)]
+mod target_defaults_tests {
+    use super::*;
+    use crate::policy::TargetPolicy;
+
+    const LISTENER: &str =
+        "[[listeners]]\nlisten_addr = '127.0.0.1:8449'\n[listeners.auth]\nenabled = false\n";
+
+    #[test]
+    fn omitted_udp_and_ip_policies_reject_private_destinations() {
+        for suffix in [
+            "",
+            "[udp_proxy]\nenabled = true\n[ip_proxy]\nenabled = true\n",
+        ] {
+            let config = parse_toml(&format!("{LISTENER}{suffix}")).unwrap();
+            let udp = TargetPolicy::new(
+                &config.udp_proxy.allow_targets,
+                &config.udp_proxy.deny_targets,
+            )
+            .unwrap();
+            let ip = TargetPolicy::new(
+                &config.ip_proxy.allow_targets,
+                &config.ip_proxy.deny_targets,
+            )
+            .unwrap();
+            assert_eq!(config.udp_proxy.deny_targets, config.tcp_proxy.deny_targets);
+            assert_eq!(config.ip_proxy.deny_targets, config.tcp_proxy.deny_targets);
+            for address in [
+                "127.0.0.1",
+                "10.1.2.3",
+                "169.254.1.1",
+                "172.16.0.1",
+                "192.168.1.1",
+                "::ffff:192.168.1.1",
+                "::1",
+                "fc00::1",
+                "fe80::1",
+            ] {
+                assert!(!udp.is_allowed(address.parse().unwrap()), "{address}");
+                assert!(!ip.is_allowed(address.parse().unwrap()), "{address}");
+            }
+            assert!(udp.is_allowed("192.0.2.1".parse().unwrap()));
+            // Preserve UDP's existing IPv4-only allow default.
+            assert!(!udp.is_allowed("2001:db8::1".parse().unwrap()));
+            assert!(ip.is_allowed("2001:db8::1".parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn explicit_private_policy_is_independent_and_preserved() {
+        let config = parse_toml(&format!(
+            "{LISTENER}[ip_proxy]\nallow_targets = ['10.20.0.0/16']\ndeny_targets = []\n"
+        ))
+        .unwrap();
+        let ip = TargetPolicy::new(
+            &config.ip_proxy.allow_targets,
+            &config.ip_proxy.deny_targets,
+        )
+        .unwrap();
+        let udp = TargetPolicy::new(
+            &config.udp_proxy.allow_targets,
+            &config.udp_proxy.deny_targets,
+        )
+        .unwrap();
+        assert!(ip.is_allowed("10.20.0.1".parse().unwrap()));
+        assert!(!ip.is_allowed("10.21.0.1".parse().unwrap()));
+        assert!(!ip.is_allowed("192.0.2.1".parse().unwrap()));
+        assert!(!udp.is_allowed("10.20.0.1".parse().unwrap()));
+        let explicit = parse_toml(&format!("{LISTENER}[udp_proxy]\ndeny_targets = []\n")).unwrap();
+        assert!(explicit.udp_proxy.deny_targets.is_empty());
     }
 }

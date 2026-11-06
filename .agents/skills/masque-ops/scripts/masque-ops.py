@@ -376,6 +376,10 @@ class ProbeConfig:
     tcp_target: str | None = None
     udp_target: str | None = None
     udp_mode: str = "dns"
+    tcp_mode: str = "tls"
+    ip_target: str | None = None
+    ip_mode: str = "dns"
+    ip_setup_only: bool = False
     timeout_secs: int = 8
     ca_cert: Path | None = None
 
@@ -742,6 +746,10 @@ PROBE_KEYS = {
     "tcp_target",
     "udp_target",
     "udp_mode",
+    "tcp_mode",
+    "ip_target",
+    "ip_mode",
+    "ip_setup_only",
     "timeout_secs",
     "ca_cert",
 }
@@ -803,6 +811,16 @@ def parse_probe(raw: object, inventory_dir: Path, host_name: str) -> ProbeConfig
     if udp_mode not in {"dns", "echo"}:
         raise OpsError("probe.udp_mode must be dns or echo")
 
+    tcp_mode = require_string(table.get("tcp_mode", "tls"), "probe.tcp_mode")
+    if tcp_mode not in {"tls", "echo"}:
+        raise OpsError("probe.tcp_mode must be tls or echo")
+    ip_mode = require_string(table.get("ip_mode", "dns"), "probe.ip_mode")
+    if ip_mode not in {"dns", "echo"}:
+        raise OpsError("probe.ip_mode must be dns or echo")
+    ip_setup_only = require_bool(table.get("ip_setup_only", False), "probe.ip_setup_only")
+    if (ip_setup_only or "ip_target" in table or "ip_mode" in table) and not table.get("connect_ip", False):
+        raise OpsError("IP probe options require probe.connect_ip = true")
+
     username_raw = table.get("username")
     username = (
         None if username_raw is None else require_string(username_raw, "probe.username")
@@ -841,6 +859,10 @@ def parse_probe(raw: object, inventory_dir: Path, host_name: str) -> ProbeConfig
         tcp_target=optional_text("tcp_target"),
         udp_target=optional_text("udp_target"),
         udp_mode=udp_mode,
+        tcp_mode=tcp_mode,
+        ip_target=optional_text("ip_target"),
+        ip_mode=ip_mode,
+        ip_setup_only=ip_setup_only,
         timeout_secs=require_int(
             table.get("timeout_secs", 8), "probe.timeout_secs", 1, 60
         ),
@@ -1816,8 +1838,16 @@ class ProbeRunner:
         ):
             if value is not None:
                 command.extend([option, value])
+        if not probe.skip_tcp and probe.tcp_mode != "tls":
+            command.extend(["--tcp-mode", probe.tcp_mode])
         if probe.connect_ip:
             command.append("--connect-ip")
+            if probe.ip_target is not None:
+                command.extend(["--ip-target", probe.ip_target])
+            if probe.ip_mode != "dns":
+                command.extend(["--ip-mode", probe.ip_mode])
+            if probe.ip_setup_only:
+                command.append("--ip-setup-only")
         if probe.skip_tcp:
             command.append("--skip-tcp")
         if probe.skip_udp:
@@ -1878,10 +1908,18 @@ class ProbeRunner:
             "status": "passed" if report.get("success") else "failed",
             "transport": report.get("selected_transport"),
             "failed_codes": failed_codes,
+            "connect_ip_forwarding_verified": any(
+                isinstance(check, dict) and check.get("name") == "connect_ip"
+                and check.get("status") == "pass"
+                and check.get("code") == "CONNECT_IP_ROUND_TRIP"
+                for check in checks
+            ) if probe.connect_ip else None,
         }
         if completed.returncode != 0 or not report.get("success"):
             codes = ", ".join(str(code) for code in failed_codes) or "UNKNOWN"
             raise OpsError(f"external MASQUE probe failed for {host.name}: {codes}")
+        if probe.connect_ip and not probe.ip_setup_only and not summary["connect_ip_forwarding_verified"]:
+            raise OpsError("CONNECT-IP forwarding was not verified; upgrade masque-probe or explicitly select ip_setup_only")
         return summary
 
 
@@ -2557,7 +2595,7 @@ class FleetOperator:
             "version": release.tag,
             "probe": probe,
             "certificate_probe": certificate_probe,
-            "connect_ip_forwarding_verified": False if host.probe and host.probe.connect_ip else None,
+            "connect_ip_forwarding_verified": bool(probe.get("connect_ip_forwarding_verified")) if host.probe and host.probe.connect_ip else None,
             "basic_password_created": password_created,
             "credential_files_saved": sum(
                 path is not None
@@ -3071,7 +3109,7 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--auth-mode", choices=("basic", "client_cert", "dual"), help="authentication required by the peer")
     initialize.add_argument("--transport", choices=("http3", "http2"), help="transport supported by the peer")
     initialize.add_argument("--cert-listen-port", type=int, default=4443, help="second listener port for dual authentication")
-    initialize.add_argument("--connect-ip", action="store_true", help="also check CONNECT-IP negotiation")
+    initialize.add_argument("--connect-ip", action="store_true", help="also verify CONNECT-IP packet forwarding")
     initialize.add_argument("--skip-tcp", action="store_true", help="peer does not need CONNECT-TCP")
     initialize.add_argument("--skip-udp", action="store_true", help="peer does not need CONNECT-UDP")
     ssh_auth = initialize.add_mutually_exclusive_group()
@@ -3113,8 +3151,12 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--resolve", help="connect to this IP while verifying the endpoint hostname")
     configure.add_argument("--interface", help="bind the HTTP/3 probe to this local interface")
     configure.add_argument("--ca-cert", help="additional trusted CA certificate")
-    configure.add_argument("--connect-ip", action="store_true", help="also test CONNECT-IP negotiation")
+    configure.add_argument("--connect-ip", action="store_true", help="also verify CONNECT-IP packet forwarding")
     configure.add_argument("--tcp-target", help="TCP target allowed by server policy")
+    configure.add_argument("--tcp-mode", choices=("tls", "echo"), default="tls")
+    configure.add_argument("--ip-target", help="inner IP:port target for CONNECT-IP")
+    configure.add_argument("--ip-mode", choices=("dns", "echo"), default="dns")
+    configure.add_argument("--ip-setup-only", action="store_true", help="explicitly skip CONNECT-IP forwarding verification")
     configure.add_argument("--udp-target", help="UDP target allowed by server policy")
     configure.add_argument("--udp-mode", choices=("dns", "echo"), default="dns")
     configure.add_argument("--timeout-secs", type=int, default=8, help="timeout per probe step (1-60)")
@@ -3374,7 +3416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             values["client_config"] = client_config
         elif not no_auth:
             raise OpsError("choose an authentication method")
-        for name in ("resolve", "interface", "ca_cert", "tcp_target", "udp_target"):
+        for name in ("resolve", "interface", "ca_cert", "tcp_target", "udp_target", "ip_target"):
             value = getattr(arguments, name)
             if value:
                 values[name] = value
@@ -3382,6 +3424,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             values["connect_ip"] = True
         if arguments.udp_mode != "dns":
             values["udp_mode"] = arguments.udp_mode
+        if arguments.tcp_mode != "tls":
+            values["tcp_mode"] = arguments.tcp_mode
+        if arguments.ip_mode != "dns":
+            values["ip_mode"] = arguments.ip_mode
+        if arguments.ip_setup_only:
+            values["ip_setup_only"] = True
         if arguments.timeout_secs != 8:
             values["timeout_secs"] = arguments.timeout_secs
         result = configure_probe(inventory, host, values, password, operator.probes)

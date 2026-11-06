@@ -214,6 +214,8 @@ fn run_probe(endpoint: SocketAddr, target: SocketAddr, transport: &str) -> std::
             "probe-user",
             "--password-stdin",
             "--insecure",
+            "--tcp-mode",
+            "echo",
             "--tcp-target",
             &target.to_string(),
             "--udp-target",
@@ -221,6 +223,7 @@ fn run_probe(endpoint: SocketAddr, target: SocketAddr, transport: &str) -> std::
             "--udp-mode",
             "echo",
             "--connect-ip",
+            "--ip-setup-only",
             "--json",
         ])
         .stdin(Stdio::piped())
@@ -250,9 +253,16 @@ fn assert_probe_passed(output: std::process::Output, transport: &str) {
     let checks = report["checks"].as_array().unwrap();
     for name in ["connect_tcp", "connect_udp", "connect_ip"] {
         let check = checks.iter().find(|check| check["name"] == name).unwrap();
-        assert_eq!(check["status"], "pass");
+        assert_eq!(
+            check["status"],
+            if name == "connect_ip" {
+                "warning"
+            } else {
+                "pass"
+            }
+        );
         if name == "connect_ip" {
-            assert_eq!(check["code"], "CONNECT_IP_READY");
+            assert_eq!(check["code"], "CONNECT_IP_SETUP_ONLY");
             assert!(
                 check["detail"]
                     .as_str()
@@ -276,6 +286,8 @@ fn run_certificate_probe(
             transport,
             "--client-config",
             client_config.to_str().unwrap(),
+            "--tcp-mode",
+            "echo",
             "--tcp-target",
             &target.to_string(),
             "--udp-target",
@@ -283,6 +295,7 @@ fn run_certificate_probe(
             "--udp-mode",
             "echo",
             "--connect-ip",
+            "--ip-setup-only",
             "--json",
         ])
         .output()
@@ -372,4 +385,132 @@ async fn released_probe_checks_certificate_http2_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn released_probe_checks_certificate_http3_end_to_end() {
     check_certificate_probe("http3", ListenerTransport::Http3).await;
+}
+
+fn run_payload_probe(
+    endpoint: SocketAddr,
+    transport: &str,
+    options: &[String],
+) -> serde_json::Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_masque-probe"))
+        .args([
+            &endpoint.to_string(),
+            "--transport",
+            transport,
+            "--username",
+            "probe-user",
+            "--password-stdin",
+            "--insecure",
+            "--json",
+            "--timeout",
+            // Authentication and CONNECT setup share the runner with other
+            // tests. Give them enough time to reach the payload stage under
+            // CI load; the tested silent payload must still time out.
+            "5",
+        ])
+        .args(options)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"probe-password")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    serde_json::from_slice(&output.stdout).expect("probe must return a structured failure")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_connect_without_matching_payload_fails_on_both_transports() {
+    for transport in [ListenerTransport::Http2, ListenerTransport::Http3] {
+        let tls = TempTls::new();
+        let (endpoint, server) = spawn_server(&tls, transport).await;
+        for silent in [false, true] {
+            let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = target.local_addr().unwrap();
+            let origin = tokio::spawn(async move {
+                let (mut stream, _) = target.accept().await.unwrap();
+                let mut request = [0; 128];
+                let received = stream.read(&mut request).await.unwrap();
+                assert!(received > 0, "must send real payload after CONNECT 200");
+                if silent {
+                    // Stay silent longer than the probe's per-stage deadline.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                } else {
+                    stream.write_all(b"not-the-request").await.unwrap();
+                }
+            });
+            let options = vec![
+                "--skip-udp".into(),
+                "--tcp-target".into(),
+                address.to_string(),
+                "--tcp-mode".into(),
+                "echo".into(),
+            ];
+            let report = tokio::task::spawn_blocking(move || {
+                run_payload_probe(endpoint, transport.as_str(), &options)
+            })
+            .await
+            .unwrap();
+            assert_eq!(report["success"], false);
+            let check = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "connect_tcp")
+                .unwrap();
+            assert_eq!(check["status"], "fail");
+            assert_eq!(
+                check["code"],
+                if silent {
+                    "TCP_RESPONSE_TIMEOUT"
+                } else {
+                    "TCP_RESPONSE_INVALID"
+                },
+                "transport={transport:?}, silent={silent}"
+            );
+            origin.abort();
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ip_assignment_without_forwarding_is_not_success_on_either_transport() {
+    for transport in [ListenerTransport::Http2, ListenerTransport::Http3] {
+        let tls = TempTls::new();
+        let (endpoint, server) = spawn_server(&tls, transport).await;
+        let options = [
+            "--skip-tcp",
+            "--skip-udp",
+            "--connect-ip",
+            "--ip-target",
+            "198.51.100.1:9999",
+            "--ip-mode",
+            "echo",
+        ]
+        .map(String::from);
+        let report = tokio::task::spawn_blocking(move || {
+            run_payload_probe(endpoint, transport.as_str(), &options)
+        })
+        .await
+        .unwrap();
+        assert_eq!(report["success"], false);
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "connect_ip")
+            .unwrap();
+        assert_eq!(check["status"], "fail");
+        assert_eq!(
+            check["code"], "CONNECT_IP_RESPONSE_TIMEOUT",
+            "transport={transport:?}"
+        );
+        server.abort();
+    }
 }

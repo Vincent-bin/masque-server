@@ -167,7 +167,7 @@ impl Shard {
             // quiche's timer moves on nearly every recv and send, so the
             // connection's next wakeup is only knowable once it is fully
             // driven.
-            Self::reschedule(client, timers, Instant::now());
+            Self::reschedule(client, timers);
             client.sync_metrics();
         }
     }

@@ -212,7 +212,12 @@ fn global_target_policies_reject_invalid_cidrs_before_check_or_startup() {
             "[[listeners]]",
             &format!("[[listeners]]\ntransport = \"{transport}\""),
         );
-        for section in ["tcp_proxy", "udp_proxy"] {
+        for section in ["tcp_proxy", "udp_proxy", "ip_proxy"] {
+            let base = if section == "ip_proxy" {
+                base.replace("[ip_proxy]\nenabled = false", "")
+            } else {
+                base.clone()
+            };
             for field in ["allow_targets", "deny_targets"] {
                 for enabled in [true, false] {
                     for invalid in ["not-a-cidr", "192.0.2.0/33", "2001:db8::/129"] {
@@ -959,4 +964,159 @@ fn check_config_validates_standard_ip_uri_templates_without_affecting_legacy_onl
             assert!(String::from_utf8_lossy(&output.stderr).contains("ip_proxy.uri_template"));
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn status_compares_running_config_and_successful_reload_without_exposing_values() {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+    struct Process(Child);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    // Unix socket paths have a small platform limit; macOS's default temp
+    // directory plus the usual test prefix would exceed it.
+    let dir = TempDir(PathBuf::from("/tmp").join(format!(
+            "masque-status-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&dir.0).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (cert, key) = write_server_identity(dir.path());
+    let path = dir.path().join("masque.toml");
+    let socket = dir.path().join("status.sock");
+    let mut cfg = masque::config::parse_toml(&config_text(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert,
+        &key,
+        "bbr2",
+    ))
+    .unwrap();
+    cfg.listeners[0].auth.enabled = true;
+    cfg.listeners[0].auth.username = "runtime-status-user-sentinel".into();
+    cfg.listeners[0].auth.password_hash = masque::auth::hash_password(b"first-password").unwrap();
+    let write_config = |config: &masque::config::ServerConfig| {
+        std::fs::write(&path, toml::to_string(config).unwrap()).unwrap()
+    };
+    write_config(&cfg);
+    let spawn = || {
+        Process(
+            Command::new(env!("CARGO_BIN_EXE_masque-server"))
+                .args([
+                    "--config",
+                    path.to_str().unwrap(),
+                    "--status-socket",
+                    socket.to_str().unwrap(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let process = spawn();
+    let status = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+            .args([
+                "--config",
+                path.to_str().unwrap(),
+                "--status-socket",
+                socket.to_str().unwrap(),
+                "status",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let wait_for = |expected: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = status();
+            if expected.iter().all(|text| output.contains(text)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "missing {expected:?}: {output}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait_for(&[
+        "loaded configuration: verified",
+        "udp_proxy: applied",
+        "basic_credentials: applied",
+    ]);
+    let mut raw = String::new();
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(!raw.contains(&cfg.listeners[0].auth.username));
+    assert!(!raw.contains(&cfg.listeners[0].auth.password_hash));
+    assert!(!raw.contains(path.to_str().unwrap()));
+    assert!(!raw.contains("BEGIN"));
+    assert_eq!(
+        std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    cfg.udp_proxy.deny_targets.clear();
+    cfg.listeners[0].auth.password_hash = masque::auth::hash_password(b"second-password").unwrap();
+    write_config(&cfg);
+    let _ = write_server_identity(dir.path());
+    wait_for(&[
+        "udp_proxy: restart required",
+        "basic_credentials: reload required",
+        "tls_identity: reload required",
+    ]);
+    let signal = || {
+        assert!(
+            Command::new("kill")
+                .args(["-HUP", &process.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    signal();
+    wait_for(&[
+        "udp_proxy: restart required",
+        "basic_credentials: applied",
+        "tls_identity: applied",
+    ]);
+
+    // A rejected trust-boundary change must not publish candidate credentials.
+    cfg.listeners[0].transport = masque::config::ListenerTransport::Http2;
+    cfg.listeners[0].auth.password_hash = masque::auth::hash_password(b"third-password").unwrap();
+    write_config(&cfg);
+    signal();
+    std::thread::sleep(Duration::from_millis(300));
+    wait_for(&[
+        "listeners: restart required",
+        "basic_credentials: reload required",
+    ]);
+    drop(process);
+    wait_for(&["loaded configuration: unknown"]);
+    // A stale socket cannot claim success, and a new process safely replaces it.
+    let _replacement = spawn();
+    wait_for(&[
+        "loaded configuration: verified",
+        "udp_proxy: applied",
+        "basic_credentials: applied",
+        "listeners: applied",
+    ]);
 }

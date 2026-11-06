@@ -59,6 +59,11 @@ do not fall back to ad hoc SSH or claim the change was applied.
    verification results, and any unverified behavior or recovery action. Never
    publish host aliases, even if the CLI's sanitized output contains them.
 
+Local `status` can compare disk configuration against a live process through its
+owner-only socket and distinguish `applied`, `reload required`, and `restart
+required`. Treat `loaded configuration: unknown` as an evidence gap, never as
+success. This does not add a fleet configuration transaction.
+
 Credential and TLS reloads affect only the documented reloadable state. A new
 listener requires a restart; other configuration fields must not be assumed
 reloadable. See [configuration reload](configuration.md#listeners) and

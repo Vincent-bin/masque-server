@@ -330,10 +330,11 @@ fn basic_user_count(auth: &crate::config::AuthSection) -> usize {
 
 /// Read-only local service overview. Journal evidence is scoped to the current
 /// systemd invocation; an absent or inaccessible record is never called success.
-pub fn print_status(
+pub async fn print_status(
     path: &Path,
     cert_override: Option<&Path>,
     key_override: Option<&Path>,
+    status_socket: &Path,
 ) -> anyhow::Result<()> {
     println!("masque-server {}", env!("CARGO_PKG_VERSION"));
     let service = systemd_summary();
@@ -353,6 +354,16 @@ pub fn print_status(
     );
     println!("reload evidence is historical; it does not prove later file changes were applied");
 
+    #[cfg(unix)]
+    let live = crate::runtime_status::read(status_socket).await;
+    #[cfg(not(unix))]
+    let live: anyhow::Result<crate::runtime_status::Snapshot> = {
+        let _ = status_socket;
+        Err(anyhow::anyhow!(
+            "local runtime status requires Unix sockets"
+        ))
+    };
+
     let result = (|| -> anyhow::Result<()> {
         let text = fs::read_to_string(path).context("cannot read configuration")?;
         let mut cfg = crate::config::parse_toml(&text).context("cannot parse configuration")?;
@@ -370,6 +381,25 @@ pub fn print_status(
         let listeners =
             crate::server::validate_config(&cfg).context("configuration validation failed")?;
         println!("configuration: valid (on disk; may differ from the running process)");
+        let comparison = live.and_then(|snapshot| {
+            snapshot.compare(
+                path,
+                &cfg,
+                crate::server::runtime_tls_fingerprint(&cfg.tls)?,
+            )
+        });
+        match comparison {
+            Ok(sections) => {
+                println!("loaded configuration: verified against a live process snapshot");
+                for (section, state) in sections {
+                    println!("  {section}: {state}");
+                }
+            }
+            Err(_) => println!(
+                "loaded configuration: unknown (no accessible matching runtime snapshot; use the same config, TLS overrides and status socket)"
+            ),
+        }
+
         for listener in listeners {
             println!(
                 "configured listener {} transport={} auth={}",

@@ -12,11 +12,9 @@
 // - `TimerQueue` orders connections by their next deadline, so the loop can ask
 //   for the earliest one instead of computing a minimum over all of them.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use crate::fxhash::FxHashSet;
+use crate::fxhash::{FxHashMap, FxHashSet};
 
 /// The connections with work pending for the current round.
 ///
@@ -59,16 +57,14 @@ impl DirtySet {
 
 /// A deadline-ordered queue of connection wakeups.
 ///
-/// quiche recomputes a connection's timeout on nearly every `recv` and `send`,
-/// so entries are never removed when a deadline moves. A superseded entry is
-/// left in the heap and discarded when it surfaces, by checking it against the
-/// deadline the connection currently holds — see
-/// `Server::expire_connection_timers`. Stale entries are always in the past
-/// relative to the live one, so they surface and die promptly rather than
-/// accumulating.
+/// An indexed min-heap keeps exactly one entry per scheduled connection.
+/// Replacing and cancelling deadlines cost O(log n); storage is bounded by
+/// peak live connections, independent of packet rate or deadline churn.
+/// `positions` is a bijection between connection indices and heap positions.
 #[derive(Default)]
 pub(crate) struct TimerQueue {
-    heap: BinaryHeap<Reverse<Timer>>,
+    heap: Vec<Timer>,
+    positions: FxHashMap<u64, usize>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -78,32 +74,87 @@ struct Timer {
 }
 
 impl TimerQueue {
-    /// Wake `index` at `at`. Any earlier entry for the same connection stays in
-    /// the heap and is rejected as stale when it surfaces.
+    /// Insert or replace a connection's deadline without retaining stale entries.
     pub(crate) fn schedule(&mut self, index: u64, at: Instant) {
-        self.heap.push(Reverse(Timer { at, index }));
+        if let Some(&position) = self.positions.get(&index) {
+            self.heap[position].at = at;
+            self.repair(position);
+        } else {
+            let position = self.heap.len();
+            self.heap.push(Timer { at, index });
+            self.positions.insert(index, position);
+            self.sift_up(position);
+        }
     }
 
-    /// The earliest scheduled deadline, stale entries included.
-    ///
-    /// A stale entry only makes the loop wake early and find nothing to do, so
-    /// it costs an iteration rather than correctness.
+    /// Remove a disarmed or closed connection immediately.
+    pub(crate) fn cancel(&mut self, index: u64) {
+        let Some(position) = self.positions.remove(&index) else {
+            return;
+        };
+        self.heap.swap_remove(position);
+        if position < self.heap.len() {
+            *self.positions.get_mut(&self.heap[position].index).unwrap() = position;
+            self.repair(position);
+        }
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        *self.positions.get_mut(&self.heap[a].index).unwrap() = a;
+        *self.positions.get_mut(&self.heap[b].index).unwrap() = b;
+    }
+
+    fn sift_up(&mut self, mut position: usize) {
+        while position > 0 {
+            let parent = (position - 1) / 2;
+            if self.heap[parent] <= self.heap[position] {
+                break;
+            }
+            self.swap(parent, position);
+            position = parent;
+        }
+    }
+
+    fn repair(&mut self, mut position: usize) {
+        if position > 0 && self.heap[position] < self.heap[(position - 1) / 2] {
+            self.sift_up(position);
+            return;
+        }
+        loop {
+            let left = 2 * position + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < self.heap.len() && self.heap[right] < self.heap[left] {
+                right
+            } else {
+                left
+            };
+            if self.heap[position] <= self.heap[child] {
+                break;
+            }
+            self.swap(position, child);
+            position = child;
+        }
+    }
+
+    /// The earliest live deadline.
     pub(crate) fn next_wakeup(&self) -> Option<(u64, Instant)> {
-        self.heap
-            .peek()
-            .map(|Reverse(timer)| (timer.index, timer.at))
+        self.heap.first().map(|timer| (timer.index, timer.at))
     }
 
     /// Pop every entry due at `now`, passing each `(index, deadline)` to
-    /// `fire`. The caller decides whether an entry is still live.
+    /// `fire` after removing it from the queue.
     pub(crate) fn expire(&mut self, now: Instant, mut fire: impl FnMut(u64, Instant)) {
-        while let Some(Reverse(timer)) = self.heap.peek() {
+        while let Some(timer) = self.heap.first() {
             if timer.at > now {
                 break;
             }
             let at = timer.at;
             let index = timer.index;
-            self.heap.pop();
+            self.cancel(index);
             fire(index, at);
         }
     }
@@ -224,11 +275,10 @@ mod tests {
     }
 
     #[test]
-    fn timer_queue_surfaces_superseded_entries_for_the_caller_to_reject() {
+    fn timer_queue_replaces_superseded_entries() {
         let now = Instant::now();
         let mut timers = TimerQueue::default();
 
-        // A deadline pushed out to a later time leaves the earlier entry behind.
         let stale = now + Duration::from_millis(10);
         let live = now + Duration::from_millis(40);
         timers.schedule(1, stale);
@@ -239,8 +289,66 @@ mod tests {
             fired.push((index, at));
         });
 
-        // Both surface; only the caller knows which deadline is current.
-        assert_eq!(fired, [(1, stale), (1, live)]);
+        assert_eq!(fired, [(1, live)]);
         assert_eq!(timers.len(), 0);
+    }
+
+    #[test]
+    fn deadline_churn_has_connection_bounded_storage() {
+        let now = Instant::now();
+        let mut timers = TimerQueue::default();
+        for i in 0..100_000 {
+            timers.schedule(7, now + Duration::from_micros(i));
+        }
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers.positions.len(), 1);
+        assert!(timers.heap.capacity() <= 4);
+        timers.cancel(7);
+        assert_eq!(timers.next_wakeup(), None);
+        assert!(timers.positions.is_empty());
+    }
+
+    #[test]
+    fn replacement_cancellation_and_expiry_match_reference() {
+        let now = Instant::now();
+        let mut timers = TimerQueue::default();
+        let mut reference = std::collections::BTreeMap::new();
+        let mut random = 17_u64;
+        for _ in 0..20_000 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let index = (random >> 32) % 128;
+            let at = now + Duration::from_millis((random >> 16) % 1_000);
+            match random % 5 {
+                0 => {
+                    timers.cancel(index);
+                    reference.remove(&index);
+                }
+                1 => {
+                    let mut expected: Vec<_> = reference
+                        .iter()
+                        .filter(|(_, deadline)| **deadline <= at)
+                        .map(|(&id, &deadline)| (deadline, id))
+                        .collect();
+                    expected.sort_unstable();
+                    let mut fired = Vec::new();
+                    timers.expire(at, |id, deadline| {
+                        fired.push((deadline, id));
+                        reference.remove(&id);
+                    });
+                    assert_eq!(fired, expected);
+                }
+                _ => {
+                    timers.schedule(index, at);
+                    reference.insert(index, at);
+                }
+            }
+            assert_eq!(timers.len(), reference.len());
+            assert_eq!(timers.positions.len(), reference.len());
+            let next = reference.iter().map(|(&id, &at)| (at, id)).min();
+            assert_eq!(timers.next_wakeup(), next.map(|(at, id)| (id, at)));
+            for (position, timer) in timers.heap.iter().enumerate() {
+                assert_eq!(timers.positions[&timer.index], position);
+            }
+        }
     }
 }

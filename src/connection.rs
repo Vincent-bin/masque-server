@@ -349,8 +349,10 @@ impl ClientConnection {
 
     /// The next instant this connection needs the event loop's attention:
     /// quiche's own timer, or the release time of a packet held back by pacing.
-    pub(crate) fn next_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
-        let quic = self.quic.timeout().map(|timeout| now + timeout);
+    pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
+        // Preserve quiche's absolute deadline. Reconstructing it from timeout()
+        // and a different Instant::now introduces jitter on every drive.
+        let quic = self.quic.timeout_instant();
         match (quic, self.deferred_send.deadline()) {
             (Some(quic), Some(pacing)) => Some(quic.min(pacing)),
             (quic, pacing) => quic.or(pacing),

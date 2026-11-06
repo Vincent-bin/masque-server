@@ -56,6 +56,7 @@ pub(super) async fn authorize_request(
     let mut values = request.headers().get_all(PROXY_AUTHORIZATION).iter();
     let first = values.next().map(HeaderValue::as_bytes);
     if values.next().is_some() {
+        context.metrics.record_auth_failure();
         let _ = send_auth_rejection(respond);
         return Authorization::ResponseSent;
     }
@@ -66,6 +67,7 @@ pub(super) async fn authorize_request(
             return Authorization::Granted;
         }
         AuthPrecheck::Rejected => {
+            context.metrics.record_auth_failure();
             let _ = send_auth_rejection(respond);
             return Authorization::ResponseSent;
         }

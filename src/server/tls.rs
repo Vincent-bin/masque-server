@@ -44,6 +44,7 @@ pub(super) struct TlsIdentity {
     leaf: X509,
     chain: Vec<X509>,
     private_key: PKey<Private>,
+    fingerprint: [u8; 32],
 }
 
 impl TlsIdentity {
@@ -92,10 +93,17 @@ impl TlsIdentity {
             );
         }
 
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        for certificate in std::iter::once(&leaf).chain(&certificates) {
+            let der = certificate.to_der()?;
+            digest.update(&(der.len() as u64).to_be_bytes());
+            digest.update(&der);
+        }
         let identity = Self {
             leaf,
             chain: certificates,
             private_key,
+            fingerprint: digest.finish().as_ref().try_into().unwrap(),
         };
 
         // Exercise the exact per-connection installation path during startup
@@ -110,6 +118,10 @@ impl TlsIdentity {
             .context("failed to install the TLS certificate chain and private key")?;
 
         Ok(identity)
+    }
+
+    pub(super) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
     }
 
     /// Copy this identity into one fresh SSL connection.
@@ -155,6 +167,9 @@ pub(super) struct SharedTlsIdentity {
 }
 
 impl SharedTlsIdentity {
+    pub(super) fn fingerprint(&self) -> [u8; 32] {
+        self.load().identity.fingerprint()
+    }
     pub(super) fn new(identity: TlsIdentity) -> Self {
         Self {
             current: RwLock::new(Arc::new(TlsSnapshot {

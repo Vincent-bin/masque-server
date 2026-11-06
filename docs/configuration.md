@@ -431,7 +431,9 @@ IPv6 CIDRs. Startup and `check-config` reject any malformed entry, including
 entries in a disabled proxy, and report the section, field, and zero-based
 entry index. An invalid deny rule is never silently skipped. Empty allow lists
 still deny all targets; empty deny lists add no exclusions.
-These tables do not govern CONNECT-IP forwarding. Restart after editing them.
+CONNECT-IP has its own `ip_proxy.allow_targets` / `deny_targets` policy.
+TCP/UDP listener restrictions do not apply to it. Restart after editing any
+destination policy.
 
 Use one HTTP/3 shard until a benchmark shows one event loop is CPU-bound.
 Memory and the effective connection capacity increase with the shard count.
@@ -917,8 +919,16 @@ connect_timeout_secs = 10
 uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
 enable_udp_gso = false
 allow_targets = ["0.0.0.0/0", "::/0"]
-deny_targets = ["127.0.0.0/8", "10.0.0.0/8", "::1/128"]
+deny_targets = [
+  "127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+  "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+]
 ```
+
+Omitting `[udp_proxy]` or `deny_targets` uses the same private, link-local and
+loopback denies as TCP. Explicit lists, including `deny_targets = []`, retain
+their meaning. The UDP allow default remains IPv4-only; the dual-stack example
+above explicitly enables IPv6.
 
 The template must retain `{target_host}` and `{target_port}`.
 `connect_timeout_secs` (`1..300`) bounds the complete DNS and socket setup; a
@@ -936,6 +946,11 @@ a loss and throughput A/B test.
 ```toml
 [ip_proxy]
 enabled = true
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = [
+  "127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+  "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+]
 require_tun = false
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
 connect_protocols = ["connect-ip", "cf-connect-ip"]
@@ -945,6 +960,26 @@ tun_offload = true
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"
 ```
+
+`allow_targets` and `deny_targets` are an independent destination ACL for
+client IP packets on both HTTP/2 and HTTP/3. Deny takes precedence. Omitted
+lists use the safe defaults above; denied packets are dropped before TUN
+forwarding. IPv4-mapped addresses cannot bypass IPv4 rules. Source addresses
+must still belong to the tunnel. Source-routing options and IPv6 routing
+headers are rejected so a later hop cannot bypass the destination check.
+
+To reach a private subnet, explicitly narrow `allow_targets` to the intended
+subnet and remove any overlapping broad deny from `deny_targets`. For example,
+`allow_targets = ["10.20.0.0/16"]` with `deny_targets = []` permits only that
+subnet. Keep other private destinations excluded. Existing configurations that
+omitted these fields will now reject private destinations after restart.
+The host firewall is still needed for host-owned public addresses, protocol/port
+restrictions, peer isolation, routing and NAT; the ACL does not discover host
+interfaces or replace these controls.
+
+HTTP/2 initial address/control delivery is also bounded by
+`server.idle_timeout_secs`. A peer that withholds response credit is reset and
+its lease and tunnel slot are released even before forwarding starts.
 
 `connect_protocols` lists the accepted CONNECT-IP protocol identifiers. RFC
 9484 registers `connect-ip`; Cloudflare's HTTP/3 endpoint uses

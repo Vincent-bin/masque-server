@@ -191,6 +191,14 @@ deny_targets = [
 
 [ip_proxy]
 enabled = true
+# Independent destination ACL for client IP packets, on both transports.
+# Deny wins over allow. Private access requires an explicit policy; remove the
+# matching broad deny and narrow allow_targets to the intended network.
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = [
+  "127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+  "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+]
 # Opt in to fail startup when TUN creation fails. The default keeps CONNECT
 # and CONNECT-UDP running; /readyz/connect-ip reports the degraded capability.
 # This does not check host routing, firewall, or end-to-end egress.

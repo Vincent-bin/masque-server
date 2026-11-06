@@ -24,5 +24,8 @@ deny_targets = ["127.0.0.0/8", "::1/128"]
 
 [ip_proxy]
 enabled = true
+# Controlled private E2E network, explicitly opted in.
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = []
 ipv4_pool = "10.89.0.0/16"
 ipv6_pool = "fd00:abcd::/64"

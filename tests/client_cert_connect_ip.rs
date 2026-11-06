@@ -42,6 +42,10 @@ use masque::server::Server;
 #[path = "client_cert_connect_ip/ip_uri.rs"]
 mod ip_uri;
 
+#[cfg(target_os = "linux")]
+#[path = "client_cert_connect_ip/ip_fragments.rs"]
+mod ip_fragments;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CLIENT_IPV4: &str = "10.89.0.2";
 const CLIENT_IPV6: &str = "fd00:abcd::2";
@@ -3121,4 +3125,102 @@ fn http3_malformed_address_requests_reset_only_the_request_stream() {
         200
     );
     assert_eq!(client.capsules(stream, 2, Duration::from_secs(5)).len(), 2);
+}
+
+#[test]
+fn all_basic_rejections_are_counted_once() {
+    use std::io::{Read, Write};
+    let dir = TempDir::new("audit-h3");
+    let key = p256_key();
+    let (cert, key) = write_pem(
+        dir.path(),
+        "server",
+        &key,
+        &self_signed(&key, Some("localhost")),
+    );
+    let mut config = ServerConfig::default();
+    config.tls.cert_path = cert;
+    config.tls.key_path = key;
+    config.listeners[0].listen_addr = ephemeral_addr();
+    config.listeners[0].auth.enabled = true;
+    config.listeners[0].auth.username = "audit".into();
+    config.listeners[0].auth.password_hash =
+        masque::auth::hash_password(b"audit-test-secret").unwrap();
+    config.observability.listen_addr = Some(ephemeral_addr());
+    let (listeners, metrics) = spawn_server_with_observability(config);
+    let metrics = metrics.unwrap();
+    let failures = || {
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&metrics, Duration::from_secs(2)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        text.lines()
+            .filter(|line| {
+                line.starts_with("masque_auth_attempts_total{")
+                    && line.contains("result=\"failure\"")
+            })
+            .map(|line| {
+                line.split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .sum::<u64>()
+    };
+    let mut client = Client::connect_anonymous(listeners[0]).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    let baseline = failures();
+    let unknown = format!("Basic {}", STANDARD.encode("unknown:secret"));
+    for value in [None, Some("invalid"), Some(unknown.as_str())] {
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", value)
+            .unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(2))
+                .unwrap(),
+            404
+        );
+    }
+    let headers = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/*/*/"),
+        quiche::h3::Header::new(b"proxy-authorization", b"invalid"),
+        quiche::h3::Header::new(b"proxy-authorization", b"invalid"),
+    ];
+    let stream = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(&mut client.quic, &headers, true)
+        .unwrap();
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(2))
+            .unwrap(),
+        404
+    );
+    let fast = failures() - baseline;
+    assert_eq!(fast, 4);
+    let wrong = format!("Basic {}", STANDARD.encode("audit:wrong"));
+    let stream = client
+        .send_connect_ip_with_credentials("connect-ip", Some(&wrong))
+        .unwrap();
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(2))
+            .unwrap(),
+        404
+    );
+    let hashed = failures() - baseline;
+    assert_eq!(hashed, 5);
 }

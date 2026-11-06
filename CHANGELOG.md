@@ -7,6 +7,33 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.12 - 2026-11-07
+
+### Fixed
+
+- Bound HTTP/2 CONNECT-IP initial control delivery by the idle timeout. Zero or
+  insufficient receive credit no longer holds an address and tunnel slot forever.
+- Replace stale HTTP/3 timer accumulation with one replaceable deadline per
+  connection and use quiche's absolute deadline without recomputation jitter.
+- Count missing, malformed, duplicate and unknown-user Basic credentials once
+  in both transports. External rejection remains an empty 404.
+- Apply TCP's private/link-local deny defaults to omitted UDP policies. Explicit
+  allow/deny lists remain unchanged; UDP's default allow list stays IPv4-only.
+
+### Added
+
+- Independent CONNECT-IP destination ACLs on both transports, with private,
+  loopback and link-local destinations denied by default. Existing installations
+  needing private IP forwarding must configure explicit allow/deny lists before
+  restart. Source-routing headers cannot bypass the destination check. Host
+  firewall, routing and NAT controls remain necessary.
+- Probe TCP data with a verified target TLS handshake or random echo, and
+  CONNECT-IP with an inner IP/UDP DNS or echo round trip. Explicit IP setup-only
+  mode reports a warning; old negotiation-only results do not prove forwarding.
+- Compare on-disk configuration with live loaded fingerprints over a private
+  local status socket. Report applied, reload-required and restart-required
+  sections without exposing credentials or adding a public management endpoint.
+
 ## 0.14.11 - 2026-11-06
 
 ### Changed
