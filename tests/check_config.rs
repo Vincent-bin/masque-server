@@ -525,6 +525,7 @@ fn check_config_reports_a_loopback_observability_endpoint() {
             "observability 127.0.0.1:9090 health=/healthz ready=/readyz metrics=/metrics"
         )
     );
+    assert!(stdout.contains("connect_ip_ready=/readyz/connect-ip"));
 }
 
 #[test]
@@ -823,4 +824,72 @@ fn status_reports_valid_and_invalid_disk_configuration() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("configuration: invalid or unavailable")
     );
+}
+
+/// Invalid interface names make TUN failure deterministic even on a privileged
+/// Linux runner, without creating or changing a host interface.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connect_ip_strict_startup_and_best_effort_apply_to_both_transports() {
+    use masque::config::ListenerTransport;
+    use masque::server::{Server, validate_config};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    for transport in [ListenerTransport::Http2, ListenerTransport::Http3] {
+        let text = config_text(
+            "127.0.0.1:0".parse().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        )
+        .replace(
+            "[ip_proxy]\nenabled = false",
+            "[ip_proxy]\nenabled = true\nrequire_tun = true\ntun_name = \"invalid/tun/name\"",
+        );
+        let mut config = masque::config::parse_toml(&text).unwrap();
+        config.listeners[0].transport = transport;
+        // Dry-run configuration checks must not acquire or require a device.
+        validate_config(&config).unwrap();
+        let error = match Server::bind(config.clone()).await {
+            Ok(_) => panic!("required TUN failure was ignored"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("ip_proxy.require_tun"));
+
+        config.ip_proxy.require_tun = false;
+        config.observability.listen_addr = Some("127.0.0.1:0".parse().unwrap());
+        let mut server = Server::bind(config).await.unwrap();
+        let addr = server.observability_addr().unwrap();
+        let task = tokio::spawn(async move { server.run().await.unwrap() });
+        for (path, status, expected) in [
+            ("/readyz", "200", "ready\n"),
+            ("/readyz/connect-ip", "503", "not ready\n"),
+            ("/metrics", "200", "masque_connect_ip_available 0\n"),
+        ] {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).await.unwrap();
+                response
+            })
+            .await
+            .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{response}"
+            );
+            assert!(response.contains(expected), "{response}");
+            if path == "/metrics" {
+                assert!(response.contains("masque_connect_ip_enabled 1\n"));
+                assert!(response.contains("masque_connect_ip_ready 0\n"));
+            }
+        }
+        task.abort();
+    }
 }

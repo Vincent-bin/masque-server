@@ -193,6 +193,10 @@ deny_targets = [
 
 [ip_proxy]
 enabled = true
+# Opt in to fail startup when TUN creation fails. The default keeps CONNECT
+# and CONNECT-UDP running; /readyz/connect-ip reports the degraded capability.
+# This does not check host routing, firewall, or end-to-end egress.
+require_tun = false
 # The process creates the TUN and relays packets to it, but never changes host
 # forwarding, routes, firewall rules, or NAT. After startup, inspect those
 # operator-managed prerequisites with:

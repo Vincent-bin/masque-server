@@ -380,9 +380,12 @@ impl Server {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let config = Arc::new(config);
-        let metrics = Arc::new(Metrics::new(config.observability.listen_addr.is_some()));
-
         let tun = build_tun(&config)?;
+        let connect_ip_available = connect_ip_capability(&config, tun.is_some());
+        let metrics = Arc::new(
+            Metrics::new(config.observability.listen_addr.is_some())
+                .with_connect_ip(config.ip_proxy.enabled, connect_ip_available),
+        );
 
         let mut key_bytes = [0u8; 64];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key_bytes)
@@ -560,6 +563,8 @@ impl Server {
         info!(
             http3_shards = total_shards,
             http2_listeners = http2_listeners.len(),
+            connect_ip_enabled = config.ip_proxy.enabled,
+            connect_ip_available,
             "server ready"
         );
         Ok(Self {
@@ -1230,6 +1235,27 @@ fn build_h3_config() -> anyhow::Result<quiche::h3::Config> {
     Ok(h3_config)
 }
 
+/// A startup capability snapshot, not a host-egress or runtime I/O probe.
+fn connect_ip_capability(config: &ServerConfig, tun_available: bool) -> bool {
+    tun_available
+        && (!config.ip_proxy.ipv4_pool.is_empty() || !config.ip_proxy.ipv6_pool.is_empty())
+        && config.ip_proxy.connect_protocols.iter().any(|protocol| {
+            // Use the same feature gates and protocol precedence as both
+            // transports. In particular, an enabled CONNECT-UDP handler can
+            // shadow that token if it also appears among the IP aliases.
+            matches!(
+                request::classify_connect_request(
+                    b"CONNECT",
+                    protocol.as_bytes(),
+                    b"",
+                    b"",
+                    config
+                ),
+                Some(ConnectRequest::Ip)
+            )
+        })
+}
+
 /// Create the TUN device if the IP proxy is enabled.
 fn build_tun(config: &ServerConfig) -> anyhow::Result<Option<TunManager>> {
     if !config.ip_proxy.enabled {
@@ -1262,16 +1288,27 @@ fn build_tun(config: &ServerConfig) -> anyhow::Result<Option<TunManager>> {
         (None, 0)
     };
 
-    match TunManager::new(
-        &config.ip_proxy.tun_name,
-        config.ip_proxy.tun_mtu as u16,
-        v4_gw,
-        v4_prefix,
-        v6_gw,
-        v6_prefix,
-        config.ip_proxy.tun_offload,
-    ) {
+    finish_tun_setup(
+        config.ip_proxy.require_tun,
+        TunManager::new(
+            &config.ip_proxy.tun_name,
+            config.ip_proxy.tun_mtu as u16,
+            v4_gw,
+            v4_prefix,
+            v6_gw,
+            v6_prefix,
+            config.ip_proxy.tun_offload,
+        ),
+    )
+}
+
+/// Keep the failure policy testable without privileges or a real TUN device.
+fn finish_tun_setup<T>(required: bool, result: std::io::Result<T>) -> anyhow::Result<Option<T>> {
+    match result {
         Ok(tun) => Ok(Some(tun)),
+        Err(e) if required => {
+            Err(e).context("ip_proxy.require_tun is true but TUN creation failed")
+        }
         Err(e) => {
             warn!(%e, "failed to create TUN device — CONNECT-IP will be unavailable");
             Ok(None)
@@ -2213,6 +2250,62 @@ mod tests {
     use crate::config::{
         AuthMode, AuthSection, ClientEntry, ListenerSection, ListenerTransport, ServerConfig,
     };
+
+    #[test]
+    fn connect_ip_capability_requires_usable_configuration_and_tun() {
+        let mut config = ServerConfig::default();
+        assert!(super::connect_ip_capability(&config, true));
+        assert!(!super::connect_ip_capability(&config, false));
+        config.ip_proxy.enabled = false;
+        assert!(!super::connect_ip_capability(&config, true));
+        config.ip_proxy.enabled = true;
+        config.ip_proxy.connect_protocols.clear();
+        assert!(!super::connect_ip_capability(&config, true));
+        config.ip_proxy.connect_protocols.push(String::new());
+        assert!(!super::connect_ip_capability(&config, true));
+        config.ip_proxy.connect_protocols = vec!["connect-udp".into()];
+        assert!(!super::connect_ip_capability(&config, true));
+        config.udp_proxy.enabled = false;
+        assert!(super::connect_ip_capability(&config, true));
+        config.ip_proxy.connect_protocols = vec!["connect-ip".into()];
+        config.ip_proxy.ipv4_pool.clear();
+        assert!(super::connect_ip_capability(&config, true));
+        config.ip_proxy.ipv6_pool.clear();
+        assert!(!super::connect_ip_capability(&config, true));
+        config.ip_proxy.ipv4_pool = "10.89.0.0/24".into();
+        assert!(super::connect_ip_capability(&config, true));
+    }
+
+    #[test]
+    fn tun_startup_failure_is_optional_unless_required() {
+        for required in [false, true] {
+            assert_eq!(super::finish_tun_setup(required, Ok(7)).unwrap(), Some(7));
+            let result = super::finish_tun_setup::<()>(
+                required,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic TUN denial",
+                )),
+            );
+            if required {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("ip_proxy.require_tun"));
+                assert!(error.contains("synthetic TUN denial"));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_ip_proxy_never_requires_a_tun() {
+        let mut config = ServerConfig::default();
+        config.ip_proxy.enabled = false;
+        config.ip_proxy.require_tun = true;
+        // Prove the disabled path does not even parse the pool or create a device.
+        config.ip_proxy.ipv4_pool = "unused invalid pool".into();
+        assert!(super::build_tun(&config).unwrap().is_none());
+    }
 
     fn invalid_roster_entry() -> ClientEntry {
         ClientEntry {

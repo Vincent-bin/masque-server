@@ -796,7 +796,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if let Some(addr) = cfg.observability.listen_addr {
-            println!("observability {addr} health=/healthz ready=/readyz metrics=/metrics");
+            println!(
+                "observability {addr} health=/healthz ready=/readyz metrics=/metrics connect_ip_ready=/readyz/connect-ip"
+            );
         }
         return Ok(());
     }
