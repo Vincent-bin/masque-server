@@ -11,9 +11,7 @@
 //! and 24 hours of validity; `:protocol: cf-connect-ip`; a hardcoded authority;
 //! and `:path: /`.
 
-#[cfg(target_os = "linux")]
 use std::io::{Read as _, Write as _};
-#[cfg(target_os = "linux")]
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -243,7 +241,6 @@ fn spawn_server_with_observability(config: ServerConfig) -> (Vec<SocketAddr>, Op
         .expect("server did not report its listen addresses")
 }
 
-#[cfg(target_os = "linux")]
 fn scrape_metrics(addr: SocketAddr) -> String {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
     stream
@@ -257,7 +254,6 @@ fn scrape_metrics(addr: SocketAddr) -> String {
     response
 }
 
-#[cfg(target_os = "linux")]
 fn metric_total(rendered: &str, name: &str) -> u64 {
     rendered
         .lines()

@@ -1,10 +1,6 @@
 use super::*;
 
-fn error_client(
-    mut config: ServerConfig,
-    stream_window: u64,
-    connection_window: u64,
-) -> (TempDir, Client) {
+fn error_server(mut config: ServerConfig) -> (TempDir, SocketAddr, Option<SocketAddr>) {
     let dir = TempDir::new("error-response-credit");
     let key = p256_key();
     let (cert, key) = write_pem(
@@ -21,7 +17,16 @@ fn error_client(
     config.tcp_proxy.deny_targets.clear();
     config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
     config.udp_proxy.deny_targets.clear();
-    let peer = spawn_server(config)[0];
+    let (peers, metrics) = spawn_server_with_observability(config);
+    (dir, peers[0], metrics)
+}
+
+fn error_client(
+    config: ServerConfig,
+    stream_window: u64,
+    connection_window: u64,
+) -> (TempDir, Client) {
+    let (dir, peer, _) = error_server(config);
     let mut client = Client::connect_with_windows(
         peer,
         None,
@@ -498,24 +503,48 @@ fn idle_tunnels_close_while_connection_credit_is_exhausted() {
 
 #[test]
 fn first_basic_auth_has_a_fixed_quic_deadline() {
-    let mut config = ServerConfig::default();
-    config.server.idle_timeout_secs = 1;
-    config.listeners[0].auth.username = BASIC_USERNAME.into();
-    config.listeners[0].auth.password_hash =
-        masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap();
-    let (_dir, mut client) = error_client(config, 32768, 1_048_576);
-    let peer = client.socket.peer_addr().unwrap();
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::{Algorithm, Argon2, Params, Version};
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while client.quic.peer_error().is_none() && Instant::now() < deadline {
-        client.quic.send_ack_eliciting().unwrap();
-        client.drive().unwrap();
-        std::thread::sleep(Duration::from_millis(80));
+    const AUTH_WINDOW: Duration = Duration::from_secs(3);
+    let mut config = ServerConfig::default();
+    config.server.idle_timeout_secs = AUTH_WINDOW.as_secs();
+    config.observability.listen_addr = Some(ephemeral_addr());
+    config.listeners[0].auth.username = BASIC_USERNAME.into();
+    // Exercise a cold verification without making this deadline test depend
+    // on production Argon2 cost under concurrent debug test load.
+    let salt = SaltString::encode_b64(b"auth-deadline-test").unwrap();
+    config.listeners[0].auth.password_hash = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(64, 1, 1, None).unwrap(),
+    )
+    .hash_password(BASIC_PASSWORD.as_bytes(), &salt)
+    .unwrap()
+    .to_string();
+
+    let (_dir, peer, metrics) = error_server(config);
+    let metrics = metrics.unwrap();
+    let active = || metric_total(&scrape_metrics(metrics), "masque_connections_active{");
+    let mut client = Client::connect_anonymous(peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    assert_eq!(active(), 1);
+
+    // Measure server-side reclamation. QUIC can close silently if its
+    // transport idle timer expires before a close packet can be sent.
+    let deadline = Instant::now() + AUTH_WINDOW + Duration::from_secs(4);
+    while active() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "keepalive extended the first Basic auth deadline"
+        );
+        if client.quic.peer_error().is_none() {
+            client.quic.send_ack_eliciting().unwrap();
+            client.drive().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        client.quic.peer_error().is_some(),
-        "keepalive extended the first Basic auth deadline"
-    );
 
     let credentials = format!(
         "Basic {}",
@@ -536,7 +565,7 @@ fn first_basic_auth_has_a_fixed_quic_deadline() {
                 .unwrap(),
             200
         );
-        let deadline = Instant::now() + Duration::from_millis(1500);
+        let deadline = Instant::now() + AUTH_WINDOW + Duration::from_millis(200);
         while Instant::now() < deadline {
             client.quic.send_ack_eliciting().unwrap();
             client.drive().unwrap();
