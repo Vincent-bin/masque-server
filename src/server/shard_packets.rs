@@ -1,6 +1,7 @@
 //! HTTP/3 packet ingress, connection IDs, and timer scheduling.
 
 use super::*;
+use quiche::h3::NameValue as _;
 
 impl Shard {
     /// Mark every connection whose deadline has arrived as needing servicing.
@@ -553,11 +554,64 @@ impl Shard {
             loop {
                 match h3.poll(&mut client.quic) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                        // A rejection already owns this stream. Trailers must
-                        // not dispatch new work or replace its original status.
+                        if client.request_headers_seen.contains(&stream_id) {
+                            // Later HEADERS are trailers. Pseudo-headers here
+                            // are malformed and must never start another CONNECT.
+                            if list.iter().any(|header| header.name().starts_with(b":")) {
+                                let code = quiche::h3::WireErrorCode::MessageError as u64;
+                                let _ = client.quic.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Read,
+                                    code,
+                                );
+                                let _ = client.quic.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Write,
+                                    code,
+                                );
+                                client
+                                    .pending_error_responses
+                                    .cancel(&mut client.quic, stream_id);
+                                client.awaiting_auth.remove(&stream_id);
+                                client.pending_tcp_tunnels.remove(&stream_id);
+                                client.tcp_tunnels.remove(&stream_id);
+                                client.tcp_read_resumes.remove(&stream_id);
+                                client.pending_udp_tunnels.remove(&stream_id);
+                                client.udp_tunnels.remove(&stream_id);
+                                client.pending_ip_responses.remove(&stream_id);
+                                pending_setups.ip.retain(|id| *id != stream_id);
+                                closed_capsule_streams.push(stream_id);
+                                if client.ip_tunnels.contains_key(&stream_id) {
+                                    closed_ip_streams.push(stream_id);
+                                }
+                            }
+                            continue;
+                        }
                         if client.pending_error_responses.contains(stream_id) {
                             continue;
                         }
+                        // QUIC bounds concurrent streams. Retire completed
+                        // entries before enforcing the fixed upper bound.
+                        if client.request_headers_seen.len() >= MAX_QUIC_STREAMS_BIDI as usize {
+                            client
+                                .request_headers_seen
+                                .retain(|id| !client.quic.stream_closed(*id));
+                            if client.request_headers_seen.len() >= MAX_QUIC_STREAMS_BIDI as usize {
+                                let code = quiche::h3::WireErrorCode::ExcessiveLoad as u64;
+                                let _ = client.quic.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Read,
+                                    code,
+                                );
+                                let _ = client.quic.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Write,
+                                    code,
+                                );
+                                continue;
+                            }
+                        }
+                        client.request_headers_seen.insert(stream_id);
                         let tcp_setup_count = pending_setups.tcp.len();
                         let udp_setup_count = pending_setups.udp.len();
                         let request_context = RequestContext {
@@ -648,6 +702,7 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
+                        client.request_headers_seen.remove(&stream_id);
                         client.tcp_read_resumes.remove(&stream_id);
                         if client.capsule_streams.contains_key(&stream_id) {
                             finished_capsule_streams.push(stream_id);
@@ -684,6 +739,7 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        client.request_headers_seen.remove(&stream_id);
                         client
                             .pending_error_responses
                             .cancel(&mut client.quic, stream_id);
