@@ -176,6 +176,8 @@ pub struct ClientConnection {
     pub pending_tcp_tunnels: FxHashMap<u64, PendingTcpTunnel>,
     /// Active standard CONNECT TCP tunnels, keyed by stream ID.
     pub tcp_tunnels: FxHashMap<u64, TcpTunnel>,
+    /// Bounded to known TCP streams; deferred parsing work after a read budget.
+    pub(crate) tcp_read_resumes: FxHashSet<u64>,
     /// CONNECT-UDP streams waiting for asynchronous target setup.
     pub(crate) pending_udp_tunnels: FxHashMap<u64, PendingUdpTunnel>,
     /// Active UDP tunnels, keyed by stream ID.
@@ -248,6 +250,7 @@ impl ClientConnection {
             h3: None,
             pending_tcp_tunnels: FxHashMap::default(),
             tcp_tunnels: FxHashMap::default(),
+            tcp_read_resumes: FxHashSet::default(),
             pending_udp_tunnels: FxHashMap::default(),
             pending_ip_responses: FxHashMap::default(),
             udp_tunnels: FxHashMap::default(),
@@ -348,8 +351,15 @@ impl ClientConnection {
     }
 
     /// The next instant this connection needs the event loop's attention:
-    /// quiche's own timer, or the release time of a packet held back by pacing.
+    /// buffered framing work, quiche's timer, or a deferred packet's release.
     pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
+        if !self.tcp_read_resumes.is_empty()
+            && self.quic.local_error().is_none()
+            && !self.quic.is_draining()
+            && !self.quic.is_closed()
+        {
+            return Some(std::time::Instant::now());
+        }
         // Preserve quiche's absolute deadline. Reconstructing it from timeout()
         // and a different Instant::now introduces jitter on every drive.
         let quic = self.quic.timeout_instant();

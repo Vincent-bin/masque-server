@@ -46,6 +46,9 @@ mod ip_uri;
 #[path = "client_cert_connect_ip/ip_fragments.rs"]
 mod ip_fragments;
 
+#[path = "client_cert_connect_ip/tcp_backpressure.rs"]
+mod tcp_backpressure;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CLIENT_IPV4: &str = "10.89.0.2";
 const CLIENT_IPV6: &str = "fd00:abcd::2";

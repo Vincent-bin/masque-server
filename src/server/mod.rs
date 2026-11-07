@@ -2136,6 +2136,7 @@ impl Shard {
             // Process QUIC DATAGRAMs → forward to target UDP/TUN.
             if !shutting_down {
                 self.retry_tcp_connect_responses(&serviced);
+                self.retry_tcp_request_bodies(&serviced);
                 self.retry_udp_connect_responses(&serviced);
                 self.retry_ip_connect_responses(&serviced);
                 self.flush_tcp_responses(&serviced);

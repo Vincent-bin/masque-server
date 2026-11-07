@@ -316,6 +316,14 @@ the userspace cross-shard fallback. Multi-shard tests run on a multi-threaded
 runtime and check that concurrent Initial copies reach one connection owner.
 A raw pre-TLS Retry probe checks encrypted tokens and fresh nonces.
 
+The `tcp_backpressure` tests in this suite fill the HTTP/3 TCP upload budget
+against a gated slow target, verify an unrelated stream still works, and then
+compare every uploaded byte after capacity returns. They also cover pending
+CONNECT response credit with the complete body and FIN already buffered, and
+a target that half-closes its response before consuming the upload. A stream
+with 256 consecutive empty DATA frames completes after one credit update with
+all further client packets withheld, exercising bounded local continuations.
+
 The general E2E client keeps an established CONNECT-UDP stream open while it
 replaces its UDP socket when `MASQUE_MIGRATION_CHECK=1`. Add
 `MASQUE_BENCH_MIGRATED=1` to its normal `MASQUE_BENCH=1` invocation to run the
