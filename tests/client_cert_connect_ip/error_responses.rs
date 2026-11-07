@@ -465,12 +465,15 @@ fn idle_tunnels_close_while_connection_credit_is_exhausted() {
     while !pending.is_empty() && Instant::now() < deadline {
         // Keep the bulk tunnel alive without reading its response. If it
         // resets too, discarding its buffered bytes can restore QUIC credit.
-        client
+        match client
             .h3
             .as_mut()
             .unwrap()
             .send_body(&mut client.quic, bulk, b"x", false)
-            .unwrap();
+        {
+            Ok(_) | Err(quiche::h3::Error::Done) => {}
+            Err(error) => panic!("bulk keepalive failed: {error}"),
+        }
         client.drive().unwrap();
         while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
             if pending.contains(&id) {
