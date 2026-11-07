@@ -7,6 +7,17 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.14 - 2026-11-07
+
+### Fixed
+
+- Preserve HTTP/3 TCP upload backpressure and FIN ordering when target writes
+  are slow or the target half-closes its response.
+- Skip unknown HTTP/2 UDP capsules incrementally and reject truncated HTTP/3
+  capsules when FIN arrives separately.
+- Handle the IPv6 address-pool zero-prefix boundary without arithmetic overflow.
+- Verify all configured probe profiles during upgrades, rollback, and recovery.
+
 ## 0.14.13 - 2026-11-07
 
 ### Fixed
