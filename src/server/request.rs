@@ -9,7 +9,7 @@ use crate::auth::{AuthPrecheck, BasicCredential, SharedBasicAuthenticator};
 use crate::config::ServerConfig;
 use crate::uri;
 
-use super::Shard;
+use super::{Shard, request_headers::RequestHeaders};
 
 /// The target of a CONNECT request, held while its credentials are verified.
 #[derive(Debug)]
@@ -127,122 +127,6 @@ pub(super) fn prepare_connect_ip(
     Ok(())
 }
 
-#[derive(Default)]
-struct RequestHeaders<'a> {
-    method: Option<&'a [u8]>,
-    path: Option<&'a [u8]>,
-    scheme: Option<&'a [u8]>,
-    protocol: Option<&'a [u8]>,
-    authority: Option<&'a [u8]>,
-    proxy_authorization: Option<&'a [u8]>,
-    duplicate_proxy_authorization: bool,
-}
-
-impl<'a> RequestHeaders<'a> {
-    /// Validate the field section in one pass, borrowing the values.
-    /// Target parsing still runs after authentication.
-    fn parse(headers: &'a [quiche::h3::Header]) -> Option<Self> {
-        let mut request = Self::default();
-        let mut regular_field_seen = false;
-        for header in headers {
-            let name = header.name();
-            let value = header.value();
-            if value
-                .iter()
-                .any(|byte| byte.is_ascii_control() && *byte != b'\t')
-            {
-                return None;
-            }
-            if name.starts_with(b":") {
-                let field = match name {
-                    b":method" => &mut request.method,
-                    b":path" => &mut request.path,
-                    b":scheme" => &mut request.scheme,
-                    b":protocol" => &mut request.protocol,
-                    b":authority" => &mut request.authority,
-                    _ => return None,
-                };
-                if regular_field_seen || field.replace(value).is_some() {
-                    return None;
-                }
-                continue;
-            }
-
-            regular_field_seen = true;
-            if name.is_empty()
-                || !name
-                    .iter()
-                    .all(|byte| token_byte(*byte) && !byte.is_ascii_uppercase())
-            {
-                return None;
-            }
-            match name {
-                b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding"
-                | b"upgrade" => return None,
-                b"te"
-                    if !value
-                        .split(|byte| *byte == b',')
-                        .map(<[u8]>::trim_ascii)
-                        .all(|coding| {
-                            coding.is_empty() || coding.eq_ignore_ascii_case(b"trailers")
-                        }) =>
-                {
-                    return None;
-                }
-                b"proxy-authorization" => {
-                    request.duplicate_proxy_authorization |=
-                        request.proxy_authorization.replace(value).is_some();
-                }
-                _ => {}
-            }
-        }
-
-        let method = request
-            .method
-            .filter(|value| !value.is_empty() && value.iter().copied().all(token_byte))?;
-        if method == b"CONNECT" {
-            request.authority.filter(|value| !value.is_empty())?;
-            match request.protocol {
-                None => {
-                    if request.path.is_some() || request.scheme.is_some() {
-                        return None;
-                    }
-                    return Some(request);
-                }
-                Some(protocol)
-                    if !protocol.is_empty() && protocol.iter().copied().all(token_byte) => {}
-                Some(_) => return None,
-            }
-        } else if request.protocol.is_some() {
-            return None;
-        }
-
-        let scheme = request.scheme?;
-        let (first, rest) = scheme.split_first()?;
-        if !first.is_ascii_alphabetic()
-            || !rest
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-        {
-            return None;
-        }
-        let path = request.path?;
-        match path {
-            [b'/', ..] => {}
-            b"*" if method == b"OPTIONS" => {}
-            b"" if method != b"CONNECT"
-                && !scheme.eq_ignore_ascii_case(b"http")
-                && !scheme.eq_ignore_ascii_case(b"https") => {}
-            _ => return None,
-        }
-        Some(request)
-    }
-}
-
-fn token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&byte)
-}
-
 /// Shared request dependencies passed together to keep dispatch APIs focused.
 pub(super) struct RequestContext<'a> {
     pub(super) metrics: &'a crate::metrics::ShardMetrics,
@@ -262,7 +146,9 @@ impl Shard {
         context: &mut RequestContext<'_>,
         pending: &mut PendingConnectSetups,
     ) -> Option<PendingAuth> {
-        let Some(headers) = RequestHeaders::parse(headers) else {
+        let Some(headers) =
+            RequestHeaders::parse(headers.iter().map(|header| (header.name(), header.value())))
+        else {
             let code = quiche::h3::WireErrorCode::MessageError as u64;
             let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
             let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code);

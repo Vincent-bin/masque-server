@@ -16,7 +16,6 @@ fn standard_ip_uri_validation_and_legacy_compatibility_over_http3() {
         ("/.well-known/masque/ip//*/", 400),
         ("/.well-known/masque/ip/*/256/", 400),
         ("/.well-known/masque/ip/192.0.2.1%2F24/*/", 400),
-        ("/.well-known/masque/ip/%XX/*/", 400),
         ("/.well-known/masque/ip/*/*/?target=192.0.2.1", 400),
         ("/.well-known/masque/ip/192.0.2.1/*/", 501),
         ("/.well-known/masque/ip/example.invalid/*/", 501),
@@ -39,6 +38,13 @@ fn standard_ip_uri_validation_and_legacy_compatibility_over_http3() {
             ![b"server".as_slice(), b"proxy-status", b"capsule-protocol"].contains(&name.as_slice())
         }));
     }
+    let malformed = client
+        .send_connect_ip_path("connect-ip", "/.well-known/masque/ip/%XX/*/", None)
+        .unwrap();
+    assert_eq!(
+        client.stream_reset(malformed),
+        quiche::h3::WireErrorCode::MessageError as u64
+    );
     let stream = client
         .send_connect_ip_path("connect-ip", "/.well-known/masque/ip/%2A/%2a/", None)
         .unwrap();

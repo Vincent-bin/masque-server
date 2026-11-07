@@ -744,6 +744,9 @@ fn malformed_initial_headers_never_open_a_target() {
         &[(b"transfer-encoding", b"chunked")],
         &[(b"te", b"gzip")],
         &[(b"x-test", b"invalid\r\nvalue")],
+        &[(b"x-test", b" leading-space")],
+        &[(b"x-test", b"trailing-tab\t")],
+        &[(b"te", b"trailers ")],
     ];
     for addition in additions {
         let mut headers = connect.to_vec();
@@ -764,6 +767,11 @@ fn malformed_initial_headers_never_open_a_target() {
     }
     let mut valid = connect.to_vec();
     valid.push(quiche::h3::Header::new(b"te", b"trailers"));
+    valid.push(quiche::h3::Header::new(
+        b"x-test",
+        b"interior \t whitespace",
+    ));
+    valid.push(quiche::h3::Header::new(b"user-agent", b""));
     let stream = send(&mut client, &valid, false);
     assert_eq!(
         client

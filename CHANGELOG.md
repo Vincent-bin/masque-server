@@ -18,7 +18,8 @@ pre-1.0.
 - Cancel HTTP/2 TCP and UDP target setup on RST_STREAM and release tunnel slots.
 - Reject malformed initial HTTP/3 request fields with H3_MESSAGE_ERROR before
   authentication or target setup, including duplicate or out-of-order
-  pseudo-headers and connection-specific fields.
+  pseudo-headers, connection-specific fields, surrounding field whitespace,
+  and invalid authority or path syntax.
 
 ## 0.14.17 - 2026-11-07
 
