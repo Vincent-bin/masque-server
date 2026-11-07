@@ -37,6 +37,9 @@ mod ip_fragments;
 #[path = "http2_connect/timeouts.rs"]
 mod timeouts;
 
+#[path = "http2_connect/udp_capsules.rs"]
+mod udp_capsules;
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
 static SIGHUP_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -796,7 +799,7 @@ async fn listener_targets_restrict_only_that_http2_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http2() {
+async fn local_target_aliases_cannot_bypass_tcp_or_udp_policy_over_http2() {
     let files = TestFiles::new();
     let tcp_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -807,8 +810,16 @@ async fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http2() {
     config.udp_proxy.deny_targets = config.tcp_proxy.deny_targets.clone();
     let (server_addr, server_task) = spawn_http2_config(config).await;
     let (mut client, driver) = connect_h2(server_addr).await;
+    let mut early_datagram = Vec::new();
+    encoder::encode_datagram_context_zero(b"must not reach loopback", &mut early_datagram);
 
-    for host in ["127.0.0.1", "::ffff:127.0.0.1"] {
+    for host in [
+        "127.0.0.1",
+        "::ffff:127.0.0.1",
+        "0.0.0.0",
+        "::",
+        "::ffff:0.0.0.0",
+    ] {
         let target = std::net::SocketAddr::new(
             host.parse().unwrap(),
             tcp_target.local_addr().unwrap().port(),
@@ -839,7 +850,10 @@ async fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http2() {
         request
             .extensions_mut()
             .insert(h2::ext::Protocol::from_static("connect-udp"));
-        let (response, _request_body) = client.send_request(request, false).unwrap();
+        let (response, mut request_body) = client.send_request(request, false).unwrap();
+        request_body
+            .send_data(Bytes::copy_from_slice(&early_datagram), false)
+            .unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), response)
                 .await
@@ -850,6 +864,18 @@ async fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http2() {
             "UDP {host}"
         );
     }
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), tcp_target.accept())
+            .await
+            .is_err(),
+        "a rejected target must not open a TCP connection"
+    );
+    let mut packet = [0u8; 64];
+    assert!(matches!(
+        udp_target.try_recv(&mut packet),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
 
     server_task.abort();
     driver.abort();

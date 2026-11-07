@@ -906,6 +906,14 @@ deny_targets = [
 Resolved addresses must match an allow prefix and must not match a deny prefix.
 Deny rules take precedence. Keep loopback, link-local, private, metadata, and
 management networks denied unless access is intentional.
+
+TCP and UDP targets always reject unspecified addresses (`0.0.0.0`, `::`,
+and IPv4-mapped zero), even if a CIDR allow rule includes them. Some kernels
+route these destinations to local services. This check applies to literals
+and every DNS answer; one unspecified answer rejects the whole request.
+To intentionally reach a local service, use its concrete loopback address and
+explicitly allow it instead.
+
 `connect_timeout_secs` (`1..300`) covers both DNS resolution and the staggered
 IPv6/IPv4 connection attempts. The server starts the other address family after
 250 ms, or immediately when the preceding attempt fails.
