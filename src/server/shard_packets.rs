@@ -524,6 +524,20 @@ impl Shard {
             }
         }
 
+        self.poll_http3_events(conn_idx);
+    }
+
+    /// Drive buffered HTTP/3 events after packet ingress or a deferred body
+    /// read. Capacity and authentication wakeups need the same framing and
+    /// lifecycle processing even when the peer sends no additional packet.
+    pub(super) fn poll_http3_events(&mut self, conn_idx: u64) {
+        let Some(conn_id) = self.conn_by_index.get(&conn_idx) else {
+            return;
+        };
+        let Some(client) = self.connections.get_mut(conn_id) else {
+            return;
+        };
+
         // Collect pending tunnel setups so we can do async I/O outside
         // the borrow of h3.
         let mut pending_setups = PendingConnectSetups::default();
@@ -599,17 +613,31 @@ impl Shard {
                         if client.awaiting_auth.contains_key(&stream_id) {
                             continue;
                         }
-                        if !Self::relay_tcp_request_body(
+                        if Self::relay_tcp_request_body(
                             h3,
                             &mut client.quic,
                             stream_id,
                             &mut client.pending_tcp_tunnels,
                             &mut client.tcp_tunnels,
-                        ) {
+                        )
+                        .is_err()
+                        {
                             failed_tcp_streams.push(stream_id);
+                        } else if client.quic.stream_readable(stream_id)
+                            && (client
+                                .tcp_tunnels
+                                .get(&stream_id)
+                                .is_some_and(|t| t.client_capacity() > 0)
+                                || client
+                                    .pending_tcp_tunnels
+                                    .get(&stream_id)
+                                    .is_some_and(|t| t.client_capacity() > 0))
+                        {
+                            client.tcp_read_resumes.insert(stream_id);
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
+                        client.tcp_read_resumes.remove(&stream_id);
                         client.pending_ip_responses.remove(&stream_id);
                         if client.capsule_streams.contains_key(&stream_id) {
                             finished_capsule_streams.push(stream_id);
@@ -638,6 +666,7 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        client.tcp_read_resumes.remove(&stream_id);
                         client.pending_ip_responses.remove(&stream_id);
                         closed_capsule_streams.push(stream_id);
                         // A late verification result for this stream is moot.

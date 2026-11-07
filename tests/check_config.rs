@@ -196,6 +196,64 @@ fn check_config_validates_without_binding_the_listen_port() {
 }
 
 #[test]
+fn check_config_handles_ipv6_pool_prefix_boundaries() {
+    let dir = TempDir::new();
+    let (cert_path, key_path) = write_server_identity(dir.path());
+    let config_path = dir.path().join("masque.toml");
+    for transport in ["http2", "http3"] {
+        let base = config_text(
+            "127.0.0.1:0".parse().unwrap(),
+            &cert_path,
+            &key_path,
+            "cubic",
+        )
+        .replace(
+            "[[listeners]]",
+            &format!("[[listeners]]\ntransport = \"{transport}\""),
+        );
+        for enabled in [true, false] {
+            for (cidr, valid) in [
+                ("", true),
+                ("::/0", true),
+                ("::/1", true),
+                ("fd00::/64", true),
+                ("fd00::/126", true),
+                // These remain valid, but have no dynamic client addresses.
+                ("fd00::/127", true),
+                ("fd00::/128", true),
+                ("::/129", false),
+                ("::/-1", false),
+                ("not-a-cidr", false),
+            ] {
+                std::fs::write(
+                    &config_path,
+                    base.replace(
+                        "[ip_proxy]\nenabled = false",
+                        &format!("[ip_proxy]\nenabled = {enabled}\nipv6_pool = \"{cidr}\""),
+                    ),
+                )
+                .unwrap();
+                let output = Command::new(env!("CARGO_BIN_EXE_masque-server"))
+                    .arg("--config")
+                    .arg(&config_path)
+                    .arg("check-config")
+                    .output()
+                    .unwrap();
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.success(),
+                    valid,
+                    "{transport} enabled={enabled} ipv6_pool={cidr:?}: {error}"
+                );
+                if !valid {
+                    assert!(error.contains("address pool: invalid CIDR"), "{error}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn global_target_policies_reject_invalid_cidrs_before_check_or_startup() {
     let dir = TempDir::new();
     let (cert_path, key_path) = write_server_identity(dir.path());

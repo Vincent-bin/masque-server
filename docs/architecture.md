@@ -334,6 +334,12 @@ After authorization and policy checks, a background task resolves and connects
 to the TCP target. Request-body bytes and target responses use bounded queues.
 The target reader waits for acknowledgement from the shard before reusing
 buffer capacity, carrying HTTP/3 flow control back to the upstream socket.
+Uploads read only as much HTTP/3 body data as the bounded target-write queue
+can hold. A full queue leaves bytes in QUIC for receive flow control; target
+writes explicitly wake the shard when capacity returns. Pending CONNECTs use
+the same byte ceiling and resume when setup and response headers complete.
+Request FIN stays behind queued uploads, and teardown waits for the target
+writer to finish even if the target half-closes its response first.
 A failure resets only the affected stream.
 
 ### CONNECT-UDP

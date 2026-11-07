@@ -71,3 +71,26 @@ transport = "http3"
 client_config = "secrets/edge-b-client.json"
 connect_ip = true
 timeout_secs = 10
+
+# Additional REQUIRED checks for listeners already configured on this host.
+# Uncomment only the combinations this host actually serves. Each table uses
+# all the same options as hosts.probe, with an explicit http2/http3 transport.
+# At most eight checks per host, including the primary and any derived legacy
+# dual-authentication certificate check. Every configured check must pass.
+# [[hosts.probes]]
+# endpoint = "proxy-b.example.com:8443"
+# transport = "http2"
+# client_config = "secrets/edge-b-client.json"
+# connect_ip = true
+#
+# [[hosts.probes]]
+# endpoint = "proxy-b.example.com:8449"
+# transport = "http3"
+# username = "probe-user"
+# password_file = "secrets/edge-b.password"
+#
+# [[hosts.probes]]
+# endpoint = "proxy-b.example.com:8449"
+# transport = "http2"
+# username = "probe-user"
+# password_file = "secrets/edge-b.password"

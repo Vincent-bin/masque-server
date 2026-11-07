@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -73,6 +73,16 @@ pub enum TcpRelayEvent {
         stream_id: u64,
         data: Bytes,
     },
+    /// A previously full client-to-target queue has capacity again.
+    Writable {
+        connection_index: u64,
+        stream_id: u64,
+    },
+    /// All request bytes and the request FIN reached the target socket.
+    WriteFinished {
+        connection_index: u64,
+        stream_id: u64,
+    },
     Eof {
         connection_index: u64,
         stream_id: u64,
@@ -92,7 +102,11 @@ impl TcpRelayEvent {
     pub(crate) fn payload_len(&self) -> usize {
         match self {
             Self::Data { data, .. } => data.len(),
-            Self::ConnectResult { .. } | Self::Eof { .. } | Self::Error { .. } => 0,
+            Self::ConnectResult { .. }
+            | Self::Writable { .. }
+            | Self::WriteFinished { .. }
+            | Self::Eof { .. }
+            | Self::Error { .. } => 0,
         }
     }
 }
@@ -131,6 +145,10 @@ impl PendingTcpTunnel {
     pub fn start_connect(&mut self, connect_task: JoinHandle<()>) {
         debug_assert!(self.connect_task.is_none());
         self.connect_task = Some(connect_task);
+    }
+
+    pub fn client_capacity(&self) -> usize {
+        MAX_BUFFERED_CLIENT_BYTES - self.early_bytes
     }
 
     pub fn buffer_client_data(&mut self, data: Vec<u8>) -> bool {
@@ -179,6 +197,8 @@ pub struct TcpTunnel {
     pub client_finished: bool,
     command_tx: mpsc::UnboundedSender<TcpCommand>,
     queued_client_bytes: Arc<AtomicUsize>,
+    client_capacity_waiter: Arc<AtomicBool>,
+    pub(crate) writer_finished: bool,
     /// Remaining target-to-client byte budget, shared with the reader task.
     response_credit: Arc<Semaphore>,
     reader_task: Option<JoinHandle<()>>,
@@ -197,6 +217,8 @@ impl TcpTunnel {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let queued_client_bytes = Arc::new(AtomicUsize::new(0));
         let writer_queued_bytes = Arc::clone(&queued_client_bytes);
+        let client_capacity_waiter = Arc::new(AtomicBool::new(false));
+        let writer_capacity_waiter = Arc::clone(&client_capacity_waiter);
         let writer_event_tx = event_tx.clone();
 
         let writer_task = tokio::spawn(async move {
@@ -205,7 +227,10 @@ impl TcpTunnel {
                     TcpCommand::Data(data) => {
                         let len = data.len();
                         let result = writer.write_all(&data).await;
-                        writer_queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                        // Release the allocation before advertising capacity;
+                        // sending the wakeup can await a full shard channel.
+                        drop(data);
+                        writer_queued_bytes.fetch_sub(len, Ordering::SeqCst);
                         if let Err(error) = result {
                             let _ = writer_event_tx
                                 .send(TcpRelayEvent::Error {
@@ -216,6 +241,21 @@ impl TcpTunnel {
                                 .await;
                             return;
                         }
+                        // Only a full queue arms this notification. Awaiting
+                        // the bounded shard channel cannot block the shard,
+                        // and coalesces a batch of writes into one wakeup.
+                        if writer_capacity_waiter.load(Ordering::SeqCst)
+                            && writer_capacity_waiter.swap(false, Ordering::SeqCst)
+                            && writer_event_tx
+                                .send(TcpRelayEvent::Writable {
+                                    connection_index,
+                                    stream_id,
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
                     }
                     TcpCommand::Finish => {
                         if let Err(error) = writer.shutdown().await {
@@ -224,6 +264,13 @@ impl TcpTunnel {
                                     connection_index,
                                     stream_id,
                                     reason: format!("target TCP shutdown failed: {error}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = writer_event_tx
+                                .send(TcpRelayEvent::WriteFinished {
+                                    connection_index,
+                                    stream_id,
                                 })
                                 .await;
                         }
@@ -324,10 +371,26 @@ impl TcpTunnel {
             client_finished: false,
             command_tx,
             queued_client_bytes,
+            client_capacity_waiter,
+            writer_finished: false,
             response_credit,
             reader_task: Some(reader_task),
             writer_task: Some(writer_task),
         }
+    }
+
+    /// Bytes the shard may take from HTTP/3 without dropping reliable data.
+    /// The shard is the sole producer; the writer can only free this capacity.
+    pub fn client_capacity(&self) -> usize {
+        let queued = self.queued_client_bytes.load(Ordering::Acquire);
+        if queued < MAX_BUFFERED_CLIENT_BYTES {
+            return MAX_BUFFERED_CLIENT_BYTES - queued;
+        }
+        // Arm before rechecking. Sequential consistency with the writer's
+        // decrement and swap ensures either this read sees freed capacity or
+        // the writer sees our waiter: capacity cannot be lost between them.
+        self.client_capacity_waiter.store(true, Ordering::SeqCst);
+        MAX_BUFFERED_CLIENT_BYTES - self.queued_client_bytes.load(Ordering::SeqCst)
     }
 
     pub fn queue_client_data(&mut self, data: Vec<u8>) -> bool {
@@ -394,7 +457,7 @@ impl TcpTunnel {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.client_finished && self.response_finished
+        self.writer_finished && self.response_finished
     }
 
     pub fn is_idle(&self, timeout: Duration) -> bool {
@@ -737,8 +800,94 @@ mod tests {
         let task = tokio::spawn(std::future::pending());
         let mut pending = PendingTcpTunnel::staging(0);
         pending.start_connect(task);
-        assert!(pending.buffer_client_data(vec![0; MAX_BUFFERED_CLIENT_BYTES]));
+        assert_eq!(pending.client_capacity(), MAX_BUFFERED_CLIENT_BYTES);
+        assert!(pending.buffer_client_data(vec![0; MAX_BUFFERED_CLIENT_BYTES - 1]));
+        assert_eq!(pending.client_capacity(), 1);
+        assert!(pending.buffer_client_data(vec![0]));
+        assert_eq!(pending.client_capacity(), 0);
         assert!(!pending.buffer_client_data(vec![0]));
+        assert_eq!(pending.early_bytes, MAX_BUFFERED_CLIENT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn full_upload_queue_wakes_once_and_preserves_fin_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, target) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (mut target, _) = target.unwrap();
+        let (events, mut receiver) = mpsc::channel(8);
+        let mut tunnel = TcpTunnel::from_stream(7, 4, address, client.unwrap(), events);
+        assert!(tunnel.queue_client_data(vec![0x5a; MAX_BUFFERED_CLIENT_BYTES - 1]));
+        assert_eq!(tunnel.client_capacity(), 1);
+        assert!(tunnel.queue_client_data(vec![0x5a]));
+        for _ in 0..8 {
+            assert_eq!(tunnel.client_capacity(), 0);
+        }
+        assert!(!tunnel.queue_client_data(vec![0]));
+        tunnel.finish_client();
+        tunnel.response_finished = true;
+        assert!(
+            !tunnel.is_complete(),
+            "queued FIN is not a completed socket write"
+        );
+        let target_reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            target.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, vec![0x5a; MAX_BUFFERED_CLIENT_BYTES]);
+            // Keep the target response open so only writer events are observed.
+            (received, target)
+        });
+        let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            TcpRelayEvent::Writable {
+                connection_index: 7,
+                stream_id: 4
+            }
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            TcpRelayEvent::WriteFinished {
+                connection_index: 7,
+                stream_id: 4
+            }
+        ));
+        assert_eq!(tunnel.client_capacity(), MAX_BUFFERED_CLIENT_BYTES);
+        tunnel.writer_finished = true;
+        assert!(tunnel.is_complete());
+        assert!(
+            receiver.try_recv().is_err(),
+            "capacity notifications must coalesce"
+        );
+        let _target = target_reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_full_upload_aborts_both_relay_tasks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, target) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (mut target, _) = target.unwrap();
+        let (events, mut receiver) = mpsc::channel(1);
+        let mut tunnel = TcpTunnel::from_stream(7, 4, address, client.unwrap(), events);
+        assert!(tunnel.queue_client_data(vec![0x5a; MAX_BUFFERED_CLIENT_BYTES]));
+        assert_eq!(tunnel.client_capacity(), 0);
+        let reader = tunnel.reader_task.as_ref().unwrap().abort_handle();
+        let writer = tunnel.writer_task.as_ref().unwrap().abort_handle();
+        // Current-thread runtime: neither background task has run yet.
+        drop(tunnel);
+        tokio::task::yield_now().await;
+        assert!(reader.is_finished());
+        assert!(writer.is_finished());
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(target.read(&mut [0; 1]).await.unwrap(), 0);
     }
 
     /// Build a tunnel over a connected socket pair so the response queue can be

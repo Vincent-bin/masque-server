@@ -93,7 +93,32 @@ The AI should let the operator enter secrets locally rather than requesting
 them in conversation. See `configure-probe --help` and the operations guide.
 
 A host's optional `[hosts.probe]` runs `masque-probe` on the administration
-machine after a deployment. Basic authentication uses `username` plus a
+machine after a deployment. Add `[[hosts.probes]]` tables for other required
+authentication/endpoint/transport combinations. They use the same fields as
+`[hosts.probe]`, but require an explicit `transport = "http2"` or `"http3"`.
+The legacy primary table remains optional and accepts `"auto"` for compatibility;
+an auto probe verifies only the selected transport, not both transports.
+
+At most eight probes are allowed per host, including the primary and any
+legacy dual-certificate check. All are required, run sequentially with bounded
+per-process timeouts, and stop on the first failure. The CLI validates every
+profile's local credentials before deploying. Bootstrap, upgrade, already-current
+verification, explicit rollback, and automatic recovery run the same checks.
+A failed recovery probe requires manual investigation even if the old binary
+is running. Output lists sanitized per-profile results in configuration order
+without endpoints, usernames, or credential paths; a single probe retains the
+existing output shape. `plan` reports `required_probe_count`.
+
+New dual-authentication inventories persist a certificate entry in
+`[[hosts.probes]]`, so it survives removing the one-time bootstrap table.
+Older inventories with `bootstrap.verify_dual = true` automatically retain the
+derived certificate check for upgrades and rollbacks. Before removing that
+bootstrap table, the operator must preserve the certificate check explicitly
+in `[[hosts.probes]]`. An identical explicit profile is not run twice as a
+derived check. The CLI never discovers or changes remote listeners; declare
+every required H2/H3 endpoint and credential combination in the private inventory.
+
+Basic authentication uses `username` plus a
 `password_file`; the password file is connected directly to probe stdin and is
 never placed in the process arguments or parsed by `masque-ops`. Certificate
 authentication uses `client_config`. A rollout normally requires a probe for

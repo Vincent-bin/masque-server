@@ -46,6 +46,12 @@ mod ip_uri;
 #[path = "client_cert_connect_ip/ip_fragments.rs"]
 mod ip_fragments;
 
+#[path = "client_cert_connect_ip/tcp_backpressure.rs"]
+mod tcp_backpressure;
+
+#[path = "client_cert_connect_ip/udp_capsules.rs"]
+mod udp_capsules;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const CLIENT_IPV4: &str = "10.89.0.2";
 const CLIENT_IPV6: &str = "fd00:abcd::2";
@@ -1958,6 +1964,78 @@ fn http3_ip_capsules_preserve_setup_and_isolate_malformed_streams() {
         client.capsules(stream_id, 2, Duration::from_secs(5)).len(),
         2
     );
+}
+
+#[test]
+fn http3_ip_separate_fin_rejects_truncated_capsules_and_releases_leases() {
+    use masque::capsule::{AssignedAddress, encoder};
+    let fixture = fixture("ip-capsules-separate-fin");
+    let mut client =
+        Client::connect(fixture.peer, &fixture.client_cert, &fixture.client_key).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    // An incomplete type and an incomplete known IP control value exercise
+    // both header and buffered-value states in the CONNECT-IP decoder.
+    for tail in [vec![0xff], vec![2, 8, 1, 4, 0]] {
+        let stream = client.send_connect_ip("connect-ip").unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        let setup = client.capsules(stream, 2, Duration::from_secs(5));
+        assert_eq!(
+            setup.len(),
+            2,
+            "the previous stream must release its pinned leases"
+        );
+        let mut wire = Vec::new();
+        encoder::encode(
+            &CapsuleFrame::AddressRequest(vec![AssignedAddress {
+                request_id: 1,
+                ip: IpAddress::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_len: 32,
+            }]),
+            &mut wire,
+        );
+        wire.extend(tail);
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &wire, false)
+            .unwrap();
+        client.flush().unwrap();
+        // This response proves that the same body read containing the partial
+        // tail has completed before FIN is sent in a later packet.
+        let replies = client.capsules(stream, 1, Duration::from_secs(5));
+        let [CapsuleFrame::AddressAssign(assigned)] = replies.as_slice() else {
+            panic!("missing ADDRESS_REQUEST reply: {replies:?}")
+        };
+        assert!(assigned.iter().any(|entry| entry.request_id == 1
+            && entry.ip == IpAddress::V4(CLIENT_IPV4.parse().unwrap())));
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &[], true)
+            .unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            client.stream_reset(stream),
+            quiche::h3::WireErrorCode::MessageError as u64
+        );
+        assert!(client.quic.peer_error().is_none());
+    }
+    let stream = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert_eq!(client.capsules(stream, 2, Duration::from_secs(5)).len(), 2);
 }
 
 #[test]

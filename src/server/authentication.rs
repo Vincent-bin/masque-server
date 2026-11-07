@@ -271,14 +271,16 @@ impl Shard {
 
                 // Body bytes stayed unread while the password verified; take
                 // them now that bounded tunnel storage exists.
-                if !Self::relay_tcp_request_body(
+                if Self::relay_tcp_request_body(
                     h3,
                     &mut client.quic,
                     stream_id,
                     &mut client.pending_tcp_tunnels,
                     &mut client.tcp_tunnels,
-                ) {
-                    warn!(stream_id, "early CONNECT body exceeded its buffer");
+                )
+                .is_err()
+                {
+                    warn!(stream_id, "failed to relay early CONNECT body");
                     Self::reset_tcp_stream(client, stream_id);
                     return;
                 }
@@ -301,6 +303,7 @@ impl Shard {
         }
 
         self.apply_connect_setups(connection_index, pending_setups);
+        self.resume_tcp_request_body(connection_index, stream_id);
     }
 }
 

@@ -13,8 +13,8 @@ use tracing::{debug, info, warn};
 use super::ConnectionContext;
 use super::request::CAPSULE_PROTOCOL;
 use super::support::{Activity, TunnelMetricsGuard, send_data, send_error, wait_until_idle};
-use crate::capsule::decoder::CapsuleDecoder;
-use crate::capsule::{CapsuleFrame, encoder};
+use crate::capsule::datagram::DatagramCapsules;
+use crate::capsule::encoder;
 use crate::tunnel::udp::connect_udp_target;
 use crate::uri::UdpTarget;
 use crate::varint;
@@ -67,17 +67,16 @@ pub(super) async fn serve(
     let activity = Arc::new(Activity::new());
     // QUIC varints may encode Context ID zero in 1, 2, 4, or 8 bytes. Keep
     // framing headroom separate from the decoded UDP payload limit below.
-    let mut decoder = CapsuleDecoder::with_max_capsule_size(max_payload + 8);
+    // As on HTTP/3, unknown capsule values are discarded incrementally, with
+    // no allocation or datagram-size restriction (RFC 9297 Section 3.2).
+    let mut decoder = DatagramCapsules::new(max_payload + 8);
 
     let client_to_target = async {
         while let Some(chunk) = body.data().await {
             let chunk = chunk?;
-            let frames = decoder.decode(&chunk)?;
+            let datagrams = decoder.decode(&chunk)?;
             body.flow_control().release_capacity(chunk.len())?;
-            for frame in frames {
-                let CapsuleFrame::Datagram(payload) = frame else {
-                    continue;
-                };
+            for payload in datagrams {
                 let (context_id, context_len) = varint::decode(&payload)
                     .map_err(|_| anyhow::anyhow!("DATAGRAM capsule has no Context ID"))?;
                 if context_id != 0 {
@@ -94,8 +93,8 @@ pub(super) async fn serve(
                 activity.touch();
             }
         }
-        if decoder.buffered() != 0 {
-            anyhow::bail!("request ended with a truncated DATAGRAM capsule");
+        if decoder.is_partial() {
+            anyhow::bail!("request ended with a truncated capsule");
         }
         Ok::<_, anyhow::Error>(())
     };

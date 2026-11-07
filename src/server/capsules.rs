@@ -328,6 +328,14 @@ impl Shard {
         stream_id: u64,
         reset: bool,
     ) {
+        // FIN may arrive in its own event after the last body read. Validate
+        // input here as well so every close path rejects a truncated capsule,
+        // regardless of packet timing or whether this is UDP or CONNECT-IP.
+        let reset = reset
+            || client
+                .capsule_streams
+                .get(&stream_id)
+                .is_some_and(|stream| stream.decoder.is_partial());
         let partial = client
             .capsule_streams
             .get(&stream_id)
