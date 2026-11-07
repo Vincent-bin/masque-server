@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.15 - 2026-11-07
+
+### Fixed
+
+- Close HTTP/3 CONNECT-UDP streams when their target receive task fails and
+  release the associated tunnel resources.
+- Retry flow-control-blocked HTTP/3 error responses and preserve their original
+  status and bounded lifetime.
+- Preserve HTTP/3 UDP and IP tunnel setup and control replies across request
+  FIN, authentication, and response flow-control delays.
+- Discard native HTTP datagrams received after request EOF while preserving
+  complete capsules and bounded early input for open requests.
+
 ## 0.14.14 - 2026-11-07
 
 ### Fixed
