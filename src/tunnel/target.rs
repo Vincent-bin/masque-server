@@ -116,7 +116,13 @@ where
         });
     }
 
-    if !unique.iter().all(|address| policy.is_allowed(address.ip())) {
+    // Unspecified destinations are not remote targets: some kernels route
+    // them to loopback, bypassing a CIDR deny for 127.0.0.0/8 or ::1/128.
+    // Reject them even with an unrestricted policy, including mapped IPv4
+    // spellings and every address in a DNS snapshot, before opening a socket.
+    if !unique.iter().all(|address| {
+        !address.ip().to_canonical().is_unspecified() && policy.is_allowed(address.ip())
+    }) {
         return Err(TargetSetupFailure {
             status: 403,
             reason: "target denied by policy".into(),
@@ -235,5 +241,78 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(resolved.addresses(), &["192.0.2.20:8443".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn unspecified_literals_are_rejected_even_with_an_unrestricted_policy() {
+        let target_policy = policy(&["0.0.0.0/0", "::/0"], &[]);
+        for host in [
+            "0.0.0.0",
+            "::",
+            "0:0:0:0:0:0:0:0",
+            "::ffff:0.0.0.0",
+            "::ffff:0:0",
+        ] {
+            let error = resolve_allowed_with(
+                host,
+                443,
+                &target_policy,
+                Instant::now() + Duration::from_secs(1),
+                |_, _| -> future::Ready<std::io::Result<Vec<SocketAddr>>> {
+                    panic!("IP literal must not enter the resolver")
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status, 403, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unspecified_dns_answers_fail_the_complete_snapshot_closed() {
+        let target_policy = policy(&["0.0.0.0/0", "::/0"], &[]);
+        let allowed: SocketAddr = "192.0.2.10:443".parse().unwrap();
+        for unspecified in ["0.0.0.0:443", "[::]:443", "[::ffff:0.0.0.0]:443"] {
+            let unspecified: SocketAddr = unspecified.parse().unwrap();
+            for answers in [
+                vec![unspecified],
+                vec![allowed, unspecified],
+                vec![unspecified, allowed],
+            ] {
+                let error = resolve_allowed_with(
+                    "unspecified.test",
+                    443,
+                    &target_policy,
+                    Instant::now() + Duration::from_secs(1),
+                    move |_, _| future::ready(Ok(answers)),
+                )
+                .await
+                .unwrap_err();
+
+                assert_eq!(error.status, 403, "{unspecified}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concrete_loopback_targets_remain_available_when_explicitly_allowed() {
+        let target_policy = policy(&["127.0.0.0/8", "::1/128"], &[]);
+        let addresses: Vec<SocketAddr> = ["127.0.0.1:443", "[::1]:443", "[::ffff:127.0.0.1]:443"]
+            .into_iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        let answers = addresses.clone();
+        let resolved = resolve_allowed_with(
+            "loopback.test",
+            443,
+            &target_policy,
+            Instant::now() + Duration::from_secs(1),
+            move |_, _| future::ready(Ok(answers)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.addresses(), addresses.as_slice());
     }
 }

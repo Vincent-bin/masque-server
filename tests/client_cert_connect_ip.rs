@@ -1789,7 +1789,7 @@ fn blocked_tcp_connect_response_keeps_target_until_client_reset() {
 }
 
 #[test]
-fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http3() {
+fn local_target_aliases_cannot_bypass_tcp_or_udp_policy_over_http3() {
     let dir = TempDir::new("mapped-policy");
     let key = p256_key();
     let (cert, key) = write_pem(
@@ -1819,8 +1819,19 @@ fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http3() {
     let mut client = Client::connect_anonymous(peer).unwrap();
     client.handshake(Duration::from_secs(5)).unwrap();
     client.init_h3().unwrap();
+    let mut early_datagram = Vec::new();
+    masque::capsule::encoder::encode_datagram_context_zero(
+        b"must not reach loopback",
+        &mut early_datagram,
+    );
 
-    for host in ["127.0.0.1", "::ffff:127.0.0.1"] {
+    for host in [
+        "127.0.0.1",
+        "::ffff:127.0.0.1",
+        "0.0.0.0",
+        "::",
+        "::ffff:0.0.0.0",
+    ] {
         let target = SocketAddr::new(
             host.parse().unwrap(),
             tcp_target.local_addr().unwrap().port(),
@@ -1843,13 +1854,21 @@ fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http3() {
             quiche::h3::Header::new(b":path", path.as_bytes()),
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
         ];
-        for headers in [tcp, udp] {
+        for (headers, send_datagram) in [(tcp, false), (udp, true)] {
             let stream_id = client
                 .h3
                 .as_mut()
                 .unwrap()
                 .send_request(&mut client.quic, &headers, false)
                 .unwrap();
+            if send_datagram {
+                client
+                    .h3
+                    .as_mut()
+                    .unwrap()
+                    .send_body(&mut client.quic, stream_id, &early_datagram, false)
+                    .unwrap();
+            }
             client.flush().unwrap();
             assert_eq!(
                 client
@@ -1860,6 +1879,17 @@ fn ipv4_mapped_targets_cannot_bypass_tcp_or_udp_policy_over_http3() {
             );
         }
     }
+    tcp_target.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        tcp_target.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    udp_target.set_nonblocking(true).unwrap();
+    let mut packet = [0u8; 64];
+    assert!(matches!(
+        udp_target.recv(&mut packet),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
 }
 
 #[test]
