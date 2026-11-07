@@ -271,3 +271,70 @@ fn credentials_in_later_headers_cannot_authorize_an_initially_unauthenticated_re
     );
     assert_eq!(accept_count(&mut client, &target), 0);
 }
+
+#[test]
+fn malformed_authority_and_path_are_rejected_before_basic_authentication() {
+    let (_dir, mut client, target) = fixture(true);
+
+    for authority in [
+        "localhost",
+        "localhost:",
+        "localhost:tcp",
+        "localhost%XX:443",
+        "[not-an-ipv6-address]:443",
+        "::1:443",
+        "user@localhost:443",
+        "localhost/path:443",
+    ] {
+        let mut headers = tcp_headers(&target, false);
+        headers[1] = quiche::h3::Header::new(b":authority", authority.as_bytes());
+        let stream = request(&mut client, &headers);
+        expect_reset(&mut client, stream);
+    }
+
+    for (authority, path) in [
+        ("localhost/invalid", "/"),
+        ("localhost:bad", "/"),
+        ("localhost", "/with space"),
+        ("localhost", "/fragment#part"),
+        ("localhost", "/invalid%XY"),
+        ("localhost", "/back\\slash"),
+        ("localhost", "/non-ascii/é"),
+        ("localhost", "//ambiguous/path"),
+    ] {
+        let headers = [
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", authority.as_bytes()),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+        ];
+        let stream = request(&mut client, &headers);
+        expect_reset(&mut client, stream);
+    }
+
+    // Valid authority and percent-encoded path/query syntax still reach the
+    // ordinary authentication boundary on the same connection.
+    let valid = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"[::1]:443"),
+        quiche::h3::Header::new(b":path", b"/valid%20path?q=%23&k=a/b?c"),
+    ];
+    let stream = request(&mut client, &valid);
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(2))
+            .unwrap(),
+        404
+    );
+    let stream = request(&mut client, &tcp_headers(&target, true));
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(2))
+            .unwrap(),
+        200
+    );
+    accept_one(&mut client, &target);
+}

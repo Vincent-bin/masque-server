@@ -11,11 +11,17 @@ fn close_idle_stream(
     reset: bool,
 ) {
     if !reset && h3.is_some_and(|h3| h3.send_body(quic, stream_id, b"", true).is_ok()) {
-        return;
+        // The response FIN only ends one half of a bidirectional stream.
+        let _ = quic.stream_shutdown(
+            stream_id,
+            quiche::Shutdown::Read,
+            quiche::h3::WireErrorCode::NoError as u64,
+        );
+    } else {
+        let code = quiche::h3::WireErrorCode::RequestCancelled as u64;
+        let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+        let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
     }
-    let code = quiche::h3::WireErrorCode::RequestCancelled as u64;
-    let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
-    let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
 }
 
 impl Shard {

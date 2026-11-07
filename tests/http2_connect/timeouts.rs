@@ -624,3 +624,99 @@ async fn first_basic_auth_deadline_releases_active_unauthenticated_connection() 
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
 }
+
+#[test]
+fn reset_during_target_setup_releases_the_tunnel_slot() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let files = TestFiles::new();
+            let mut config = http2_config(&files);
+            config.server.max_tunnels_per_connection = 1;
+            config.tcp_proxy.connect_timeout_secs = 15;
+            config.udp_proxy.connect_timeout_secs = 15;
+            let server = ObservedServer::bind(config).await;
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = target.local_addr().unwrap();
+
+            // Keep the sole blocking worker busy so hostname resolution in
+            // the real target setup cannot finish. The replacement uses a
+            // numeric address and needs no blocking worker.
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = hold.recv();
+            });
+            waiting.await.unwrap();
+
+            let connect = |authority: &str| {
+                Request::builder()
+                    .method(Method::CONNECT)
+                    .uri(authority)
+                    .body(())
+                    .unwrap()
+            };
+            let mut udp = Request::builder()
+                .method(Method::CONNECT)
+                .uri(format!(
+                    "https://localhost/.well-known/masque/udp/localhost/{}/",
+                    addr.port()
+                ))
+                .header("capsule-protocol", "?1")
+                .body(())
+                .unwrap();
+            udp.extensions_mut()
+                .insert(h2::ext::Protocol::from_static("connect-udp"));
+
+            for request in [connect(&format!("localhost:{}", addr.port())), udp] {
+                let (mut client, driver) = connect_h2(server.addr).await;
+                let _driver = AbortOnDrop(driver);
+                let (mut waiting, mut stream) = client.send_request(request, false).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), &mut waiting)
+                        .await
+                        .is_err(),
+                    "target setup was not pending"
+                );
+
+                let (limited, _) = client
+                    .send_request(connect(&addr.to_string()), true)
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::timeout(IO_TIMEOUT, limited)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+                stream.send_reset(h2::Reason::CANCEL);
+                tokio::time::timeout(IO_TIMEOUT, async {
+                    loop {
+                        let (replacement, _) = client
+                            .send_request(connect(&addr.to_string()), true)
+                            .unwrap();
+                        let status = replacement.await.unwrap().status();
+                        if status == StatusCode::OK {
+                            break;
+                        }
+                        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("reset did not release the tunnel slot before the setup timeout");
+                tokio::time::timeout(IO_TIMEOUT, target.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+
+            drop(release);
+            worker.await.unwrap();
+        });
+}

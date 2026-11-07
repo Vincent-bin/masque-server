@@ -12,7 +12,9 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::{info, warn};
 
 use super::ConnectionContext;
-use super::support::{Activity, TunnelMetricsGuard, send_data, send_error, wait_until_idle};
+use super::support::{
+    Activity, TunnelMetricsGuard, send_data, send_error, until_reset, wait_until_idle,
+};
 use crate::tunnel::tcp::{TcpSetupFailure, resolve_and_connect};
 use crate::uri::TcpTarget;
 
@@ -26,14 +28,16 @@ pub(super) async fn serve(
     context: ConnectionContext,
     _tunnel_slot: OwnedSemaphorePermit,
 ) -> anyhow::Result<()> {
-    let (stream, target_addr) = match resolve_and_connect(
+    let setup = resolve_and_connect(
         target,
         &context.tcp_policy,
         Duration::from_secs(context.config.tcp_proxy.connect_timeout_secs),
         &context.resolver,
-    )
-    .await
-    {
+    );
+    let Some(result) = until_reset(&mut respond, setup).await else {
+        return Ok(());
+    };
+    let (stream, target_addr) = match result {
         Ok(connected) => connected,
         Err(TcpSetupFailure { status, reason }) => {
             warn!(stream_id, %reason, "HTTP/2 TCP target setup failed");

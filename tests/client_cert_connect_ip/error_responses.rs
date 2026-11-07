@@ -1,10 +1,6 @@
 use super::*;
 
-fn error_client(
-    mut config: ServerConfig,
-    stream_window: u64,
-    connection_window: u64,
-) -> (TempDir, Client) {
+fn error_server(mut config: ServerConfig) -> (TempDir, SocketAddr, Option<SocketAddr>) {
     let dir = TempDir::new("error-response-credit");
     let key = p256_key();
     let (cert, key) = write_pem(
@@ -21,7 +17,16 @@ fn error_client(
     config.tcp_proxy.deny_targets.clear();
     config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
     config.udp_proxy.deny_targets.clear();
-    let peer = spawn_server(config)[0];
+    let (peers, metrics) = spawn_server_with_observability(config);
+    (dir, peers[0], metrics)
+}
+
+fn error_client(
+    config: ServerConfig,
+    stream_window: u64,
+    connection_window: u64,
+) -> (TempDir, Client) {
+    let (dir, peer, _) = error_server(config);
     let mut client = Client::connect_with_windows(
         peer,
         None,
@@ -460,12 +465,15 @@ fn idle_tunnels_close_while_connection_credit_is_exhausted() {
     while !pending.is_empty() && Instant::now() < deadline {
         // Keep the bulk tunnel alive without reading its response. If it
         // resets too, discarding its buffered bytes can restore QUIC credit.
-        client
+        match client
             .h3
             .as_mut()
             .unwrap()
             .send_body(&mut client.quic, bulk, b"x", false)
-            .unwrap();
+        {
+            Ok(_) | Err(quiche::h3::Error::Done) => {}
+            Err(error) => panic!("bulk keepalive failed: {error}"),
+        }
         client.drive().unwrap();
         while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
             if pending.contains(&id) {
@@ -498,29 +506,65 @@ fn idle_tunnels_close_while_connection_credit_is_exhausted() {
 
 #[test]
 fn first_basic_auth_has_a_fixed_quic_deadline() {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    const AUTH_WINDOW: Duration = Duration::from_secs(3);
     let mut config = ServerConfig::default();
-    config.server.idle_timeout_secs = 1;
+    config.server.idle_timeout_secs = AUTH_WINDOW.as_secs();
+    config.observability.listen_addr = Some(ephemeral_addr());
     config.listeners[0].auth.username = BASIC_USERNAME.into();
-    config.listeners[0].auth.password_hash =
-        masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap();
-    let (_dir, mut client) = error_client(config, 32768, 1_048_576);
-    let peer = client.socket.peer_addr().unwrap();
+    // Exercise a cold verification without making this deadline test depend
+    // on production Argon2 cost under concurrent debug test load.
+    let salt = SaltString::encode_b64(b"auth-deadline-test").unwrap();
+    config.listeners[0].auth.password_hash = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(64, 1, 1, None).unwrap(),
+    )
+    .hash_password(BASIC_PASSWORD.as_bytes(), &salt)
+    .unwrap()
+    .to_string();
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while client.quic.peer_error().is_none() && Instant::now() < deadline {
-        client.quic.send_ack_eliciting().unwrap();
-        client.drive().unwrap();
-        std::thread::sleep(Duration::from_millis(80));
-    }
-    assert!(
-        client.quic.peer_error().is_some(),
-        "keepalive extended the first Basic auth deadline"
+    let (_dir, peer, metrics) = error_server(config);
+    let metrics = metrics.unwrap();
+    let active = || metric_total(&scrape_metrics(metrics), "masque_connections_active{");
+    let mut client = Client::connect_anonymous(peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    assert_eq!(active(), 1);
+
+    let check = unsupported(&mut client, true);
+    assert_eq!(
+        client
+            .response_status(check, Duration::from_secs(2))
+            .unwrap(),
+        404
     );
-
     let credentials = format!(
         "Basic {}",
         STANDARD.encode(format!("{BASIC_USERNAME}:{BASIC_PASSWORD}"))
     );
+
+    // The authentication deadline prevents new requests from being admitted
+    // even while QUIC retains the connection for its PTO-based drain period.
+    let late = Instant::now() + AUTH_WINDOW + Duration::from_millis(200);
+    while client.quic.peer_error().is_none() && Instant::now() < late {
+        client.quic.send_ack_eliciting().unwrap();
+        client.drive().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if client.quic.peer_error().is_none() && active() != 0 {
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", Some(&credentials))
+            .unwrap();
+        let response = client.response_status(stream, Duration::from_secs(3));
+        assert!(
+            response.is_err(),
+            "a late request received a response: {response:?}"
+        );
+    }
+
     // A fresh connection exercises cold authentication first and the shared
     // credential cache on the next connection.
     for _ in 0..2 {
@@ -536,7 +580,7 @@ fn first_basic_auth_has_a_fixed_quic_deadline() {
                 .unwrap(),
             200
         );
-        let deadline = Instant::now() + Duration::from_millis(1500);
+        let deadline = Instant::now() + AUTH_WINDOW + Duration::from_millis(200);
         while Instant::now() < deadline {
             client.quic.send_ack_eliciting().unwrap();
             client.drive().unwrap();
@@ -550,4 +594,190 @@ fn first_basic_auth_has_a_fixed_quic_deadline() {
             404
         );
     }
+}
+
+#[test]
+fn idle_tunnels_release_the_bidirectional_stream_slot() {
+    let mut config = unauthenticated_config();
+    config.server.idle_timeout_secs = 1;
+    config.quic.initial_max_streams_bidi = 1;
+    let (_dir, mut client) = error_client(config, 262_144, 1_048_576);
+    let target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    let udp_target = UdpSocket::bind(ephemeral_addr()).unwrap();
+    let udp_path = format!(
+        "/.well-known/masque/udp/127.0.0.1/{}/",
+        udp_target.local_addr().unwrap().port()
+    );
+
+    for protocol in ["tcp", "udp", "ip"] {
+        let stream = match protocol {
+            "tcp" => tcp(
+                &mut client,
+                &target.local_addr().unwrap().to_string(),
+                false,
+            ),
+            "udp" => send(
+                &mut client,
+                &[
+                    quiche::h3::Header::new(b":method", b"CONNECT"),
+                    quiche::h3::Header::new(b":protocol", b"connect-udp"),
+                    quiche::h3::Header::new(b":scheme", b"https"),
+                    quiche::h3::Header::new(b":authority", b"localhost"),
+                    quiche::h3::Header::new(b":path", udp_path.as_bytes()),
+                ],
+                false,
+            ),
+            _ => client.send_connect_ip("connect-ip").unwrap(),
+        };
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(2))
+                .unwrap(),
+            200
+        );
+        assert_eq!(client.quic.peer_streams_left_bidi(), 0);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut finished = false;
+        let mut body = [0; 1024];
+        while Instant::now() < deadline && !(finished && client.quic.peer_streams_left_bidi() > 0) {
+            client.quic.send_ack_eliciting().unwrap();
+            client.drive().unwrap();
+            let h3 = client.h3.as_mut().unwrap();
+            while let Ok((id, event)) = h3.poll(&mut client.quic) {
+                if id != stream {
+                    continue;
+                }
+                match event {
+                    quiche::h3::Event::Data => {
+                        while h3.recv_body(&mut client.quic, id, &mut body).is_ok() {}
+                    }
+                    quiche::h3::Event::Finished => finished = true,
+                    other => panic!("unexpected idle {protocol} event: {other:?}"),
+                }
+            }
+        }
+        assert!(finished, "idle {protocol} response did not finish");
+        assert_eq!(
+            client.quic.peer_streams_left_bidi(),
+            1,
+            "idle {protocol} request held the stream slot"
+        );
+    }
+}
+
+#[test]
+fn stop_sending_releases_silent_tcp_tunnel_before_admission() {
+    assert_stop_sending_releases_silent_tcp_tunnel(false);
+}
+
+#[test]
+fn stop_sending_with_fin_releases_silent_tcp_tunnel_before_admission() {
+    assert_stop_sending_releases_silent_tcp_tunnel(true);
+}
+
+fn assert_stop_sending_releases_silent_tcp_tunnel(with_fin: bool) {
+    use std::io::Read as _;
+
+    let mut config = unauthenticated_config();
+    config.server.max_tunnels_per_connection = 1;
+    let (_dir, mut client) = error_client(config, 262_144, 1_048_576);
+    let target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    let authority = target.local_addr().unwrap().to_string();
+    let first = tcp(&mut client, &authority, false);
+    assert_eq!(
+        client
+            .response_status(first, Duration::from_secs(2))
+            .unwrap(),
+        200
+    );
+    let (mut first_target, _) = target.accept().unwrap();
+
+    // Queue FIN (when requested), STOP_SENDING and replacement HEADERS
+    // before flushing, without sending a request RESET_STREAM.
+    if with_fin {
+        client.quic.stream_send(first, b"", true).unwrap();
+    }
+    client
+        .quic
+        .stream_shutdown(
+            first,
+            quiche::Shutdown::Read,
+            quiche::h3::WireErrorCode::RequestCancelled as u64,
+        )
+        .unwrap();
+    let replacement = tcp(&mut client, &authority, false);
+    assert_eq!(
+        client
+            .response_status(replacement, Duration::from_secs(2))
+            .unwrap(),
+        200
+    );
+    first_target
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(
+        first_target.read(&mut [0]).unwrap(),
+        0,
+        "silent target was not closed"
+    );
+}
+
+#[test]
+fn malformed_initial_headers_never_open_a_target() {
+    let (_dir, mut client) = error_client(unauthenticated_config(), 262_144, 1_048_576);
+    let target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    target.set_nonblocking(true).unwrap();
+    let authority = target.local_addr().unwrap().to_string();
+    let connect = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":authority", authority.as_bytes()),
+    ];
+    let additions: &[&[(&[u8], &[u8])]] = &[
+        &[(b":method", b"CONNECT")],
+        &[(b":authority", b"localhost:443")],
+        &[(b":protocol", b"")],
+        &[(b":path", b"/")],
+        &[(b":status", b"200")],
+        &[(b"x-test", b"ok"), (b":scheme", b"https")],
+        &[(b"connection", b"keep-alive")],
+        &[(b"proxy-connection", b"keep-alive")],
+        &[(b"transfer-encoding", b"chunked")],
+        &[(b"te", b"gzip")],
+        &[(b"x-test", b"invalid\r\nvalue")],
+        &[(b"x-test", b" leading-space")],
+        &[(b"x-test", b"trailing-tab\t")],
+        &[(b"te", b"trailers ")],
+    ];
+    for addition in additions {
+        let mut headers = connect.to_vec();
+        headers.extend(
+            addition
+                .iter()
+                .map(|(name, value)| quiche::h3::Header::new(name, value)),
+        );
+        let stream = send(&mut client, &headers, false);
+        assert_eq!(
+            client.stream_reset(stream),
+            quiche::h3::WireErrorCode::MessageError as u64
+        );
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    let mut valid = connect.to_vec();
+    valid.push(quiche::h3::Header::new(b"te", b"trailers"));
+    valid.push(quiche::h3::Header::new(
+        b"x-test",
+        b"interior \t whitespace",
+    ));
+    valid.push(quiche::h3::Header::new(b"user-agent", b""));
+    let stream = send(&mut client, &valid, false);
+    assert_eq!(
+        client
+            .response_status(stream, Duration::from_secs(2))
+            .unwrap(),
+        200
+    );
+    target.accept().unwrap();
 }
