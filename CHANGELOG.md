@@ -7,6 +7,14 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.16 - 2026-11-07
+
+### Fixed
+
+- Reject repeated HTTP/3 request pseudo-headers on the same stream before
+  dispatching a second CONNECT. Cancel pending authentication and tunnel setup
+  and release active stream resources while preserving valid trailers.
+
 ## 0.14.15 - 2026-11-07
 
 ### Fixed
