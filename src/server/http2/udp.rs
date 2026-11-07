@@ -65,8 +65,9 @@ pub(super) async fn serve(
     info!(stream_id, %target_addr, transport = "http2", "UDP tunnel established");
     let _metrics = TunnelMetricsGuard::new(Arc::clone(&context.metrics), 1);
     let activity = Arc::new(Activity::new());
-    // One extra byte admits the context ID zero before the UDP payload.
-    let mut decoder = CapsuleDecoder::with_max_capsule_size(max_payload + 1);
+    // QUIC varints may encode Context ID zero in 1, 2, 4, or 8 bytes. Keep
+    // framing headroom separate from the decoded UDP payload limit below.
+    let mut decoder = CapsuleDecoder::with_max_capsule_size(max_payload + 8);
 
     let client_to_target = async {
         while let Some(chunk) = body.data().await {

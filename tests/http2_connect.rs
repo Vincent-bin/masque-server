@@ -37,6 +37,9 @@ mod ip_fragments;
 #[path = "http2_connect/timeouts.rs"]
 mod timeouts;
 
+#[path = "http2_connect/udp_capsules.rs"]
+mod udp_capsules;
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
 static SIGHUP_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
