@@ -12,7 +12,9 @@ use tracing::{debug, info, warn};
 
 use super::ConnectionContext;
 use super::request::CAPSULE_PROTOCOL;
-use super::support::{Activity, TunnelMetricsGuard, send_data, send_error, wait_until_idle};
+use super::support::{
+    Activity, TunnelMetricsGuard, send_data, send_error, until_reset, wait_until_idle,
+};
 use crate::capsule::datagram::DatagramCapsules;
 use crate::capsule::encoder;
 use crate::tunnel::udp::connect_udp_target;
@@ -32,16 +34,18 @@ pub(super) async fn serve(
     _tunnel_slot: OwnedSemaphorePermit,
 ) -> anyhow::Result<()> {
     let max_payload = context.config.http2.max_datagram_size.min(MAX_UDP_PAYLOAD);
-    let prepared = match connect_udp_target(
+    let setup = connect_udp_target(
         target,
         &context.udp_policy,
         Duration::from_secs(context.config.udp_proxy.connect_timeout_secs),
         false,
         max_payload,
         &context.resolver,
-    )
-    .await
-    {
+    );
+    let Some(result) = until_reset(&mut respond, setup).await else {
+        return Ok(());
+    };
+    let prepared = match result {
         Ok(prepared) => prepared,
         Err(failure) => {
             warn!(

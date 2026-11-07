@@ -300,6 +300,7 @@ session. A longer local parser run is:
 ```sh
 cargo +nightly install cargo-fuzz --version 0.13.2 --locked
 cargo +nightly fuzz run protocol_parsers -- -max_total_time=3600
+cargo +nightly fuzz run http3_request_headers -- -max_total_time=60
 ```
 
 Run the Linux pressure suite without ASan with:

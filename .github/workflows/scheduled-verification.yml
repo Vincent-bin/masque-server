@@ -164,3 +164,6 @@ jobs:
 
       - name: Fuzz public protocol parsers
         run: cargo +nightly fuzz run protocol_parsers -- -max_total_time=180
+
+      - name: Fuzz initial HTTP/3 request fields
+        run: cargo +nightly fuzz run http3_request_headers -- -max_total_time=60

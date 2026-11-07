@@ -5,6 +5,7 @@ pub(crate) mod capsules;
 mod http2;
 mod listener_address;
 mod request;
+mod request_headers;
 mod retry;
 mod shard_datagrams;
 mod shard_lifecycle;

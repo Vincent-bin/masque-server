@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.18 - 2026-11-07
+
+### Fixed
+
+- Stop reading idle HTTP/3 tunnel requests after finishing their responses so
+  the peer can reuse the bidirectional stream slot.
+- Release silent or connecting HTTP/3 TCP tunnels on STOP_SENDING before
+  applying the tunnel admission limit to a replacement request.
+- Cancel HTTP/2 TCP and UDP target setup on RST_STREAM and release tunnel slots.
+- Reject malformed initial HTTP/3 request fields with H3_MESSAGE_ERROR before
+  authentication or target setup, including duplicate or out-of-order
+  pseudo-headers, connection-specific fields, surrounding field whitespace,
+  and invalid authority or path syntax.
+
 ## 0.14.17 - 2026-11-07
 
 ### Fixed

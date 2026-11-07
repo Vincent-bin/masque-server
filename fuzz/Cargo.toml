@@ -20,3 +20,10 @@ bench = false
 
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "http3_request_headers"
+path = "fuzz_targets/http3_request_headers.rs"
+test = false
+doc = false
+bench = false

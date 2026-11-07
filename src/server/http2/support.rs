@@ -1,6 +1,6 @@
 //! Shared HTTP/2 stream lifecycle helpers.
 
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,18 @@ use h2::{Reason, SendStream};
 use http::{Response, StatusCode};
 
 use crate::metrics::ShardMetrics;
+
+/// Stop waiting for pre-response work when the peer resets the stream.
+pub(super) async fn until_reset<T>(
+    respond: &mut SendResponse<Bytes>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = poll_fn(|cx| respond.poll_reset(cx)) => None,
+        result = work => Some(result),
+    }
+}
 
 pub(super) async fn send_data(
     send: &mut SendStream<Bytes>,

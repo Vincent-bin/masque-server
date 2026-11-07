@@ -9,7 +9,7 @@ use crate::auth::{AuthPrecheck, BasicCredential, SharedBasicAuthenticator};
 use crate::config::ServerConfig;
 use crate::uri;
 
-use super::Shard;
+use super::{Shard, request_headers::RequestHeaders};
 
 /// The target of a CONNECT request, held while its credentials are verified.
 #[derive(Debug)]
@@ -146,30 +146,19 @@ impl Shard {
         context: &mut RequestContext<'_>,
         pending: &mut PendingConnectSetups,
     ) -> Option<PendingAuth> {
-        // One pass over the header list, borrowing the values rather than
-        // copying each one into an owned String.
-        let mut method: &[u8] = b"";
-        let mut path: &[u8] = b"";
-        let mut scheme: &[u8] = b"";
-        let mut protocol: &[u8] = b"";
-        let mut authority: &[u8] = b"";
-        let mut proxy_authorization: Option<&[u8]> = None;
-        let mut duplicate_proxy_authorization = false;
-
-        for header in headers {
-            match header.name() {
-                b":method" => method = header.value(),
-                b":path" => path = header.value(),
-                b":scheme" => scheme = header.value(),
-                b":protocol" => protocol = header.value(),
-                b":authority" => authority = header.value(),
-                b"proxy-authorization" => {
-                    duplicate_proxy_authorization |=
-                        proxy_authorization.replace(header.value()).is_some();
-                }
-                _ => {}
-            }
-        }
+        let Some(headers) =
+            RequestHeaders::parse(headers.iter().map(|header| (header.name(), header.value())))
+        else {
+            let code = quiche::h3::WireErrorCode::MessageError as u64;
+            let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+            let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+            return None;
+        };
+        let method = headers.method.unwrap_or_default();
+        let path = headers.path.unwrap_or_default();
+        let scheme = headers.scheme.unwrap_or_default();
+        let protocol = headers.protocol.unwrap_or_default();
+        let authority = headers.authority.unwrap_or_default();
 
         info!(
             stream_id,
@@ -202,13 +191,13 @@ impl Shard {
             // The cheap half runs here; only a well-formed request for the
             // configured user reaches the password hash, and that is
             // deliberately slow enough that it must not run on this thread.
-            if duplicate_proxy_authorization {
+            if headers.duplicate_proxy_authorization {
                 context.metrics.record_auth_failure();
                 warn!(stream_id, "duplicate proxy credentials");
                 Self::send_auth_rejection(h3, quic, pending_errors, stream_id);
                 return None;
             }
-            match auth.precheck(proxy_authorization) {
+            match auth.precheck(headers.proxy_authorization) {
                 AuthPrecheck::Authenticated => {
                     // A long batch of header events can cross the deadline
                     // after the shard began polling it.

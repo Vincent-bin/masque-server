@@ -1118,10 +1118,16 @@ fn status_compares_running_config_and_successful_reload_without_exposing_values(
         "basic_credentials: applied",
     ]);
     let mut raw = String::new();
-    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let stream = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    // Set the timeout before connecting. The server may write its snapshot
+    // and close immediately, which races setsockopt on macOS.
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
+    stream
+        .connect(&socket2::SockAddr::unix(&socket).unwrap())
+        .unwrap();
+    let mut stream = std::os::unix::net::UnixStream::from(stream);
     stream.read_to_string(&mut raw).unwrap();
     assert!(!raw.contains(&cfg.listeners[0].auth.username));
     assert!(!raw.contains(&cfg.listeners[0].auth.password_hash));
