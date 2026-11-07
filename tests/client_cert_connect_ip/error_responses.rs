@@ -531,25 +531,37 @@ fn first_basic_auth_has_a_fixed_quic_deadline() {
     client.init_h3().unwrap();
     assert_eq!(active(), 1);
 
-    // Measure server-side reclamation. QUIC can close silently if its
-    // transport idle timer expires before a close packet can be sent.
-    let deadline = Instant::now() + AUTH_WINDOW + Duration::from_secs(4);
-    while active() != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "keepalive extended the first Basic auth deadline"
-        );
-        if client.quic.peer_error().is_none() {
-            client.quic.send_ack_eliciting().unwrap();
-            client.drive().unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
+    let check = unsupported(&mut client, true);
+    assert_eq!(
+        client
+            .response_status(check, Duration::from_secs(2))
+            .unwrap(),
+        404
+    );
     let credentials = format!(
         "Basic {}",
         STANDARD.encode(format!("{BASIC_USERNAME}:{BASIC_PASSWORD}"))
     );
+
+    // The authentication deadline prevents new requests from being admitted
+    // even while QUIC retains the connection for its PTO-based drain period.
+    let late = Instant::now() + AUTH_WINDOW + Duration::from_millis(200);
+    while client.quic.peer_error().is_none() && Instant::now() < late {
+        client.quic.send_ack_eliciting().unwrap();
+        client.drive().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if client.quic.peer_error().is_none() && active() != 0 {
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", Some(&credentials))
+            .unwrap();
+        let response = client.response_status(stream, Duration::from_secs(3));
+        assert!(
+            response.is_err(),
+            "a late request received a response: {response:?}"
+        );
+    }
+
     // A fresh connection exercises cold authentication first and the shared
     // credential cache on the next connection.
     for _ in 0..2 {
