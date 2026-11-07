@@ -167,6 +167,8 @@ impl DeferredSend {
 pub struct ClientConnection {
     pub(crate) capsule_streams: FxHashMap<u64, crate::server::capsules::CapsuleStream>,
     pub(crate) capsule_readable: FxHashSet<u64>,
+    /// Known capsule streams with bounded local HTTP/3 framing work remaining.
+    pub(crate) capsule_read_resumes: FxHashSet<u64>,
     pub(crate) capsule_writable: FxHashSet<u64>,
     pub(crate) finished_capsules: Vec<u64>,
     pub(crate) capsule_send_bytes: usize,
@@ -245,6 +247,7 @@ impl ClientConnection {
             resolver,
             capsule_streams: FxHashMap::default(),
             capsule_readable: FxHashSet::default(),
+            capsule_read_resumes: FxHashSet::default(),
             capsule_writable: FxHashSet::default(),
             finished_capsules: Vec::new(),
             capsule_send_bytes: 0,
@@ -359,7 +362,7 @@ impl ClientConnection {
     /// The next instant this connection needs the event loop's attention:
     /// buffered framing work, quiche's timer, or a deferred packet's release.
     pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
-        if !self.tcp_read_resumes.is_empty()
+        if (!self.tcp_read_resumes.is_empty() || !self.capsule_read_resumes.is_empty())
             && self.quic.local_error().is_none()
             && !self.quic.is_draining()
             && !self.quic.is_closed()

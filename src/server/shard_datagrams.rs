@@ -3,6 +3,36 @@
 use super::*;
 
 impl Shard {
+    /// Replay bounded setup-time native input only after the initial request
+    /// body has been read and validated, and only if that request is still open.
+    pub(super) fn relay_early_udp_datagrams(
+        tunnel: &mut UdpTunnel,
+        early_datagrams: crate::tunnel::udp::EarlyUdpDatagrams,
+    ) {
+        let count = early_datagrams.len();
+        let bytes = early_datagrams.bytes();
+        for payload in early_datagrams.into_payloads() {
+            if tunnel.stage_to_target(&payload)
+                && let Err(error) = tunnel.flush_to_target()
+            {
+                debug!(stream_id = tunnel.stream_id, %error, "failed to flush early UDP datagrams");
+            }
+        }
+        if tunnel.has_staged()
+            && let Err(error) = tunnel.flush_to_target()
+        {
+            debug!(stream_id = tunnel.stream_id, %error, "failed to flush early UDP datagrams");
+        }
+        if count > 0 {
+            debug!(
+                stream_id = tunnel.stream_id,
+                datagrams = count,
+                bytes,
+                "relayed buffered early UDP datagrams"
+            );
+        }
+    }
+
     /// Relay QUIC DATAGRAMs from clients to target UDP sockets and TUN device.
     ///
     /// A connection only has datagrams to hand over after receiving a packet,
@@ -24,6 +54,13 @@ impl Shard {
             let Some(client) = self.connections.get_mut(conn_id) else {
                 continue;
             };
+
+            if client.quic.local_error().is_some()
+                || client.quic.is_draining()
+                || client.quic.is_closed()
+            {
+                continue;
+            }
 
             staged_udp_tunnels.clear();
 
@@ -66,7 +103,14 @@ impl Shard {
                 // request's receive side closes are silently discarded. QUIC
                 // retains EOF even while auth/setup or response FIN is pending.
                 // Capsules already parsed before FIN still need forwarding.
-                if capsule.is_none() && client.quic.stream_finished(dgram.stream_id) {
+                if capsule.is_none()
+                    && (client.quic.stream_finished(dgram.stream_id)
+                        || (client.capsule_streams.contains_key(&dgram.stream_id)
+                            && client.quic.stream_readable(dgram.stream_id)))
+                {
+                    // An active stream can still be draining buffered H3
+                    // framing before EOF becomes observable. Native input is
+                    // lossy: do not forward it ahead of that receive-state check.
                     continue;
                 }
 

@@ -550,7 +550,7 @@ impl Shard {
                 }
             }
         });
-        let mut tunnel = UdpTunnel::from_socket(
+        let tunnel = UdpTunnel::from_socket(
             stream_id,
             target_addr,
             send_socket,
@@ -558,28 +558,6 @@ impl Shard {
             recv_task,
             target_udp_gso,
         );
-        let early_datagram_count = early_datagrams.len();
-        let early_datagram_bytes = early_datagrams.bytes();
-        if early_datagram_count > 0 {
-            for payload in early_datagrams.into_payloads() {
-                if tunnel.stage_to_target(&payload)
-                    && let Err(error) = tunnel.flush_to_target()
-                {
-                    debug!(stream_id, %error, "failed to flush early UDP datagrams");
-                }
-            }
-            if tunnel.has_staged()
-                && let Err(error) = tunnel.flush_to_target()
-            {
-                debug!(stream_id, %error, "failed to flush early UDP datagrams");
-            }
-            debug!(
-                stream_id,
-                datagrams = early_datagram_count,
-                bytes = early_datagram_bytes,
-                "relayed buffered early UDP datagrams"
-            );
-        }
         info!(
             stream_id,
             target = %target_addr,
@@ -589,7 +567,7 @@ impl Shard {
         client.udp_tunnels.insert(stream_id, tunnel);
         client.capsule_streams.insert(
             stream_id,
-            capsules::CapsuleStream::new(capsules::MAX_UDP_PAYLOAD),
+            capsules::CapsuleStream::new_udp(capsules::MAX_UDP_PAYLOAD, early_datagrams),
         );
         // Also run for HEADERS+FIN: there may be no future Data/Finished event
         // after async authentication/setup or a blocked 200 response.

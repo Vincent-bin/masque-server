@@ -429,3 +429,129 @@ fn headers_fin_waits_for_pending_udp_and_ip_response_credit() {
         assert_status(&response(&mut client, stream), 200);
     }
 }
+
+#[test]
+fn body_fin_during_cold_auth_never_replays_later_native_datagrams() {
+    let (_dir, mut client, target) = fixture(true);
+    for _ in 0..2 {
+        let mut capsule = Vec::new();
+        encoder::encode_datagram_context_zero(b"capsule before authentication FIN", &mut capsule);
+        let stream = send_request(
+            &mut client,
+            "connect-udp",
+            &path("connect-udp", &target),
+            Some(CREDENTIALS),
+            Some(&capsule),
+        );
+        // First iteration is cold Argon2; the second uses cached credentials.
+        // FIN/body precede this native datagram in a separate QUIC packet.
+        client
+            .quic
+            .dgram_send(
+                &DatagramHeader::new(stream)
+                    .unwrap()
+                    .encode(b"native after authentication FIN"),
+            )
+            .unwrap();
+        client.flush().unwrap();
+        assert_status(&response(&mut client, stream), 200);
+        let mut buffer = [0; 2048];
+        let count = target.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..count], b"capsule before authentication FIN");
+        target
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let error = target
+            .recv(&mut buffer)
+            .expect_err("post-FIN native input replayed after authentication");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        assert!(client.quic.peer_error().is_none());
+    }
+}
+
+#[test]
+fn pending_ip_body_fin_after_empty_frames_drains_complete_control_replies() {
+    for protocol in ["connect-ip", "cf-connect-ip"] {
+        let (_dir, mut client, target) = fixture_with_windows(true, 2, 4096, 256);
+        let mut body = Vec::new();
+        encoder::encode(
+            &CapsuleFrame::AddressRequest(
+                (1..=64)
+                    .map(|request_id| RequestedAddress {
+                        request_id,
+                        ip: IpAddress::V4(Ipv4Addr::UNSPECIFIED),
+                        prefix_len: 32,
+                    })
+                    .collect(),
+            ),
+            &mut body,
+        );
+        let blocker = send_request(
+            &mut client,
+            "connect-ip",
+            &path("connect-ip", &target),
+            Some(CREDENTIALS),
+            Some(&body),
+        );
+        assert_eq!(
+            client
+                .response_status(blocker, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            client.drive().unwrap();
+        }
+        let stream = client
+            .send_connect_ip_with_credentials(protocol, Some(CREDENTIALS))
+            .unwrap();
+        let empty_frames = [0; 512];
+        assert_eq!(
+            client
+                .quic
+                .stream_send(stream, &empty_frames, false)
+                .unwrap(),
+            empty_frames.len()
+        );
+        assert_eq!(
+            client
+                .h3
+                .as_mut()
+                .unwrap()
+                .send_body(&mut client.quic, stream, &body, true)
+                .unwrap(),
+            body.len()
+        );
+        client.flush().unwrap();
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            client.drive().unwrap();
+        }
+        assert!(
+            !client.quic.stream_readable(stream),
+            "IP response HEADERS must remain flow-control blocked"
+        );
+        let replies = responses(&mut client, &[blocker, stream]);
+        assert_eq!(replies[0].reset, None);
+        assert_status(&replies[1], 200);
+        let frames = decode(&replies[1].body);
+        assert_eq!(frames.len(), 3);
+        let CapsuleFrame::AddressAssign(assigned) = &frames[2] else {
+            panic!("missing complete ADDRESS_ASSIGN");
+        };
+        for id in 1..=64 {
+            assert_eq!(
+                assigned
+                    .iter()
+                    .filter(|entry| entry.request_id == id)
+                    .count(),
+                1
+            );
+        }
+        assert!(client.quic.peer_error().is_none());
+    }
+}

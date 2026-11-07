@@ -143,8 +143,13 @@ This verifies actual CONNECT-IP and `cf-connect-ip` TUN forwarding before FIN,
 then silent late-packet discard while a control reply is flow-control blocked,
 with TUN offload on and off. It also requires the complete control reply and
 response FIN after credit returns. The unprivileged `datagram_fin` tests cover
-real QUIC-to-UDP forwarding, pending setup, pre-FIN capsules, sibling streams,
-and response FIN retries.
+real QUIC-to-UDP forwarding, pending setup with unread body plus FIN, pre-FIN
+capsules, sibling streams, and response FIN retries. They include 256 empty
+HTTP/3 DATA frames before FIN, local parsing with further client packets
+withheld, open-body early native input, and malformed-body rejection. Cold and
+cached Basic authentication and blocked CONNECT-IP control replies cover the
+same body/FIN ordering; a unit test verifies deferred native queues retain their
+shared memory budget and release continuation state on removal.
 
 The Docker script creates development certificates, builds the server and E2E client,
 starts an echo target, grants the server container `NET_ADMIN` and TUN access,

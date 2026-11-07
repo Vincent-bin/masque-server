@@ -9,6 +9,7 @@ use crate::capsule::datagram::DatagramCapsules;
 use crate::capsule::decoder::DecodeError;
 use crate::capsule::ip::{AddressRequests, IpCapsules};
 use crate::connection::ClientConnection;
+use crate::tunnel::udp::EarlyUdpDatagrams;
 use crate::{capsule, varint};
 
 const MAX_STREAM_SEND_BYTES: usize = 256 * 1024;
@@ -55,9 +56,19 @@ pub(crate) struct CapsuleStream {
     bytes: usize,
     max_payload: usize,
     finished_at: Option<Instant>,
+    // Keep the original shared budget charged until the first body read can
+    // distinguish an open request from an unread body followed by FIN.
+    early_udp_datagrams: Option<EarlyUdpDatagrams>,
 }
 
 impl CapsuleStream {
+    pub(super) fn new_udp(max_payload: usize, early_datagrams: EarlyUdpDatagrams) -> Self {
+        Self {
+            early_udp_datagrams: Some(early_datagrams),
+            ..Self::new(max_payload)
+        }
+    }
+
     pub(super) fn new_ip(max_payload: usize) -> Self {
         Self {
             decoder: StreamDecoder::Ip(IpCapsules::new(max_payload + 8)),
@@ -84,6 +95,7 @@ impl CapsuleStream {
             bytes: 0,
             max_payload,
             finished_at: None,
+            early_udp_datagrams: None,
         }
     }
 }
@@ -162,6 +174,7 @@ impl ClientConnection {
             self.capsule_send_packets -= stream.send.len();
         }
         self.capsule_readable.remove(&stream_id);
+        self.capsule_read_resumes.remove(&stream_id);
         self.capsule_writable.remove(&stream_id);
         self.finished_capsules.retain(|id| *id != stream_id);
     }
@@ -208,121 +221,189 @@ impl ClientConnection {
 
 impl Shard {
     pub(super) fn read_capsule_bodies(&mut self, dirty: &[u64]) {
+        const MAX_FRAMING_RETRIES: usize = 32;
         for index in dirty {
-            let Some(id) = self.conn_by_index.get(index) else {
+            let Some(conn_id) = self.conn_by_index.get(index).cloned() else {
                 continue;
             };
-            let Some(client) = self.connections.get_mut(id) else {
-                continue;
-            };
-            let readable = std::mem::take(&mut client.capsule_readable);
-            for stream_id in readable {
-                if client.awaiting_auth.contains_key(&stream_id)
-                    || client.pending_udp_tunnels.contains_key(&stream_id)
+            let mut framing_before = crate::fxhash::FxHashMap::default();
+            for attempt in 0..MAX_FRAMING_RETRIES {
+                self.read_capsule_bodies_once(*index);
+                let Some(client) = self.connections.get_mut(&conn_id) else {
+                    break;
+                };
+                if client.quic.local_error().is_some()
+                    || client.quic.is_draining()
+                    || client.quic.is_closed()
                 {
-                    client.capsule_readable.insert(stream_id);
-                    continue;
+                    client.capsule_read_resumes.clear();
+                    break;
                 }
-                if !client.capsule_streams.contains_key(&stream_id) {
-                    continue;
+                if client.capsule_read_resumes.is_empty() {
+                    break;
                 }
-                if client.h3.is_none() {
-                    continue;
+                for stream in &client.capsule_read_resumes {
+                    framing_before
+                        .entry(*stream)
+                        .or_insert_with(|| client.quic.stream_readable_len(*stream, usize::MAX));
                 }
-                let mut input = [0; 16 * 1024];
-                let mut failed = false;
-                loop {
-                    let count = match client.h3.as_mut().unwrap().recv_body(
-                        &mut client.quic,
-                        stream_id,
-                        &mut input,
-                    ) {
-                        Ok(0) | Err(quiche::h3::Error::Done) => break,
-                        Ok(count) => count,
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    };
-                    let stream = client.capsule_streams.get_mut(&stream_id).unwrap();
-                    let max_payload = stream.max_payload;
-                    let packets = match stream.decoder.decode(&input[..count]) {
-                        Ok(packets) => packets,
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    };
-                    for frame in packets {
-                        let payload = match frame {
-                            CapsuleFrame::Datagram(payload) => payload,
-                            CapsuleFrame::AddressRequest(requests) => {
-                                let Some(tunnel) = client.ip_tunnels.get_mut(&stream_id) else {
-                                    failed = true;
-                                    break;
-                                };
-                                let reply = client
-                                    .capsule_streams
-                                    .get_mut(&stream_id)
-                                    .unwrap()
-                                    .address_requests
-                                    .as_mut()
-                                    .unwrap()
-                                    .respond(&requests, &tunnel.assigned_addrs);
-                                let Ok(reply) = reply else {
-                                    failed = true;
-                                    break;
-                                };
-                                tunnel.last_activity = std::time::Instant::now();
-                                let mut output = Vec::new();
-                                capsule::encoder::encode(&reply, &mut output);
-                                if !client.queue_capsule_bytes(stream_id, output) {
-                                    failed = true;
-                                    break;
-                                }
-                                continue;
-                            }
-                            _ => continue,
-                        };
-                        let Ok((context, context_len)) = varint::decode(&payload) else {
-                            continue;
-                        };
-                        if context != 0 {
-                            continue;
-                        }
-                        if payload.len() - context_len > max_payload {
-                            failed = true;
-                            break;
-                        }
-                        if client.received_capsules.len() >= MAX_RECEIVED_PACKETS
-                            || client.received_capsule_bytes + payload.len() + 8
-                                > MAX_RECEIVED_BYTES
-                        {
-                            self.metrics.record_datagram_queue_drop(1);
-                            continue;
-                        }
-                        let mut wire = Vec::with_capacity(payload.len() + 8);
-                        varint::encode_to_vec(stream_id / 4, &mut wire)
-                            .expect("request QSID fits varint");
-                        wire.extend_from_slice(&payload);
-                        client.received_capsule_bytes += wire.len();
-                        client.received_capsules.push_back(wire);
-                    }
-                    if failed {
+                // recv_body can stop at an empty DATA frame. Polling advances
+                // its frame state before another read, even without a packet.
+                self.poll_http3_events(*index);
+                if attempt + 1 == MAX_FRAMING_RETRIES
+                    && let Some(client) = self.connections.get_mut(&conn_id)
+                {
+                    // Continue on a local wake only when this bounded batch
+                    // consumed bytes. A partial frame/gap cannot busy-loop.
+                    client.capsule_read_resumes.retain(|stream| {
+                        framing_before.get(stream).is_some_and(|before| {
+                            client.quic.stream_readable_len(*stream, usize::MAX) < *before
+                        })
+                    });
+                }
+            }
+        }
+    }
+
+    fn read_capsule_bodies_once(&mut self, index: u64) {
+        let Some(id) = self.conn_by_index.get(&index) else {
+            return;
+        };
+        let Some(client) = self.connections.get_mut(id) else {
+            return;
+        };
+        let readable = std::mem::take(&mut client.capsule_readable);
+        for stream_id in readable {
+            client.capsule_read_resumes.remove(&stream_id);
+            if client.awaiting_auth.contains_key(&stream_id)
+                || client.pending_udp_tunnels.contains_key(&stream_id)
+            {
+                client.capsule_readable.insert(stream_id);
+                continue;
+            }
+            if !client.capsule_streams.contains_key(&stream_id) {
+                continue;
+            }
+            if client.h3.is_none() {
+                continue;
+            }
+            let mut input = [0; 16 * 1024];
+            let mut failed = false;
+            loop {
+                let count = match client.h3.as_mut().unwrap().recv_body(
+                    &mut client.quic,
+                    stream_id,
+                    &mut input,
+                ) {
+                    Ok(0) | Err(quiche::h3::Error::Done) => break,
+                    Ok(count) => count,
+                    Err(_) => {
+                        failed = true;
                         break;
                     }
-                }
-                if client.quic.stream_finished(stream_id) {
-                    failed |= client
-                        .capsule_streams
-                        .get(&stream_id)
-                        .unwrap()
-                        .decoder
-                        .is_partial();
-                    client.mark_capsule_finished(stream_id);
+                };
+                let stream = client.capsule_streams.get_mut(&stream_id).unwrap();
+                let max_payload = stream.max_payload;
+                let packets = match stream.decoder.decode(&input[..count]) {
+                    Ok(packets) => packets,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                };
+                for frame in packets {
+                    let payload = match frame {
+                        CapsuleFrame::Datagram(payload) => payload,
+                        CapsuleFrame::AddressRequest(requests) => {
+                            let Some(tunnel) = client.ip_tunnels.get_mut(&stream_id) else {
+                                failed = true;
+                                break;
+                            };
+                            let reply = client
+                                .capsule_streams
+                                .get_mut(&stream_id)
+                                .unwrap()
+                                .address_requests
+                                .as_mut()
+                                .unwrap()
+                                .respond(&requests, &tunnel.assigned_addrs);
+                            let Ok(reply) = reply else {
+                                failed = true;
+                                break;
+                            };
+                            tunnel.last_activity = std::time::Instant::now();
+                            let mut output = Vec::new();
+                            capsule::encoder::encode(&reply, &mut output);
+                            if !client.queue_capsule_bytes(stream_id, output) {
+                                failed = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let Ok((context, context_len)) = varint::decode(&payload) else {
+                        continue;
+                    };
+                    if context != 0 {
+                        continue;
+                    }
+                    if payload.len() - context_len > max_payload {
+                        failed = true;
+                        break;
+                    }
+                    if client.received_capsules.len() >= MAX_RECEIVED_PACKETS
+                        || client.received_capsule_bytes + payload.len() + 8 > MAX_RECEIVED_BYTES
+                    {
+                        self.metrics.record_datagram_queue_drop(1);
+                        continue;
+                    }
+                    let mut wire = Vec::with_capacity(payload.len() + 8);
+                    varint::encode_to_vec(stream_id / 4, &mut wire)
+                        .expect("request QSID fits varint");
+                    wire.extend_from_slice(&payload);
+                    client.received_capsule_bytes += wire.len();
+                    client.received_capsules.push_back(wire);
                 }
                 if failed {
-                    Self::close_capsule_stream(&self.shared, client, stream_id, true);
+                    break;
+                }
+            }
+            if client.quic.stream_finished(stream_id) {
+                failed |= client
+                    .capsule_streams
+                    .get(&stream_id)
+                    .unwrap()
+                    .decoder
+                    .is_partial();
+                client.mark_capsule_finished(stream_id);
+            }
+            if failed {
+                Self::close_capsule_stream(&self.shared, client, stream_id, true);
+            } else if client.quic.stream_readable(stream_id)
+                && !client.quic.stream_finished(stream_id)
+                && client.quic.local_error().is_none()
+            {
+                client.capsule_readable.insert(stream_id);
+                client.capsule_read_resumes.insert(stream_id);
+            } else {
+                // stream_finished() only reports EOF after reading the
+                // body. Do not replay native input retained during auth,
+                // setup, or blocked response HEADERS before this point.
+                // With EOF, discard the ambiguous native queue, but keep
+                // the complete pre-FIN capsules staged above for relay.
+                let early_datagrams = client
+                    .capsule_streams
+                    .get_mut(&stream_id)
+                    .and_then(|stream| stream.early_udp_datagrams.take());
+                if !client.quic.stream_finished(stream_id)
+                    && client.quic.local_error().is_none()
+                    && !client.quic.is_draining()
+                    && !client.quic.is_closed()
+                    && let Some(early_datagrams) = early_datagrams
+                    && let Some(tunnel) = client.udp_tunnels.get_mut(&stream_id)
+                {
+                    Self::relay_early_udp_datagrams(tunnel, early_datagrams);
                 }
             }
         }
@@ -442,6 +523,25 @@ mod tests {
             id,
             ResolverBudget::default().connection(),
         )
+    }
+
+    #[test]
+    fn deferred_early_native_input_keeps_its_budget_and_clears_resume_state() {
+        let mut client = client();
+        let budget = crate::tunnel::udp::EarlyUdpBudget::default();
+        let mut early = EarlyUdpDatagrams::new(budget.clone());
+        assert!(early.push(&vec![0; 64 * 1024]));
+        client
+            .capsule_streams
+            .insert(0, CapsuleStream::new_udp(MAX_UDP_PAYLOAD, early));
+        client.capsule_readable.insert(0);
+        client.capsule_read_resumes.insert(0);
+        let mut other = EarlyUdpDatagrams::new(budget);
+        assert!(!other.push(b"budget remains charged after setup"));
+        client.remove_capsule_stream(0);
+        assert!(other.push(&vec![0; 64 * 1024]));
+        assert!(client.capsule_read_resumes.is_empty());
+        assert!(client.capsule_readable.is_empty());
     }
 
     #[test]

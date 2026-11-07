@@ -166,9 +166,18 @@ fn assert_no_target_packet(client: &mut Client, target: &UdpSocket) {
 }
 
 fn drain_responses(client: &mut Client, blocker: u64, stream: u64, pending_headers: bool) {
+    drain_responses_with_prefix(client, blocker, stream, pending_headers, Vec::new());
+}
+
+fn drain_responses_with_prefix(
+    client: &mut Client,
+    blocker: u64,
+    stream: u64,
+    pending_headers: bool,
+    mut body: Vec<u8>,
+) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut finished = Vec::new();
-    let mut body = Vec::new();
     let mut headers_seen = false;
     while finished.len() < 2 {
         while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
@@ -282,6 +291,227 @@ fn udp_native_datagrams_after_headers_fin_are_not_buffered_during_pending_setup(
     send_native(&mut client, stream, b"after pending FIN");
     assert_no_target_packet(&mut client, &target);
     drain_responses(&mut client, blocker, stream, true);
+    assert_no_target_packet(&mut client, &target);
+    let replacement = open_udp(&mut client, &target);
+    send_native(&mut client, replacement, b"replacement works");
+    receive_target(&mut client, &target, b"replacement works");
+}
+
+#[test]
+fn udp_native_datagrams_after_body_fin_are_not_replayed_after_pending_response() {
+    let (_dir, mut client, target) = fixture();
+    let blocker = block_response_credit(&mut client);
+    let stream = udp_request(&mut client, &target, false);
+    let mut capsule = Vec::new();
+    encoder::encode_datagram_context_zero(b"capsule before pending FIN", &mut capsule);
+    assert_eq!(
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &capsule, true)
+            .unwrap(),
+        capsule.len()
+    );
+    client.flush().unwrap();
+    // HEADERS cannot complete, so the server has the full body and FIN but
+    // has not consumed that body. Send native input in a later QUIC packet.
+    assert_blocked(&mut client, stream);
+    send_native(&mut client, stream, b"native after pending body FIN");
+    assert_no_target_packet(&mut client, &target);
+    drain_responses(&mut client, blocker, stream, true);
+    receive_target(&mut client, &target, b"capsule before pending FIN");
+    assert_no_target_packet(&mut client, &target);
+    let replacement = open_udp(&mut client, &target);
+    send_native(&mut client, replacement, b"replacement works");
+    receive_target(&mut client, &target, b"replacement works");
+}
+
+fn send_empty_data(client: &mut Client, stream: u64, count: usize) {
+    // send_body suppresses non-FIN empty DATA frames. Insert their valid H3
+    // encoding directly, ahead of the real capsule body and its FIN.
+    let wire = vec![0; 2 * count];
+    assert_eq!(
+        client.quic.stream_send(stream, &wire, false).unwrap(),
+        wire.len()
+    );
+}
+
+#[test]
+fn pending_udp_body_fin_after_empty_data_drains_body_without_more_client_packets() {
+    let (_dir, mut client, target) = fixture();
+    let blocker = block_response_credit(&mut client);
+    let stream = udp_request(&mut client, &target, false);
+    send_empty_data(&mut client, stream, 256);
+    let mut capsule = Vec::new();
+    encoder::encode_datagram_context_zero(b"capsule after empty frames", &mut capsule);
+    assert_eq!(
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &capsule, true)
+            .unwrap(),
+        capsule.len()
+    );
+    client.flush().unwrap();
+    assert_blocked(&mut client, stream);
+    send_native(
+        &mut client,
+        stream,
+        b"late native after empty frames and FIN",
+    );
+    assert_no_target_packet(&mut client, &target);
+    let mut buffer = [0; 4096];
+    let mut prefix = Vec::new();
+    while let Ok(count) =
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .recv_body(&mut client.quic, blocker, &mut buffer)
+    {
+        if count == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&buffer[..count]);
+    }
+    client.flush().unwrap();
+    // Grant credit once, then withhold every client packet, including ACKs.
+    // Delivery of the capsule beyond 256 empty frames proves local parsing
+    // progress. The large blocker can legitimately use up response FIN credit.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        client.recv_once().unwrap();
+        match target.recv(&mut buffer) {
+            Ok(len) => {
+                assert_eq!(&buffer[..len], b"capsule after empty frames");
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "buffered empty DATA/FIN needed another client packet"
+                );
+            }
+            Err(e) => panic!("target receive failed: {e}"),
+        }
+    }
+    // Restore output credit separately and still require the full control
+    // reply and a clean response FIN, with no post-FIN native packet delivered.
+    drain_responses_with_prefix(&mut client, blocker, stream, true, prefix);
+    assert_no_target_packet(&mut client, &target);
+}
+
+// Release the blocker without requiring the tested stream's send side to
+// finish, so open-request and malformed-request cases can check their outcome.
+fn release_blocker(client: &mut Client, blocker: u64, stream: u64, reset: Option<u64>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut blocker_done = false;
+    let mut headers = false;
+    let mut reset_seen = false;
+    while !blocker_done || !headers || (reset.is_some() && !reset_seen) {
+        while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            match event {
+                quiche::h3::Event::Finished if id == blocker => blocker_done = true,
+                quiche::h3::Event::Headers { list, .. } if id == stream => {
+                    assert!(
+                        list.iter()
+                            .any(|h| h.name() == b":status" && h.value() == b"200")
+                    );
+                    headers = true;
+                }
+                quiche::h3::Event::Reset(code) if id == stream => {
+                    assert_eq!(Some(code), reset);
+                    reset_seen = true;
+                }
+                quiche::h3::Event::Finished if id == stream => {
+                    panic!("request unexpectedly finished")
+                }
+                _ => {}
+            }
+        }
+        let mut buffer = [0; 4096];
+        while client
+            .h3
+            .as_mut()
+            .unwrap()
+            .recv_body(&mut client.quic, blocker, &mut buffer)
+            .is_ok()
+        {}
+        assert!(Instant::now() < deadline, "pending response did not resume");
+        client.drive().unwrap();
+    }
+}
+
+#[test]
+fn pending_open_udp_body_preserves_capsules_and_bounded_early_native_input() {
+    let (_dir, mut client, target) = fixture();
+    let blocker = block_response_credit(&mut client);
+    let stream = udp_request(&mut client, &target, false);
+    send_empty_data(&mut client, stream, 256);
+    let mut capsule = Vec::new();
+    encoder::encode_datagram_context_zero(b"open capsule", &mut capsule);
+    assert_eq!(
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &capsule, false)
+            .unwrap(),
+        capsule.len()
+    );
+    client.flush().unwrap();
+    assert_blocked(&mut client, stream);
+    send_native(&mut client, stream, b"open native");
+    assert_no_target_packet(&mut client, &target);
+    release_blocker(&mut client, blocker, stream, None);
+    // No relative ordering is guaranteed across capsule and native delivery.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut received = Vec::new();
+    while received.len() < 2 {
+        let mut buffer = [0; 2048];
+        match target.recv(&mut buffer) {
+            Ok(len) => received.push(buffer[..len].to_vec()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "open input was lost");
+                client.drive().unwrap();
+            }
+            Err(e) => panic!("target receive failed: {e}"),
+        }
+    }
+    received.sort();
+    assert_eq!(
+        received,
+        [b"open capsule".to_vec(), b"open native".to_vec()]
+    );
+    send_native(&mut client, stream, b"still open");
+    receive_target(&mut client, &target, b"still open");
+}
+
+#[test]
+fn pending_truncated_udp_body_fin_drops_early_native_input() {
+    let (_dir, mut client, target) = fixture();
+    let blocker = block_response_credit(&mut client);
+    let stream = udp_request(&mut client, &target, false);
+    send_empty_data(&mut client, stream, 256);
+    // DATAGRAM capsule claims two bytes but only carries Context ID zero.
+    client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_body(&mut client.quic, stream, &[0, 2, 0], true)
+        .unwrap();
+    client.flush().unwrap();
+    assert_blocked(&mut client, stream);
+    send_native(&mut client, stream, b"native after malformed FIN");
+    assert_no_target_packet(&mut client, &target);
+    release_blocker(
+        &mut client,
+        blocker,
+        stream,
+        Some(quiche::h3::WireErrorCode::MessageError as u64),
+    );
     assert_no_target_packet(&mut client, &target);
     let replacement = open_udp(&mut client, &target);
     send_native(&mut client, replacement, b"replacement works");

@@ -384,10 +384,17 @@ sweep enforces a fixed drain deadline using `server.idle_timeout_secs`; native
 datagram activity cannot renew it. Completion or expiry releases tunnel slots,
 address leases, routes, and queued memory. The final empty DATA frame carrying
 FIN also waits for credit within that deadline for both IP and UDP capsules.
-Native HTTP Datagrams received after request EOF are silently discarded before
-UDP/IP forwarding or early setup buffering, as required by RFC 9297 section
-2.1. Complete DATAGRAM capsules parsed before EOF still forward; the response
-send side and queued control replies drain independently.
+Native HTTP Datagrams are silently discarded after request EOF, as required by
+RFC 9297 section 2.1. Setup-time UDP datagrams retain their original bounded
+queue and shared budget until the buffered request body has been read and
+validated. An unread body can hide FIN from QUIC's application EOF query, so
+setup never replays these packets directly. EOF or invalid input discards the
+ambiguous native queue; an open request may replay it. Complete pre-FIN
+DATAGRAM capsules still forward, independently of response/control draining.
+Empty HTTP/3 DATA frames use at most 32 poll/read continuations per connection
+round. Remaining framing work gets a local wake only if buffered
+bytes decreased; partial frames and gaps cannot cause a busy loop. Native UDP
+and IP input cannot bypass an active stream's unfinished receive-state check.
 
 ### CONNECT-IP
 
