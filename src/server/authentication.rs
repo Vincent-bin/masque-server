@@ -237,6 +237,9 @@ impl Shard {
                 .connections
                 .get_mut(&conn_id)
                 .expect("connection checked above");
+            if client.quic.local_error().is_some() || client.expire_first_auth() {
+                return;
+            }
             let Some(h3) = client.h3.as_mut() else {
                 return;
             };
@@ -259,6 +262,8 @@ impl Shard {
                 return;
             }
 
+            client.first_auth_deadline = None;
+
             // FIN closes only the request body, not the response. Dispatch
             // authenticated UDP/IP requests too; setup resumes capsule reads
             // and observes the FIN retained by QUIC. A reset, unlike FIN,
@@ -267,6 +272,7 @@ impl Shard {
                 metrics: &self.metrics,
                 config: &self.config,
                 auth: self.auth.as_deref(),
+                first_auth_deadline: &mut client.first_auth_deadline,
             };
             Self::dispatch_connect(
                 h3,

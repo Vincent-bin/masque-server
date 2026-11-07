@@ -87,7 +87,7 @@ max_tunnels_per_connection = 100
 
 | Key | Meaning |
 | --- | --- |
-| `idle_timeout_secs` | Inactive tunnel lifetime; also the lifetime of an HTTP/2 connection with no active requests |
+| `idle_timeout_secs` | Inactive tunnel lifetime, HTTP/2 connection idle timeout, and time allowed for the first successful Basic authentication |
 | `max_connections` | Per-HTTP/3-shard or per-HTTP/2-listener connection cap; `1..1000000` |
 | `max_connections_per_ip` | Process-wide live H2 + H3 connections from one source IP; `1..65536` |
 | `max_pending_auth_per_ip` | Process-wide running + queued Basic/Argon2 checks from one source; `1..256` |
@@ -103,6 +103,12 @@ tunnels retain their protocol-specific inactivity rules, including the
 120-second minimum for UDP. Connection-level PING traffic does not extend the
 empty-connection lifetime. Timeout shutdown sends GOAWAY and permits at most
 5 additional seconds for a blocked transport flush.
+
+On Basic listeners, the first successful authentication must occur within
+`idle_timeout_secs` of accepting the QUIC connection or completing the HTTP/2
+handshake, with a one-second minimum. Traffic and rejected requests do not
+renew this deadline. Later
+CONNECT requests still authenticate individually.
 
 ## Observability
 

@@ -407,3 +407,147 @@ fn blocked_error_timeout_is_not_renewed_by_retries() {
         quiche::h3::WireErrorCode::RequestCancelled as u64
     );
 }
+
+#[test]
+fn idle_tunnels_close_while_connection_credit_is_exhausted() {
+    let mut config = unauthenticated_config();
+    config.server.idle_timeout_secs = 1;
+    let (_dir, mut client) = error_client(config, 32768, 16384);
+
+    let tcp_target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+    let tcp = tcp(
+        &mut client,
+        &tcp_target.local_addr().unwrap().to_string(),
+        false,
+    );
+    assert_eq!(
+        client.response_status(tcp, Duration::from_secs(5)).unwrap(),
+        200
+    );
+    let (_upstream, _) = tcp_target.accept().unwrap();
+    let udp_target = UdpSocket::bind(ephemeral_addr()).unwrap();
+    let target = udp_target.local_addr().unwrap();
+    let path = format!("/.well-known/masque/udp/127.0.0.1/{}/", target.port());
+    let udp = send(
+        &mut client,
+        &[
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-udp"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ],
+        false,
+    );
+    assert_eq!(
+        client.response_status(udp, Duration::from_secs(5)).unwrap(),
+        200
+    );
+    let ip = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client.response_status(ip, Duration::from_secs(5)).unwrap(),
+        200
+    );
+    assert_eq!(client.capsules(ip, 2, Duration::from_secs(5)).len(), 2);
+
+    let bulk = block_connection(&mut client, None);
+    let mut pending = [tcp, udp, ip]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut reset_count = 0;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !pending.is_empty() && Instant::now() < deadline {
+        // Keep the bulk tunnel alive without reading its response. If it
+        // resets too, discarding its buffered bytes can restore QUIC credit.
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, bulk, b"x", false)
+            .unwrap();
+        client.drive().unwrap();
+        while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            if pending.contains(&id) {
+                match event {
+                    quiche::h3::Event::Reset(code) => {
+                        assert_eq!(code, quiche::h3::WireErrorCode::RequestCancelled as u64);
+                        reset_count += 1;
+                    }
+                    quiche::h3::Event::Finished => {}
+                    quiche::h3::Event::Data => {
+                        // Any residual credit may fit an empty FIN frame.
+                        let _ = client.h3.as_mut().unwrap().recv_body(
+                            &mut client.quic,
+                            id,
+                            &mut [0; 32],
+                        );
+                        continue;
+                    }
+                    _ => panic!("unexpected event while waiting for idle cleanup: {event:?}"),
+                }
+                pending.remove(&id);
+            }
+        }
+    }
+    assert!(pending.is_empty(), "idle streams still open: {pending:?}");
+    assert!(reset_count > 0, "no idle close encountered backpressure");
+    let check = unsupported(&mut client, true);
+    resume_errors(&mut client, bulk, &[(check, b"404")]);
+}
+
+#[test]
+fn first_basic_auth_has_a_fixed_quic_deadline() {
+    let mut config = ServerConfig::default();
+    config.server.idle_timeout_secs = 1;
+    config.listeners[0].auth.username = BASIC_USERNAME.into();
+    config.listeners[0].auth.password_hash =
+        masque::auth::hash_password(BASIC_PASSWORD.as_bytes()).unwrap();
+    let (_dir, mut client) = error_client(config, 32768, 1_048_576);
+    let peer = client.socket.peer_addr().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while client.quic.peer_error().is_none() && Instant::now() < deadline {
+        client.quic.send_ack_eliciting().unwrap();
+        client.drive().unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    assert!(
+        client.quic.peer_error().is_some(),
+        "keepalive extended the first Basic auth deadline"
+    );
+
+    let credentials = format!(
+        "Basic {}",
+        STANDARD.encode(format!("{BASIC_USERNAME}:{BASIC_PASSWORD}"))
+    );
+    // A fresh connection exercises cold authentication first and the shared
+    // credential cache on the next connection.
+    for _ in 0..2 {
+        let mut client = Client::connect_anonymous(peer).unwrap();
+        client.handshake(Duration::from_secs(5)).unwrap();
+        client.init_h3().unwrap();
+        let stream = client
+            .send_connect_ip_with_credentials("connect-ip", Some(&credentials))
+            .unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            client.quic.send_ack_eliciting().unwrap();
+            client.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        let request = unsupported(&mut client, true);
+        assert_eq!(
+            client
+                .response_status(request, Duration::from_secs(5))
+                .unwrap(),
+            404
+        );
+    }
+}

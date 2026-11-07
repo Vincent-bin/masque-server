@@ -232,11 +232,17 @@ impl Shard {
         }
     }
 
-    /// Forward queued target responses and drain the receive queue in a batch.
+    /// Forward a bounded batch of target responses before servicing other events.
     pub(super) fn relay_target_datagrams(&mut self, first: UdpResponse) {
-        let mut response = Some(first);
+        let mut first = Some(first);
 
-        while let Some(batch) = response {
+        for _ in 0..MAX_UDP_RESPONSES_PER_ROUND {
+            let Some(batch) = first
+                .take()
+                .or_else(|| self.udp_response_rx.try_recv().ok())
+            else {
+                break;
+            };
             let mut queue_full = false;
             if let Some(conn_id) = self.conn_by_index.get(&batch.connection_index)
                 && let Some(client) = self.connections.get_mut(conn_id)
@@ -248,7 +254,6 @@ impl Shard {
                     Err(error) => {
                         debug!(stream_id = batch.stream_id, %error, "target recv failed");
                         Self::reset_udp_stream(client, batch.stream_id);
-                        response = self.udp_response_rx.try_recv().ok();
                         continue;
                     }
                 };
@@ -290,7 +295,6 @@ impl Shard {
             if queue_full {
                 break;
             }
-            response = self.udp_response_rx.try_recv().ok();
         }
     }
 

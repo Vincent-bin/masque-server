@@ -435,7 +435,7 @@ impl Shard {
                     .expect("index ownership poisoned")
                     .insert(conn_idx, self.index);
 
-                let client = ClientConnection::new(
+                let mut client = ClientConnection::new(
                     quic,
                     conn_idx,
                     Arc::clone(&self.metrics),
@@ -443,6 +443,11 @@ impl Shard {
                     scid.clone(),
                     self.shared.resolver.connection(),
                 );
+                if self.auth.is_some() {
+                    client.first_auth_deadline = Instant::now().checked_add(Duration::from_secs(
+                        self.config.server.idle_timeout_secs.max(1),
+                    ));
+                }
                 self.connections.insert(scid.clone(), client);
                 scid
             }
@@ -539,6 +544,10 @@ impl Shard {
             return;
         };
 
+        if client.quic.local_error().is_some() || client.expire_first_auth() {
+            return;
+        }
+
         // Collect pending tunnel setups so we can do async I/O outside
         // the borrow of h3.
         let mut pending_setups = PendingConnectSetups::default();
@@ -614,10 +623,11 @@ impl Shard {
                         client.request_headers_seen.insert(stream_id);
                         let tcp_setup_count = pending_setups.tcp.len();
                         let udp_setup_count = pending_setups.udp.len();
-                        let request_context = RequestContext {
+                        let mut request_context = RequestContext {
                             metrics: &self.metrics,
                             config: &self.config,
                             auth: self.auth.as_deref(),
+                            first_auth_deadline: &mut client.first_auth_deadline,
                         };
                         if let Some(pending) = Self::handle_request(
                             h3,
@@ -625,7 +635,7 @@ impl Shard {
                             &mut client.pending_error_responses,
                             stream_id,
                             &list,
-                            &request_context,
+                            &mut request_context,
                             &mut pending_setups,
                         ) {
                             if client.awaiting_auth.len() >= MAX_PENDING_AUTH_PER_CONNECTION {

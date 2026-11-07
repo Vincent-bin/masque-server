@@ -132,6 +132,7 @@ pub(super) struct RequestContext<'a> {
     pub(super) metrics: &'a crate::metrics::ShardMetrics,
     pub(super) config: &'a ServerConfig,
     pub(super) auth: Option<&'a SharedBasicAuthenticator>,
+    pub(super) first_auth_deadline: &'a mut Option<std::time::Instant>,
 }
 
 impl Shard {
@@ -142,7 +143,7 @@ impl Shard {
         pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         headers: &[quiche::h3::Header],
-        context: &RequestContext<'_>,
+        context: &mut RequestContext<'_>,
         pending: &mut PendingConnectSetups,
     ) -> Option<PendingAuth> {
         // One pass over the header list, borrowing the values rather than
@@ -209,6 +210,15 @@ impl Shard {
             }
             match auth.precheck(proxy_authorization) {
                 AuthPrecheck::Authenticated => {
+                    // A long batch of header events can cross the deadline
+                    // after the shard began polling it.
+                    if context
+                        .first_auth_deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        return None;
+                    }
+                    *context.first_auth_deadline = None;
                     context.metrics.record_auth_cache_hit();
                     context.metrics.record_auth_success();
                     Self::dispatch_connect(

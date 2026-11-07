@@ -7,6 +7,18 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.17 - 2026-11-07
+
+### Fixed
+
+- Finish idle HTTP/3 TCP, UDP, and IP tunnel streams even when response
+  flow control blocks FIN. Reset only the affected stream when needed.
+- Limit target UDP response processing per shard iteration so queued responses
+  leave time for other connections and timers.
+- Bound the time to first Basic authentication for HTTP/2 and HTTP/3 by
+  `idle_timeout_secs` with a one-second minimum. Unauthenticated activity
+  cannot extend this deadline.
+
 ## 0.14.16 - 2026-11-07
 
 ### Fixed

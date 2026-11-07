@@ -2,6 +2,22 @@
 
 use super::*;
 
+/// Close an idle stream before releasing the tunnel. If the empty DATA frame
+/// carrying FIN is blocked, RESET_STREAM closes the response without credit.
+fn close_idle_stream(
+    quic: &mut quiche::Connection,
+    h3: Option<&mut quiche::h3::Connection>,
+    stream_id: u64,
+    reset: bool,
+) {
+    if !reset && h3.is_some_and(|h3| h3.send_body(quic, stream_id, b"", true).is_ok()) {
+        return;
+    }
+    let code = quiche::h3::WireErrorCode::RequestCancelled as u64;
+    let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+    let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+}
+
 impl Shard {
     /// Close tunnels that have been idle too long.
     /// Disconnect connections whose roster entry was removed or changed.
@@ -131,10 +147,8 @@ impl Shard {
                     return true;
                 }
                 info!(stream_id, "closing idle TCP tunnel");
-                if let Some(h3) = h3.as_mut() {
-                    h3.send_body(quic, *stream_id, b"", true).ok();
-                    wrote = true;
-                }
+                close_idle_stream(quic, h3.as_mut(), *stream_id, false);
+                wrote = true;
                 false
             });
 
@@ -147,21 +161,12 @@ impl Shard {
                     return true;
                 }
                 info!(stream_id, "closing idle UDP tunnel");
-                if drain_expired == Some(true)
+                let reset = drain_expired == Some(true)
                     || capsule_streams
                         .get(stream_id)
-                        .is_some_and(capsules::CapsuleStream::has_partial_output)
-                {
-                    let _ = quic.stream_shutdown(
-                        *stream_id,
-                        quiche::Shutdown::Write,
-                        quiche::h3::WireErrorCode::RequestCancelled as u64,
-                    );
-                    wrote = true;
-                } else if let Some(h3) = h3.as_mut() {
-                    h3.send_body(quic, *stream_id, b"", true).ok();
-                    wrote = true;
-                }
+                        .is_some_and(capsules::CapsuleStream::has_partial_output);
+                close_idle_stream(quic, h3.as_mut(), *stream_id, reset);
+                wrote = true;
                 false
             });
 
@@ -177,21 +182,12 @@ impl Shard {
                     continue;
                 }
                 info!(stream_id, "closing idle IP tunnel");
-                if drain_expired == Some(true)
+                let reset = drain_expired == Some(true)
                     || capsule_streams
                         .get(stream_id)
-                        .is_some_and(capsules::CapsuleStream::has_partial_output)
-                {
-                    let _ = quic.stream_shutdown(
-                        *stream_id,
-                        quiche::Shutdown::Write,
-                        quiche::h3::WireErrorCode::RequestCancelled as u64,
-                    );
-                    wrote = true;
-                } else if let Some(h3) = h3.as_mut() {
-                    h3.send_body(quic, *stream_id, b"", true).ok();
-                    wrote = true;
-                }
+                        .is_some_and(capsules::CapsuleStream::has_partial_output);
+                close_idle_stream(quic, h3.as_mut(), *stream_id, reset);
+                wrote = true;
                 idle_ip_tunnels.push((conn_id.clone(), *stream_id, *index));
             }
 

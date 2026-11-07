@@ -1,7 +1,10 @@
 //! TLS/H2 connection lifecycle and request dispatch.
 
 use std::future::pending;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -120,7 +123,18 @@ pub(super) async fn serve(
     // would cut off healthy long-lived tunnels (including quiet UDP tunnels).
     // An unrepresentably distant deadline is effectively disabled, rather
     // than panicking on a very large configured duration.
-    let mut idle_deadline = tokio::time::Instant::now().checked_add(idle_timeout);
+    let established = tokio::time::Instant::now();
+    let mut idle_deadline = established.checked_add(idle_timeout);
+    let first_auth = context
+        .auth
+        .as_ref()
+        .and_then(|_| established.checked_add(idle_timeout.max(Duration::from_secs(1))))
+        .map(|deadline| {
+            Arc::new(FirstAuth {
+                deadline,
+                verified: AtomicBool::new(false),
+            })
+        });
     let mut roster_sweep = tokio::time::interval_at(
         tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
         HEARTBEAT_INTERVAL,
@@ -177,6 +191,21 @@ pub(super) async fn serve(
                 // Keep polling below, but bound even a blocked transport flush.
                 connection.abrupt_shutdown(Reason::NO_ERROR);
             }
+            _ = async {
+                match first_auth.as_deref().filter(|auth| !auth.verified.load(Ordering::Acquire)) {
+                    Some(auth) => tokio::time::sleep_until(auth.deadline).await,
+                    None => pending::<()>().await,
+                }
+            }, if !draining => {
+                // A request task may have authenticated since the timer was armed.
+                if first_auth.as_deref().is_some_and(|auth| !auth.verified.load(Ordering::Acquire)) {
+                    debug!(%peer, "HTTP/2 first authentication timed out");
+                    draining = true;
+                    drain_deadline = Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+                    connection.abrupt_shutdown(Reason::NO_ERROR);
+                    requests.abort_all();
+                }
+            }
             joined = requests.join_next(), if !requests.is_empty() => {
                 if let Some(Err(error)) = joined {
                     warn!(%peer, %error, "HTTP/2 request task panicked");
@@ -199,6 +228,7 @@ pub(super) async fn serve(
                                 tunnel_slots: Arc::clone(&tunnel_slots),
                                 auth_slots: Arc::clone(&auth_slots),
                                 source_ip: peer.ip(),
+                                first_auth: first_auth.clone(),
                             },
                         ));
                     }
@@ -220,10 +250,17 @@ pub(super) async fn serve(
     debug!(%peer, "HTTP/2 connection closed");
 }
 
+/// A fixed deadline shared by the connection and its request tasks.
+struct FirstAuth {
+    deadline: tokio::time::Instant,
+    verified: AtomicBool,
+}
+
 struct RequestAdmission {
     tunnel_slots: Arc<Semaphore>,
     auth_slots: Arc<Semaphore>,
     source_ip: std::net::IpAddr,
+    first_auth: Option<Arc<FirstAuth>>,
 }
 
 async fn handle_request(
@@ -252,6 +289,15 @@ async fn handle_request(
         Authorization::ResponseSent
     ) {
         return;
+    }
+
+    if let Some(auth) = &admission.first_auth
+        && !auth.verified.load(Ordering::Acquire)
+    {
+        if tokio::time::Instant::now() >= auth.deadline {
+            return;
+        }
+        auth.verified.store(true, Ordering::Release);
     }
 
     // Match HTTP/3's ordering: a recognized proxy request authenticates before
