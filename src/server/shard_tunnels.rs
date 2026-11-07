@@ -25,6 +25,8 @@ impl Shard {
         };
         let max_tunnels = self.config.server.max_tunnels_per_connection;
 
+        // A replacement CONNECT can share a packet with STOP_SENDING.
+        Self::reap_stopped_tcp_tunnels(client);
         for (stream_id, target) in pending_tcp_setups {
             if !client.pending_tcp_tunnels.contains_key(&stream_id) {
                 continue;
@@ -880,6 +882,7 @@ impl Shard {
             let Some(client) = self.connections.get_mut(conn_id) else {
                 continue;
             };
+            Self::reap_stopped_tcp_tunnels(client);
             for (stream_id, pending) in &mut client.pending_tcp_tunnels {
                 if let Some(connected) = pending.connected.take() {
                     ready.push(TcpRelayEvent::ConnectResult {
@@ -981,6 +984,32 @@ impl Shard {
                 }
             }
         }
+    }
+
+    /// quiche handles STOP_SENDING at the transport layer without an H3
+    /// event. Check known TCP streams even when the target has no data to send.
+    fn reap_stopped_tcp_tunnels(client: &mut ClientConnection) {
+        let quic = &mut client.quic;
+        let resumes = &mut client.tcp_read_resumes;
+        let mut keep = |stream_id: &u64| {
+            if !matches!(
+                quic.stream_capacity(*stream_id),
+                Err(quiche::Error::StreamStopped(_))
+            ) {
+                return true;
+            }
+
+            // quiche has already scheduled RESET_STREAM on the response.
+            let _ = quic.stream_shutdown(
+                *stream_id,
+                quiche::Shutdown::Read,
+                quiche::h3::WireErrorCode::RequestCancelled as u64,
+            );
+            resumes.remove(stream_id);
+            false
+        };
+        client.pending_tcp_tunnels.retain(|id, _| keep(id));
+        client.tcp_tunnels.retain(|id, _| keep(id));
     }
 
     pub(super) fn reset_tcp_stream(client: &mut ClientConnection, stream_id: u64) {

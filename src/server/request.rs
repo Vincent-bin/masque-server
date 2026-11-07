@@ -127,6 +127,122 @@ pub(super) fn prepare_connect_ip(
     Ok(())
 }
 
+#[derive(Default)]
+struct RequestHeaders<'a> {
+    method: Option<&'a [u8]>,
+    path: Option<&'a [u8]>,
+    scheme: Option<&'a [u8]>,
+    protocol: Option<&'a [u8]>,
+    authority: Option<&'a [u8]>,
+    proxy_authorization: Option<&'a [u8]>,
+    duplicate_proxy_authorization: bool,
+}
+
+impl<'a> RequestHeaders<'a> {
+    /// Validate the field section in one pass, borrowing the values.
+    /// Target parsing still runs after authentication.
+    fn parse(headers: &'a [quiche::h3::Header]) -> Option<Self> {
+        let mut request = Self::default();
+        let mut regular_field_seen = false;
+        for header in headers {
+            let name = header.name();
+            let value = header.value();
+            if value
+                .iter()
+                .any(|byte| byte.is_ascii_control() && *byte != b'\t')
+            {
+                return None;
+            }
+            if name.starts_with(b":") {
+                let field = match name {
+                    b":method" => &mut request.method,
+                    b":path" => &mut request.path,
+                    b":scheme" => &mut request.scheme,
+                    b":protocol" => &mut request.protocol,
+                    b":authority" => &mut request.authority,
+                    _ => return None,
+                };
+                if regular_field_seen || field.replace(value).is_some() {
+                    return None;
+                }
+                continue;
+            }
+
+            regular_field_seen = true;
+            if name.is_empty()
+                || !name
+                    .iter()
+                    .all(|byte| token_byte(*byte) && !byte.is_ascii_uppercase())
+            {
+                return None;
+            }
+            match name {
+                b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding"
+                | b"upgrade" => return None,
+                b"te"
+                    if !value
+                        .split(|byte| *byte == b',')
+                        .map(<[u8]>::trim_ascii)
+                        .all(|coding| {
+                            coding.is_empty() || coding.eq_ignore_ascii_case(b"trailers")
+                        }) =>
+                {
+                    return None;
+                }
+                b"proxy-authorization" => {
+                    request.duplicate_proxy_authorization |=
+                        request.proxy_authorization.replace(value).is_some();
+                }
+                _ => {}
+            }
+        }
+
+        let method = request
+            .method
+            .filter(|value| !value.is_empty() && value.iter().copied().all(token_byte))?;
+        if method == b"CONNECT" {
+            request.authority.filter(|value| !value.is_empty())?;
+            match request.protocol {
+                None => {
+                    if request.path.is_some() || request.scheme.is_some() {
+                        return None;
+                    }
+                    return Some(request);
+                }
+                Some(protocol)
+                    if !protocol.is_empty() && protocol.iter().copied().all(token_byte) => {}
+                Some(_) => return None,
+            }
+        } else if request.protocol.is_some() {
+            return None;
+        }
+
+        let scheme = request.scheme?;
+        let (first, rest) = scheme.split_first()?;
+        if !first.is_ascii_alphabetic()
+            || !rest
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        {
+            return None;
+        }
+        let path = request.path?;
+        match path {
+            [b'/', ..] => {}
+            b"*" if method == b"OPTIONS" => {}
+            b"" if method != b"CONNECT"
+                && !scheme.eq_ignore_ascii_case(b"http")
+                && !scheme.eq_ignore_ascii_case(b"https") => {}
+            _ => return None,
+        }
+        Some(request)
+    }
+}
+
+fn token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&byte)
+}
+
 /// Shared request dependencies passed together to keep dispatch APIs focused.
 pub(super) struct RequestContext<'a> {
     pub(super) metrics: &'a crate::metrics::ShardMetrics,
@@ -146,30 +262,17 @@ impl Shard {
         context: &mut RequestContext<'_>,
         pending: &mut PendingConnectSetups,
     ) -> Option<PendingAuth> {
-        // One pass over the header list, borrowing the values rather than
-        // copying each one into an owned String.
-        let mut method: &[u8] = b"";
-        let mut path: &[u8] = b"";
-        let mut scheme: &[u8] = b"";
-        let mut protocol: &[u8] = b"";
-        let mut authority: &[u8] = b"";
-        let mut proxy_authorization: Option<&[u8]> = None;
-        let mut duplicate_proxy_authorization = false;
-
-        for header in headers {
-            match header.name() {
-                b":method" => method = header.value(),
-                b":path" => path = header.value(),
-                b":scheme" => scheme = header.value(),
-                b":protocol" => protocol = header.value(),
-                b":authority" => authority = header.value(),
-                b"proxy-authorization" => {
-                    duplicate_proxy_authorization |=
-                        proxy_authorization.replace(header.value()).is_some();
-                }
-                _ => {}
-            }
-        }
+        let Some(headers) = RequestHeaders::parse(headers) else {
+            let code = quiche::h3::WireErrorCode::MessageError as u64;
+            let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+            let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+            return None;
+        };
+        let method = headers.method.unwrap_or_default();
+        let path = headers.path.unwrap_or_default();
+        let scheme = headers.scheme.unwrap_or_default();
+        let protocol = headers.protocol.unwrap_or_default();
+        let authority = headers.authority.unwrap_or_default();
 
         info!(
             stream_id,
@@ -202,13 +305,13 @@ impl Shard {
             // The cheap half runs here; only a well-formed request for the
             // configured user reaches the password hash, and that is
             // deliberately slow enough that it must not run on this thread.
-            if duplicate_proxy_authorization {
+            if headers.duplicate_proxy_authorization {
                 context.metrics.record_auth_failure();
                 warn!(stream_id, "duplicate proxy credentials");
                 Self::send_auth_rejection(h3, quic, pending_errors, stream_id);
                 return None;
             }
-            match auth.precheck(proxy_authorization) {
+            match auth.precheck(headers.proxy_authorization) {
                 AuthPrecheck::Authenticated => {
                     // A long batch of header events can cross the deadline
                     // after the shard began polling it.
