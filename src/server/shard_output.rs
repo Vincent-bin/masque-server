@@ -46,6 +46,7 @@ impl Shard {
                 continue;
             };
 
+            client.expire_first_auth();
             client.quic.on_timeout();
             if client.quic.local_error().is_some()
                 || client.quic.is_draining()

@@ -202,6 +202,8 @@ pub struct ClientConnection {
     /// quiche, so an unauthenticated caller cannot make the server buffer
     /// anything; stream flow control bounds them until the tunnel exists.
     pub(crate) awaiting_auth: FxHashMap<u64, AwaitingAuth>,
+    /// Absolute deadline for a Basic connection to authenticate once.
+    pub(crate) first_auth_deadline: Option<std::time::Instant>,
     /// One constant-time memory budget shared by every early CONNECT-UDP
     /// queue on this connection. Queue ownership carries the reservation
     /// through authentication and target setup.
@@ -268,6 +270,7 @@ impl ClientConnection {
             udp_tunnels: FxHashMap::default(),
             ip_tunnels: FxHashMap::default(),
             awaiting_auth: FxHashMap::default(),
+            first_auth_deadline: None,
             early_udp_budget: EarlyUdpBudget::default(),
             index,
             identity: None,
@@ -362,6 +365,19 @@ impl ClientConnection {
         EarlyUdpDatagramResult::UnknownTunnel
     }
 
+    pub(crate) fn expire_first_auth(&mut self) -> bool {
+        if !self
+            .first_auth_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return false;
+        }
+        self.first_auth_deadline = None;
+        self.awaiting_auth.clear();
+        let _ = self.quic.close(false, 0, b"");
+        true
+    }
+
     /// The next instant this connection needs the event loop's attention:
     /// buffered framing work, quiche's timer, or a deferred packet's release.
     pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
@@ -374,11 +390,12 @@ impl ClientConnection {
         }
         // Preserve quiche's absolute deadline. Reconstructing it from timeout()
         // and a different Instant::now introduces jitter on every drive.
-        let quic = self.quic.timeout_instant();
-        match (quic, self.deferred_send.deadline()) {
-            (Some(quic), Some(pacing)) => Some(quic.min(pacing)),
-            (quic, pacing) => quic.or(pacing),
-        }
+        self.quic
+            .timeout_instant()
+            .into_iter()
+            .chain(self.deferred_send.deadline())
+            .chain(self.first_auth_deadline)
+            .min()
     }
 
     /// Total active/connecting tunnels and rejected requests awaiting output.

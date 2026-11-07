@@ -34,6 +34,10 @@ impl ObservedServer {
         config.server.max_connections = if source_limit { 2 } else { 1 };
         config.server.max_connections_per_ip = if source_limit { 1 } else { 2 };
         config.server.max_tunnels_per_connection = 1;
+        Self::bind(config).await
+    }
+
+    async fn bind(mut config: ServerConfig) -> Self {
         config.observability.listen_addr = Some("127.0.0.1:0".parse().unwrap());
         let mut server = Server::bind(config).await.unwrap();
         let addr = server.listen_addrs()[0];
@@ -559,4 +563,64 @@ async fn resetting_the_last_tunnel_starts_connection_idle_cleanup() {
     );
     server.expect_new_request_works().await;
     eprintln!("HTTP2_TIMEOUT phase=last_tunnel_reset cleanup_active=0 replacement_request=ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_basic_auth_deadline_releases_active_unauthenticated_connection() {
+    let files = TestFiles::new();
+    let mut config = http2_config(&files);
+    config.listeners[0].auth.enabled = true;
+    config.listeners[0].auth.username = "test".into();
+    config.listeners[0].auth.password_hash = masque::auth::hash_password(b"password").unwrap();
+    config.server.idle_timeout_secs = IDLE_SECS;
+    config.server.max_connections = 1;
+    let server = ObservedServer::bind(config).await;
+    let addr = server.addr;
+    let (mut client, driver) = connect_h2(addr).await;
+    let _driver = AbortOnDrop(driver);
+
+    let unknown = || {
+        Request::builder()
+            .uri("https://localhost/not-a-tunnel")
+            .body(())
+            .unwrap()
+    };
+    let (first, _) = client.send_request(unknown(), true).unwrap();
+    assert_eq!(first.await.unwrap().status(), StatusCode::NOT_FOUND);
+    server.expect_active(1).await;
+    tokio::time::timeout(IDLE_DEADLINE_WITH_SLACK, async {
+        while let Ok((response, _)) = client.send_request(unknown(), true) {
+            match response.await {
+                Ok(response) => assert_eq!(response.status(), StatusCode::NOT_FOUND),
+                Err(_) => break,
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    })
+    .await
+    .expect("unauthenticated requests extended the first Basic auth deadline");
+    server.expect_active(0).await;
+
+    let (mut client, driver) = connect_h2(addr).await;
+    let _driver = AbortOnDrop(driver);
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut request = connect_request(target.local_addr().unwrap());
+    request.headers_mut().insert(
+        "proxy-authorization",
+        format!("Basic {}", STANDARD.encode("test:password"))
+            .parse()
+            .unwrap(),
+    );
+    let (response, _request_body) = client.send_request(request, false).unwrap();
+    assert_eq!(response.await.unwrap().status(), StatusCode::OK);
+    let (_upstream, _) = target.accept().await.unwrap();
+
+    // Keep issuing unsupported requests past the original deadline. The
+    // connection should remain usable after the first successful Basic auth.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    while tokio::time::Instant::now() < deadline {
+        let (response, _) = client.send_request(unknown(), true).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::NOT_FOUND);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
 }

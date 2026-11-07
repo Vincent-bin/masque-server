@@ -78,6 +78,8 @@ const CONN_ID_LEN: usize = 16;
 /// Counted in batches, so the datagram bound is this times
 /// [`MAX_UDP_RECV_BATCH`].
 const UDP_RESPONSE_QUEUE_CAPACITY: usize = 256;
+// Each response holds one capsule payload or one bounded native UDP batch.
+const MAX_UDP_RESPONSES_PER_ROUND: usize = 64;
 
 /// Completed UDP target setups waiting for their owning shard. The live
 /// pending-tunnel maps provide the per-connection bound; this queue prevents a
