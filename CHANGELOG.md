@@ -7,6 +7,16 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.13 - 2026-11-07
+
+### Fixed
+
+- Reject unspecified TCP and UDP targets, including IPv4-mapped addresses and
+  mixed DNS answers, even when target policies permit them. Use concrete
+  addresses for intentional local services.
+- Accept all valid Context ID zero encodings in HTTP/2 CONNECT-UDP capsules
+  while preserving the configured UDP payload limit.
+
 ## 0.14.12 - 2026-11-07
 
 ### Fixed
