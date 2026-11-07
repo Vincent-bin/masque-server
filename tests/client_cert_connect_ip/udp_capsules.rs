@@ -1,6 +1,7 @@
 //! CONNECT-UDP shares the same skip/length/EOF behavior on HTTP/2 and HTTP/3.
 
 use super::*;
+use masque::capsule::encoder;
 
 #[path = "../support/udp_capsules.rs"]
 mod wire_fixtures;
@@ -53,8 +54,7 @@ fn send_fragment(client: &mut Client, stream: u64, mut bytes: &[u8]) {
     }
 }
 
-#[test]
-fn http3_udp_unknown_capsules_match_http2_streaming_and_truncation_behavior() {
+fn fixture() -> (TempDir, Client, UdpSocket) {
     let dir = TempDir::new("h3-udp-unknown-capsules");
     let key = p256_key();
     let (cert, key_path) = write_pem(
@@ -88,6 +88,58 @@ fn http3_udp_unknown_capsules_match_http2_streaming_and_truncation_behavior() {
     .unwrap();
     client.handshake(Duration::from_secs(5)).unwrap();
     client.init_h3().unwrap();
+    (dir, client, target)
+}
+
+fn assert_echo(client: &mut Client, target: &UdpSocket, stream: u64, payload: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut received = vec![0; payload.len() + 1];
+    let (length, source) = loop {
+        match target.recv_from(&mut received) {
+            Ok(packet) => break packet,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "UDP payload did not reach the target"
+                );
+                client.drive().unwrap();
+            }
+            Err(error) => panic!("target receive failed: {error}"),
+        }
+    };
+    assert_eq!(&received[..length], payload);
+    target.send_to(payload, source).unwrap();
+    assert_eq!(
+        client.capsules(stream, 1, Duration::from_secs(5)),
+        [CapsuleFrame::Datagram([&[0][..], payload].concat())]
+    );
+    assert!(client.quic.peer_error().is_none());
+}
+
+fn assert_clean_finish(client: &mut Client, stream: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.h3.as_mut().unwrap().poll(&mut client.quic) {
+            Ok((id, quiche::h3::Event::Finished)) if id == stream => return,
+            Ok((id, quiche::h3::Event::Reset(code))) if id == stream => {
+                panic!("complete capsules were reset with {code}");
+            }
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "complete capsule stream did not finish"
+                );
+                client.drive().unwrap();
+            }
+            Err(error) => panic!("HTTP/3 poll while waiting for FIN: {error}"),
+        }
+    }
+}
+
+#[test]
+fn http3_udp_unknown_capsules_match_http2_streaming_and_truncation_behavior() {
+    let (_dir, mut client, target) = fixture();
 
     let mut malformed = wire_fixtures::truncated_capsules()
         .into_iter()
@@ -123,27 +175,48 @@ fn http3_udp_unknown_capsules_match_http2_streaming_and_truncation_behavior() {
         for chunk in wire[..16].chunks(1).chain(wire[16..].chunks(997)) {
             send_fragment(&mut client, stream, chunk);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut received = [0; 1201];
-        let (length, source) = loop {
-            match target.recv_from(&mut received) {
-                Ok(packet) => break packet,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "UDP payload did not reach the target"
-                    );
-                    client.drive().unwrap();
-                }
-                Err(error) => panic!("target receive failed: {error}"),
-            }
-        };
-        assert_eq!(&received[..length], payload);
-        target.send_to(&payload, source).unwrap();
+        assert_echo(&mut client, &target, stream, &payload);
+    }
+    client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_body(&mut client.quic, stream, &[], true)
+        .unwrap();
+    client.flush().unwrap();
+    assert_clean_finish(&mut client, stream);
+}
+
+#[test]
+fn http3_udp_separate_fin_rejects_truncated_capsules_and_preserves_other_streams() {
+    let (_dir, mut client, target) = fixture();
+    let healthy = open_udp(&mut client, target.local_addr().unwrap());
+    for tail in wire_fixtures::truncated_capsules() {
+        let stream = open_udp(&mut client, target.local_addr().unwrap());
+        let payload = b"body parsed before standalone FIN";
+        let mut wire = Vec::new();
+        encoder::encode_datagram_context_zero(payload, &mut wire);
+        wire.extend(tail);
+        send_fragment(&mut client, stream, &wire);
+        // The prefix and truncated tail fit in one body read. Its echo proves
+        // the decoder has consumed that read before a separate FIN arrives.
+        assert_echo(&mut client, &target, stream, payload);
+        client
+            .h3
+            .as_mut()
+            .unwrap()
+            .send_body(&mut client.quic, stream, &[], true)
+            .unwrap();
+        client.flush().unwrap();
         assert_eq!(
-            client.capsules(stream, 1, Duration::from_secs(5)),
-            [CapsuleFrame::Datagram([&[0][..], &payload].concat())]
+            client.stream_reset(stream),
+            quiche::h3::WireErrorCode::MessageError as u64
         );
         assert!(client.quic.peer_error().is_none());
+
+        let mut wire = Vec::new();
+        encoder::encode_datagram_context_zero(b"still usable", &mut wire);
+        send_fragment(&mut client, healthy, &wire);
+        assert_echo(&mut client, &target, healthy, b"still usable");
     }
 }

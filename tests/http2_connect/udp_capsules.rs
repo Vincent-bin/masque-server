@@ -241,10 +241,26 @@ async fn large_unknown_udp_capsules_are_skipped_across_flow_control_windows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncated_skipped_udp_capsules_reset_only_the_affected_stream() {
+    assert_truncated_capsules(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separate_fin_rejects_truncated_capsules_and_preserves_other_streams() {
+    assert_truncated_capsules(true).await;
+}
+
+async fn assert_truncated_capsules(separate_fin: bool) {
     let files = TestFiles::new();
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (server_addr, server_task) = spawn_http2_config(http2_config(&files)).await;
     let (mut client, driver) = connect_h2(server_addr).await;
+
+    let (healthy_response, mut healthy_request) = client
+        .send_request(udp_request(target.local_addr().unwrap()), false)
+        .unwrap();
+    let healthy_response = healthy_response.await.unwrap();
+    assert_eq!(healthy_response.status(), StatusCode::OK);
+    let mut healthy_body = healthy_response.into_body();
 
     for wire in wire_fixtures::truncated_capsules() {
         let (response, mut request_body) = client
@@ -253,10 +269,20 @@ async fn truncated_skipped_udp_capsules_reset_only_the_affected_stream() {
         let response = response.await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let mut response_body = response.into_body();
-        for byte in wire {
-            request_body
-                .send_data(Bytes::from(vec![byte]), false)
-                .unwrap();
+        if separate_fin {
+            let payload = b"body parsed before standalone FIN";
+            let mut prefix = datagram_capsule(&[0], payload);
+            prefix.extend(wire);
+            request_body.send_data(Bytes::from(prefix), false).unwrap();
+            // Receipt of the prefix echo is a barrier after the body read,
+            // so END_STREAM cannot be coalesced with the truncated tail.
+            assert_echo(&target, &mut response_body, payload).await;
+        } else {
+            for byte in wire {
+                request_body
+                    .send_data(Bytes::from(vec![byte]), false)
+                    .unwrap();
+            }
         }
         request_body.send_data(Bytes::new(), true).unwrap();
         let error = tokio::time::timeout(Duration::from_secs(2), response_body.data())
@@ -265,18 +291,12 @@ async fn truncated_skipped_udp_capsules_reset_only_the_affected_stream() {
             .expect("truncated capsule ended without a reset")
             .unwrap_err();
         assert_eq!(error.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+        healthy_request
+            .send_data(Bytes::from(datagram_capsule(&[0], b"still usable")), false)
+            .unwrap();
+        assert_echo(&target, &mut healthy_body, b"still usable").await;
     }
 
-    let (response, mut request_body) = client
-        .send_request(udp_request(target.local_addr().unwrap()), false)
-        .unwrap();
-    let response = response.await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let mut response_body = response.into_body();
-    request_body
-        .send_data(Bytes::from(datagram_capsule(&[0], b"still usable")), false)
-        .unwrap();
-    assert_echo(&target, &mut response_body, b"still usable").await;
     server_task.abort();
     driver.abort();
 }
