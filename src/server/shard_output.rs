@@ -8,34 +8,21 @@ impl Shard {
     pub(super) fn send_auth_rejection(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
+        pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
     ) {
-        Self::send_error_response(h3, quic, stream_id, 404);
+        Self::send_error_response(h3, quic, pending_errors, stream_id, 404);
     }
 
     /// Send an HTTP error response.
     pub(super) fn send_error_response(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
+        pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         status: u16,
     ) {
-        // Every status we send is three digits, so format it without a
-        // heap-allocated String.
-        let status_buf = [
-            b'0' + (status / 100 % 10) as u8,
-            b'0' + (status / 10 % 10) as u8,
-            b'0' + (status % 10) as u8,
-        ];
-
-        let headers = [
-            quiche::h3::Header::new(b":status", &status_buf),
-            quiche::h3::Header::new(b"content-length", b"0"),
-        ];
-
-        if let Err(e) = h3.send_response(quic, stream_id, &headers, true) {
-            warn!(stream_id, %e, "failed to send response");
-        }
+        pending_errors.send(h3, quic, stream_id, status);
     }
 
     /// Drive the connections with work pending: handle timers, flush outgoing
@@ -65,6 +52,9 @@ impl Shard {
                 || client.quic.is_closed()
             {
                 client.deferred_send.discard();
+                client.pending_error_responses.clear();
+            } else if let Some(h3) = client.h3.as_mut() {
+                client.pending_error_responses.retry(h3, &mut client.quic);
             }
             client.flush_capsule_output();
 

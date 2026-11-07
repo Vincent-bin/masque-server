@@ -1,5 +1,9 @@
 // Per-client QUIC + HTTP/3 connection state.
 
+mod error_responses;
+
+pub(crate) use error_responses::PendingErrorResponses;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -172,6 +176,7 @@ pub struct ClientConnection {
     pub(crate) resolver: TargetResolver,
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
+    pub(crate) pending_error_responses: PendingErrorResponses,
     /// Standard CONNECT tunnels waiting for a target TCP connection.
     pub pending_tcp_tunnels: FxHashMap<u64, PendingTcpTunnel>,
     /// Active standard CONNECT TCP tunnels, keyed by stream ID.
@@ -248,6 +253,7 @@ impl ClientConnection {
             received_capsule_bytes: 0,
             quic,
             h3: None,
+            pending_error_responses: PendingErrorResponses::default(),
             pending_tcp_tunnels: FxHashMap::default(),
             tcp_tunnels: FxHashMap::default(),
             tcp_read_resumes: FxHashSet::default(),
@@ -369,7 +375,8 @@ impl ClientConnection {
         }
     }
 
-    /// Total active or connecting tunnels open on this connection.
+    /// Total active/connecting tunnels and rejected requests awaiting output.
+    /// Pending errors still occupy admission capacity until sent or cancelled.
     pub fn tunnel_count(&self) -> usize {
         self.pending_tcp_tunnels.len()
             + self.tcp_tunnels.len()
@@ -377,6 +384,7 @@ impl ClientConnection {
             + self.udp_tunnels.len()
             + self.ip_tunnels.len()
             + self.pending_ip_responses.len()
+            + self.pending_error_responses.len()
     }
 
     /// Use finer deadline wakeups only for TCP-only connections. A pending

@@ -198,14 +198,14 @@ fn auth_concurrency(basic_shards: usize) -> usize {
 /// packet path.
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A batch of framed target responses for one UDP tunnel.
+/// A batch of framed target responses, or a terminal receive error, for one UDP tunnel.
 ///
 /// Batching keeps a busy tunnel from costing one channel send and one event
 /// loop wakeup per datagram.
 struct UdpResponse {
     connection_index: u64,
     stream_id: u64,
-    datagrams: Vec<Vec<u8>>,
+    datagrams: std::io::Result<Vec<Vec<u8>>>,
 }
 
 /// Return path for one CONNECT-IP stream carried by HTTP/2.
@@ -1404,8 +1404,10 @@ async fn recv_target_batch(
         use std::os::fd::AsRawFd;
         use tokio::io::Interest;
 
+        // Like Tokio's recv(), observe error-only readiness as well. A
+        // connected UDP socket can receive ICMP without readable payload.
         socket
-            .async_io(Interest::READABLE, || {
+            .async_io(Interest::READABLE | Interest::ERROR, || {
                 target_udp::recv_mmsg(socket.as_raw_fd(), batch)
             })
             .await

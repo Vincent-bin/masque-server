@@ -36,7 +36,13 @@ impl Shard {
                     "tunnel limit reached, rejecting TCP tunnel"
                 );
                 if let Some(h3) = &mut client.h3 {
-                    Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                    Self::send_error_response(
+                        h3,
+                        &mut client.quic,
+                        &mut client.pending_error_responses,
+                        stream_id,
+                        503,
+                    );
                 }
                 client.pending_tcp_tunnels.remove(&stream_id);
                 continue;
@@ -73,7 +79,13 @@ impl Shard {
                     "tunnel limit reached, rejecting"
                 );
                 if let Some(h3) = &mut client.h3 {
-                    Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                    Self::send_error_response(
+                        h3,
+                        &mut client.quic,
+                        &mut client.pending_error_responses,
+                        stream_id,
+                        503,
+                    );
                 }
                 client.pending_udp_tunnels.remove(&stream_id);
                 continue;
@@ -104,7 +116,13 @@ impl Shard {
                     "tunnel limit reached, rejecting IP tunnel"
                 );
                 if let Some(h3) = &mut client.h3 {
-                    Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                    Self::send_error_response(
+                        h3,
+                        &mut client.quic,
+                        &mut client.pending_error_responses,
+                        stream_id,
+                        503,
+                    );
                 }
                 continue;
             }
@@ -148,7 +166,13 @@ impl Shard {
                         "cannot attach IP tunnel to this client's fixed addresses"
                     );
                     if let Some(h3) = &mut client.h3 {
-                        Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                        Self::send_error_response(
+                            h3,
+                            &mut client.quic,
+                            &mut client.pending_error_responses,
+                            stream_id,
+                            503,
+                        );
                     }
                     return;
                 }
@@ -159,7 +183,13 @@ impl Shard {
         if addresses.is_empty() {
             warn!(stream_id, "address pool exhausted for IP tunnel");
             if let Some(h3) = &mut client.h3 {
-                Self::send_error_response(h3, &mut client.quic, stream_id, 503);
+                Self::send_error_response(
+                    h3,
+                    &mut client.quic,
+                    &mut client.pending_error_responses,
+                    stream_id,
+                    503,
+                );
             }
             return;
         }
@@ -234,6 +264,9 @@ impl Shard {
             .capsule_streams
             .insert(stream_id, capsules::CapsuleStream::new_ip(max_payload));
         client.ip_tunnels.insert(stream_id, tunnel);
+        // DATA/FIN may already have been polled while authentication or the
+        // response headers were pending. Resume from QUIC's bounded storage.
+        client.capsule_readable.insert(stream_id);
         if !client.queue_capsule_bytes(stream_id, capsules) {
             Self::teardown_ip_tunnel(shared, client, stream_id, conn_idx);
             let error = quiche::h3::WireErrorCode::ExcessiveLoad as u64;
@@ -408,7 +441,13 @@ impl Shard {
                     "UDP tunnel setup failed"
                 );
                 if let Some(h3) = client.h3.as_mut() {
-                    Self::send_error_response(h3, &mut client.quic, stream_id, failure.status);
+                    Self::send_error_response(
+                        h3,
+                        &mut client.quic,
+                        &mut client.pending_error_responses,
+                        stream_id,
+                        failure.status,
+                    );
                 }
                 return;
             }
@@ -451,7 +490,16 @@ impl Shard {
                 loop {
                     let len = match recv_socket.recv(&mut buffer).await {
                         Ok(len) => len,
-                        Err(_) => return,
+                        Err(error) => {
+                            report_udp_receive_error(
+                                &response_tx,
+                                connection_index,
+                                stream_id,
+                                error,
+                            )
+                            .await;
+                            return;
+                        }
                     };
                     if len > capsules::MAX_UDP_PAYLOAD {
                         continue;
@@ -460,7 +508,7 @@ impl Shard {
                         .send(UdpResponse {
                             connection_index,
                             stream_id,
-                            datagrams: vec![header.encode(&buffer[..len])],
+                            datagrams: Ok(vec![header.encode(&buffer[..len])]),
                         })
                         .await
                         .is_err()
@@ -476,7 +524,8 @@ impl Shard {
                 let received = match recv_target_batch(&recv_socket, &mut batch).await {
                     Ok(received) => received,
                     Err(error) => {
-                        debug!(stream_id, %error, "target recv failed");
+                        report_udp_receive_error(&response_tx, connection_index, stream_id, error)
+                            .await;
                         break;
                     }
                 };
@@ -492,7 +541,7 @@ impl Shard {
                     .send(UdpResponse {
                         connection_index,
                         stream_id,
-                        datagrams,
+                        datagrams: Ok(datagrams),
                     })
                     .await
                     .is_err()
@@ -542,6 +591,9 @@ impl Shard {
             stream_id,
             capsules::CapsuleStream::new(capsules::MAX_UDP_PAYLOAD),
         );
+        // Also run for HEADERS+FIN: there may be no future Data/Finished event
+        // after async authentication/setup or a blocked 200 response.
+        client.capsule_readable.insert(stream_id);
     }
 
     pub(super) fn retry_udp_connect_responses(&mut self, dirty: &[u64]) {
@@ -706,6 +758,7 @@ impl Shard {
                             Self::send_error_response(
                                 h3,
                                 &mut client.quic,
+                                &mut client.pending_error_responses,
                                 stream_id,
                                 failure.status,
                             );
@@ -965,5 +1018,81 @@ impl Shard {
             .quic
             .stream_shutdown(stream_id, quiche::Shutdown::Write, error)
             .ok();
+    }
+}
+
+/// A failed receiver must wake its owning shard even if the response queue is
+/// full. Awaiting this existing bounded channel adds no retry queue, and tunnel
+/// teardown aborts this wait with the rest of the receive task.
+async fn report_udp_receive_error(
+    response_tx: &mpsc::Sender<UdpResponse>,
+    connection_index: u64,
+    stream_id: u64,
+    error: std::io::Error,
+) {
+    let _ = response_tx
+        .send(UdpResponse {
+            connection_index,
+            stream_id,
+            datagrams: Err(error),
+        })
+        .await;
+}
+
+#[cfg(test)]
+mod udp_receive_tests {
+    use super::*;
+
+    fn response() -> UdpResponse {
+        UdpResponse {
+            connection_index: 7,
+            stream_id: 4,
+            datagrams: Ok(vec![vec![0]]),
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_receive_failure_waits_for_full_queue_instead_of_losing_close() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(response()).await.unwrap();
+        let task = tokio::spawn(async move {
+            report_udp_receive_error(&tx, 7, 4, std::io::ErrorKind::ConnectionRefused.into()).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert!(rx.recv().await.unwrap().datagrams.is_ok());
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = rx.recv().await.unwrap();
+        assert_eq!(failed.connection_index, 7);
+        assert_eq!(failed.stream_id, 4);
+        assert_eq!(
+            failed.datagrams.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_receive_failure_wait_is_cancelled_when_tunnel_is_dropped() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(response()).await.unwrap();
+        let task = tokio::spawn(async move {
+            report_udp_receive_error(&tx, 7, 4, std::io::ErrorKind::ConnectionRefused.into()).await;
+        });
+        let abort = task.abort_handle();
+        let mut tunnel = UdpTunnel::new(4, "127.0.0.1:9".parse().unwrap())
+            .await
+            .unwrap();
+        tunnel.recv_task = Some(task);
+        tokio::task::yield_now().await;
+        assert!(!abort.is_finished());
+        drop(tunnel);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+        assert!(rx.recv().await.unwrap().datagrams.is_ok());
+        assert!(rx.recv().await.is_none());
     }
 }

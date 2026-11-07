@@ -39,8 +39,17 @@ use masque::config::{
 use masque::datagram::DatagramHeader;
 use masque::server::Server;
 
+#[path = "client_cert_connect_ip/cold_auth_fin.rs"]
+mod cold_auth_fin;
+
+#[path = "client_cert_connect_ip/error_responses.rs"]
+mod error_responses;
+
 #[path = "client_cert_connect_ip/ip_uri.rs"]
 mod ip_uri;
+
+#[path = "client_cert_connect_ip/ip_fin.rs"]
+mod ip_fin;
 
 #[cfg(target_os = "linux")]
 #[path = "client_cert_connect_ip/ip_fragments.rs"]

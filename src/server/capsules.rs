@@ -1,6 +1,7 @@
 //! Bounded HTTP/3 capsule I/O for CONNECT-UDP and CONNECT-IP.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use super::{Shard, Shared};
 use crate::capsule::CapsuleFrame;
@@ -53,6 +54,7 @@ pub(crate) struct CapsuleStream {
     offset: usize,
     bytes: usize,
     max_payload: usize,
+    finished_at: Option<Instant>,
 }
 
 impl CapsuleStream {
@@ -62,6 +64,12 @@ impl CapsuleStream {
             address_requests: Some(AddressRequests::default()),
             ..Self::new(max_payload)
         }
+    }
+
+    /// None denotes an open request, whose ordinary activity timeout applies.
+    pub(super) fn drain_expired(&self, timeout: Duration) -> Option<bool> {
+        self.finished_at
+            .map(|finished| finished.elapsed() > timeout)
     }
 
     pub(super) fn has_partial_output(&self) -> bool {
@@ -75,6 +83,7 @@ impl CapsuleStream {
             offset: 0,
             bytes: 0,
             max_payload,
+            finished_at: None,
         }
     }
 }
@@ -90,7 +99,10 @@ impl ClientConnection {
         let Some(stream) = self.capsule_streams.get_mut(&stream_id) else {
             return false;
         };
-        if stream.bytes + data.len() > MAX_STREAM_SEND_BYTES
+        // FIN drains only output already staged for this request. Later TUN
+        // packets must not keep growing the queue while a control reply drains.
+        if stream.finished_at.is_some()
+            || stream.bytes + data.len() > MAX_STREAM_SEND_BYTES
             || self.capsule_send_bytes + data.len() > MAX_CONNECTION_SEND_BYTES
             || stream.send.len() >= MAX_STREAM_SEND_PACKETS
             || self.capsule_send_packets >= MAX_CONNECTION_SEND_PACKETS
@@ -110,7 +122,9 @@ impl ClientConnection {
         let Some(stream) = self.capsule_streams.get(&stream_id) else {
             return false;
         };
-        if self.capsule_send_bytes.saturating_add(payload.len() + 17) > MAX_CONNECTION_SEND_BYTES
+        if stream.finished_at.is_some()
+            || self.capsule_send_bytes.saturating_add(payload.len() + 17)
+                > MAX_CONNECTION_SEND_BYTES
             || stream.bytes.saturating_add(payload.len() + 17) > MAX_STREAM_SEND_BYTES
             || stream.send.len() >= MAX_STREAM_SEND_PACKETS
             || self.capsule_send_packets >= MAX_CONNECTION_SEND_PACKETS
@@ -120,6 +134,26 @@ impl ClientConnection {
         let mut capsule = Vec::with_capacity(payload.len() + 17);
         capsule::encoder::encode_datagram_context_zero(payload, &mut capsule);
         self.queue_capsule_bytes(stream_id, capsule)
+    }
+
+    pub(super) fn mark_capsule_finished(&mut self, stream_id: u64) {
+        if let Some(stream) = self.capsule_streams.get_mut(&stream_id)
+            && stream.finished_at.is_none()
+        {
+            stream.finished_at = Some(Instant::now());
+            self.finished_capsules.push(stream_id);
+        }
+    }
+
+    fn discard_capsule_output(&mut self, stream_id: u64) {
+        if let Some(stream) = self.capsule_streams.get_mut(&stream_id) {
+            self.capsule_send_bytes -= stream.bytes;
+            self.capsule_send_packets -= stream.send.len();
+            stream.send.clear();
+            stream.bytes = 0;
+            stream.offset = 0;
+        }
+        self.capsule_writable.remove(&stream_id);
     }
 
     pub(super) fn remove_capsule_stream(&mut self, stream_id: u64) {
@@ -285,9 +319,7 @@ impl Shard {
                         .unwrap()
                         .decoder
                         .is_partial();
-                    if !client.finished_capsules.contains(&stream_id) {
-                        client.finished_capsules.push(stream_id);
-                    }
+                    client.mark_capsule_finished(stream_id);
                 }
                 if failed {
                     Self::close_capsule_stream(&self.shared, client, stream_id, true);
@@ -305,13 +337,16 @@ impl Shard {
                 continue;
             };
             for stream_id in std::mem::take(&mut client.finished_capsules) {
-                // A complete request immediately followed by FIN still needs
-                // its response, including across a small peer receive window.
+                // All FIN paths drain complete CONNECT-IP control replies.
+                // Reject truncated input before waiting for output credit;
+                // the idle sweep bounds the drain from the first FIN.
                 if client
                     .capsule_streams
                     .get(&stream_id)
                     .is_some_and(|stream| {
-                        matches!(stream.decoder, StreamDecoder::Ip(_)) && !stream.send.is_empty()
+                        matches!(stream.decoder, StreamDecoder::Ip(_))
+                            && !stream.decoder.is_partial()
+                            && !stream.send.is_empty()
                     })
                 {
                     client.finished_capsules.push(stream_id);
@@ -352,8 +387,27 @@ impl Shard {
             let _ = client
                 .quic
                 .stream_shutdown(stream_id, quiche::Shutdown::Write, error);
-        } else if let Some(h3) = &mut client.h3 {
-            let _ = h3.send_body(&mut client.quic, stream_id, &[], true);
+        } else {
+            // UDP is lossy: discard whole unsent capsules on FIN, but never
+            // send them after a retried FIN. IP control output has already
+            // drained before reaching this path.
+            if !client.ip_tunnels.contains_key(&stream_id) {
+                client.discard_capsule_output(stream_id);
+            }
+            if let Some(h3) = &mut client.h3
+                && matches!(
+                    h3.send_body(&mut client.quic, stream_id, &[], true),
+                    Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked)
+                )
+            {
+                // Even an empty H3 DATA frame needs flow-control credit for
+                // its header. Retain the original deadline and retry FIN when
+                // credit returns instead of silently abandoning the response.
+                if !client.finished_capsules.contains(&stream_id) {
+                    client.finished_capsules.push(stream_id);
+                }
+                return;
+            }
         }
         client.udp_tunnels.remove(&stream_id);
         client.pending_udp_tunnels.remove(&stream_id);
@@ -419,6 +473,47 @@ mod tests {
         assert_eq!(client.capsule_send_bytes, 0);
         assert_eq!(client.capsule_send_packets, 0);
         assert!(client.capsule_writable.is_empty());
+    }
+
+    #[test]
+    fn capsule_fin_keeps_one_fixed_deadline_and_stops_new_output() {
+        let mut client = client();
+        client
+            .capsule_streams
+            .insert(0, CapsuleStream::new_ip(1280));
+        assert!(client.queue_capsule_bytes(0, vec![1; 64]));
+        client.mark_capsule_finished(0);
+        assert_eq!(client.finished_capsules, [0]);
+        assert_eq!(
+            client.capsule_streams[&0].drain_expired(Duration::from_secs(1)),
+            Some(false)
+        );
+        assert!(!client.queue_capsule_bytes(0, vec![2; 64]));
+        assert!(!client.queue_datagram_capsule(0, &[3; 64]));
+        assert_eq!(client.capsule_send_bytes, 64);
+        assert_eq!(client.capsule_send_packets, 1);
+
+        let expired = Instant::now() - Duration::from_secs(2);
+        client.capsule_streams.get_mut(&0).unwrap().finished_at = Some(expired);
+        client.mark_capsule_finished(0);
+        client.mark_capsule_finished(4); // Unknown streams allocate no state.
+        assert_eq!(client.finished_capsules, [0]);
+        assert_eq!(client.capsule_streams[&0].finished_at, Some(expired));
+        assert_eq!(
+            client.capsule_streams[&0].drain_expired(Duration::from_secs(1)),
+            Some(true)
+        );
+        client.discard_capsule_output(0);
+        assert_eq!(client.capsule_send_bytes, 0);
+        assert_eq!(client.capsule_send_packets, 0);
+        assert!(client.capsule_streams[&0].send.is_empty());
+        assert_eq!(client.capsule_streams[&0].finished_at, Some(expired));
+        assert_eq!(client.finished_capsules, [0]);
+        client.remove_capsule_stream(0);
+        assert!(client.finished_capsules.is_empty());
+        assert!(client.capsule_writable.is_empty());
+        assert_eq!(client.capsule_send_bytes, 0);
+        assert_eq!(client.capsule_send_packets, 0);
     }
 
     #[test]

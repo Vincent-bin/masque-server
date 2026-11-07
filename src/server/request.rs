@@ -139,6 +139,7 @@ impl Shard {
     pub(super) fn handle_request(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
+        pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         headers: &[quiche::h3::Header],
         context: &RequestContext<'_>,
@@ -185,7 +186,15 @@ impl Shard {
             classify_connect_request(method, protocol, authority, path, scheme, context.config)
         {
             let Some(auth) = context.auth else {
-                Self::dispatch_connect(h3, quic, stream_id, &request, context, pending);
+                Self::dispatch_connect(
+                    h3,
+                    quic,
+                    pending_errors,
+                    stream_id,
+                    &request,
+                    context,
+                    pending,
+                );
                 return None;
             };
 
@@ -195,20 +204,28 @@ impl Shard {
             if duplicate_proxy_authorization {
                 context.metrics.record_auth_failure();
                 warn!(stream_id, "duplicate proxy credentials");
-                Self::send_auth_rejection(h3, quic, stream_id);
+                Self::send_auth_rejection(h3, quic, pending_errors, stream_id);
                 return None;
             }
             match auth.precheck(proxy_authorization) {
                 AuthPrecheck::Authenticated => {
                     context.metrics.record_auth_cache_hit();
                     context.metrics.record_auth_success();
-                    Self::dispatch_connect(h3, quic, stream_id, &request, context, pending);
+                    Self::dispatch_connect(
+                        h3,
+                        quic,
+                        pending_errors,
+                        stream_id,
+                        &request,
+                        context,
+                        pending,
+                    );
                     return None;
                 }
                 AuthPrecheck::Rejected => {
                     context.metrics.record_auth_failure();
                     warn!(stream_id, "proxy authentication failed");
-                    Self::send_auth_rejection(h3, quic, stream_id);
+                    Self::send_auth_rejection(h3, quic, pending_errors, stream_id);
                     return None;
                 }
                 AuthPrecheck::NeedsVerify {
@@ -226,7 +243,7 @@ impl Shard {
         }
 
         // Default: 404 for anything we don't handle.
-        Self::send_error_response(h3, quic, stream_id, 404);
+        Self::send_error_response(h3, quic, pending_errors, stream_id, 404);
         None
     }
 
@@ -234,6 +251,7 @@ impl Shard {
     pub(super) fn dispatch_connect(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
+        pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         request: &ConnectRequest,
         context: &RequestContext<'_>,
@@ -252,13 +270,14 @@ impl Shard {
                 }
                 Err(error) => {
                     warn!(stream_id, %error, "bad CONNECT authority");
-                    Self::send_error_response(h3, quic, stream_id, 400);
+                    Self::send_error_response(h3, quic, pending_errors, stream_id, 400);
                 }
             },
             ConnectRequest::Udp { path } => {
                 Self::handle_connect_udp(
                     h3,
                     quic,
+                    pending_errors,
                     stream_id,
                     path,
                     context.config,
@@ -273,7 +292,7 @@ impl Shard {
                 if let Err(status) =
                     prepare_connect_ip(path, *standard, *valid_pseudo_headers, context.config)
                 {
-                    Self::send_error_response(h3, quic, stream_id, status);
+                    Self::send_error_response(h3, quic, pending_errors, stream_id, status);
                     return;
                 }
                 // Address allocation can fail (pool exhaustion, bad fixed
@@ -293,6 +312,7 @@ impl Shard {
     fn handle_connect_udp(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
+        pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         path: &str,
         config: &ServerConfig,
@@ -302,7 +322,7 @@ impl Shard {
             Ok(target) => target,
             Err(e) => {
                 warn!(stream_id, %e, "bad CONNECT-UDP URI");
-                Self::send_error_response(h3, quic, stream_id, 400);
+                Self::send_error_response(h3, quic, pending_errors, stream_id, 400);
                 return;
             }
         };
@@ -312,7 +332,7 @@ impl Shard {
             Ok(header) => header,
             Err(error) => {
                 warn!(stream_id, %error, "cannot frame datagrams for stream");
-                Self::send_error_response(h3, quic, stream_id, 400);
+                Self::send_error_response(h3, quic, pending_errors, stream_id, 400);
                 return;
             }
         };

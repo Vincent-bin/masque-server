@@ -78,7 +78,11 @@ SemVer prerelease tags must retain their prerelease status.
 The HTTP/3 protocol tests include early fragmented UDP capsules through Basic
 authentication, 4 KiB echoes over a 64-byte initial response window, partial
 response cancellation, CONNECT-IP setup capsules, and malformed-capsule stream
-isolation. Resolver tests hold real blocking work across cancellation to verify
+isolation. The `error_responses` HTTP/3 tests exhaust connection credit before invalid
+requests and Basic rejections, then require the exact empty status plus FIN
+when credit returns. They also cover request FIN, RESET_STREAM/STOP_SENDING,
+a 64-response retry ceiling, fixed expiry during active retries, and admission
+recovery. Resolver tests hold real blocking work across cancellation to verify
 that both global and per-connection permits remain charged until it finishes.
 
 ```sh
