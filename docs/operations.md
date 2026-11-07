@@ -71,12 +71,16 @@ private file. Do not paste either password into an AI conversation. Guided
 setup asks for Basic, client-certificate or dual authentication, HTTP/2 or
 HTTP/3, and which CONNECT paths to test. Noninteractive setup requires
 `--auth-mode` and `--transport` explicitly. With dual authentication, the
-two listeners use separate ports, and fresh bootstrap probes both modes.
-Subsequent upgrades and rollbacks check the configured primary probe only;
-the certificate listener needs a separate probe if both modes must be checked.
+two listeners use separate ports, and bootstrap, upgrades and rollbacks probe
+both modes. New inventories save the certificate check in `[[hosts.probes]]`;
+older inventories retain it while `bootstrap.verify_dual = true` is present.
+Before removing an older bootstrap table, preserve that certificate check as
+an explicit required probe. Add further `[[hosts.probes]]` entries for every
+configured H2/H3 endpoint and authentication combination that must stay working.
 `--skip-tcp` and `--skip-udp` affect the probe, not server capabilities;
-`--connect-ip` tests negotiation, not forwarding. The inventory and credential
-files remain outside the checkout.
+`--connect-ip` requires an inner IP round trip; negotiation-only checks must be
+selected explicitly with `ip_setup_only` in the probe settings. The inventory
+and credential files remain outside the checkout.
 
 The transport-aware fresh installer requires a release that includes this
 feature (v0.14.4 or newer); the tool rejects older releases for HTTP/2 setup.
@@ -223,6 +227,21 @@ are also available on `configure-probe`. Upgrade the probe binary together with
 the operations bundle; an old negotiation-only result cannot satisfy a required
 CONNECT-IP forwarding check.
 
+For an advanced inventory, keep the primary `[hosts.probe]` and add
+`[[hosts.probes]]` tables for each additional required combination. A host can
+also use only `[[hosts.probes]]`. Every list entry requires an explicit `http2`
+or `http3` transport; legacy primary probes still accept `auto`, which verifies
+only the transport it selects. The CLI does not infer missing listeners or
+credentials, or enable listeners on the server. See the installed example and
+[inventory reference](../.agents/skills/masque-ops/references/inventory.md#external-probes).
+
+There are at most eight required checks per host, including the primary and
+legacy dual check. They run sequentially, stop at the first failure, and retain
+the per-probe subprocess timeout (`timeout_secs * 6 + 15`, at most 375 seconds
+per profile). `plan` reports `required_probe_count` and validates all referenced
+credentials before mutation. Multi-probe results include an ordered `profiles`
+array of sanitized summaries; existing single-probe output is unchanged.
+
 ## Deploy and roll back
 
 Mutations require an exact version and the explicit `--apply` gate:
@@ -241,8 +260,12 @@ proceeds sequentially. For a single-host inventory, `deploy` and `rollback`
 also select the host automatically. A host is considered upgraded only after systemd is active, the
 new binary version matches, the live configuration passes `check-config`, and
 its SHA-256 still matches the preflight snapshot, and the optional external
-TCP/UDP/IP probe succeeds. A failed host is restored to its prior version when
-possible, and the rollout stops without touching later hosts.
+TCP/UDP/IP probes all succeed. The same required set runs when verifying an
+already-current release and after explicit rollback. A failed host is restored
+to its prior version when possible, and the rollout stops without touching
+later hosts. Automatic restoration and rollback recovery also require every
+probe to pass; a running restored binary with failing external probes is
+reported as requiring manual recovery, not as a verified restoration.
 
 ## Bootstrap an empty Linux host
 

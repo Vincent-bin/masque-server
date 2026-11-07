@@ -37,6 +37,7 @@ from typing import Any
 import tomllib
 
 SCHEMA_VERSION = 1
+MAX_REQUIRED_PROBES = 8
 SCRIPT_PATH = Path(__file__).resolve()
 SKILL_ROOT = SCRIPT_PATH.parent.parent
 INSTALLER_PATH = SKILL_ROOT / "scripts" / "install-latest.sh"
@@ -439,6 +440,32 @@ class Host:
     probe: ProbeConfig | None
     bootstrap: BootstrapConfig | None
     ssh_password_file: Path | None = None
+    probes: tuple[ProbeConfig, ...] = ()
+
+
+def dual_certificate_probe(host: Host) -> ProbeConfig | None:
+    """Retain the certificate check from older dual-bootstrap inventories."""
+    bootstrap = host.bootstrap
+    if bootstrap is None or not bootstrap.verify_dual:
+        return None
+    if host.probe is None or bootstrap.client_endpoint is None or bootstrap.client_config is None:
+        raise OpsError("dual probe configuration is incomplete")
+    return dataclasses.replace(
+        host.probe, endpoint=bootstrap.client_endpoint, username=None,
+        password_file=None, client_config=bootstrap.client_config,
+        ca_cert=None, server_name=None,
+    )
+
+
+def required_probes(host: Host) -> tuple[ProbeConfig, ...]:
+    """All configured checks are mandatory; never infer unconfigured endpoints."""
+    profiles = ([host.probe] if host.probe is not None else []) + list(host.probes)
+    certificate = dual_certificate_probe(host)
+    if certificate is not None and certificate not in profiles:
+        profiles.append(certificate)
+    if len(profiles) > MAX_REQUIRED_PROBES:
+        raise OpsError(f"at most {MAX_REQUIRED_PROBES} required probes are allowed per host")
+    return tuple(profiles)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -654,6 +681,14 @@ def initialize_inventory(
         lines.append("skip_udp = true")
     if ca_cert is not None and auth_mode != "client_cert":
         lines.append(f"ca_cert = {q(ca_cert)}")
+    if auth_mode == "dual":
+        # Persist the certificate check independently of the one-time bootstrap
+        # table so removing bootstrap settings cannot silently drop coverage.
+        lines.extend(["[[hosts.probes]]", f"endpoint = {q(cert_endpoint)}",
+                      f"transport = {q(transport)}", f"client_config = {q(str(client_path))}"])
+        for option, enabled in (("connect_ip", connect_ip), ("skip_tcp", skip_tcp), ("skip_udp", skip_udp)):
+            if enabled:
+                lines.append(f"{option} = true")
     new_host = ("\n".join(lines) + "\n").encode("utf-8")
     content = ((original.rstrip() + b"\n\n") if original else b"schema_version = 1\n") + new_host
     created_inventory = False
@@ -730,7 +765,7 @@ CONNECTION_KEYS = {
     "command_timeout_secs",
     "deploy_timeout_secs",
 }
-HOST_KEYS = CONNECTION_KEYS | {"name", "address", "canary", "probe", "bootstrap"}
+HOST_KEYS = CONNECTION_KEYS | {"name", "address", "canary", "probe", "probes", "bootstrap"}
 PROBE_KEYS = {
     "endpoint",
     "transport",
@@ -1155,6 +1190,12 @@ def load_inventory(path: Path) -> Inventory:
         probe = None
         if "probe" in table:
             probe = parse_probe(table["probe"], inventory_dir, name)
+        raw_probes = table.get("probes", [])
+        if not isinstance(raw_probes, list) or len(raw_probes) > MAX_REQUIRED_PROBES:
+            raise OpsError(f"hosts[{name}].probes must be a list of at most {MAX_REQUIRED_PROBES} probe tables")
+        probes = tuple(parse_probe(value, inventory_dir, name) for value in raw_probes)
+        if any(profile.transport == "auto" for profile in probes):
+            raise OpsError("hosts.probes entries require explicit http2 or http3 transport")
         bootstrap = None
         if "bootstrap" in table:
             bootstrap = parse_bootstrap(table["bootstrap"], inventory_dir, name)
@@ -1221,8 +1262,10 @@ def load_inventory(path: Path) -> Inventory:
                 probe=probe,
                 bootstrap=bootstrap,
                 ssh_password_file=ssh_password_file,
+                probes=probes,
             )
         )
+        required_probes(hosts[-1])  # Include legacy and derived checks in the bound.
     return Inventory(path, repository, state_path, probe_binary, tuple(hosts))
 
 
@@ -1918,6 +1961,8 @@ class ProbeRunner:
         if completed.returncode != 0 or not report.get("success"):
             codes = ", ".join(str(code) for code in failed_codes) or "UNKNOWN"
             raise OpsError(f"external MASQUE probe failed for {host.name}: {codes}")
+        if probe.transport != "auto" and summary["transport"] != probe.transport:
+            raise OpsError("external MASQUE probe did not verify the required transport")
         if probe.connect_ip and not probe.ip_setup_only and not summary["connect_ip_forwarding_verified"]:
             raise OpsError("CONNECT-IP forwarding was not verified; upgrade masque-probe or explicitly select ip_setup_only")
         return summary
@@ -1931,7 +1976,7 @@ def configure_probe(
     runner: ProbeRunner,
 ) -> dict[str, object]:
     """Test a new probe before atomically adding it to a private inventory."""
-    if host.probe is not None:
+    if required_probes(host):
         raise OpsError("a probe is already configured for the selected host")
     ensure_private_parent(inventory.path, "inventory")
     ensure_private_file(inventory.path, "inventory")
@@ -2156,6 +2201,39 @@ class FleetOperator:
         except OpsError:
             return False
 
+    def preflight_probes(
+        self, host: Host, *, allow_missing: frozenset[Path] = frozenset()
+    ) -> None:
+        for profile in required_probes(host):
+            self.probes.preflight(profile, allow_missing=allow_missing)
+
+    def run_probes(self, host: Host) -> dict[str, object]:
+        profiles = required_probes(host)
+        if not profiles:
+            return {"status": "not_configured"}
+        # Validate every credential before making any external connection. Run
+        # sequentially with the existing per-process timeout, never unbounded
+        # fan-out or automatic transport expansion.
+        self.preflight_probes(host)
+        results = []
+        for index, profile in enumerate(profiles, 1):
+            try:
+                results.append(self.probes.run(dataclasses.replace(host, probe=profile)))
+            except OpsError as error:
+                if len(profiles) == 1:
+                    raise
+                raise OpsError(f"required probe {index}/{len(profiles)} failed: {error}") from error
+        if len(results) == 1:
+            return results[0]
+        ip_results = [result for profile, result in zip(profiles, results, strict=True) if profile.connect_ip]
+        return {
+            **results[0],
+            "profiles": results,
+            "connect_ip_forwarding_verified": all(
+                bool(result.get("connect_ip_forwarding_verified")) for result in ip_results
+            ) if ip_results else None,
+        }
+
     def _maintenance(
         self, host: Host, *arguments: str, timeout: int | None = None
     ) -> subprocess.CompletedProcess[str]:
@@ -2248,8 +2326,7 @@ class FleetOperator:
     @staticmethod
     def _bootstrap_missing_probe_credentials(host: Host) -> frozenset[Path]:
         bootstrap = host.bootstrap
-        probe = host.probe
-        if bootstrap is None or probe is None:
+        if bootstrap is None:
             return frozenset()
         generated = {
             path
@@ -2262,6 +2339,7 @@ class FleetOperator:
         }
         return frozenset(
             path
+            for probe in required_probes(host)
             for path in (probe.password_file, probe.client_config, probe.ca_cert)
             if path is not None and path in generated and not path.exists()
         )
@@ -2287,8 +2365,8 @@ class FleetOperator:
         ):
             if path is not None:
                 ensure_secret_destination(path, label, allow_existing=False)
-        self.probes.preflight(
-            host.probe,
+        self.preflight_probes(
+            host,
             allow_missing=self._bootstrap_missing_probe_credentials(host),
         )
 
@@ -2554,17 +2632,11 @@ class FleetOperator:
                     "bootstrap certificate client configuration",
                 )
             after = self.verify_bootstrap(host, release.tag)
-            probe = self.probes.run(host)
+            probe = self.run_probes(host)
             certificate_probe = None
             if bootstrap.verify_dual:
-                if host.probe is None or bootstrap.client_endpoint is None or bootstrap.client_config is None:
-                    raise OpsError("dual probe configuration is incomplete")
-                certificate = dataclasses.replace(
-                    host.probe, endpoint=bootstrap.client_endpoint, username=None,
-                    password_file=None, client_config=bootstrap.client_config,
-                    ca_cert=None, server_name=None,
-                )
-                certificate_probe = self.probes.run(dataclasses.replace(host, probe=certificate))
+                certificate_index = required_probes(host).index(dual_certificate_probe(host))
+                certificate_probe = probe["profiles"][certificate_index]
         except OpsError as error:
             self._audit_best_effort(
                 "bootstrap_failed",
@@ -2595,7 +2667,7 @@ class FleetOperator:
             "version": release.tag,
             "probe": probe,
             "certificate_probe": certificate_probe,
-            "connect_ip_forwarding_verified": bool(probe.get("connect_ip_forwarding_verified")) if host.probe and host.probe.connect_ip else None,
+            "connect_ip_forwarding_verified": probe.get("connect_ip_forwarding_verified"),
             "basic_password_created": password_created,
             "credential_files_saved": sum(
                 path is not None
@@ -2719,6 +2791,7 @@ class FleetOperator:
     ) -> None:
         self._run_upgrade(host, version, bootstrap=bootstrap)
         self.verify_remote(host, version, expected_config_sha256)
+        self.run_probes(host)
 
     def deploy_one(
         self,
@@ -2737,7 +2810,7 @@ class FleetOperator:
                 f"installed version or configuration hash is unknown on {host.name}"
             )
         if previous_version == release.tag:
-            probe = self.probes.run(host)
+            probe = self.run_probes(host)
             return {
                 "host": host.name,
                 "status": "already_current",
@@ -2746,7 +2819,7 @@ class FleetOperator:
             }
         previous_release = releases.fetch(previous_version)
         self.ensure_release(host, before, previous_release)
-        self.probes.preflight(host.probe)
+        self.preflight_probes(host)
         self.state.audit(
             "deploy_started",
             host.name,
@@ -2756,7 +2829,7 @@ class FleetOperator:
         try:
             self._run_upgrade(host, release.tag, bootstrap=bootstrap)
             after = self.verify_remote(host, release.tag, config_sha256)
-            probe = self.probes.run(host)
+            probe = self.run_probes(host)
             self.state.save_transition(host.name, previous_version, release.tag)
         except OpsError as deploy_error:
             audit_ok = self._audit_best_effort(
@@ -2779,6 +2852,10 @@ class FleetOperator:
                         config_sha256,
                         bootstrap=bootstrap,
                     )
+                else:
+                    # Even an installer that restored the old release itself
+                    # has not established external authentication/transport health.
+                    self.run_probes(host)
             except OpsError as rollback_error:
                 self._audit_best_effort(
                     "automatic_rollback_failed",
@@ -2834,7 +2911,7 @@ class FleetOperator:
         target = self.state.rollback_target(host.name, before.version)
         release = releases.fetch(target)
         self.ensure_release(host, before, release)
-        self.probes.preflight(host.probe)
+        self.preflight_probes(host)
         self.state.audit(
             "rollback_started",
             host.name,
@@ -2844,7 +2921,7 @@ class FleetOperator:
         try:
             self._run_upgrade(host, target, bootstrap=False)
             self.verify_remote(host, target, config_sha256)
-            probe = self.probes.run(host)
+            probe = self.run_probes(host)
             self.state.save_transition(host.name, before.version, target)
         except OpsError as rollback_error:
             audit_ok = self._audit_best_effort(
@@ -2959,7 +3036,8 @@ def plan_bootstrap(
         "action": "fresh_install",
         "ready": not blockers,
         "blockers": blockers,
-        "probe_configured": host.probe is not None,
+        "probe_configured": bool(required_probes(host)),
+        "required_probe_count": len(required_probes(host)),
         "install_dependencies": install_dependencies,
         "certificate_mode": host.bootstrap.tls_mode if host.bootstrap else None,
     }
@@ -2995,9 +3073,9 @@ def plan_upgrade(
                     previous_cache[status.version] = False
             if not previous_cache[status.version]:
                 blockers.append("current release is unavailable for automatic rollback")
-        if host.probe is not None:
+        if required_probes(host):
             try:
-                operator.probes.preflight(host.probe)
+                operator.preflight_probes(host)
             except OpsError as error:
                 blockers.append(str(error))
         if status.version == release.tag:
@@ -3015,7 +3093,8 @@ def plan_upgrade(
                 "target_version": release.tag,
                 "action": action,
                 "canary": host.canary,
-                "probe_configured": host.probe is not None,
+                "probe_configured": bool(required_probes(host)),
+                "required_probe_count": len(required_probes(host)),
                 "ready": not blockers,
                 "blockers": blockers,
             }
@@ -3068,7 +3147,8 @@ def print_plan(plan: dict[str, object]) -> None:
         marker = "canary" if host["canary"] else "node"
         print(
             f"[{marker}] {host['host']}: {host['current_version'] or 'unknown'} "
-            f"-> {host['target_version']} ({host['action']}){suffix}"
+            f"-> {host['target_version']} ({host['action']}, "
+            f"{host['required_probe_count']} required probes){suffix}"
         )
 
 
@@ -3371,7 +3451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             host = inventory.select([arguments.host], require_names=True)[0]
         else:
             host = inventory.default_host(canary_for_fleet=True)
-        if host.probe is not None:
+        if required_probes(host):
             raise OpsError("a probe is already configured for the selected host")
         interactive = sys.stdin.isatty()
 
@@ -3475,8 +3555,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         host.bootstrap.basic_password_file,
                         "bootstrap Basic password file",
                     )
-            operator.probes.preflight(
-                host.probe,
+            operator.preflight_probes(
+                host,
                 allow_missing=operator._bootstrap_missing_probe_credentials(host),
             )
         payload = {
@@ -3557,7 +3637,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if plan["certificate_mode"] == "self_signed":
                     print("Will generate a self-signed certificate for the probe and server.")
                 if plan["probe_configured"]:
-                    print("Will verify the installation with an external probe.")
+                    print(f"Will verify the installation with {plan['required_probe_count']} required external probes.")
             emit(plan, arguments.json)
             return 0 if plan["ready"] else 1
         if not plan["ready"]:
@@ -3594,7 +3674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if len(selected) != 1:
                 raise OpsError("rollout requires exactly one selected canary")
             canary = selected[0]
-        if canary.probe is None and not arguments.allow_no_probe:
+        if not required_probes(canary) and not arguments.allow_no_probe:
             raise OpsError(
                 "the selected host has no external probe; configure one or explicitly use --allow-no-probe"
             )

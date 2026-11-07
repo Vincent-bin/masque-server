@@ -276,6 +276,68 @@ class InventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ops.OpsError, "group or others"):
             ops.load_inventory(inventory.path)
 
+    def test_required_profiles_support_legacy_and_explicit_transports(self) -> None:
+        path = self.write_inventory(
+            '[hosts.probe]\nendpoint = "primary.example:443"\n'
+            '[[hosts.probes]]\nendpoint = "fallback.example:8443"\ntransport = "http2"\n'
+            'client_config = "secrets/client.json"\n'
+        )
+        host = ops.load_inventory(path).hosts[0]
+        profiles = ops.required_probes(host)
+        self.assertEqual(len(profiles), 2)
+        self.assertEqual(profiles[0].transport, "auto")
+        self.assertEqual(profiles[1].transport, "http2")
+        self.assertEqual(profiles[1].client_config, self.root / "secrets/client.json")
+
+    def test_required_profiles_validate_shape_transport_and_secret_references(self) -> None:
+        invalid = [
+            ('probes = {}', "must be a list"),
+            ('probes = [1]', "must be a TOML table"),
+            ('[[hosts.probes]]\nendpoint = "proxy.example:443"', "explicit http2 or http3"),
+            ('[[hosts.probes]]\nendpoint = "proxy.example:443"\ntransport = "auto"', "explicit http2 or http3"),
+            ('[[hosts.probes]]\nendpoint = "proxy.example:443"\ntransport = "http2"\npassword = "secret"', "unknown"),
+        ]
+        for stanza, expected in invalid:
+            with self.subTest(stanza=stanza), self.assertRaisesRegex(ops.OpsError, expected):
+                ops.load_inventory(self.write_inventory(stanza))
+
+    def test_required_profile_bound_includes_primary_and_legacy_dual(self) -> None:
+        stanza = '[[hosts.probes]]\nendpoint = "proxy.example:443"\ntransport = "http3"\n'
+        host = ops.load_inventory(self.write_inventory(stanza * ops.MAX_REQUIRED_PROBES)).hosts[0]
+        self.assertEqual(len(ops.required_probes(host)), ops.MAX_REQUIRED_PROBES)
+        for text in (
+            stanza * (ops.MAX_REQUIRED_PROBES + 1),
+            '[hosts.probe]\nendpoint = "proxy.example:443"\n' + stanza * ops.MAX_REQUIRED_PROBES,
+        ):
+            with self.assertRaisesRegex(ops.OpsError, "at most 8"):
+                ops.load_inventory(self.write_inventory(text))
+        path = self.root / "dual.toml"
+        ops.initialize_inventory(path, ssh_host="203.0.113.10", endpoint_host="proxy.example.com",
+                                 auth_mode="dual", self_signed=True)
+        dual = ops.load_inventory(path).hosts[0]
+        legacy = ops.dataclasses.replace(dual, probes=())
+        self.assertEqual(len(ops.required_probes(legacy)), 2)
+        with self.assertRaisesRegex(ops.OpsError, "at most 8"):
+            ops.required_probes(ops.dataclasses.replace(legacy, probes=(host.probes[0],) * 7))
+
+    def test_new_dual_profiles_survive_removing_bootstrap_and_do_not_duplicate(self) -> None:
+        for transport in ("http2", "http3"):
+            path = self.root / f"dual-{transport}.toml"
+            ops.initialize_inventory(path, ssh_host="203.0.113.10", endpoint_host="proxy.example.com",
+                                     auth_mode="dual", transport=transport, self_signed=True,
+                                     connect_ip=True, skip_tcp=True)
+            host = ops.load_inventory(path).hosts[0]
+            self.assertEqual(len(ops.required_probes(host)), 2)
+            self.assertEqual(ops.required_probes(host), ops.required_probes(ops.dataclasses.replace(host, bootstrap=None)))
+            certificate = host.probes[0]
+            self.assertEqual(certificate.transport, transport)
+            self.assertTrue(certificate.connect_ip)
+            self.assertTrue(certificate.skip_tcp)
+            self.assertIsNone(certificate.username)
+            self.assertIsNone(certificate.ca_cert)
+            self.assertEqual(certificate.client_config, host.bootstrap.client_config)
+            self.assertIn(certificate.client_config, ops.FleetOperator._bootstrap_missing_probe_credentials(host))
+
     def test_initialize_inventory_generates_safe_bootstrap_and_probe(self) -> None:
         path = self.root / "fresh" / "fleet.toml"
         result = ops.initialize_inventory(
@@ -928,6 +990,215 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(ops.main(["--json", "rollback", "--apply"]), 0)
         self.assertEqual(operator.deploy_one.call_args.args[0], host)
         self.assertEqual(operator.rollback_one.call_args.args[0], host)
+
+    def profile_operator(self, version: str = "v0.12.2") -> tuple[object, object, object]:
+        password = self.root / "secret.password"
+        password.write_text("fixture-password")
+        password.chmod(0o600)
+        client = self.root / "client.json"
+        client.write_text('{"private_key":"fixture-key"}')
+        client.chmod(0o600)
+        profiles = tuple(
+            ops.ProbeConfig(endpoint=f"proxy.example:{port}", transport=transport,
+                            username="fixture-user" if auth == "basic" else None,
+                            password_file=password if auth == "basic" else None,
+                            client_config=client if auth == "certificate" else None)
+            for transport, port in (("http3", 443), ("http2", 8443))
+            for auth in ("basic", "certificate")
+        )
+        host = ops.dataclasses.replace(self.host, probe=profiles[0], probes=profiles[1:])
+        inventory = ops.dataclasses.replace(self.inventory, hosts=(host,))
+        ssh = FakeSsh(version)
+        operator = ops.FleetOperator(inventory, ssh=ssh)
+        return host, ssh, operator
+
+    @staticmethod
+    def passing_probe(host: object) -> dict[str, object]:
+        return {"status": "passed", "transport": host.probe.transport, "failed_codes": [],
+                "connect_ip_forwarding_verified": True if host.probe.connect_ip else None}
+
+    def test_upgrade_rollback_and_already_current_run_complete_matrix(self) -> None:
+        host, ssh, operator = self.profile_operator()
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = self.passing_probe
+        releases = FakeReleases("v0.12.2", "v0.13.0")
+        for action in (
+            lambda: operator.deploy_one(host, release("v0.13.0"), releases),
+            lambda: operator.deploy_one(host, release("v0.13.0"), releases),
+            lambda: operator.rollback_one(host, releases),
+        ):
+            operator.probes.reset_mock()
+            result = action()
+            self.assertEqual([call.args[0].probe for call in operator.probes.run.call_args_list], list(ops.required_probes(host)))
+            self.assertEqual(len(result["probe"]["profiles"]), 4)
+            output = json.dumps(result)
+            for private in ("proxy.example", "fixture-user", "secret.password", "client.json", "fixture-key"):
+                self.assertNotIn(private, output)
+        self.assertEqual(ssh.upgrades, ["v0.13.0", "v0.12.2"])
+
+    def test_real_runner_matrix_uses_explicit_transport_and_private_credentials(self) -> None:
+        host, _ssh, operator = self.profile_operator()
+        calls = []
+        def probe_process(command: list[str], **kwargs: object) -> object:
+            transport = command[command.index("--transport") + 1]
+            calls.append(command)
+            self.assertEqual(kwargs["timeout"], 63)
+            if "--username" in command:
+                self.assertIn("--password-stdin", command)
+                self.assertEqual(kwargs["stdin"].read(), b"fixture-password")
+                self.assertNotIn("fixture-password", " ".join(command))
+            else:
+                self.assertIn("--client-config", command)
+            report = {"success": True, "selected_transport": transport, "checks": []}
+            return subprocess.CompletedProcess(command, 0, json.dumps(report).encode(), b"")
+        with mock.patch.object(operator.probes, "resolve_binary", return_value="fixture-probe"), \
+             mock.patch.object(ops.subprocess, "run", side_effect=probe_process):
+            result = operator.run_probes(host)
+        self.assertEqual(len(result["profiles"]), 4)
+        self.assertEqual([args[args.index("--transport") + 1] for args in calls], ["http3", "http3", "http2", "http2"])
+
+    def test_explicit_transport_cannot_pass_through_another_transport(self) -> None:
+        host, _ssh, operator = self.profile_operator()
+        report = {"success": True, "selected_transport": "http2", "checks": []}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(report).encode(), b"")
+        with mock.patch.object(operator.probes, "resolve_binary", return_value="fixture-probe"), \
+             mock.patch.object(ops.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(ops.OpsError, "required transport"):
+                operator.run_probes(host)
+
+    def test_legacy_dual_upgrade_runs_certificate_probe(self) -> None:
+        path = self.root / "legacy-dual.toml"
+        ops.initialize_inventory(path, ssh_host="203.0.113.10", endpoint_host="proxy.example.com",
+                                 auth_mode="dual", self_signed=True)
+        host = ops.dataclasses.replace(ops.load_inventory(path).hosts[0], probes=())
+        operator = ops.FleetOperator(self.inventory, ssh=FakeSsh("v0.12.2"))
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = self.passing_probe
+        result = operator.deploy_one(host, release("v0.13.0"), FakeReleases("v0.12.2", "v0.13.0"))
+        self.assertEqual(len(result["probe"]["profiles"]), 2)
+        self.assertEqual(operator.probes.run.call_args_list[1].args[0].probe.client_config, host.bootstrap.client_config)
+
+    def test_missing_secondary_credential_blocks_before_upgrade_or_any_probe(self) -> None:
+        host, ssh, operator = self.profile_operator()
+        host.probes[0].client_config.unlink()
+        with mock.patch.object(operator.probes, "resolve_binary", return_value="fixture-probe"), \
+             mock.patch.object(operator.probes, "run") as run:
+            plan = ops.plan_upgrade(operator, [host], release("v0.13.0"), FakeReleases("v0.12.2", "v0.13.0"))
+            self.assertFalse(plan["ready"])
+            self.assertEqual(plan["hosts"][0]["required_probe_count"], 4)
+            with self.assertRaises(ops.OpsError):
+                operator.deploy_one(host, release("v0.13.0"), FakeReleases("v0.12.2", "v0.13.0"))
+            run.assert_not_called()
+        self.assertEqual(ssh.upgrades, [])
+        self.assertFalse(self.inventory.state_path.exists())
+
+    def test_secondary_failure_rolls_back_and_rechecks_every_profile(self) -> None:
+        host, ssh, operator = self.profile_operator()
+        operator.probes = mock.Mock()
+        seen = []
+        def run(selected: object) -> dict[str, object]:
+            seen.append((ssh.version, selected.probe))
+            if ssh.version == "v0.13.0" and selected.probe == host.probes[-1]:
+                raise ops.OpsError("fixture secondary failed")
+            return self.passing_probe(selected)
+        operator.probes.run.side_effect = run
+        with self.assertRaisesRegex(ops.OpsError, "was restored.*required probe 4/4"):
+            operator.deploy_one(host, release("v0.13.0"), FakeReleases("v0.12.2", "v0.13.0"))
+        self.assertEqual(seen, [(version, profile) for version in ("v0.13.0", "v0.12.2") for profile in ops.required_probes(host)])
+        self.assertFalse(self.inventory.state_path.exists())
+
+    def test_unverified_automatic_recovery_never_reports_restored(self) -> None:
+        host, ssh, operator = self.profile_operator()
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = ops.OpsError("fixture path unavailable")
+        with self.assertRaisesRegex(ops.OpsError, "manual recovery is required"):
+            operator.deploy_one(host, release("v0.13.0"), FakeReleases("v0.12.2", "v0.13.0"))
+        self.assertEqual(ssh.version, "v0.12.2")
+        self.assertFalse(self.inventory.state_path.exists())
+        audit = operator.state.audit_path.read_text()
+        self.assertIn("automatic_rollback_failed", audit)
+        self.assertNotIn("automatic_rollback_succeeded", audit)
+
+    def test_installer_self_recovery_still_requires_external_probes(self) -> None:
+        host, ssh, operator = self.profile_operator()
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = self.passing_probe
+        with mock.patch.object(operator, "_run_upgrade", side_effect=ops.OpsError("fixture install failed")):
+            with self.assertRaisesRegex(ops.OpsError, "was restored"):
+                operator.deploy_one(host, release("v0.13.0"), FakeReleases("v0.12.2", "v0.13.0"))
+        self.assertEqual(operator.probes.run.call_count, 4)
+        self.assertEqual(ssh.upgrades, [])
+
+    def test_failed_rollback_checks_recovery_and_preserves_local_state(self) -> None:
+        host, ssh, operator = self.profile_operator("v0.13.0")
+        operator.state.save_transition(host.name, "v0.12.2", "v0.13.0")
+        before = self.inventory.state_path.read_bytes()
+        operator.probes = mock.Mock()
+        seen = []
+        def run(selected: object) -> dict[str, object]:
+            seen.append((ssh.version, selected.probe))
+            if ssh.version == "v0.12.2" and selected.probe == host.probes[-1]:
+                raise ops.OpsError("fixture older release failed")
+            return self.passing_probe(selected)
+        operator.probes.run.side_effect = run
+        with self.assertRaisesRegex(ops.OpsError, "rollback failed.*was restored"):
+            operator.rollback_one(host, FakeReleases("v0.12.2", "v0.13.0"))
+        self.assertEqual(seen, [(version, profile) for version in ("v0.12.2", "v0.13.0") for profile in ops.required_probes(host)])
+        self.assertEqual(self.inventory.state_path.read_bytes(), before)
+        self.assertEqual(ssh.upgrades, ["v0.12.2", "v0.13.0"])
+
+    def test_failed_rollback_recovery_probe_requires_manual_recovery(self) -> None:
+        host, ssh, operator = self.profile_operator("v0.13.0")
+        operator.state.save_transition(host.name, "v0.12.2", "v0.13.0")
+        before = self.inventory.state_path.read_bytes()
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = ops.OpsError("fixture path unavailable")
+        with self.assertRaisesRegex(ops.OpsError, "rollback and recovery both failed.*manual recovery"):
+            operator.rollback_one(host, FakeReleases("v0.12.2", "v0.13.0"))
+        self.assertEqual(ssh.version, "v0.13.0")
+        self.assertEqual(self.inventory.state_path.read_bytes(), before)
+        audit = operator.state.audit_path.read_text()
+        self.assertIn("rollback_recovery_failed", audit)
+        self.assertNotIn("rollback_recovery_succeeded", audit)
+
+    def test_multi_profile_ip_summary_never_promotes_setup_only_to_forwarding(self) -> None:
+        host, _ssh, operator = self.profile_operator()
+        host = ops.dataclasses.replace(host, probes=(ops.dataclasses.replace(host.probes[0], connect_ip=True),))
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = [self.passing_probe(host), {"status": "passed", "connect_ip_forwarding_verified": False}]
+        self.assertFalse(operator.run_probes(host)["connect_ip_forwarding_verified"])
+
+    def test_profiles_only_rollout_and_plan_do_not_need_a_primary(self) -> None:
+        host, _ssh, operator = self.profile_operator()
+        host = ops.dataclasses.replace(host, probe=None)
+        operator.probes = mock.Mock()
+        operator.probes.run.side_effect = self.passing_probe
+        releases = FakeReleases("v0.12.2", "v0.13.0")
+        plan = ops.plan_upgrade(operator, [host], release("v0.13.0"), releases)
+        self.assertTrue(plan["ready"])
+        self.assertTrue(plan["hosts"][0]["probe_configured"])
+        self.assertEqual(plan["hosts"][0]["required_probe_count"], 3)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            ops.print_plan(plan)
+        self.assertIn("3 required probes", output.getvalue())
+        inventory = ops.dataclasses.replace(self.inventory, hosts=(host,))
+        with mock.patch.object(ops, "load_inventory", return_value=inventory), \
+             mock.patch.object(ops, "FleetOperator", return_value=operator), \
+             mock.patch.object(ops, "ReleaseClient", return_value=releases), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(ops.main(["--json", "rollout", "--version", "v0.13.0", "--apply"]), 0)
+        self.assertEqual(operator.probes.run.call_count, 3)
+        with self.assertRaisesRegex(ops.OpsError, "already configured"):
+            ops.configure_probe(inventory, host, {}, None, operator.probes)
+
+    def test_legacy_single_probe_result_remains_unchanged(self) -> None:
+        host, _ssh, operator = self.profile_operator()
+        host = ops.dataclasses.replace(host, probes=())
+        operator.probes = mock.Mock()
+        expected = self.passing_probe(host)
+        operator.probes.run.return_value = expected
+        self.assertEqual(operator.run_probes(host), expected)
+        self.assertEqual(operator.run_probes(self.host), {"status": "not_configured"})
 
     def test_deploy_records_transition_and_rollback_is_reversible(self) -> None:
         ssh = FakeSsh("v0.12.2")

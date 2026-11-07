@@ -93,8 +93,11 @@ and inspect status if post-install verification fails.
 For a single selected host, `rollout` selects it automatically without a
 canary designation and normally requires its external probe. For multiple
 selected hosts, choose exactly one canary in inventory or with `--canary`.
-The canary is upgraded and externally probed before the remaining hosts are
-changed, one at a time:
+The canary is upgraded and every required probe is checked before the remaining
+hosts are changed, one at a time. `plan` reports the required probe count;
+`transport = "auto"` alone is not evidence that both H2 and H3 work. Use the
+private inventory's explicit `[[hosts.probes]]` profiles for each required
+transport and authentication combination:
 
 ```sh
 "$OPS_CLI" --inventory "$inventory" \
@@ -103,7 +106,9 @@ changed, one at a time:
 
 On any failure, stop and report which hosts changed and which did not. The
 failing host is automatically restored when possible; earlier successful hosts
-are not silently rolled back as a group.
+are not silently rolled back as a group. Automatic restoration must pass the
+same required probes before it is reported successful. A restored version
+with failing external checks requires manual investigation; do not continue.
 
 ## Roll back one host
 

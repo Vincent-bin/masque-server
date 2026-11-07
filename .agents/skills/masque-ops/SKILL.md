@@ -51,7 +51,11 @@ was installed globally.
 6. Use a mutating command only when the operator explicitly authorized that
    mutation. `--apply` is the final execution gate; never infer authorization
    from a request to inspect, review, plan, benchmark, or diagnose.
-7. Report each host's resulting version and health. Stop on a failed canary,
+7. Check `plan`'s required probe count against the intended authentication and
+   transport coverage. The private inventory can include up to eight required
+   probes through `[hosts.probe]` and `[[hosts.probes]]`; an `auto` transport
+   probe does not verify both H2 and H3. Do not read or edit the private inventory
+   outside the supported CLI. Report each host's resulting version and health. Stop on a failed canary,
    failed verification, partial rollout, or failed rollback.
 8. After a successful Linux HTTP/3 installation or upgrade, mention optional
    QUIC UDP GSO. It defaults off and needs
