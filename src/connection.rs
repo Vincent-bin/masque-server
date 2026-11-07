@@ -179,6 +179,8 @@ pub struct ClientConnection {
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
     pub(crate) pending_error_responses: PendingErrorResponses,
+    /// Request streams whose initial HTTP/3 HEADERS have been dispatched.
+    pub(crate) request_headers_seen: FxHashSet<u64>,
     /// Standard CONNECT tunnels waiting for a target TCP connection.
     pub pending_tcp_tunnels: FxHashMap<u64, PendingTcpTunnel>,
     /// Active standard CONNECT TCP tunnels, keyed by stream ID.
@@ -257,6 +259,7 @@ impl ClientConnection {
             quic,
             h3: None,
             pending_error_responses: PendingErrorResponses::default(),
+            request_headers_seen: FxHashSet::default(),
             pending_tcp_tunnels: FxHashMap::default(),
             tcp_tunnels: FxHashMap::default(),
             tcp_read_resumes: FxHashSet::default(),

@@ -51,6 +51,9 @@ mod error_responses;
 #[path = "client_cert_connect_ip/ip_uri.rs"]
 mod ip_uri;
 
+#[path = "client_cert_connect_ip/request_headers.rs"]
+mod request_headers;
+
 #[path = "client_cert_connect_ip/ip_fin.rs"]
 mod ip_fin;
 
