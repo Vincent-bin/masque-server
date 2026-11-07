@@ -652,6 +652,15 @@ fn idle_tunnels_release_the_bidirectional_stream_slot() {
 
 #[test]
 fn stop_sending_releases_silent_tcp_tunnel_before_admission() {
+    assert_stop_sending_releases_silent_tcp_tunnel(false);
+}
+
+#[test]
+fn stop_sending_with_fin_releases_silent_tcp_tunnel_before_admission() {
+    assert_stop_sending_releases_silent_tcp_tunnel(true);
+}
+
+fn assert_stop_sending_releases_silent_tcp_tunnel(with_fin: bool) {
     use std::io::Read as _;
 
     let mut config = unauthenticated_config();
@@ -668,11 +677,18 @@ fn stop_sending_releases_silent_tcp_tunnel_before_admission() {
     );
     let (mut first_target, _) = target.accept().unwrap();
 
-    // Send no request FIN or RESET_STREAM. The replacement can arrive with
-    // STOP_SENDING before any target data or normal output processing.
+    // Queue FIN (when requested), STOP_SENDING and replacement HEADERS
+    // before flushing, without sending a request RESET_STREAM.
+    if with_fin {
+        client.quic.stream_send(first, b"", true).unwrap();
+    }
     client
         .quic
-        .stream_shutdown(first, quiche::Shutdown::Read, 0x10c)
+        .stream_shutdown(
+            first,
+            quiche::Shutdown::Read,
+            quiche::h3::WireErrorCode::RequestCancelled as u64,
+        )
         .unwrap();
     let replacement = tcp(&mut client, &authority, false);
     assert_eq!(

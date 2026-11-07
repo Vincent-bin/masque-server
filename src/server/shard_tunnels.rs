@@ -991,25 +991,30 @@ impl Shard {
     fn reap_stopped_tcp_tunnels(client: &mut ClientConnection) {
         let quic = &mut client.quic;
         let resumes = &mut client.tcp_read_resumes;
-        let mut keep = |stream_id: &u64| {
-            if !matches!(
-                quic.stream_capacity(*stream_id),
-                Err(quiche::Error::StreamStopped(_))
-            ) {
-                return true;
+        let mut keep = |stream_id: &u64, response_finished: bool| {
+            match quic.stream_capacity(*stream_id) {
+                Err(quiche::Error::StreamStopped(_)) => {
+                    // quiche has already scheduled RESET_STREAM on the response.
+                    let _ = quic.stream_shutdown(
+                        *stream_id,
+                        quiche::Shutdown::Read,
+                        quiche::h3::WireErrorCode::RequestCancelled as u64,
+                    );
+                }
+                // Consuming a request FIN can collect the stopped stream
+                // before we see StreamStopped. After our own graceful FIN,
+                // leave the TCP writer to drain already accepted uploads.
+                Err(quiche::Error::InvalidStreamState(_))
+                    if !response_finished && quic.stream_closed(*stream_id) => {}
+                _ => return true,
             }
-
-            // quiche has already scheduled RESET_STREAM on the response.
-            let _ = quic.stream_shutdown(
-                *stream_id,
-                quiche::Shutdown::Read,
-                quiche::h3::WireErrorCode::RequestCancelled as u64,
-            );
             resumes.remove(stream_id);
             false
         };
-        client.pending_tcp_tunnels.retain(|id, _| keep(id));
-        client.tcp_tunnels.retain(|id, _| keep(id));
+        client.pending_tcp_tunnels.retain(|id, _| keep(id, false));
+        client
+            .tcp_tunnels
+            .retain(|id, tunnel| keep(id, tunnel.response_finished));
     }
 
     pub(super) fn reset_tcp_stream(client: &mut ClientConnection, stream_id: u64) {
