@@ -264,13 +264,9 @@ impl AddressPool {
     /// Allocate the next available IPv6 address.
     pub fn allocate_v6(&mut self) -> Result<Ipv6Addr, PoolError> {
         let net = self.v6_net.ok_or(PoolError::Exhausted)?;
-        let prefix_len = net.prefix_len();
         let net_bits = u128::from(net.network());
-        let host_mask: u128 = if prefix_len >= 128 {
-            0
-        } else {
-            (1u128 << (128 - prefix_len)) - 1
-        };
+        // Derive the host bits without shifting by 128 for the valid ::/0.
+        let host_mask = !u128::from(net.netmask());
 
         // Offset 0 is the subnet-router anycast address and 1 belongs to the
         // TUN gateway. IPv6 has no broadcast, so offsets 2..=host_mask remain.
@@ -563,6 +559,69 @@ mod tests {
 
         assert_eq!(a1, "fd00:abcd::2".parse::<Ipv6Addr>().unwrap());
         assert_eq!(a2, "fd00:abcd::3".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn allocate_v6_handles_every_prefix_length() {
+        for prefix in 0..=128 {
+            let mut pool = AddressPool::new("", &format!("::/{prefix}")).unwrap();
+            if prefix <= 126 {
+                assert_eq!(pool.allocate_v6(), Ok(Ipv6Addr::from(2)), "/{prefix}");
+                assert_eq!(pool.allocate_v6(), Ok(Ipv6Addr::from(3)), "/{prefix}");
+            } else {
+                // /127 and /128 have no addresses beyond network and gateway.
+                assert_eq!(pool.allocate_v6(), Err(PoolError::Exhausted), "/{prefix}");
+                assert_eq!(pool.allocated_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn allocate_v6_zero_prefix_wraps_without_reusing_reserved_or_live_addresses() {
+        let mut pool = AddressPool::new("", "::/0").unwrap();
+        let pinned = IpAddr::V6(Ipv6Addr::from(2));
+        let gateway = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(
+            pool.reserve_static(gateway, b"owner"),
+            Err(PoolError::AlreadyAllocated(gateway))
+        );
+        pool.reserve_static(pinned, b"owner").unwrap();
+        assert_eq!(
+            pool.claim(pinned, b"other"),
+            Err(PoolError::NotReserved(pinned))
+        );
+        pool.claim(pinned, b"owner").unwrap();
+        assert_eq!(pool.allocate_v6(), Ok(Ipv6Addr::from(3)));
+
+        // Reach the last address without walking the whole IPv6 space. The
+        // counter must wrap before overflowing, skipping offsets 0 and 1.
+        let last = Ipv6Addr::from(u128::MAX);
+        pool.v6_next = u128::MAX;
+        assert_eq!(pool.allocate_v6(), Ok(last));
+        assert_eq!(pool.v6_next, 2);
+        assert_eq!(pool.allocate_v6(), Ok(Ipv6Addr::from(4)));
+
+        // A released pinned lease stays reserved, while a dynamic lease can
+        // be reused after wraparound.
+        assert!(pool.release(pinned));
+        assert!(pool.release(IpAddr::V6(last)));
+        pool.v6_next = u128::MAX;
+        assert_eq!(pool.allocate_v6(), Ok(last));
+        assert_eq!(pool.allocate_v6(), Ok(Ipv6Addr::from(5)));
+        pool.claim(pinned, b"owner").unwrap();
+    }
+
+    #[test]
+    fn allocate_v6_small_pool_reuses_released_address() {
+        let mut pool = AddressPool::new("", "fd00::/126").unwrap();
+        let first = pool.allocate_v6().unwrap();
+        let last = pool.allocate_v6().unwrap();
+        assert_eq!(pool.allocate_v6(), Err(PoolError::Exhausted));
+
+        assert!(pool.release(IpAddr::V6(first)));
+        assert_eq!(pool.allocate_v6(), Ok(first));
+        assert!(pool.is_allocated(&IpAddr::V6(last)));
+        assert_eq!(pool.allocate_v6(), Err(PoolError::Exhausted));
     }
 
     #[test]
