@@ -132,6 +132,20 @@ after kernel reassembly. They cover HTTP/2 capsules, HTTP/3 capsules, and
 HTTP/3 native DATAGRAMs. These privileged tests are explicitly ignored by
 ordinary workspace test runs.
 
+For native HTTP/3 DATAGRAM input after request FIN, use the same compiled
+`client_cert_connect_ip` executable:
+
+```sh
+sudo MASQUE_TEST_BIN_DIR=/absolute/path/to/test-executables tests/connect-ip-fin.sh
+```
+
+This verifies actual CONNECT-IP and `cf-connect-ip` TUN forwarding before FIN,
+then silent late-packet discard while a control reply is flow-control blocked,
+with TUN offload on and off. It also requires the complete control reply and
+response FIN after credit returns. The unprivileged `datagram_fin` tests cover
+real QUIC-to-UDP forwarding, pending setup, pre-FIN capsules, sibling streams,
+and response FIN retries.
+
 The Docker script creates development certificates, builds the server and E2E client,
 starts an echo target, grants the server container `NET_ADMIN` and TUN access,
 runs the suite, and removes the Compose network and volumes.

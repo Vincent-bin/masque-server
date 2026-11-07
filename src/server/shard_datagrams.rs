@@ -62,6 +62,14 @@ impl Shard {
                     }
                 };
 
+                // RFC 9297 section 2.1: native datagrams received after the
+                // request's receive side closes are silently discarded. QUIC
+                // retains EOF even while auth/setup or response FIN is pending.
+                // Capsules already parsed before FIN still need forwarding.
+                if capsule.is_none() && client.quic.stream_finished(dgram.stream_id) {
+                    continue;
+                }
+
                 // Only handle context_id=0 (raw payload)
                 if dgram.context_id != 0 {
                     debug!(

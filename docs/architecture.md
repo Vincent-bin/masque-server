@@ -384,6 +384,10 @@ sweep enforces a fixed drain deadline using `server.idle_timeout_secs`; native
 datagram activity cannot renew it. Completion or expiry releases tunnel slots,
 address leases, routes, and queued memory. The final empty DATA frame carrying
 FIN also waits for credit within that deadline for both IP and UDP capsules.
+Native HTTP Datagrams received after request EOF are silently discarded before
+UDP/IP forwarding or early setup buffering, as required by RFC 9297 section
+2.1. Complete DATAGRAM capsules parsed before EOF still forward; the response
+send side and queued control replies drain independently.
 
 ### CONNECT-IP
 

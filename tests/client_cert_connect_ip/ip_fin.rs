@@ -1,6 +1,9 @@
 use super::*;
 use masque::capsule::{AssignedAddress, encoder};
 
+#[cfg(target_os = "linux")]
+use super::ipv6_fragments as packets;
+
 fn request_addresses(client: &mut Client, stream: u64, tail: &[u8]) {
     let mut wire = Vec::new();
     encoder::encode(
@@ -189,7 +192,7 @@ fn separate_fin_rejects_truncated_ip_input_before_draining_blocked_reply() {
 }
 
 #[test]
-fn blocked_ip_fin_drain_expires_despite_native_datagram_activity() {
+fn blocked_ip_fin_drain_expires_despite_late_native_datagrams() {
     let dir = TempDir::new("ip-fin-drain-timeout");
     let key = p256_key();
     let (cert, key) = write_pem(dir.path(), "server", &key, &self_signed(&key, None));
@@ -239,8 +242,8 @@ fn blocked_ip_fin_drain_expires_despite_native_datagram_activity() {
     let finished_at = Instant::now();
     finish_request(&mut client, stream);
 
-    // A valid synthetic IPv4 header refreshes tunnel activity without needing
-    // a target or TUN. The FIN deadline must be independent of that activity.
+    // Keep attempting valid native input after FIN without a target or TUN.
+    // These packets must be discarded and cannot renew the drain deadline.
     let mut packet = [0; 20];
     packet[0] = 0x45;
     packet[2..4].copy_from_slice(&20u16.to_be_bytes());
@@ -285,4 +288,110 @@ fn blocked_ip_fin_drain_expires_despite_native_datagram_activity() {
     assert_eq!(setup.len(), 2);
     assert!(setup.iter().any(|frame| matches!(frame,
         CapsuleFrame::AddressAssign(assigned) if assigned.iter().any(|entry| entry.ip == IpAddress::V4(source)))));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an isolated Linux network namespace and TUN; run tests/connect-ip-fin.sh"]
+fn ip_native_datagrams_stop_at_request_fin_while_control_reply_is_blocked() {
+    let dir = TempDir::new("ip-native-fin");
+    let key = p256_key();
+    let (cert, key) = write_pem(dir.path(), "server", &key, &self_signed(&key, None));
+    let mut config = server_config(cert, key, ephemeral_addr(), vec![]);
+    config.listeners[0].auth.enabled = false;
+    packets::configure(&mut config);
+    let peer = spawn_server(config)[0];
+    let target = UdpSocket::bind((packets::TARGET, 0)).unwrap();
+    target.set_nonblocking(true).unwrap();
+    let mut client = Client::connect_with_transport(
+        peer,
+        None,
+        None,
+        false,
+        "127.0.0.1".parse().unwrap(),
+        true,
+        64,
+    )
+    .unwrap();
+    client
+        .socket
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+    for protocol in ["connect-ip", "cf-connect-ip"] {
+        let stream = client.send_connect_ip(protocol).unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        let setup = client.capsules(stream, 2, Duration::from_secs(5));
+        let source = packets::assigned_source(&setup);
+        let wire_packets = packets::packets(source, target.local_addr().unwrap().port());
+        let send = |client: &mut Client| {
+            for packet in &wire_packets {
+                let wire = DatagramHeader::new(stream).unwrap().encode(packet);
+                client.quic.dgram_send(&wire).unwrap();
+            }
+            client.flush().unwrap();
+        };
+        // A real kernel-delivered payload before FIN rules out a false pass
+        // caused by disabled TUN forwarding, policy, or invalid packet bytes.
+        send(&mut client);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut received = [0; 2048];
+        loop {
+            match target.recv_from(&mut received) {
+                Ok((length, from)) => {
+                    assert_eq!(&received[..length], &packets::PAYLOAD);
+                    assert_eq!(from.ip(), source);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "pre-FIN IP forwarding failed");
+                    client.drive().unwrap();
+                }
+                Err(e) => panic!("target receive failed: {e}"),
+            }
+        }
+        request_addresses(&mut client, stream, &[]);
+        finish_request(&mut client, stream);
+        send(&mut client);
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            client.drive().unwrap();
+            let error = target
+                .recv(&mut received)
+                .expect_err("IP native DATAGRAM after FIN reached TUN target");
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            while let Ok((id, event)) = client.h3.as_mut().unwrap().poll(&mut client.quic) {
+                if id == stream {
+                    assert!(
+                        !matches!(
+                            event,
+                            quiche::h3::Event::Finished | quiche::h3::Event::Reset(_)
+                        ),
+                        "control reply did not remain blocked: {event:?}"
+                    );
+                }
+            }
+        }
+        let frames = read_finished_reply(&mut client, stream);
+        let [CapsuleFrame::AddressAssign(assigned)] = frames.as_slice() else {
+            panic!("incomplete control reply: {frames:?}");
+        };
+        for id in 1..=256 {
+            let entries: Vec<_> = assigned
+                .iter()
+                .filter(|entry| entry.request_id == id)
+                .collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].ip, IpAddress::V6(source));
+            assert_eq!(entries[0].prefix_len, 128);
+        }
+        assert!(client.quic.peer_error().is_none());
+        // The next protocol reuses the same connection and released leases.
+    }
 }

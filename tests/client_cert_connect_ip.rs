@@ -42,6 +42,9 @@ use masque::server::Server;
 #[path = "client_cert_connect_ip/cold_auth_fin.rs"]
 mod cold_auth_fin;
 
+#[path = "client_cert_connect_ip/datagram_fin.rs"]
+mod datagram_fin;
+
 #[path = "client_cert_connect_ip/error_responses.rs"]
 mod error_responses;
 
@@ -50,6 +53,10 @@ mod ip_uri;
 
 #[path = "client_cert_connect_ip/ip_fin.rs"]
 mod ip_fin;
+
+#[cfg(target_os = "linux")]
+#[path = "support/ipv6_fragments.rs"]
+mod ipv6_fragments;
 
 #[cfg(target_os = "linux")]
 #[path = "client_cert_connect_ip/ip_fragments.rs"]
