@@ -154,4 +154,62 @@ mod tests {
         );
         assert!(decoder.value.is_none());
     }
+
+    #[test]
+    fn large_unknown_values_and_grease_resume_datagrams_with_bounded_state() {
+        let payload = b"\0packet";
+        let mut wire = Vec::new();
+        // Exercise all type varint widths, zero-length GREASE, and malformed
+        // IP-only controls (which have no semantics for CONNECT-UDP).
+        for (kind, length) in [
+            (0x20, 70_000),
+            (0x21, 0),
+            (0x40, 3),
+            (1 << 20, 2),
+            (varint::MAX_VALUE, 1),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+        ] {
+            encoder::encode(
+                &super::super::CapsuleFrame::Unknown {
+                    capsule_type: kind,
+                    value: vec![0xff; length],
+                },
+                &mut wire,
+            );
+        }
+        encoder::encode_datagram(payload, &mut wire);
+        for chunk_size in [1, 2, 3, 7, 16, 997, 16_384, wire.len()] {
+            let mut decoder = DatagramCapsules::new(payload.len());
+            let mut packets = Vec::new();
+            for chunk in wire.chunks(chunk_size) {
+                packets.extend(decoder.decode(chunk).unwrap());
+                assert!(decoder.header_len <= decoder.header.len());
+                if let Some(value) = &decoder.value {
+                    assert_eq!(decoder.kind, CAPSULE_DATAGRAM);
+                    assert!(value.capacity() <= payload.len());
+                }
+            }
+            assert_eq!(packets, [payload.to_vec()]);
+            assert!(!decoder.is_partial());
+        }
+    }
+
+    #[test]
+    fn every_partial_unknown_header_or_value_is_truncated() {
+        let mut wire = Vec::new();
+        // Force the longest possible header, including a non-minimal length
+        // encoding, so every incremental header boundary is covered.
+        varint::encode_to_vec(varint::MAX_VALUE, &mut wire).unwrap();
+        wire.extend_from_slice(&[0xc0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3]);
+        for end in 0..=wire.len() {
+            let mut decoder = DatagramCapsules::new(1);
+            for byte in &wire[..end] {
+                assert!(decoder.decode(&[*byte]).unwrap().is_empty());
+                assert!(decoder.value.is_none());
+            }
+            assert_eq!(decoder.is_partial(), end != 0 && end != wire.len());
+        }
+    }
 }
