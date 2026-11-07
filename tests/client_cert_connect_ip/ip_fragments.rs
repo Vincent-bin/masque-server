@@ -1,7 +1,6 @@
 use super::*;
 
-#[path = "../support/ipv6_fragments.rs"]
-mod fragments;
+use super::ipv6_fragments as fragments;
 
 #[test]
 #[ignore = "requires an isolated Linux network namespace and TUN; run tests/connect-ip-fragments.sh"]

@@ -1,5 +1,9 @@
 // Per-client QUIC + HTTP/3 connection state.
 
+mod error_responses;
+
+pub(crate) use error_responses::PendingErrorResponses;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -163,6 +167,8 @@ impl DeferredSend {
 pub struct ClientConnection {
     pub(crate) capsule_streams: FxHashMap<u64, crate::server::capsules::CapsuleStream>,
     pub(crate) capsule_readable: FxHashSet<u64>,
+    /// Known capsule streams with bounded local HTTP/3 framing work remaining.
+    pub(crate) capsule_read_resumes: FxHashSet<u64>,
     pub(crate) capsule_writable: FxHashSet<u64>,
     pub(crate) finished_capsules: Vec<u64>,
     pub(crate) capsule_send_bytes: usize,
@@ -172,6 +178,7 @@ pub struct ClientConnection {
     pub(crate) resolver: TargetResolver,
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
+    pub(crate) pending_error_responses: PendingErrorResponses,
     /// Standard CONNECT tunnels waiting for a target TCP connection.
     pub pending_tcp_tunnels: FxHashMap<u64, PendingTcpTunnel>,
     /// Active standard CONNECT TCP tunnels, keyed by stream ID.
@@ -240,6 +247,7 @@ impl ClientConnection {
             resolver,
             capsule_streams: FxHashMap::default(),
             capsule_readable: FxHashSet::default(),
+            capsule_read_resumes: FxHashSet::default(),
             capsule_writable: FxHashSet::default(),
             finished_capsules: Vec::new(),
             capsule_send_bytes: 0,
@@ -248,6 +256,7 @@ impl ClientConnection {
             received_capsule_bytes: 0,
             quic,
             h3: None,
+            pending_error_responses: PendingErrorResponses::default(),
             pending_tcp_tunnels: FxHashMap::default(),
             tcp_tunnels: FxHashMap::default(),
             tcp_read_resumes: FxHashSet::default(),
@@ -353,7 +362,7 @@ impl ClientConnection {
     /// The next instant this connection needs the event loop's attention:
     /// buffered framing work, quiche's timer, or a deferred packet's release.
     pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
-        if !self.tcp_read_resumes.is_empty()
+        if (!self.tcp_read_resumes.is_empty() || !self.capsule_read_resumes.is_empty())
             && self.quic.local_error().is_none()
             && !self.quic.is_draining()
             && !self.quic.is_closed()
@@ -369,7 +378,8 @@ impl ClientConnection {
         }
     }
 
-    /// Total active or connecting tunnels open on this connection.
+    /// Total active/connecting tunnels and rejected requests awaiting output.
+    /// Pending errors still occupy admission capacity until sent or cancelled.
     pub fn tunnel_count(&self) -> usize {
         self.pending_tcp_tunnels.len()
             + self.tcp_tunnels.len()
@@ -377,6 +387,7 @@ impl ClientConnection {
             + self.udp_tunnels.len()
             + self.ip_tunnels.len()
             + self.pending_ip_responses.len()
+            + self.pending_error_responses.len()
     }
 
     /// Use finer deadline wakeups only for TCP-only connections. A pending

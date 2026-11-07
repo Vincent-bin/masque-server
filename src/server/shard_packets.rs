@@ -553,6 +553,11 @@ impl Shard {
             loop {
                 match h3.poll(&mut client.quic) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                        // A rejection already owns this stream. Trailers must
+                        // not dispatch new work or replace its original status.
+                        if client.pending_error_responses.contains(stream_id) {
+                            continue;
+                        }
                         let tcp_setup_count = pending_setups.tcp.len();
                         let udp_setup_count = pending_setups.udp.len();
                         let request_context = RequestContext {
@@ -563,6 +568,7 @@ impl Shard {
                         if let Some(pending) = Self::handle_request(
                             h3,
                             &mut client.quic,
+                            &mut client.pending_error_responses,
                             stream_id,
                             &list,
                             &request_context,
@@ -573,7 +579,12 @@ impl Shard {
                                     stream_id,
                                     "too many CONNECT requests awaiting authorization"
                                 );
-                                Self::send_auth_rejection(h3, &mut client.quic, stream_id);
+                                Self::send_auth_rejection(
+                                    h3,
+                                    &mut client.quic,
+                                    &mut client.pending_error_responses,
+                                    stream_id,
+                                );
                             } else {
                                 let connect_udp =
                                     matches!(&pending.request, ConnectRequest::Udp { .. });
@@ -638,24 +649,31 @@ impl Shard {
                     }
                     Ok((stream_id, quiche::h3::Event::Finished)) => {
                         client.tcp_read_resumes.remove(&stream_id);
-                        client.pending_ip_responses.remove(&stream_id);
                         if client.capsule_streams.contains_key(&stream_id) {
                             finished_capsule_streams.push(stream_id);
                             continue;
                         }
-                        closed_capsule_streams.push(stream_id);
                         if let Some(finished) = client.awaiting_auth.get_mut(&stream_id) {
                             finished.client_finished = true;
+                            continue;
                         }
+                        // Request FIN must not cancel authorization, target
+                        // setup, or a flow-control-blocked response. Setup
+                        // schedules a body read even if no DATA event remains,
+                        // and QUIC retains EOF until that read can run.
+                        if client.pending_udp_tunnels.contains_key(&stream_id)
+                            || client.pending_ip_responses.contains_key(&stream_id)
+                            || pending_setups.ip.contains(&stream_id)
+                        {
+                            continue;
+                        }
+                        closed_capsule_streams.push(stream_id);
                         if let Some(tunnel) = client.pending_tcp_tunnels.get_mut(&stream_id) {
                             tunnel.client_finished = true;
                             tunnel.last_activity = Instant::now();
                         }
                         if let Some(tunnel) = client.tcp_tunnels.get_mut(&stream_id) {
                             tunnel.finish_client();
-                        }
-                        if client.pending_udp_tunnels.remove(&stream_id).is_some() {
-                            info!(stream_id, "pending UDP tunnel closed by client");
                         }
                         // Stream closed by client — remove tunnel if any.
                         if client.udp_tunnels.remove(&stream_id).is_some() {
@@ -666,6 +684,9 @@ impl Shard {
                         }
                     }
                     Ok((stream_id, quiche::h3::Event::Reset { .. })) => {
+                        client
+                            .pending_error_responses
+                            .cancel(&mut client.quic, stream_id);
                         client.tcp_read_resumes.remove(&stream_id);
                         client.pending_ip_responses.remove(&stream_id);
                         closed_capsule_streams.push(stream_id);
@@ -702,7 +723,7 @@ impl Shard {
             client.remove_capsule_stream(stream_id);
         }
         for stream_id in finished_capsule_streams {
-            Self::close_capsule_stream(&self.shared, client, stream_id, false);
+            client.mark_capsule_finished(stream_id);
         }
         for stream_id in failed_tcp_streams {
             warn!(

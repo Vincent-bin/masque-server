@@ -55,6 +55,10 @@ fn send_fragment(client: &mut Client, stream: u64, mut bytes: &[u8]) {
 }
 
 fn fixture() -> (TempDir, Client, UdpSocket) {
+    fixture_with_transport(false)
+}
+
+fn fixture_with_transport(native_datagrams: bool) -> (TempDir, Client, UdpSocket) {
     let dir = TempDir::new("h3-udp-unknown-capsules");
     let key = p256_key();
     let (cert, key_path) = write_pem(
@@ -70,6 +74,9 @@ fn fixture() -> (TempDir, Client, UdpSocket) {
     config.listeners[0].shards = 1;
     config.listeners[0].auth.enabled = false;
     config.ip_proxy.enabled = false;
+    // Opening a replacement after closing one of two streams also verifies
+    // tunnel admission capacity is returned.
+    config.server.max_tunnels_per_connection = 2;
     config.udp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
     config.udp_proxy.deny_targets.clear();
     config.quic.initial_max_stream_data = 4096;
@@ -82,7 +89,7 @@ fn fixture() -> (TempDir, Client, UdpSocket) {
         None,
         false,
         "127.0.0.1".parse().unwrap(),
-        false,
+        native_datagrams,
         262_144,
     )
     .unwrap();
@@ -219,4 +226,87 @@ fn http3_udp_separate_fin_rejects_truncated_capsules_and_preserves_other_streams
         send_fragment(&mut client, healthy, &wire);
         assert_echo(&mut client, &target, healthy, b"still usable");
     }
+}
+
+// Linux reliably delivers the loopback ICMP port-unreachable error to a
+// connected UDP receiver. Other platforms may silently discard that ICMP;
+// stream cleanup and queue bounds also have platform-independent unit tests.
+#[cfg(target_os = "linux")]
+fn receive_failure_closes_only_its_udp_stream(native_datagrams: bool) {
+    let (_dir, mut client, target) = fixture_with_transport(native_datagrams);
+    let healthy = open_udp(&mut client, target.local_addr().unwrap());
+    let closed_target = UdpSocket::bind(ephemeral_addr()).unwrap();
+    let closed_address = closed_target.local_addr().unwrap();
+    let failed = open_udp(&mut client, closed_address);
+    drop(closed_target);
+
+    send_udp_payload(&mut client, failed, b"trigger ICMP", native_datagrams);
+    assert_eq!(
+        client.stream_reset(failed),
+        quiche::h3::WireErrorCode::ConnectError as u64
+    );
+    assert!(client.quic.peer_error().is_none());
+
+    // An existing tunnel and a new one on the same QUIC connection still work.
+    for stream in [healthy, open_udp(&mut client, target.local_addr().unwrap())] {
+        let payload = b"sibling tunnel still works";
+        send_udp_payload(&mut client, stream, payload, native_datagrams);
+        if !native_datagrams {
+            assert_echo(&mut client, &target, stream, payload);
+            continue;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buffer = [0; 2048];
+        let (len, source) = loop {
+            match target.recv_from(&mut buffer) {
+                Ok(packet) => break packet,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "healthy target did not receive");
+                    client.drive().unwrap();
+                }
+                Err(error) => panic!("healthy target receive failed: {error}"),
+            }
+        };
+        assert_eq!(&buffer[..len], payload);
+        target.send_to(payload, source).unwrap();
+        let received = loop {
+            match client.quic.dgram_recv(&mut buffer) {
+                Ok(len) => break &buffer[..len],
+                Err(quiche::Error::Done) => {
+                    assert!(Instant::now() < deadline, "healthy tunnel did not echo");
+                    client.drive().unwrap();
+                }
+                Err(error) => panic!("healthy native datagram receive failed: {error}"),
+            }
+        };
+        let decoded = masque::datagram::decode_ref(received).unwrap();
+        assert_eq!(decoded.stream_id, stream);
+        assert_eq!(decoded.payload, payload);
+    }
+    assert!(client.quic.peer_error().is_none());
+}
+
+#[cfg(target_os = "linux")]
+fn send_udp_payload(client: &mut Client, stream: u64, payload: &[u8], native: bool) {
+    if native {
+        let header = DatagramHeader::new(stream).unwrap();
+        client.quic.dgram_send(&header.encode(payload)).unwrap();
+        client.flush().unwrap();
+    } else {
+        let mut wire = Vec::new();
+        encoder::encode_datagram_context_zero(payload, &mut wire);
+        send_fragment(client, stream, &wire);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn http3_udp_capsule_receive_error_closes_tunnel_and_preserves_siblings() {
+    receive_failure_closes_only_its_udp_stream(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn http3_udp_native_receive_error_closes_tunnel_and_preserves_siblings() {
+    receive_failure_closes_only_its_udp_stream(true);
 }

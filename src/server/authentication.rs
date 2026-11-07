@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::auth::{BasicCredential, PasswordVerification};
 use crate::connection::AwaitingAuth;
@@ -137,7 +137,12 @@ impl Shard {
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
                         if let Some(h3) = &mut client.h3 {
-                            Self::send_auth_rejection(h3, &mut client.quic, stream_id);
+                            Self::send_auth_rejection(
+                                h3,
+                                &mut client.quic,
+                                &mut client.pending_error_responses,
+                                stream_id,
+                            );
                         }
                     }
                     continue;
@@ -151,7 +156,12 @@ impl Shard {
                     if let Some(client) = self.connections.get_mut(&conn_id) {
                         client.awaiting_auth.remove(&stream_id);
                         if let Some(h3) = &mut client.h3 {
-                            Self::send_auth_rejection(h3, &mut client.quic, stream_id);
+                            Self::send_auth_rejection(
+                                h3,
+                                &mut client.quic,
+                                &mut client.pending_error_responses,
+                                stream_id,
+                            );
                         }
                     }
                     continue;
@@ -240,16 +250,19 @@ impl Shard {
 
             if !authorized {
                 warn!(stream_id, "proxy authentication failed");
-                Self::send_auth_rejection(h3, &mut client.quic, stream_id);
+                Self::send_auth_rejection(
+                    h3,
+                    &mut client.quic,
+                    &mut client.pending_error_responses,
+                    stream_id,
+                );
                 return;
             }
 
-            // A half-closed datagram/IP request will never use the tunnel.
-            if client_finished && !matches!(request, ConnectRequest::Tcp { .. }) {
-                info!(stream_id, "CONNECT abandoned before authorization");
-                return;
-            }
-
+            // FIN closes only the request body, not the response. Dispatch
+            // authenticated UDP/IP requests too; setup resumes capsule reads
+            // and observes the FIN retained by QUIC. A reset, unlike FIN,
+            // removes awaiting_auth above and never reaches this point.
             let request_context = RequestContext {
                 metrics: &self.metrics,
                 config: &self.config,
@@ -258,6 +271,7 @@ impl Shard {
             Self::dispatch_connect(
                 h3,
                 &mut client.quic,
+                &mut client.pending_error_responses,
                 stream_id,
                 &request,
                 &request_context,

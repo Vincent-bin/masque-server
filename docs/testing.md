@@ -78,7 +78,11 @@ SemVer prerelease tags must retain their prerelease status.
 The HTTP/3 protocol tests include early fragmented UDP capsules through Basic
 authentication, 4 KiB echoes over a 64-byte initial response window, partial
 response cancellation, CONNECT-IP setup capsules, and malformed-capsule stream
-isolation. Resolver tests hold real blocking work across cancellation to verify
+isolation. The `error_responses` HTTP/3 tests exhaust connection credit before invalid
+requests and Basic rejections, then require the exact empty status plus FIN
+when credit returns. They also cover request FIN, RESET_STREAM/STOP_SENDING,
+a 64-response retry ceiling, fixed expiry during active retries, and admission
+recovery. Resolver tests hold real blocking work across cancellation to verify
 that both global and per-connection permits remain charged until it finishes.
 
 ```sh
@@ -127,6 +131,25 @@ after the Fragment header, then verify the exact UDP payload at the target
 after kernel reassembly. They cover HTTP/2 capsules, HTTP/3 capsules, and
 HTTP/3 native DATAGRAMs. These privileged tests are explicitly ignored by
 ordinary workspace test runs.
+
+For native HTTP/3 DATAGRAM input after request FIN, use the same compiled
+`client_cert_connect_ip` executable:
+
+```sh
+sudo MASQUE_TEST_BIN_DIR=/absolute/path/to/test-executables tests/connect-ip-fin.sh
+```
+
+This verifies actual CONNECT-IP and `cf-connect-ip` TUN forwarding before FIN,
+then silent late-packet discard while a control reply is flow-control blocked,
+with TUN offload on and off. It also requires the complete control reply and
+response FIN after credit returns. The unprivileged `datagram_fin` tests cover
+real QUIC-to-UDP forwarding, pending setup with unread body plus FIN, pre-FIN
+capsules, sibling streams, and response FIN retries. They include 256 empty
+HTTP/3 DATA frames before FIN, local parsing with further client packets
+withheld, open-body early native input, and malformed-body rejection. Cold and
+cached Basic authentication and blocked CONNECT-IP control replies cover the
+same body/FIN ordering; a unit test verifies deferred native queues retain their
+shared memory budget and release continuation state on removal.
 
 The Docker script creates development certificates, builds the server and E2E client,
 starts an echo target, grants the server container `NET_ADMIN` and TUN access,

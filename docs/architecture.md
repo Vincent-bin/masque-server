@@ -230,6 +230,14 @@ sends `200` only after that task succeeds. HTTP/2 uses the same resolver and
 policy path; TCP connections stagger interleaved IPv6/IPv4 attempts so a dead
 address family does not consume the complete setup timeout.
 
+Empty HTTP/3 error responses, including authentication's uniform 404, retain
+only a status and the first blocked-send timestamp when HEADERS lacks stream
+or connection credit. At most 64 such responses are retained per connection,
+and they count toward tunnel admission until sent or cancelled. A dirty
+connection retries them without a polling timer. Request FIN preserves output;
+reset, terminal send failure, connection close, and the ordinary idle sweep
+release the state. Overflow resets only the rejected stream.
+
 When work arrives, only affected connections enter the dirty set. The shard
 drives those connections, stages output using quiche's send quantum, emits a
 bounded UDP batch, and reschedules their next deadlines.
@@ -347,7 +355,12 @@ A failure resets only the affected stream.
 One connected UDP socket is created per tunnel. Client datagrams are decoded,
 staged during an event-loop round, and sent to the target in one `sendmmsg`
 call on Linux. A background readiness task drains target responses with
-`recvmmsg` and sends a bounded batch to the owning shard.
+`recvmmsg` and sends a bounded batch to the owning shard. Both native and
+capsule receivers report a socket receive error through that same bounded
+channel before exiting. The shard resets only the affected CONNECT stream
+with `H3_CONNECT_ERROR` and releases its socket and queued capsule state, so
+client traffic cannot keep a send-only tunnel alive. Linux receive readiness
+includes error-only notifications such as ICMP port-unreachable.
 
 Receive buffers are sized from the configured maximum QUIC datagram size plus
 one sentinel byte. Linux also checks `MSG_TRUNC`; the sentinel makes oversized
@@ -363,6 +376,25 @@ Capsule response queues allow 64 items / 256 KiB per stream and 256 items /
 1 MiB per connection. A partial write retains its full memory charge until the
 buffer is released. Capsule input staging is capped at 64 packets / 256 KiB per
 connection. Full data queues drop UDP/IP packets.
+
+CONNECT-IP request FIN drains already queued control replies, including when
+FIN arrives after the last body read. Truncated capsule input still resets the
+stream immediately. No new capsule output is staged after FIN, and the idle
+sweep enforces a fixed drain deadline using `server.idle_timeout_secs`; native
+datagram activity cannot renew it. Completion or expiry releases tunnel slots,
+address leases, routes, and queued memory. The final empty DATA frame carrying
+FIN also waits for credit within that deadline for both IP and UDP capsules.
+Native HTTP Datagrams are silently discarded after request EOF, as required by
+RFC 9297 section 2.1. Setup-time UDP datagrams retain their original bounded
+queue and shared budget until the buffered request body has been read and
+validated. An unread body can hide FIN from QUIC's application EOF query, so
+setup never replays these packets directly. EOF or invalid input discards the
+ambiguous native queue; an open request may replay it. Complete pre-FIN
+DATAGRAM capsules still forward, independently of response/control draining.
+Empty HTTP/3 DATA frames use at most 32 poll/read continuations per connection
+round. Remaining framing work gets a local wake only if buffered
+bytes decreased; partial frames and gaps cannot cause a busy loop. Native UDP
+and IP input cannot bypass an active stream's unfinished receive-state check.
 
 ### CONNECT-IP
 

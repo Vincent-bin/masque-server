@@ -798,8 +798,65 @@ async fn listener_targets_restrict_only_that_http2_listener() {
     server_task.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Queue request HEADERS and the early DATA synchronously on one runtime
+// thread, before the connection driver can process a fast 403 and close the
+// send stream. This guarantees early-payload coverage without a scheduler race.
+#[tokio::test]
 async fn local_target_aliases_cannot_bypass_tcp_or_udp_policy_over_http2() {
+    check_local_target_alias_policy(PolicyPayloadTiming::BeforeRejection).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_target_aliases_cannot_bypass_policy_with_data_after_http2_rejection() {
+    check_local_target_alias_policy(PolicyPayloadTiming::AfterRejection).await;
+}
+
+#[derive(Clone, Copy)]
+enum PolicyPayloadTiming {
+    BeforeRejection,
+    AfterRejection,
+}
+
+async fn assert_policy_rejection(
+    response: h2::client::ResponseFuture,
+    mut request_body: h2::SendStream<Bytes>,
+    payload: &[u8],
+    timing: PolicyPayloadTiming,
+    target: &str,
+) {
+    if matches!(timing, PolicyPayloadTiming::BeforeRejection) {
+        // The current-thread caller has not yielded since send_request, so
+        // early DATA must be accepted before the driver observes rejection.
+        request_body
+            .send_data(Bytes::copy_from_slice(payload), false)
+            .unwrap();
+    }
+
+    let response = tokio::time::timeout(Duration::from_secs(2), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{target}");
+    assert!(response.body().is_end_stream(), "{target}");
+
+    if matches!(timing, PolicyPayloadTiming::AfterRejection) {
+        // Wait for the peer to close the unread request body. This forces
+        // rejection to win without sleeps or assumptions about scheduling.
+        let reason = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| request_body.poll_reset(cx)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reason, h2::Reason::NO_ERROR, "{target}");
+        request_body
+            .send_data(Bytes::copy_from_slice(payload), false)
+            .expect_err("DATA on the peer-closed request stream must be rejected");
+    }
+}
+
+async fn check_local_target_alias_policy(timing: PolicyPayloadTiming) {
     let files = TestFiles::new();
     let tcp_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -824,17 +881,15 @@ async fn local_target_aliases_cannot_bypass_tcp_or_udp_policy_over_http2() {
             host.parse().unwrap(),
             tcp_target.local_addr().unwrap().port(),
         );
-        let (response, _request_body) =
-            client.send_request(connect_request(target), false).unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), response)
-                .await
-                .unwrap()
-                .unwrap()
-                .status(),
-            StatusCode::FORBIDDEN,
-            "TCP {host}"
-        );
+        let (response, request_body) = client.send_request(connect_request(target), false).unwrap();
+        assert_policy_rejection(
+            response,
+            request_body,
+            b"must not reach loopback",
+            timing,
+            &format!("TCP {host}"),
+        )
+        .await;
 
         let uri = format!(
             "https://localhost/.well-known/masque/udp/{}/{}/",
@@ -850,19 +905,15 @@ async fn local_target_aliases_cannot_bypass_tcp_or_udp_policy_over_http2() {
         request
             .extensions_mut()
             .insert(h2::ext::Protocol::from_static("connect-udp"));
-        let (response, mut request_body) = client.send_request(request, false).unwrap();
-        request_body
-            .send_data(Bytes::copy_from_slice(&early_datagram), false)
-            .unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), response)
-                .await
-                .unwrap()
-                .unwrap()
-                .status(),
-            StatusCode::FORBIDDEN,
-            "UDP {host}"
-        );
+        let (response, request_body) = client.send_request(request, false).unwrap();
+        assert_policy_rejection(
+            response,
+            request_body,
+            &early_datagram,
+            timing,
+            &format!("UDP {host}"),
+        )
+        .await;
     }
 
     assert!(

@@ -44,6 +44,12 @@ impl Shard {
         let dirty = &mut self.dirty;
 
         for (conn_id, client) in &mut self.connections {
+            if client
+                .pending_error_responses
+                .expire(&mut client.quic, timeout)
+            {
+                dirty.mark(client.index);
+            }
             let expired_ip: Vec<u64> = client
                 .pending_ip_responses
                 .iter()
@@ -66,6 +72,7 @@ impl Shard {
                 quic,
                 h3,
                 pending_tcp_tunnels,
+                pending_error_responses,
                 tcp_tunnels,
                 pending_udp_tunnels,
                 udp_tunnels,
@@ -94,7 +101,7 @@ impl Shard {
                     return false;
                 }
                 if let Some(h3) = h3.as_mut() {
-                    Self::send_error_response(h3, quic, *stream_id, 504);
+                    Self::send_error_response(h3, quic, pending_error_responses, *stream_id, 504);
                     wrote = true;
                 }
                 false
@@ -113,7 +120,7 @@ impl Shard {
                     return false;
                 }
                 if let Some(h3) = h3.as_mut() {
-                    Self::send_error_response(h3, quic, *stream_id, 504);
+                    Self::send_error_response(h3, quic, pending_error_responses, *stream_id, 504);
                     wrote = true;
                 }
                 false
@@ -133,13 +140,17 @@ impl Shard {
 
             // UDP tunnels: dropping the tunnel aborts its receive task.
             udp_tunnels.retain(|stream_id, tunnel| {
-                if !tunnel.is_idle(timeout) {
+                let drain_expired = capsule_streams
+                    .get(stream_id)
+                    .and_then(|stream| stream.drain_expired(timeout));
+                if !drain_expired.unwrap_or_else(|| tunnel.is_idle(timeout)) {
                     return true;
                 }
                 info!(stream_id, "closing idle UDP tunnel");
-                if capsule_streams
-                    .get(stream_id)
-                    .is_some_and(capsules::CapsuleStream::has_partial_output)
+                if drain_expired == Some(true)
+                    || capsule_streams
+                        .get(stream_id)
+                        .is_some_and(capsules::CapsuleStream::has_partial_output)
                 {
                     let _ = quic.stream_shutdown(
                         *stream_id,
@@ -157,13 +168,19 @@ impl Shard {
             // IP tunnels also need pool and route cleanup, which needs
             // `&mut self`, so only signal the close here and tear down below.
             for (stream_id, tunnel) in ip_tunnels.iter() {
-                if !tunnel.is_idle(timeout) {
+                // Native datagrams can still arrive after stream FIN. They
+                // must not renew the deadline for a blocked control reply.
+                let drain_expired = capsule_streams
+                    .get(stream_id)
+                    .and_then(|stream| stream.drain_expired(timeout));
+                if !drain_expired.unwrap_or_else(|| tunnel.is_idle(timeout)) {
                     continue;
                 }
                 info!(stream_id, "closing idle IP tunnel");
-                if capsule_streams
-                    .get(stream_id)
-                    .is_some_and(capsules::CapsuleStream::has_partial_output)
+                if drain_expired == Some(true)
+                    || capsule_streams
+                        .get(stream_id)
+                        .is_some_and(capsules::CapsuleStream::has_partial_output)
                 {
                     let _ = quic.stream_shutdown(
                         *stream_id,
