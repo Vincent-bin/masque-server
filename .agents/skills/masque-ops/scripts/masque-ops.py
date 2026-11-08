@@ -2444,7 +2444,7 @@ class FleetOperator:
 
         token = secrets.token_hex(16)
         remote_basic_config = (
-            f"/root/.masque-ops-{token}.surge.conf"
+            f"/root/.masque-ops-{token}.basic.json"
             if bootstrap.basic_client_config is not None
             else None
         )

@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+### Fixed
+
+- Release an HTTP/2 TCP tunnel when the peer resets the stream after ending its
+  upload, even when the target is silent.
+- Discard queued HTTP/3 datagrams and release CONNECT-UDP and CONNECT-IP tunnel
+  resources when the peer stops reading the response.
+
+### Changed
+
+- Export Basic credentials and certificate enrollment as protocol-neutral JSON.
+  Use `client-config json` and `--emit-client json` for Basic credential exports.
+  Certificate enrollment includes the full endpoint, including its port.
+
 ## 0.14.18 - 2026-11-07
 
 ### Fixed
@@ -348,7 +361,7 @@ pre-1.0.
 
 - CONNECT-UDP retains a small, bounded set of client DATAGRAMs that arrive
   while Basic authentication or asynchronous target setup is still pending.
-  Clients such as Surge may therefore send their first UDP packet immediately
+  A peer can send its first UDP packet immediately
   after the CONNECT headers without losing it before the server returns 200.
 
 ## 0.12.1 - 2026-09-01
@@ -436,7 +449,7 @@ pre-1.0.
   real CONNECT-TCP establishment and a CONNECT-UDP round trip, optional
   CONNECT-IP setup, fake-DNS overrides, interface binding, and stable JSON
   output.
-- Basic listener and account creation can emit a mode-`0600` Surge configuration
+- Basic listener and account creation can emit a mode-`0600` credential file
   while the plaintext password is available. The standalone `client-config`
   command provides the same safe output for an already known credential, and
   fresh installs can generate it through installer prompts or environment
@@ -533,11 +546,9 @@ pre-1.0.
   CONNECT-UDP/CONNECT-IP over TCP/TLS with the `h2` ALPN, Extended CONNECT,
   RFC 9297 DATAGRAM capsules, explicit flow-control limits, and bounded
   graceful drain. HTTP/3 remains the performance default.
-- CONNECT-IP also accepts the deployed Cloudflare/usque HTTP/2 dialect: a
+- CONNECT-IP also accepts the legacy context-free HTTP/2 format: a
   regular CONNECT carrying `cf-connect-proto: cf-connect-ip`, with Context ID
   zero omitted from DATAGRAM capsule values.
-- `enroll-client` fills usque's `endpoint_h2_v4` / `endpoint_h2_v6` fields and
-  prints the matching `--http2` launch hint.
 - HTTP/2 listeners support the same per-request Basic authentication, TLS
   client-certificate roster, target policy, global authentication queue, and
   per-connection tunnel limits as HTTP/3. Roster reloads also disconnect
@@ -545,7 +556,7 @@ pre-1.0.
 - `add-listener` accepts `--transport http2|http3`, probes the corresponding TCP
   or UDP socket, and writes the transport explicitly.
 - Real TLS/H2 integration tests cover TCP CONNECT, CONNECT-UDP, standards-based
-  CONNECT-IP, the usque-compatible H2 shape, Basic authentication, and
+  CONNECT-IP, the legacy H2 format, Basic authentication, and
   client-certificate authentication.
 
 ### Changed
@@ -731,9 +742,8 @@ pre-1.0.
 
 - `[[listeners]]` runs one or more listening sockets from one process, each with
   its own `listen_addr`, `shards`, and authentication mode. This is what allows
-  one server to accept both standards-compliant MASQUE clients, which send
-  `Proxy-Authorization`, and Cloudflare-style clients, which authenticate with
-  a TLS client certificate: `auth.mode` decides which TLS context a socket is
+  one server to accept HTTP Basic credentials and TLS client certificates on
+  different listeners. `auth.mode` decides which TLS context a socket is
   bound with, so the two modes cannot share a socket. They do share everything
   behind them — one `[[clients]]` roster, one TUN device, one CONNECT-IP
   address pool, one routing table — which two processes could not.
@@ -789,9 +799,8 @@ pre-1.0.
   binary, systemd unit, and service state if activation fails.
 - `masque-server check-config` validates startup configuration without binding
   a socket or creating a TUN device, allowing safe preflight before replacement.
-- Compatibility with VPN-style MASQUE clients modelled on Cloudflare WARP, such
-  as usque:
-  - `ip_proxy.connect_protocols` accepts Cloudflare's `cf-connect-ip` alongside
+- CONNECT-IP support with TLS certificate authentication:
+  - `ip_proxy.connect_protocols` accepts the legacy `cf-connect-ip` alongside
     the registered `connect-ip`, both by default.
   - `auth.mode = "client_cert"` authenticates clients by TLS client
     certificate, matched against a `[[clients]]` roster by public key. An
@@ -801,19 +810,15 @@ pre-1.0.
     clients that configure their tunnel interface out of band require. Pinned
     addresses are withheld from dynamic pool allocation.
   - `masque-server enroll-client` generates a client key pair and prints both
-    the server's `[[clients]]` block and the client's own configuration,
-    replacing the vendor enrollment API for self-hosted setups.
+    the server's `[[clients]]` block and the enrollment details.
   - Pinned-address leases tolerate an authenticated reconnect overlapping its
     stale predecessor; the newest tunnel takes over the return route.
-  - `tests/client_cert_connect_ip.rs` drives a synthetic client imitating this
-    family against a real server, covering certificate authentication,
+  - `tests/client_cert_connect_ip.rs` exercises real QUIC connections and
+    covers certificate authentication,
     `cf-connect-ip`, pinned assignment, reconnect overlap, full-MTU datagram
     sizing, and rejection of unenrolled and absent certificates.
   - A documented interop procedure and failure-signature table for qualifying a
     real client on Linux, where packet forwarding can be exercised.
-  - `enroll-client` also prints a mihomo-style `proxies:` entry, which needs the
-    same key in a different encoding (bare base64 rather than PEM) and addresses
-    in CIDR form.
   - `SIGHUP` reloads the `[[clients]]` roster. Revoked clients are disconnected
     and refused at their next handshake, other tunnels are untouched, and a
     roster that fails validation is rejected as a whole so the running one stays
@@ -829,8 +834,6 @@ pre-1.0.
 - `SIGHUP` cannot switch a running server into `client_cert` mode and validates
   reservations against the IP-proxy state the process bound with rather than
   unrelated edits awaiting restart.
-- Generated mihomo configuration uses the configured `ip_proxy.tun_mtu` instead
-  of always emitting 1280.
 
 ### Changed
 
@@ -841,8 +844,7 @@ pre-1.0.
 - Dynamic CONNECT-IP allocation starts at network address `+2`, leaving `+1`
   exclusively to the server's TUN gateway.
 - Client enrollment files are created with mode `0600` on Unix and never
-  overwrite an existing path. The endpoint port is printed as usque's required
-  `--connect-port` argument because its JSON schema stores only the IP.
+  overwrite an existing path.
 - CONNECT-IP sends `200` only after address allocation succeeds, so exhaustion
   and setup failures return a real `503` instead of a successful dead tunnel.
 

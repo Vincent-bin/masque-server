@@ -405,9 +405,9 @@ fn refuses_stealth_without_basic_authentication() {
 }
 
 #[test]
-fn adding_a_basic_listener_can_emit_its_private_surge_configuration() {
+fn adding_a_basic_listener_can_emit_its_private_json_configuration() {
     let fixture = Fixture::new(false);
-    let client_path = fixture._dir.path().join("new-listener.conf");
+    let client_path = fixture._dir.path().join("new-listener.json");
     let output = fixture.user_command(
         "add-listener",
         &[
@@ -419,7 +419,7 @@ fn adding_a_basic_listener_can_emit_its_private_surge_configuration() {
             "phone",
             "--password-stdin",
             "--emit-client",
-            "surge",
+            "json",
             "--client-endpoint",
             "proxy.example:8465",
             "--client-name",
@@ -435,10 +435,13 @@ fn adding_a_basic_listener_can_emit_its_private_surge_configuration() {
         "add-listener failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        std::fs::read_to_string(&client_path).unwrap(),
-        "[Proxy]\nphone = masque, proxy.example, 8465, username=phone, password=listener-secret\n"
-    );
+    let data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&client_path).unwrap()).unwrap();
+    assert_eq!(data["name"], "phone");
+    assert_eq!(data["endpoint"], "proxy.example:8465");
+    assert_eq!(data["transport"], "http3");
+    assert_eq!(data["username"], "phone");
+    assert_eq!(data["password"], "listener-secret");
     assert!(!fixture.text().contains("listener-secret"));
     assert_eq!(
         fixture.config().listeners[1].auth.users[0].username,
@@ -455,9 +458,9 @@ fn adding_a_basic_listener_can_emit_its_private_surge_configuration() {
 }
 
 #[test]
-fn surge_output_is_rejected_for_an_http2_listener_without_editing_config() {
+fn basic_json_reports_the_http2_listener_transport() {
     let fixture = Fixture::new(false);
-    let client_path = fixture._dir.path().join("unused.conf");
+    let client_path = fixture._dir.path().join("listener.json");
     let output = fixture.user_command(
         "add-listener",
         &[
@@ -471,7 +474,7 @@ fn surge_output_is_rejected_for_an_http2_listener_without_editing_config() {
             "phone",
             "--password-stdin",
             "--emit-client",
-            "surge",
+            "json",
             "--client-endpoint",
             "proxy.example:8465",
             "--client-out",
@@ -479,9 +482,18 @@ fn surge_output_is_rejected_for_an_http2_listener_without_editing_config() {
         ],
         Some(b"listener-secret\n"),
     );
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("requires an HTTP/3 listener"));
-    fixture.assert_unchanged();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&client_path).unwrap()).unwrap();
+    assert_eq!(data["transport"], "http2");
+    assert_eq!(
+        fixture.config().listeners[1].transport,
+        masque::config::ListenerTransport::Http2
+    );
 }
 
 /// Without a flag or a terminal there is no password to write, and a Basic
@@ -888,9 +900,9 @@ fn add_user_migrates_legacy_credentials_and_list_users_redacts_hashes() {
 }
 
 #[test]
-fn add_user_can_write_a_private_surge_configuration() {
+fn add_user_can_write_a_private_json_configuration() {
     let fixture = Fixture::new(false);
-    let client_path = fixture._dir.path().join("phone.conf");
+    let client_path = fixture._dir.path().join("phone.json");
     let output = fixture.user_command(
         "add-user",
         &[
@@ -898,7 +910,7 @@ fn add_user_can_write_a_private_surge_configuration() {
             "bob",
             "--password-stdin",
             "--emit-client",
-            "surge",
+            "json",
             "--client-endpoint",
             "proxy.example:8449",
             "--client-name",
@@ -914,10 +926,13 @@ fn add_user_can_write_a_private_surge_configuration() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("bob secret"));
-    assert_eq!(
-        std::fs::read_to_string(&client_path).unwrap(),
-        "[Proxy]\nphone = masque, proxy.example, 8449, username=bob, password=\"bob secret,with comma\"\n"
-    );
+    let data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&client_path).unwrap()).unwrap();
+    assert_eq!(data["name"], "phone");
+    assert_eq!(data["endpoint"], "proxy.example:8449");
+    assert_eq!(data["transport"], "http3");
+    assert_eq!(data["username"], "bob");
+    assert_eq!(data["password"], "bob secret,with comma");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -961,7 +976,7 @@ fn failed_client_output_leaves_the_account_file_unchanged() {
             "bob",
             "--password-stdin",
             "--emit-client",
-            "surge",
+            "json",
             "--client-endpoint",
             "proxy.example:8449",
             "--client-out",

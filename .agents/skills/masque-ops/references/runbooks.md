@@ -83,8 +83,8 @@ The CLI checks Linux architecture, release assets, remote dependencies, absence
 of an existing MASQUE install, readable TLS files, local secret destinations,
 and the optional probe before changing the host. The Basic password is read or
 created in its mode-`0600` local file and sent only over SSH standard input.
-Generated Surge or certificate-client configuration streams directly into new
-local mode-`0600` files. The model sees only the host alias, status, blockers,
+Generated Basic credential JSON and certificate enrollment JSON stream directly
+into new local mode-`0600` files. The model sees only the host alias, status, blockers,
 version, and probe result. A fresh host has no prior release to restore, so stop
 and inspect status if post-install verification fails.
 

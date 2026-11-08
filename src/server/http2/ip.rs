@@ -38,19 +38,19 @@ const MAX_CONTROL_RESPONSES: usize = MAX_ADDRESS_REQUEST_IDS;
 /// CONNECT-IP has two HTTP/2 wire shapes in active use.
 ///
 /// RFC 9484 uses Extended CONNECT and keeps Context ID zero in each DATAGRAM
-/// capsule. Cloudflare's TCP fallback predates that shape: it uses a regular
+/// capsule. The legacy HTTP/2 format uses a regular
 /// CONNECT plus `cf-connect-proto`, and removes the zero byte from capsule
 /// values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum IpCapsuleMode {
     Standard,
-    Cloudflare,
+    ContextFree,
 }
 
 impl IpCapsuleMode {
     fn decode_packet(self, payload: &[u8]) -> anyhow::Result<Option<&[u8]>> {
         match self {
-            Self::Cloudflare => Ok(Some(payload)),
+            Self::ContextFree => Ok(Some(payload)),
             Self::Standard => {
                 let (context_id, context_len) = varint::decode(payload)
                     .map_err(|_| anyhow::anyhow!("DATAGRAM capsule has no Context ID"))?;
@@ -66,7 +66,7 @@ impl IpCapsuleMode {
     fn encode_packet(self, packet: &[u8], output: &mut Vec<u8>) {
         match self {
             Self::Standard => encoder::encode_datagram_context_zero(packet, output),
-            Self::Cloudflare => encoder::encode_datagram(packet, output),
+            Self::ContextFree => encoder::encode_datagram(packet, output),
         }
     }
 }
@@ -218,7 +218,7 @@ pub(super) async fn serve(
 
     // Keep the two directions independent. In particular, waiting for response
     // flow-control credit must not stop us from consuming request DATA frames:
-    // Cloudflare-style clients put each inner TCP ACK in a small DATA frame,
+    // Some peers put each inner TCP ACK in a small DATA frame,
     // and h2 deliberately closes a connection when too many unconsumed small
     // frames accumulate. A single select loop whose return-path arm awaited
     // `send_data` could therefore reset an otherwise healthy bulk transfer.
@@ -419,14 +419,14 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_ip_capsule_omits_context_id_zero() {
+    fn context_free_ip_capsule_omits_context_id_zero() {
         let mut encoded = Vec::new();
-        IpCapsuleMode::Cloudflare.encode_packet(b"packet", &mut encoded);
+        IpCapsuleMode::ContextFree.encode_packet(b"packet", &mut encoded);
 
         let frames = CapsuleDecoder::new().decode(&encoded).unwrap();
         assert_eq!(frames, vec![CapsuleFrame::Datagram(b"packet".to_vec())]);
         assert_eq!(
-            IpCapsuleMode::Cloudflare.decode_packet(b"packet").unwrap(),
+            IpCapsuleMode::ContextFree.decode_packet(b"packet").unwrap(),
             Some(&b"packet"[..])
         );
     }

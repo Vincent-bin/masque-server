@@ -660,8 +660,7 @@ impl Client {
         self.wait_for_server_capabilities(Duration::from_secs(5))
     }
 
-    /// Wait until the server SETTINGS advertise the capabilities required by
-    /// a standards-compliant CONNECT-UDP client such as Surge.
+    /// Wait for SETTINGS that permit Extended CONNECT and HTTP Datagrams.
     fn wait_for_server_capabilities(&mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2073,8 +2072,8 @@ fn test_connect_udp_happy_path(server_addr: &str, echo_addr: &str) -> Result<()>
     let headers = connect_udp_headers(server_addr, echo_host, echo_port)?;
     let payload = b"hello masque e2e";
     let stream_id = client.send_request(&headers, false)?;
-    // Surge sends its probe immediately after the request rather than waiting
-    // for the 200. Flush it as a separate flight so it reaches the server while
+    // Send the first datagram before waiting for the 200. Flush it separately
+    // so it reaches the server while
     // Argon2 and target setup are still pending.
     client.send_dgram(stream_id, payload)?;
 

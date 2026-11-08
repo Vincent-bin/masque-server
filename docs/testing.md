@@ -40,14 +40,14 @@ the exact environment and commands.
 | Microbenchmark | `cargo bench --bench core` | Codec, routing, and allocation regressions |
 | Network benchmark | `scripts/network-bench.sh` | Local direct-vs-MASQUE throughput and RTT |
 | Docker E2E | `scripts/e2e-test.sh` | TCP, UDP, IP/TUN, and container networking |
-| Client interop | `cargo test --test client_cert_connect_ip` | Cloudflare-compatible certificate auth, CONNECT-IP setup, mixed authentication, and live HTTP/3 TLS reload/rollback |
+| Client interop | `cargo test --test client_cert_connect_ip` | TLS certificate authentication, CONNECT-IP setup, mixed authentication, and live HTTP/3 TLS reload/rollback |
 | HTTP/2 interop | `cargo test --test http2_connect` | Real TLS/H2 CONNECT variants, multiple Basic accounts, both authentication modes, and credential/TLS reload rollback without dropping an established connection |
 | End-user probe | `cargo test -p masque-probe` | Basic/certificate authentication over H2/H3 with live TCP payload and CONNECT-UDP echo round trips, explicit CONNECT-IP setup-only and forwarding-failure checks, and stable result/error handling on Linux and macOS |
 | Observability assets | `cargo test --test monitoring_assets` | Prometheus metric references and importable Grafana JSON |
 | Service shutdown | `tests/systemd-shutdown.sh` | Real SIGTERM/SIGINT handling and every-shard drain; Linux exercises two shards |
 | Config and host diagnostics | `cargo test --test check_config` | `check-config` accepts what a server accepts; `doctor` remains read-only; support bundles omit credential/identity sentinels |
 | Config editing | `cargo test --test add_listener` | Listener and Basic-account edits are validated, atomic, and preserve deployed comments and secrets |
-| Client config | `cargo test --test client_config` | Surge output is importable, private, secret-aware, and never overwritten |
+| Client config | `cargo test --test client_config` | Credential JSON preserves transport and endpoint, uses private permissions, and refuses existing files |
 | Fleet operations | `python3 -m unittest -v tests/test_masque_ops.py` | Inventory validation, SSH hardening, release guards, secret filtering, deploy verification, and automatic rollback |
 | Linux package | `scripts/package-linux.sh` | Artifact layout and static binary build |
 | Parser fuzzing | `cargo +nightly fuzz run protocol_parsers` | Incremental capsule, datagram, varint, IP, and URI parser safety |
@@ -320,19 +320,19 @@ A release candidate is not complete until an x86_64 Linux host verifies:
 5. UDP GSO on/off behavior is tested across the external path;
 6. single- and multi-shard modes pass concurrent traffic;
 7. memory and CPU remain bounded under invalid authentication load; and
-8. a real Cloudflare-compatible client passes traffic through a TUN device —
-   see [Cloudflare-compatible client interop](#cloudflare-compatible-client-interop).
+8. CONNECT-IP forwards packets through a TUN device over both transports. See
+   [CONNECT-IP interoperability](#connect-ip-interoperability).
 
 For target datagram sizing, raise `quic.max_datagram_size` above 2048 in a test
 configuration and verify oversized responses are rejected rather than silently
 truncated.
 
-## Cloudflare-compatible client interop
+## CONNECT-IP interoperability
 
 `cargo test --test client_cert_connect_ip` covers the handshake, the
 `cf-connect-ip` request, pinned address assignment, reconnect overlap, datagram
 sizing, rejection of unenrolled keys, and a real QUIC source-port migration —
-all against a synthetic client that imitates this family. It runs anywhere.
+using a synthetic peer and real QUIC traffic. It runs anywhere.
 On Linux the same target also changes the peer IP, verifies migration cannot
 bypass `max_connections_per_ip`, proves long- and short-header CIDs select the
 intended SO_REUSEPORT socket, and confirms migrated connections do not enter
@@ -353,115 +353,12 @@ replaces its UDP socket when `MASQUE_MIGRATION_CHECK=1`. Add
 `MASQUE_BENCH_MIGRATED=1` to its normal `MASQUE_BENCH=1` invocation to run the
 64-byte and 1200-byte measurements only after that path has validated.
 
-The synthetic test does not cover packet forwarding because that requires a
-TUN device. Qualifying a peer therefore needs a Linux host with appropriate
-network privileges. The commands below are examples of testing independent
-implementations; adapt them to the peer and configuration under test.
-
-`masque-server enroll-client` emits configuration examples with the same key
-and address assignments in different encodings. Treat these outputs as secrets.
-
-**1. Build the example peer.** Skip this step when using a prebuilt binary.
-
-```sh
-git clone https://github.com/Diniboy1123/usque && cd usque && go build .
-```
-
-**2. Configure the server.** Use `auth.mode = "client_cert"` on its listener,
-and a certificate with an ECDSA key so the client can pin it:
-
-```sh
-scripts/gen-certs.sh certs
-```
-
-```toml
-[tls]
-cert_path = "certs/server.crt"
-key_path = "certs/server.key"
-
-[[listeners]]
-listen_addr = "0.0.0.0:4433"
-shards = 1
-
-[listeners.auth]
-enabled = true
-mode = "client_cert"
-
-[ip_proxy]
-enabled = true
-ipv4_pool = "10.89.0.0/24"
-ipv6_pool = "fd00:abcd::/64"
-```
-
-**3. Enroll the client.** Do not hand-write either side; the pinned addresses
-must match exactly, and enrollment is what guarantees that:
-
-```sh
-masque-server --config masque.toml enroll-client \
-    --name interop --endpoint <server-ip>:4433 \
-    --ipv4 10.89.0.2 --ipv6 fd00:abcd::2 --out config.json
-```
-
-Append the printed `[[clients]]` block to `masque.toml` and start the server.
-
-**4. Let the host forward and translate.** The server moves packets between
-QUIC and its TUN device and nothing more; egress is the host's job:
-
-```sh
-sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A POSTROUTING -s 10.89.0.0/24 -o <wan-if> -j MASQUERADE
-```
-
-**5. Connect.** For the local proxy example, paste the generated `proxies:` block into a config
-with a listener and a catch-all rule, then run it unprivileged:
-
-```yaml
-mixed-port: 7899
-mode: rule
-proxies:
-  # ... the generated block ...
-rules:
-  - MATCH,<proxy name>
-```
-
-```sh
-./mihomo -d <config-dir>          # no root, no TUN
-```
-
-For the TUN example, the JSON stores the endpoint IP but not its port, so the port is a
-flag — enrollment prints the exact argument:
-
-```sh
-sudo ./usque nativetun --config config.json --connect-port 4433
-```
-
-Add `--http2` to that command when testing a listener with
-`transport = "http2"`; enrollment already fills the JSON's `endpoint_h2_v4` or
-`endpoint_h2_v6` field.
-
-**6. Verify.** The most decisive target is the server's own TUN address, because
-it exercises the tunnel end to end without depending on the host's egress path
-at all. Serve a large file there and pull it through the tunnel, comparing
-checksums:
-
-```sh
-# on the server, bound to the TUN gateway only
-python3 -m http.server 8080 --bind 10.89.0.1
-
-# from the client
-curl -x http://127.0.0.1:7899 -o out.bin http://10.89.0.1:8080/blob.bin   # mihomo
-curl -o out.bin http://10.89.0.1:8080/blob.bin                            # usque
-```
-
-Then an ICMP echo to `10.89.0.1`, both address families, and a full-MTU probe:
-
-```sh
-ping -M do -s 1252 -I 10.89.0.2 10.89.0.1   # 1252 + 28 = the 1280-byte MTU
-ping -M do -s 1253 -I 10.89.0.2 10.89.0.1   # must fail: proves where the limit is
-```
-
-Only then test egress to the internet. Small-packet success with bulk-transfer
-failure means MTU, not routing.
+Packet forwarding requires a Linux TUN device. Use `scripts/e2e-test.sh`
+or the standalone `tests/connect-ip-policy.sh` test in a disposable Linux
+environment. They exercise forwarding in addition to handshake and address
+assignment. To verify a configured peer path, run `masque-probe` with
+`--connect-ip` and an inner UDP target that can return DNS or echo traffic.
+Select the transport explicitly when validating both HTTP/2 and HTTP/3.
 
 ### Egress testing needs an uncontended host
 

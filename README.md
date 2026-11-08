@@ -325,7 +325,7 @@ upgrades, and diagnostics.
 | CONNECT (TCP) | HTTP/3 or HTTP/2 | Basic or client certificate | HTTP/2 and HTTP/3 integration and probe tests. |
 | CONNECT-UDP | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | HTTP/2 and HTTP/3 integration and probe tests. |
 | CONNECT-IP (RFC 9484) | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | Protocol setup and address assignment are tested; forwarding requires Linux TUN and host routing. |
-| `cf-connect-ip` | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | Synthetic interoperability tests cover certificate authentication and address assignment; see [testing](docs/testing.md#cloudflare-compatible-client-interop). |
+| `cf-connect-ip` | HTTP/3 datagrams or HTTP/2 capsules | Basic or client certificate | Synthetic interoperability tests cover certificate authentication and address assignment; see [testing](docs/testing.md#connect-ip-interoperability). |
 
 Authentication and transport are configured per listener. These entries describe
 server protocol support; actual interoperability depends on the peer's supported

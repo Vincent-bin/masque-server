@@ -3,7 +3,7 @@
 //! HTTP/2 is a compatibility transport for networks where UDP/QUIC is
 //! unavailable. Standard CONNECT streams carry bytes directly in DATA frames;
 //! CONNECT-UDP and CONNECT-IP streams carry DATAGRAM capsules. Both RFC 9484
-//! Extended CONNECT and Cloudflare's deployed H2 CONNECT-IP dialect are
+//! Extended CONNECT and the legacy HTTP/2 CONNECT-IP format are
 //! accepted. HTTP/3 remains the preferred transport because HTTP/2 makes
 //! datagrams reliable and ordered.
 

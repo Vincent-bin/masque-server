@@ -1,4 +1,4 @@
-//! Standard request validation must not change Cloudflare or stealth behavior.
+//! Standard request validation preserves legacy framing and the authentication boundary.
 use super::*;
 
 #[test]

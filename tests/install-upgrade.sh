@@ -234,7 +234,7 @@ assert_upgrade_output_is_summary_only() {
 # both authentication modes. This runs first, while the runner still has no
 # configuration; the upgrade cases below overwrite everything it leaves behind.
 DUAL_CLIENT_JSON=$TEST_TMP/dual-client.json
-DUAL_SURGE_CONFIG=$TEST_TMP/dual-surge.conf
+DUAL_BASIC_JSON=$TEST_TMP/dual-basic.json
 MASQUE_AUTH_MODE=dual \
     MASQUE_AUTH_USERNAME=proxy-user \
     MASQUE_AUTH_PASSWORD=a-strong-password \
@@ -245,7 +245,7 @@ MASQUE_AUTH_MODE=dual \
     MASQUE_CLIENT_CONFIG_OUT="$DUAL_CLIENT_JSON" \
     MASQUE_BASIC_CLIENT_ENDPOINT=proxy.example:8449 \
     MASQUE_BASIC_CLIENT_NAME=dual-proxy \
-    MASQUE_BASIC_CLIENT_CONFIG_OUT="$DUAL_SURGE_CONFIG" \
+    MASQUE_BASIC_CLIENT_CONFIG_OUT="$DUAL_BASIC_JSON" \
     MASQUE_START_SERVICE=0 \
     "$PACKAGE_DIR/install.sh" >"$TEST_TMP/dual.log" 2>&1 ||
     die "fresh dual installation failed; see $TEST_TMP/dual.log"
@@ -255,7 +255,7 @@ grep -Eq 'password_hash[[:space:]]*=[[:space:]]*"<redacted>"' "$TEST_TMP/dual.lo
     die "fresh installation did not redact its generated password hash"
 grep -q 'Host diagnostics: not requested' "$TEST_TMP/dual.log" ||
     die "fresh installation did not report the explicitly skipped host diagnostics"
-! grep -q 'private-key=' "$TEST_TMP/dual.log" ||
+! grep -q 'private_key' "$TEST_TMP/dual.log" ||
     die "fresh installation printed the client private key"
 
 [ "$(grep -c '^\[\[listeners\]\]$' "$CONFIG_PATH")" -eq 2 ] ||
@@ -274,11 +274,19 @@ grep -q '^\[server\]$' "$CONFIG_PATH" ||
 grep -q '^\[\[clients\]\]$' "$CONFIG_PATH" ||
     die "dual mode did not enroll the first certificate client"
 [ -s "$DUAL_CLIENT_JSON" ] || die "dual mode did not write the client JSON"
-[ -s "$DUAL_SURGE_CONFIG" ] || die "dual mode did not write the Surge configuration"
-grep -q '^dual-proxy = masque, proxy.example, 8449, username=proxy-user, password=a-strong-password$' \
-    "$DUAL_SURGE_CONFIG" || die "the generated Surge configuration is not importable"
-[ "$(stat -c '%a' "$DUAL_SURGE_CONFIG")" = 600 ] ||
-    die "the generated Surge configuration is not mode 0600"
+[ -s "$DUAL_BASIC_JSON" ] || die "dual mode did not write Basic credential JSON"
+grep -Fq '"endpoint": "proxy.example:8449"' "$DUAL_BASIC_JSON" ||
+    die "the Basic credential JSON omitted the endpoint"
+grep -Fq '"transport": "http3"' "$DUAL_BASIC_JSON" ||
+    die "the Basic credential JSON omitted the transport"
+grep -Fq '"username": "proxy-user"' "$DUAL_BASIC_JSON" ||
+    die "the Basic credential JSON omitted the username"
+grep -Fq '"password": "a-strong-password"' "$DUAL_BASIC_JSON" ||
+    die "the Basic credential JSON omitted the password"
+grep -Fq '"endpoint": "203.0.113.9:8450"' "$DUAL_CLIENT_JSON" ||
+    die "the certificate enrollment JSON omitted the full endpoint"
+[ "$(stat -c '%a' "$DUAL_BASIC_JSON")" = 600 ] ||
+    die "the Basic credential JSON is not mode 0600"
 [ -x "$PROBE_PATH" ] || die "the diagnostic probe was not installed"
 [ -x "$MAINTENANCE_PATH" ] || die "the maintenance helper was not installed"
 [ -x "$BOOTSTRAP_PATH" ] || die "the pinned bootstrap was not installed"

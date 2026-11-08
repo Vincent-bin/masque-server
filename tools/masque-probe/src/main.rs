@@ -32,8 +32,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Transport::Auto)]
     transport: Transport,
 
-    /// TLS DNS name. Defaults to the endpoint hostname for Basic auth and to
-    /// the usque-compatible SNI for a certificate enrollment.
+    /// TLS server name. Defaults to the endpoint host.
     #[arg(long)]
     server_name: Option<String>,
 
@@ -251,15 +250,9 @@ fn run_probe(cli: &Cli) -> ProbeReport {
         credentials_started,
     ));
 
-    let server_name = cli.server_name.clone().unwrap_or_else(|| {
-        if credentials.client_identity().is_some() {
-            "consumer-masque.cloudflareclient.com".into()
-        } else {
-            endpoint.host.clone()
-        }
-    });
+    let server_name = cli.server_name.as_deref().unwrap_or(&endpoint.host);
     if credentials.client_identity().is_none()
-        && let Err(failure) = endpoint::validate_server_name(&server_name)
+        && let Err(failure) = endpoint::validate_server_name(server_name)
     {
         report.checks.push(CheckResult::fail(
             "tls_server_name",
@@ -340,7 +333,7 @@ fn run_probe(cli: &Cli) -> ProbeReport {
         cli,
         &endpoint,
         &addresses,
-        &server_name,
+        server_name,
         &credentials,
         timeout,
         &mut report,

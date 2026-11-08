@@ -100,14 +100,8 @@ pub struct BasicUserPassword {
     pub client_output: Option<BasicClientOutput>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BasicClientFormat {
-    Surge,
-}
-
 #[derive(Debug)]
 pub struct BasicClientOutput {
-    pub format: BasicClientFormat,
     pub endpoint: ClientEndpoint,
     pub name: Option<String>,
     pub out: Option<PathBuf>,
@@ -180,10 +174,6 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
         ensure!(
             !request.disable_auth && mode == AuthMode::Basic,
             "client configuration output applies only to an authenticated Basic listener"
-        );
-        ensure!(
-            transport == ListenerTransport::Http3,
-            "Surge MASQUE client output requires an HTTP/3 listener"
         );
     }
     if request.stealth {
@@ -338,7 +328,7 @@ pub fn add_listener(config_path: &Path, request: AddListener) -> anyhow::Result<
             .as_ref()
             .and_then(|resolved| resolved.plaintext.as_ref())
             .context("client output requires a plaintext password")?;
-        deliver_basic_client_config(output, username, password)?;
+        deliver_basic_client_config(output, transport, username, password)?;
     }
 
     write_in_place(config_path, &text, &merged)?;
@@ -472,12 +462,7 @@ fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
         UserEdit::Add(request) => request.client_output.as_ref(),
         UserEdit::SetPassword(_) | UserEdit::Remove { .. } => None,
     };
-    if client_output.is_some() {
-        ensure!(
-            config.listeners[listener_index].transport == ListenerTransport::Http3,
-            "Surge MASQUE client output requires an HTTP/3 listener"
-        );
-    }
+    let transport = config.listeners[listener_index].transport;
     let mut expected = config.clone();
     let expected_auth = &mut expected.listeners[listener_index].auth;
     migrate_legacy_basic_user(expected_auth);
@@ -612,7 +597,7 @@ fn edit_basic_user(config_path: &Path, edit: UserEdit) -> anyhow::Result<()> {
             .as_ref()
             .and_then(|resolved| resolved.plaintext.as_ref())
             .context("client output requires a plaintext password")?;
-        deliver_basic_client_config(output, &username, password)?;
+        deliver_basic_client_config(output, transport, &username, password)?;
     }
     write_in_place(config_path, &text, &merged)?;
 
@@ -692,22 +677,21 @@ fn resolve_user_password(
 
 fn deliver_basic_client_config(
     output: &BasicClientOutput,
+    transport: ListenerTransport,
     username: &str,
     password: &str,
 ) -> anyhow::Result<()> {
-    let name = output
-        .name
-        .clone()
-        .unwrap_or_else(|| enroll::default_surge_proxy_name(&output.endpoint));
-    let contents = Zeroizing::new(match output.format {
-        BasicClientFormat::Surge => {
-            enroll::surge_proxy_config(&name, &output.endpoint, username, password)?
-        }
-    });
+    let contents = Zeroizing::new(enroll::basic_client_config_json(
+        output.name.as_deref(),
+        &output.endpoint,
+        transport,
+        username,
+        password,
+    )?);
     if let Some(path) = &output.out {
         enroll::write_client_config(path, &contents)?;
         println!(
-            "Surge client configuration written to {} (contains the plaintext password)",
+            "Client configuration written to {} (contains the plaintext password)",
             path.display()
         );
         return Ok(());
@@ -717,7 +701,7 @@ fn deliver_basic_client_config(
     let mut writer = stdout.lock();
     writeln!(
         writer,
-        "\n# Surge client configuration (contains the plaintext password):"
+        "\n# Client configuration (contains the plaintext password)"
     )?;
     writer.write_all(contents.as_bytes())?;
     writer

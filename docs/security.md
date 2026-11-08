@@ -224,17 +224,13 @@ the exact proxy hostname, and renew it before expiry as usual.
 
 ### With listener `auth.mode = "client_cert"`
 
-Clients in this family skip chain validation entirely — the SNI they send names
-a vendor endpoint rather than this server — and instead pin the leaf public key
-they were enrolled with. Chain, hostname, and expiry therefore play no part in
-their trust decision.
+The bundled probe can verify the server by pinning the leaf public key in the
+enrollment JSON. In that mode the key pin is the trust decision. The client
+certificate still proves possession of the enrolled client key.
 
-A self-signed certificate is appropriate here, and is what `scripts/gen-certs.sh`
-produces. Pinning trusts exactly one key distributed out of band rather than
-every public CA, so the trusted set is smaller than under PKI. A CA-issued
-certificate brings no benefit to these clients and introduces a hazard: ACME
-renewal rotates the key by default, and a new key invalidates every client's
-pin. If you use one anyway, renew with a stable key.
+`scripts/gen-certs.sh` generates a self-signed certificate. With public-key
+pinning, a key rotation requires distributing a new pin even if both the old
+and new certificates were issued by a trusted CA.
 
 Consequences worth planning for:
 
@@ -250,11 +246,10 @@ Consequences worth planning for:
 
 - `[[clients]]` holds only **public** keys. A leaked server configuration does
   not let anyone connect.
-- The **client private key** — in the enrolled JSON or `proxies:` entry — is a
-  bearer credential: whoever holds it is that client. With `--out`,
-  `enroll-client` writes the JSON as `0600` and refuses to overwrite an existing
-  path. Distribute it over a confidential channel and treat the command's
-  terminal output, including the generated proxy entry, as secret.
+- The **client private key** in the enrollment JSON lets its holder authenticate
+  as that client. With `--out`, `enroll-client` creates a mode-`0600` file and
+  refuses an existing path. Distribute it through a confidential channel. When
+  omitting `--out`, treat the JSON printed to the terminal as a secret.
 - The one-command installer prints its effective configuration with password
   hashes redacted, but it also prints a newly generated Basic password or the
   generated client block. Run it only from a private terminal and keep provisioning

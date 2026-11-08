@@ -1,13 +1,7 @@
-//! Client enrollment without an enrollment API.
+//! Generate a certificate key pair and protocol connection details for local enrollment.
 //!
-//! Clients in the Cloudflare WARP MASQUE family normally learn their key, their
-//! tunnel addresses, and the endpoint's public key from a vendor registration
-//! service. A self-hosted server has no such service, so the operator plays its
-//! part: generate a key pair, keep the public half in `[[clients]]`, and hand
-//! the private half to the client along with the addresses it was pinned to.
-//!
-//! This module produces both halves of that exchange from one call, so the two
-//! sides cannot drift apart.
+//! Keep the public key in the server roster and transfer the private key with
+//! the endpoint and pinned addresses through a private channel.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -23,13 +17,11 @@ use boring::nid::Nid;
 use boring::x509::X509;
 use zeroize::Zeroize as _;
 
+use crate::config::ListenerTransport;
+
 /// A freshly generated client key pair, in the encodings each side expects.
 pub struct ClientKeyPair {
     /// SEC1 / RFC 5915 EC private key DER, base64 encoded.
-    ///
-    /// This is the `private_key` form these clients store: they parse it with
-    /// an EC-specific parser, so PKCS#8 — what most tooling emits by default —
-    /// is silently rejected.
     pub private_key_b64: String,
     /// SubjectPublicKeyInfo DER, base64 encoded. Goes in `[[clients]]`.
     pub public_key_b64: String,
@@ -66,11 +58,7 @@ pub fn generate_client_key() -> anyhow::Result<ClientKeyPair> {
     })
 }
 
-/// Read the server certificate's public key as PEM.
-///
-/// These clients do not verify the certificate chain — the SNI they send rarely
-/// matches the endpoint — and pin this key instead, comparing it byte for byte
-/// against the leaf they are offered.
+/// Read the server certificate's public key in PEM form for key pinning.
 pub fn server_public_key_pem(cert_path: &Path) -> anyhow::Result<String> {
     let pem = std::fs::read(cert_path)
         .with_context(|| format!("failed to read {}", cert_path.display()))?;
@@ -80,71 +68,10 @@ pub fn server_public_key_pem(cert_path: &Path) -> anyhow::Result<String> {
         .public_key()
         .context("server certificate has no public key")?;
 
-    // A client that pins an ECDSA key will refuse anything else outright, so
-    // catch it here rather than at the client's first connection attempt.
-    if key.ec_key().is_err() {
-        bail!(
-            "{} does not use an ECDSA key; regenerate it with an EC key \
-             (scripts/gen-certs.sh does this) or these clients cannot pin it",
-            cert_path.display()
-        );
-    }
-
     let pem = key
         .public_key_to_pem()
         .context("failed to encode the server public key")?;
     String::from_utf8(pem).context("server public key PEM is not valid UTF-8")
-}
-
-/// Strip the armour from a PEM block, leaving the base64 DER body.
-///
-/// Some clients want the key this way rather than as PEM, and reject a value
-/// that still carries the header lines or embedded newlines.
-pub fn pem_to_base64_der(pem: &str) -> String {
-    pem.lines()
-        .filter(|line| !line.starts_with("-----"))
-        .flat_map(|line| line.chars().filter(|c| !c.is_ascii_whitespace()))
-        .collect()
-}
-
-/// A `proxies:` entry for mihomo-style clients.
-///
-/// Same protocol as the JSON form, different spelling of the same four facts:
-/// the key is base64 DER rather than PEM, the tunnel addresses are CIDR rather
-/// than bare, and the endpoint splits into separate host and port fields.
-pub fn mihomo_proxy_yaml(
-    name: &str,
-    private_key_b64: &str,
-    server_public_key_b64: &str,
-    endpoint: SocketAddr,
-    ipv4: Option<Ipv4Addr>,
-    ipv6: Option<Ipv6Addr>,
-    mtu: usize,
-) -> String {
-    let mut block = String::from("proxies:\n");
-    block.push_str(&format!("  - name: {}\n", yaml_string(name)));
-    block.push_str("    type: masque\n");
-    block.push_str(&format!("    server: {}\n", endpoint.ip()));
-    block.push_str(&format!("    port: {}\n", endpoint.port()));
-    block.push_str(&format!(
-        "    private-key: {}\n",
-        yaml_string(private_key_b64)
-    ));
-    block.push_str(&format!(
-        "    public-key: {}\n",
-        yaml_string(server_public_key_b64)
-    ));
-    // CIDR form, and a single-host prefix: the server assigns exactly this
-    // address, not a subnet the client may pick from.
-    if let Some(ipv4) = ipv4 {
-        block.push_str(&format!("    ip: {ipv4}/32\n"));
-    }
-    if let Some(ipv6) = ipv6 {
-        block.push_str(&format!("    ipv6: {ipv6}/128\n"));
-    }
-    block.push_str(&format!("    mtu: {mtu}\n"));
-    block.push_str("    udp: true\n");
-    block
 }
 
 /// Public address placed in a generated client configuration.
@@ -197,77 +124,42 @@ impl ClientEndpoint {
             port,
         })
     }
+}
 
-    fn surge_host(&self) -> String {
+impl std::fmt::Display for ClientEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.host.contains(':') {
-            format!("[{}]", self.host)
+            write!(f, "[{}]:{}", self.host, self.port)
         } else {
-            self.host.clone()
+            write!(f, "{}:{}", self.host, self.port)
         }
     }
 }
 
-/// A complete Surge `[Proxy]` block for one standard HTTP/3 MASQUE account.
-///
-/// This intentionally takes the plaintext password. The server stores only an
-/// Argon2id hash and cannot export the configuration later, so callers invoke
-/// it while creating or replacing the credential and immediately zeroize the
-/// plaintext afterwards.
-pub fn surge_proxy_config(
-    name: &str,
+/// Export a Basic account while its plaintext password is available.
+pub fn basic_client_config_json(
+    name: Option<&str>,
     endpoint: &ClientEndpoint,
+    transport: ListenerTransport,
     username: &str,
     password: &str,
-) -> anyhow::Result<String> {
-    if name.is_empty() || name.contains(['\r', '\n', '=']) || name.chars().any(char::is_control) {
-        bail!(
-            "Surge proxy name must be non-empty and contain no '=', newline, or control character"
-        );
+) -> serde_json::Result<String> {
+    #[derive(serde::Serialize)]
+    struct BasicConfig<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+        endpoint: String,
+        transport: ListenerTransport,
+        username: &'a str,
+        password: &'a str,
     }
-    if username.is_empty()
-        || username.contains(['\r', '\n'])
-        || username.chars().any(char::is_control)
-    {
-        bail!("Surge username cannot be represented safely in a proxy declaration");
-    }
-    if password.is_empty() || password.chars().any(char::is_control) {
-        bail!("Surge password must be non-empty and contain no control character");
-    }
-
-    Ok(format!(
-        "[Proxy]\n{name} = masque, {}, {}, username={}, password={}\n",
-        endpoint.surge_host(),
-        endpoint.port,
-        surge_value(username),
-        surge_value(password),
-    ))
-}
-
-/// A stable default that remains readable when several server accounts are
-/// imported into the same Surge configuration.
-pub fn default_surge_proxy_name(endpoint: &ClientEndpoint) -> String {
-    format!("[masque] {}:{}", endpoint.surge_host(), endpoint.port)
-}
-
-fn surge_value(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~'))
-    {
-        return value.to_owned();
-    }
-
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            other => quoted.push(other),
-        }
-    }
-    quoted.push('"');
-    quoted
+    json_config(&BasicConfig {
+        name,
+        endpoint: endpoint.to_string(),
+        transport,
+        username,
+        password,
+    })
 }
 
 /// The `[[clients]]` block to append to the server's config file.
@@ -317,45 +209,37 @@ pub fn write_client_config(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The client-side JSON configuration.
-///
-/// The UDP/HTTP3 and TCP/HTTP2 endpoint fields are bare addresses, not
-/// `host:port`: the port is a separate client-side flag. Both transports point
-/// at the enrolled server by default. The `id` and `access_token` fields belong
-/// to the vendor API and are emitted empty so a client that reads them finds
-/// something well formed rather than a missing key.
+/// Export certificate enrollment details with the full public endpoint.
 pub fn client_config_json(
     private_key_b64: &str,
     server_public_key_pem: &str,
-    endpoint: IpAddr,
+    endpoint: SocketAddr,
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
-) -> String {
-    let (endpoint_v4, endpoint_v6) = match endpoint {
-        IpAddr::V4(v4) => (v4.to_string(), String::new()),
-        IpAddr::V6(v6) => (String::new(), v6.to_string()),
-    };
+) -> serde_json::Result<String> {
+    #[derive(serde::Serialize)]
+    struct CertificateConfig<'a> {
+        endpoint: SocketAddr,
+        private_key: &'a str,
+        endpoint_pub_key: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ipv4: Option<Ipv4Addr>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ipv6: Option<Ipv6Addr>,
+    }
+    json_config(&CertificateConfig {
+        endpoint,
+        private_key: private_key_b64,
+        endpoint_pub_key: server_public_key_pem,
+        ipv4,
+        ipv6,
+    })
+}
 
-    let fields = [
-        ("private_key", private_key_b64.to_string()),
-        ("endpoint_v4", endpoint_v4.clone()),
-        ("endpoint_v6", endpoint_v6.clone()),
-        ("endpoint_h2_v4", endpoint_v4),
-        ("endpoint_h2_v6", endpoint_v6),
-        ("endpoint_pub_key", server_public_key_pem.to_string()),
-        ("id", String::new()),
-        ("access_token", String::new()),
-        ("ipv4", ipv4.map(|ip| ip.to_string()).unwrap_or_default()),
-        ("ipv6", ipv6.map(|ip| ip.to_string()).unwrap_or_default()),
-    ];
-
-    let body = fields
-        .iter()
-        .map(|(key, value)| format!("  \"{key}\": {}", json_string(value)))
-        .collect::<Vec<_>>()
-        .join(",\n");
-
-    format!("{{\n{body}\n}}\n")
+fn json_config(value: &impl serde::Serialize) -> serde_json::Result<String> {
+    let mut json = serde_json::to_string_pretty(value)?;
+    json.push('\n');
+    Ok(json)
 }
 
 /// Quote a value as a TOML basic string.
@@ -377,48 +261,11 @@ pub(crate) fn toml_string(value: &str) -> String {
     out
 }
 
-/// Quote a value as a YAML double-quoted scalar.
-///
-/// Base64 can start with characters YAML treats specially, so these values are
-/// always quoted rather than emitted bare.
-fn yaml_string(value: &str) -> String {
-    // YAML's double-quoted style uses the same escapes as JSON for everything
-    // that appears in a key, an address, or a name.
-    json_string(value)
-}
-
-/// Quote a value as a JSON string.
-///
-/// The PEM key carries newlines, so escaping is not optional here.
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client_identity::{ClientRegistry, spki_from_cert_der};
     use crate::config::{self, ClientEntry};
-
-    /// A key standing in for the server's, where only its encoding matters.
-    fn throwaway_p256_key() -> boring::pkey::PKey<boring::pkey::Private> {
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        boring::pkey::PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
-    }
 
     fn parse_with_listener(fragment: &str) -> config::ServerConfig {
         config::parse_toml(&format!(
@@ -442,8 +289,7 @@ mod tests {
         assert!(ClientRegistry::from_config(&[entry]).is_ok());
     }
 
-    /// The private key must round-trip through the SEC1 parser these clients
-    /// use, and its public half must match what we told the server to expect.
+    /// The SEC1 private key must match the public key in the server roster.
     #[test]
     fn private_key_is_sec1_der_matching_the_published_public_key() {
         let pair = generate_client_key().unwrap();
@@ -497,129 +343,51 @@ mod tests {
     }
 
     #[test]
-    fn client_json_escapes_the_multiline_pem_key() {
+    fn certificate_json_preserves_keys_and_the_full_endpoint() {
+        let key = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
         let json = client_config_json(
             "cHJpdmF0ZQ==",
-            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
-            "203.0.113.9".parse().unwrap(),
-            Some("10.89.0.2".parse().unwrap()),
+            key,
+            "[2001:db8::1]:8449".parse().unwrap(),
+            Some("192.0.2.2".parse().unwrap()),
             None,
-        );
-
-        // A raw newline inside a JSON string would make the file unparseable.
-        assert!(json.contains("\\n"));
-        assert!(!json.contains("KEY-----\n-"));
-        assert!(json.contains("\"endpoint_v4\": \"203.0.113.9\""));
-        assert!(json.contains("\"endpoint_h2_v4\": \"203.0.113.9\""));
-        assert!(json.contains("\"endpoint_h2_v6\": \"\""));
-        // The port travels as a client flag, so it must not leak into the field.
-        assert!(!json.contains("203.0.113.9:443"));
-        assert!(json.contains("\"ipv4\": \"10.89.0.2\""));
-        assert!(json.contains("\"ipv6\": \"\""));
-    }
-
-    #[test]
-    fn pem_to_base64_der_strips_armour_and_newlines() {
-        let key = throwaway_p256_key();
-        let pem = String::from_utf8(key.public_key_to_pem().unwrap()).unwrap();
-        let stripped = pem_to_base64_der(&pem);
-
-        assert!(!stripped.contains("-----"));
-        assert!(!stripped.contains('\n'));
-        // Must still be the same key, byte for byte, after the round trip.
-        assert_eq!(stripped, STANDARD.encode(key.public_key_to_der().unwrap()));
-    }
-
-    #[test]
-    fn mihomo_block_carries_cidr_addresses_and_a_split_endpoint() {
-        let pair = generate_client_key().unwrap();
-        let server_key = STANDARD.encode(throwaway_p256_key().public_key_to_der().unwrap());
-        let yaml = mihomo_proxy_yaml(
-            "laptop",
-            &pair.private_key_b64,
-            &server_key,
-            "203.0.113.9:4433".parse().unwrap(),
-            Some("10.89.0.2".parse().unwrap()),
-            Some("fd00:abcd::2".parse().unwrap()),
-            1420,
-        );
-
-        assert!(yaml.contains("type: masque"));
-        // Host and port are separate fields, unlike the JSON form.
-        assert!(yaml.contains("server: 203.0.113.9"));
-        assert!(yaml.contains("port: 4433"));
-        assert!(!yaml.contains("203.0.113.9:4433"));
-        // Addresses are CIDR here, and single-host: the server pins exactly one.
-        assert!(yaml.contains("ip: 10.89.0.2/32"));
-        assert!(yaml.contains("ipv6: fd00:abcd::2/128"));
-        assert!(yaml.contains("mtu: 1420"));
-        // The server key must be bare base64, never PEM.
-        assert!(yaml.contains(&format!("public-key: \"{server_key}\"")));
-        assert!(!yaml.contains("-----BEGIN"));
-    }
-
-    #[test]
-    fn mihomo_block_omits_addresses_that_were_not_pinned() {
-        let pair = generate_client_key().unwrap();
-        let yaml = mihomo_proxy_yaml(
-            "phone",
-            &pair.private_key_b64,
-            "AAAA",
-            "203.0.113.9:443".parse().unwrap(),
-            None,
-            None,
-            1280,
-        );
-        assert!(!yaml.contains("ip:"));
-        assert!(!yaml.contains("ipv6:"));
-    }
-
-    #[test]
-    fn surge_block_carries_basic_credentials_and_public_endpoint() {
-        let endpoint = ClientEndpoint::parse("proxy.example:8449").unwrap();
-        let block = surge_proxy_config(
-            "phone",
-            &endpoint,
-            "alice",
-            "password with spaces, and commas",
         )
         .unwrap();
-        assert_eq!(
-            block,
-            "[Proxy]\nphone = masque, proxy.example, 8449, username=alice, password=\"password with spaces, and commas\"\n"
-        );
+        let data: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(data["endpoint"], "[2001:db8::1]:8449");
+        assert_eq!(data["private_key"], "cHJpdmF0ZQ==");
+        assert_eq!(data["endpoint_pub_key"], key);
+        assert_eq!(data["ipv4"], "192.0.2.2");
+        assert!(data.get("ipv6").is_none());
     }
 
     #[test]
-    fn surge_endpoint_accepts_bracketed_ipv6() {
+    fn basic_json_preserves_transport_and_credentials() {
         let endpoint = ClientEndpoint::parse("[2001:db8::1]:443").unwrap();
-        assert_eq!(endpoint.host, "2001:db8::1");
+        let json = basic_client_config_json(
+            Some("phone"),
+            &endpoint,
+            ListenerTransport::Http2,
+            "alice",
+            "password with spaces, commas and \"quotes\"",
+        )
+        .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(data["name"], "phone");
+        assert_eq!(data["endpoint"], "[2001:db8::1]:443");
+        assert_eq!(data["transport"], "http2");
+        assert_eq!(data["username"], "alice");
         assert_eq!(
-            default_surge_proxy_name(&endpoint),
-            "[masque] [2001:db8::1]:443"
+            data["password"],
+            "password with spaces, commas and \"quotes\""
         );
     }
 
     #[test]
-    fn surge_endpoint_rejects_user_information_and_port_zero() {
+    fn client_endpoint_rejects_user_information_and_invalid_ports() {
         assert!(ClientEndpoint::parse("user@proxy.example:443").is_err());
         assert!(ClientEndpoint::parse("proxy.example:0").is_err());
         assert!(ClientEndpoint::parse("proxy.example,udp-relay=true:443").is_err());
-    }
-
-    #[test]
-    fn client_json_uses_the_v6_endpoint_field_for_a_v6_address() {
-        let json = client_config_json(
-            "a2V5",
-            "pem",
-            "2001:db8::1".parse().unwrap(),
-            None,
-            Some("fd00:abcd::2".parse().unwrap()),
-        );
-        assert!(json.contains("\"endpoint_v6\": \"2001:db8::1\""));
-        assert!(json.contains("\"endpoint_v4\": \"\""));
-        assert!(json.contains("\"endpoint_h2_v6\": \"2001:db8::1\""));
-        assert!(json.contains("\"endpoint_h2_v4\": \"\""));
     }
 
     #[test]
@@ -695,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn non_ec_server_certificate_is_rejected() {
+    fn rsa_server_certificate_can_be_pinned() {
         let key = boring::pkey::PKey::from_rsa(boring::rsa::Rsa::generate(2048).unwrap()).unwrap();
         let mut builder = boring::x509::X509Builder::new().unwrap();
         builder.set_version(2).unwrap();
@@ -723,8 +491,9 @@ mod tests {
         let path = dir.join("rsa.crt");
         std::fs::write(&path, builder.build().to_pem().unwrap()).unwrap();
 
-        let error = server_public_key_pem(&path).unwrap_err();
-        assert!(format!("{error:#}").contains("ECDSA"), "{error:#}");
+        let pem = server_public_key_pem(&path).unwrap();
+        let pinned = boring::pkey::PKey::public_key_from_pem(pem.as_bytes()).unwrap();
+        assert!(pinned.public_eq(&key));
 
         std::fs::remove_dir_all(&dir).ok();
     }

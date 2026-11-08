@@ -1,15 +1,7 @@
-//! End-to-end coverage for the Cloudflare-compatible CONNECT-IP path.
+//! TLS client-certificate and CONNECT-IP integration tests over real QUIC.
 //!
-//! These tests drive a real QUIC client against a real server, because the
-//! parts that were most likely to be wrong are the parts unit tests cannot
-//! reach: whether BoringSSL actually asks for a client certificate when the
-//! chain is unverifiable, and whether a request shaped the way Cloudflare's
-//! clients shape it survives quiche's HTTP/3 layer.
-//!
-//! The client is deliberately built to mimic that family of clients rather than
-//! an RFC 9484 one: a self-signed certificate with an empty subject, serial 0,
-//! and 24 hours of validity; `:protocol: cf-connect-ip`; a hardcoded authority;
-//! and `:path: /`.
+//! The fixtures use self-signed certificates with enrolled public keys. They
+//! exercise standard and legacy CONNECT-IP request framing and address leases.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -400,10 +392,8 @@ impl Client {
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut scid)
             .map_err(|_| anyhow::anyhow!("RNG failed"))?;
 
-        // The SNI these clients send names the vendor's endpoint rather than
-        // this server, which is exactly why they cannot verify the chain.
         let mut quic = quiche::connect(
-            Some("consumer-masque.cloudflareclient.com"),
+            Some("masque.example"),
             &quiche::ConnectionId::from_ref(&scid),
             local,
             peer,
@@ -619,7 +609,7 @@ impl Client {
         panic!("stream {stream_id} was not reset");
     }
 
-    /// Send standard CONNECT-IP or the deployed Cloudflare request shape.
+    /// Send standard CONNECT-IP or the legacy request format.
     fn send_connect_ip(&mut self, protocol: &str) -> anyhow::Result<u64> {
         self.send_connect_ip_with_credentials(protocol, None)
     }
@@ -648,7 +638,7 @@ impl Client {
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", protocol.as_bytes()),
             quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+            quiche::h3::Header::new(b":authority", b"proxy.example"),
             quiche::h3::Header::new(b":path", path.as_bytes()),
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
             // These clients send an empty User-Agent, which has to survive
@@ -2270,9 +2260,8 @@ fn malformed_or_unknown_datagram_contexts_leave_http3_usable() {
 /// One process, two listeners, two authentication modes.
 ///
 /// `auth.mode` decides which TLS context a shard builds, and that is settled
-/// when its socket is bound — so a Cloudflare-style client and a
-/// standards-compliant one cannot share a listener. They can share a process,
-/// and this is the test that says so.
+/// when its socket is bound. Certificate and Basic authentication use
+/// separate listeners in the same process.
 ///
 /// It also pins the reason for sharing one: the address pool is per server, not
 /// per listener, so the two clients cannot be handed the same tunnel address.
@@ -2493,8 +2482,7 @@ fn assigned_addresses(client: &mut Client, stream_id: u64) -> Vec<IpAddress> {
         .expect("server must send ADDRESS_ASSIGN")
 }
 
-/// The registered `connect-ip` spelling has to keep working: accepting
-/// Cloudflare's identifier must not come at the cost of RFC 9484 clients.
+/// The legacy identifier must coexist with RFC 9484 CONNECT-IP.
 #[test]
 fn registered_client_may_also_use_the_rfc_protocol_identifier() {
     let fixture = fixture("rfc");
@@ -3053,7 +3041,7 @@ fn client_without_a_certificate_is_refused() {
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut scid).unwrap();
     let quic = quiche::connect(
-        Some("consumer-masque.cloudflareclient.com"),
+        Some("masque.example"),
         &quiche::ConnectionId::from_ref(&scid),
         local,
         fixture.peer,
