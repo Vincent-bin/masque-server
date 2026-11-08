@@ -1,15 +1,8 @@
 //! Pre-registered client identities for TLS client-certificate authentication.
 //!
-//! Clients built against Cloudflare's WARP MASQUE endpoint authenticate with a
-//! TLS client certificate rather than `Proxy-Authorization`, and the
-//! certificate is self-signed, freshly minted per connection, and carries no
-//! usable subject: only the key inside it identifies the caller. So the roster
-//! is keyed by public key, and the certificate around it is treated as a
-//! disposable envelope.
-//!
-//! Nothing here talks to an enrollment API. An operator generates a key pair
-//! per client, records the public key in `[[clients]]`, and hands the private
-//! key over out of band.
+//! The roster identifies peers by the certificate's public key. Peers can
+//! present a short-lived self-signed certificate using the enrolled key.
+//! Enrollment generates the key locally and distributes it out of band.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -249,10 +242,8 @@ impl SharedRoster {
 /// Configure a TLS server context to require a client certificate and admit
 /// only public keys present in `roster`.
 ///
-/// MASQUE clients in this family present short-lived self-signed certificates,
-/// so normal CA-chain verification is intentionally replaced by a canonical
-/// public-key lookup. Keeping the callback here lets QUIC and TCP/TLS listeners
-/// enforce exactly the same identity rule.
+/// A canonical public-key lookup permits self-signed client certificates.
+/// QUIC and TCP/TLS listeners share the same identity check.
 pub(crate) fn configure_client_cert_verification(
     builder: &mut SslContextBuilder,
     roster: Arc<SharedRoster>,
@@ -326,9 +317,6 @@ pub fn spki_from_cert_der(cert_der: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Parse a roster `public_key` value: base64 SPKI DER, or a PEM public key.
-///
-/// Both forms show up in practice — vendor APIs exchange the base64 DER, while
-/// `openssl x509 -pubkey` prints PEM — and telling them apart is unambiguous.
 pub fn parse_public_key(text: &str) -> anyhow::Result<Vec<u8>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -352,11 +340,8 @@ pub fn parse_public_key(text: &str) -> anyhow::Result<Vec<u8>> {
     canonical_spki(&key)
 }
 
-/// Re-encode a public key to its canonical SPKI DER, rejecting key types no
-/// known client uses.
+/// Canonicalize the enrolled P-256 public key as SPKI DER.
 fn canonical_spki(key: &PKey<Public>) -> anyhow::Result<Vec<u8>> {
-    // MASQUE clients in this family use secp256r1 exclusively, and accepting
-    // anything else would mean advertising support we cannot test.
     let ec = key
         .ec_key()
         .context("public key is not ECDSA (expected secp256r1 / P-256)")?;
@@ -391,8 +376,7 @@ mod tests {
         STANDARD.encode(key.public_key_to_der().unwrap())
     }
 
-    /// A stand-in for what these clients present: self-signed, empty subject,
-    /// serial 0, short validity.
+    /// A short-lived, self-signed certificate with no subject identity.
     fn self_signed_der(key: &PKey<Private>) -> Vec<u8> {
         let mut builder = X509Builder::new().unwrap();
         builder.set_version(2).unwrap();
@@ -537,8 +521,8 @@ mod tests {
             ipv4: Some("10.89.0.2".into()),
             ipv6: None,
         };
-        let clash = [pinned("a", &p256_key()), pinned("b", &p256_key())];
-        let error = ClientRegistry::from_config(&clash).unwrap_err();
+        let duplicate = [pinned("a", &p256_key()), pinned("b", &p256_key())];
+        let error = ClientRegistry::from_config(&duplicate).unwrap_err();
         assert!(format!("{error:#}").contains("pinned to"), "{error:#}");
     }
 

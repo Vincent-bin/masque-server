@@ -395,9 +395,9 @@ generate_basic_client_config() {
     if [ -z "$BASIC_CLIENT_CONFIG_OUT" ]; then
         if can_prompt; then
             BASIC_CLIENT_CONFIG_OUT=$(prompt_value \
-                "Secret client configuration output path" /root/masque-surge.conf)
+                "Secret client configuration output path" /root/masque-basic.json)
         else
-            BASIC_CLIENT_CONFIG_OUT=/root/masque-surge.conf
+            BASIC_CLIENT_CONFIG_OUT=/root/masque-basic.json
         fi
     fi
     case "$BASIC_CLIENT_CONFIG_OUT" in
@@ -407,7 +407,7 @@ generate_basic_client_config() {
     [ ! -e "$BASIC_CLIENT_CONFIG_OUT" ] || die \
         "refusing to overwrite existing client configuration: $BASIC_CLIENT_CONFIG_OUT"
 
-    set -- "$CANDIDATE_BIN" client-config surge \
+    set -- "$CANDIDATE_BIN" client-config json --transport "$FRESH_TRANSPORT" \
         --endpoint "$basic_client_endpoint" --username "$AUTH_USERNAME" \
         --out "$BASIC_CLIENT_CONFIG_OUT"
     if [ -n "${MASQUE_BASIC_CLIENT_NAME:-}" ]; then

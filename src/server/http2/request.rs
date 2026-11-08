@@ -9,7 +9,7 @@ use crate::config::ServerConfig;
 use crate::uri::{self, TcpTarget, UdpTarget};
 
 pub(super) const CAPSULE_PROTOCOL: HeaderName = HeaderName::from_static("capsule-protocol");
-const CF_CONNECT_PROTO: HeaderName = HeaderName::from_static("cf-connect-proto");
+const LEGACY_CONNECT_PROTOCOL_HEADER: HeaderName = HeaderName::from_static("cf-connect-proto");
 
 pub(super) enum RequestKind {
     Tcp(TcpTarget),
@@ -21,8 +21,8 @@ pub(super) enum RequestKind {
 /// needed after authentication succeeds.
 pub(super) struct RecognizedRequest {
     connect: ConnectRequest,
-    cloudflare_capsules: bool,
-    duplicate_cloudflare_protocol: bool,
+    context_free_capsules: bool,
+    duplicate_legacy_protocol: bool,
 }
 
 /// Recognize a proxy request without parsing its target.
@@ -38,11 +38,14 @@ pub(super) fn recognize(
         .extensions()
         .get::<h2::ext::Protocol>()
         .map(|protocol| protocol.as_str().to_owned());
-    let mut cloudflare_protocols = request.headers().get_all(&CF_CONNECT_PROTO).iter();
-    let cloudflare_protocol = cloudflare_protocols.next().map(HeaderValue::as_bytes);
-    let duplicate_cloudflare_protocol = cloudflare_protocols.next().is_some();
-    let cloudflare_capsules = protocol.is_none() && cloudflare_protocol == Some(b"cf-connect-ip");
-    let effective_protocol = if cloudflare_capsules {
+    let mut legacy_protocols = request
+        .headers()
+        .get_all(&LEGACY_CONNECT_PROTOCOL_HEADER)
+        .iter();
+    let legacy_protocol = legacy_protocols.next().map(HeaderValue::as_bytes);
+    let duplicate_legacy_protocol = legacy_protocols.next().is_some();
+    let context_free_capsules = protocol.is_none() && legacy_protocol == Some(b"cf-connect-ip");
+    let effective_protocol = if context_free_capsules {
         "cf-connect-ip"
     } else {
         protocol.as_deref().unwrap_or("")
@@ -71,8 +74,8 @@ pub(super) fn recognize(
     )?;
     Some(RecognizedRequest {
         connect,
-        cloudflare_capsules,
-        duplicate_cloudflare_protocol,
+        context_free_capsules,
+        duplicate_legacy_protocol,
     })
 }
 
@@ -98,11 +101,11 @@ pub(super) fn prepare(
             standard,
             valid_pseudo_headers,
         } => {
-            if recognized.cloudflare_capsules {
-                if recognized.duplicate_cloudflare_protocol {
+            if recognized.context_free_capsules {
+                if recognized.duplicate_legacy_protocol {
                     return Err(StatusCode::BAD_REQUEST);
                 }
-                return Ok(RequestKind::Ip(IpCapsuleMode::Cloudflare));
+                return Ok(RequestKind::Ip(IpCapsuleMode::ContextFree));
             }
             if !uses_capsule_protocol(request) {
                 return Err(StatusCode::BAD_REQUEST);

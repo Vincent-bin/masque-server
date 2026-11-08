@@ -83,8 +83,8 @@ The following environment variables make provisioning non-interactive:
 | `MASQUE_AUTH_USERNAME` | Basic username; randomly generated when omitted |
 | `MASQUE_AUTH_PASSWORD` | Basic password; random when omitted |
 | `MASQUE_BASIC_CLIENT_ENDPOINT` | Optional public Basic endpoint in `host:port` form; enables client configuration generation |
-| `MASQUE_BASIC_CLIENT_NAME` | Optional proxy name in the generated client configuration |
-| `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret client output path; defaults to `/root/masque-surge.conf` when generation is enabled |
+| `MASQUE_BASIC_CLIENT_NAME` | Optional label in the generated Basic credential JSON |
+| `MASQUE_BASIC_CLIENT_CONFIG_OUT` | Absolute secret client output path; defaults to `/root/masque-basic.json` when generation is enabled |
 | `MASQUE_LISTEN_PORT` | Public UDP listen port; defaults to `443` |
 | `MASQUE_CERT_LISTEN_PORT` | `dual` only; certificate listener port, defaults to `4443` |
 | `MASQUE_TLS_CERT` / `MASQUE_TLS_KEY` | Source PEM certificate and key copied into `/etc/masque/certs` |

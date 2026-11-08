@@ -53,8 +53,8 @@ impl PendingConnectSetups {
 
 /// Whether `protocol` names CONNECT-IP according to the configured list.
 ///
-/// RFC 9484 registers `connect-ip`, but Cloudflare's endpoint uses
-/// `cf-connect-ip`, and clients written against it send only that. The value is
+/// RFC 9484 registers `connect-ip`. Deployed configurations can also accept
+/// the legacy `cf-connect-ip` identifier. The value is
 /// compared case-sensitively: `:protocol` is a registered token, not a header
 /// name.
 ///
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn default_list_accepts_both_the_registered_and_cloudflare_identifiers() {
+    fn default_list_accepts_both_the_registered_and_legacy_identifiers() {
         assert!(accepts_connect_ip(&defaults(), b"connect-ip"));
         assert!(accepts_connect_ip(&defaults(), b"cf-connect-ip"));
     }

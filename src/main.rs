@@ -60,11 +60,15 @@ enum LogFormat {
 enum Command {
     /// Read a password from standard input and print an Argon2id PHC hash.
     HashPassword,
-    /// Read a Basic password from stdin and emit an importable client configuration.
+    /// Read a Basic password from stdin and emit protocol connection details as JSON.
     ClientConfig {
         /// Client configuration syntax.
         #[arg(value_enum)]
         format: BasicClientArg,
+
+        /// Listener transport included in the connection details.
+        #[arg(long, value_enum, default_value = "http3")]
+        transport: TransportArg,
 
         /// Public host:port the client dials.
         #[arg(long)]
@@ -108,8 +112,7 @@ enum Command {
         #[arg(long)]
         name: String,
 
-        /// Address:port clients dial. The IP is written to JSON; the port is
-        /// printed as the client's --connect-port argument.
+        /// Public IP address and port included in the enrollment JSON.
         #[arg(long)]
         endpoint: SocketAddr,
 
@@ -183,7 +186,7 @@ enum Command {
         #[arg(long, hide = true, conflicts_with = "disable_auth")]
         stealth: bool,
 
-        /// Emit a ready-to-import client configuration while the plaintext
+        /// Emit a JSON credential file while the plaintext
         /// password is still available.
         #[arg(
             long,
@@ -273,7 +276,7 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
 
-        /// Emit a ready-to-import client configuration while the plaintext
+        /// Emit a JSON credential file while the plaintext
         /// password is still available.
         #[arg(
             long,
@@ -350,15 +353,7 @@ enum TransportArg {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum BasicClientArg {
-    Surge,
-}
-
-impl From<BasicClientArg> for config_edit::BasicClientFormat {
-    fn from(format: BasicClientArg) -> Self {
-        match format {
-            BasicClientArg::Surge => Self::Surge,
-        }
-    }
+    Json,
 }
 
 impl From<TransportArg> for config::ListenerTransport {
@@ -395,12 +390,6 @@ fn auth_label(auth: &config::AuthSection) -> &'static str {
     }
 }
 
-fn usque_port_instruction(port: u16) -> String {
-    format!(
-        "# For the generated JSON, set --connect-port {port} (short form: -P {port}); add --http2 for an HTTP/2 listener."
-    )
-}
-
 /// Generate and print one client enrollment.
 fn enroll_client(
     cert_path: &Path,
@@ -408,7 +397,6 @@ fn enroll_client(
     endpoint: SocketAddr,
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
-    tun_mtu: usize,
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let pair = enroll::generate_client_key()?;
@@ -417,10 +405,10 @@ fn enroll_client(
     let client_json = Zeroizing::new(enroll::client_config_json(
         &pair.private_key_b64,
         &server_key,
-        endpoint.ip(),
+        endpoint,
         ipv4,
         ipv6,
-    ));
+    )?);
 
     println!("# Add to the server config, then reload or restart the server:\n");
     print!(
@@ -438,33 +426,6 @@ fn enroll_client(
             print!("{}", client_json.as_str());
         }
     }
-
-    // The JSON schema stores only the endpoint IP; its connection port is
-    // a launch flag. Always print it so a non-443 deployment cannot silently
-    // fall back to the client's default port.
-    println!("\n{}", usque_port_instruction(endpoint.port()));
-
-    // The same enrollment in a proxy configuration format. Emitted alongside
-    // rather than behind a flag: the encodings differ in ways that are easy to
-    // get subtly wrong by hand, and a wrong key only shows up as a handshake
-    // failure much later.
-    println!(
-        "\n# Or add the following proxy block to a compatible configuration \
-         (also contains the private key):\n"
-    );
-    print!(
-        "{}",
-        Zeroizing::new(enroll::mihomo_proxy_yaml(
-            name,
-            &pair.private_key_b64,
-            &enroll::pem_to_base64_der(&server_key),
-            endpoint,
-            ipv4,
-            ipv6,
-            tun_mtu,
-        ))
-        .as_str()
-    );
 
     if ipv4.is_none() && ipv6.is_none() {
         eprintln!(
@@ -507,7 +468,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(Command::ClientConfig {
-        format,
+        format: _,
+        transport,
         endpoint,
         username,
         name,
@@ -517,14 +479,13 @@ async fn main() -> anyhow::Result<()> {
         auth::check_username(username)?;
         let endpoint = enroll::ClientEndpoint::parse(endpoint)?;
         let password = read_password_from_stdin()?;
-        let name = name
-            .clone()
-            .unwrap_or_else(|| enroll::default_surge_proxy_name(&endpoint));
-        let contents = Zeroizing::new(match format {
-            BasicClientArg::Surge => {
-                enroll::surge_proxy_config(&name, &endpoint, username, &password)?
-            }
-        });
+        let contents = Zeroizing::new(enroll::basic_client_config_json(
+            name.as_deref(),
+            &endpoint,
+            (*transport).into(),
+            username,
+            &password,
+        )?);
         match out {
             Some(path) => {
                 enroll::write_client_config(path, &contents)?;
@@ -607,8 +568,7 @@ async fn main() -> anyhow::Result<()> {
     }) = &cli.command
     {
         let client_output = match emit_client {
-            Some(format) => Some(config_edit::BasicClientOutput {
-                format: (*format).into(),
+            Some(BasicClientArg::Json) => Some(config_edit::BasicClientOutput {
                 endpoint: enroll::ClientEndpoint::parse(
                     client_endpoint
                         .as_deref()
@@ -665,8 +625,7 @@ async fn main() -> anyhow::Result<()> {
     }) = &cli.command
     {
         let client_output = match emit_client {
-            Some(format) => Some(config_edit::BasicClientOutput {
-                format: (*format).into(),
+            Some(BasicClientArg::Json) => Some(config_edit::BasicClientOutput {
                 endpoint: enroll::ClientEndpoint::parse(
                     client_endpoint
                         .as_deref()
@@ -754,15 +713,7 @@ async fn main() -> anyhow::Result<()> {
         out,
     }) = cli.command
     {
-        return enroll_client(
-            &cfg.tls.cert_path,
-            &name,
-            endpoint,
-            ipv4,
-            ipv6,
-            cfg.ip_proxy.tun_mtu,
-            out,
-        );
+        return enroll_client(&cfg.tls.cert_path, &name, endpoint, ipv4, ipv6, out);
     }
 
     if matches!(cli.command, Some(Command::CheckConfig)) {
@@ -909,7 +860,7 @@ fn read_password_from_stdin() -> anyhow::Result<Zeroizing<String>> {
 mod tests {
     use clap::CommandFactory as _;
 
-    use super::{Cli, usque_port_instruction};
+    use super::Cli;
 
     #[test]
     fn cli_reports_the_package_version() {
@@ -922,14 +873,6 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn enrollment_preserves_a_non_default_endpoint_port_as_a_client_flag() {
-        let instruction = usque_port_instruction(8449);
-        assert!(instruction.contains("--connect-port 8449"));
-        assert!(instruction.contains("-P 8449"));
-        assert!(instruction.contains("--http2"));
     }
 
     #[test]

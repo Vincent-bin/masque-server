@@ -262,9 +262,8 @@ impl ResolvedListener {
 
 /// One pre-registered client.
 ///
-/// This replaces the vendor enrollment API for self-hosted setups: the
-/// operator generates a key pair, records its public key here, and hands the
-/// private key to the client out of band.
+/// The operator records the public key here and distributes the private key
+/// through a separate, confidential channel.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientEntry {
@@ -276,10 +275,8 @@ pub struct ClientEntry {
     /// Fixed IPv4 handed to this client's CONNECT-IP tunnels. Must fall inside
     /// `ip_proxy.ipv4_pool`.
     ///
-    /// Clients that configure their tunnel interface from a vendor API rather
-    /// than from the `ADDRESS_ASSIGN` capsule need the server to assign the
-    /// same address every time, otherwise the two disagree and every packet is
-    /// dropped as spoofed.
+    /// Peers that configure addresses out of band need this assignment to
+    /// match the tunnel interface address used for source validation.
     pub ipv4: Option<String>,
     /// Fixed IPv6, inside `ip_proxy.ipv6_pool`.
     pub ipv6: Option<String>,
@@ -404,7 +401,7 @@ pub struct IpProxySection {
     pub uri_template: String,
     /// Accepted `:protocol` values for an Extended CONNECT IP request.
     ///
-    /// RFC 9484 registers `connect-ip`. Cloudflare's endpoint uses
+    /// RFC 9484 registers `connect-ip`. The legacy protocol uses
     /// `cf-connect-ip` instead, and clients written against it send only that,
     /// so both are accepted by default; an RFC client never sends the latter.
     pub connect_protocols: Vec<String>,
@@ -658,7 +655,7 @@ enabled = false
         assert!(!cfg.ip_proxy.require_tun);
         assert_eq!(cfg.ip_proxy.tun_mtu, 1280);
         assert_eq!(cfg.observability.listen_addr, None);
-        // Cloudflare's non-standard identifier is accepted out of the box; an
+        // The legacy identifier is accepted out of the box; an
         // RFC 9484 client never sends it, so this costs nothing.
         assert_eq!(
             cfg.ip_proxy.connect_protocols,

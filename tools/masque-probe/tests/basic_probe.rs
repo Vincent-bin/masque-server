@@ -357,10 +357,11 @@ async fn check_certificate_probe(transport: &str, configured: ListenerTransport)
     let enrollment = masque::enroll::client_config_json(
         &pair.private_key_b64,
         &server_key,
-        Ipv4Addr::LOCALHOST.into(),
+        (Ipv4Addr::LOCALHOST, 443).into(),
         None,
         None,
-    );
+    )
+    .unwrap();
     std::fs::write(&enrollment_path, enrollment).unwrap();
     let (target, tcp_echo, udp_echo) = spawn_echo().await;
 

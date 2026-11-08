@@ -83,8 +83,7 @@ password_hash = "__MASQUE_AUTH_PASSWORD_HASH__"
 # their config file rather than from the ADDRESS_ASSIGN capsule — the two sides
 # must agree, or every packet is dropped as spoofed.
 #
-# The client JSON stores only the endpoint IP. The command also prints the
-# matching --connect-port/-P argument; do not omit it on non-443 servers.
+# The enrollment JSON contains the public endpoint and its port.
 # An --out path is created as a new 0600 file on Unix and is never overwritten.
 #
 # [[clients]]
@@ -212,10 +211,8 @@ require_tun = false
 # use /.well-known/masque/ip/*/*/. Scoped requests are rejected (501), not
 # silently widened; cf-connect-ip keeps its deployed path behavior.
 uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
-# Accepted `:protocol` values. RFC 9484 registers "connect-ip"; Cloudflare's
-# endpoint uses "cf-connect-ip" and clients built against it send only that.
-# Both are accepted by default, which costs nothing: an RFC client never sends
-# the second one.
+# Accepted CONNECT-IP identifiers. The registered "connect-ip" identifier
+# and the legacy "cf-connect-ip" identifier are both enabled by default.
 connect_protocols = ["connect-ip", "cf-connect-ip"]
 tun_name = "masque0"
 tun_mtu = 1280

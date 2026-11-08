@@ -45,7 +45,7 @@ With a listener's `auth.mode = "client_cert"` there is no per-request step: the 
 identified once, from its TLS client certificate, during the TLS handshake. An
 unregistered key never reaches the request path — it is refused with a TLS
 `access_denied` alert. See
-[Cloudflare-compatible clients](#cloudflare-compatible-clients).
+[Legacy CONNECT-IP format](#legacy-connect-ip-format).
 
 ## Standard CONNECT
 
@@ -146,8 +146,8 @@ Control replies share bounded output handling and survive fragmented input,
 small receive windows, and a clean request FIN. HTTP/3 retains its shared
 64-buffer per-stream and 256-buffer per-connection output ceilings; overflowing
 either resets only the requesting stream rather than growing the queue.
-Initial unsolicited assignments and Cloudflare's context-free HTTP/2 packet
-format remain supported.
+Initial unsolicited assignments and context-free HTTP/2 packet framing
+remain supported.
 
 IP packets use HTTP Datagrams with Context ID `0`. HTTP/3 sends them as QUIC
 DATAGRAM frames; HTTP/2 sends the same payload inside DATAGRAM capsules on the
@@ -180,66 +180,26 @@ than close every tunnel on the HTTP connection.
 Clients must support proxy CONNECT on the selected transport and the relevant
 MASQUE extension. Standards-based HTTP/2 CONNECT-UDP and CONNECT-IP require
 Extended CONNECT and Capsule Protocol support; an ordinary HTTP proxy client
-is sufficient only for standard CONNECT. The additional Cloudflare-compatible
-CONNECT-IP shape below is deliberately supported for deployed clients.
+is sufficient only for standard CONNECT. The legacy CONNECT-IP format below is also supported.
 Client configuration syntax is outside these protocols. Test authentication,
 target policy, TCP, UDP, and DNS separately when qualifying a peer.
 
-## Cloudflare-compatible clients
+## Legacy CONNECT-IP format
 
-The server supports an additional CONNECT-IP wire format alongside RFC 9484.
-It can be selected independently of client implementation.
+`ip_proxy.connect_protocols` accepts both `connect-ip` and `cf-connect-ip` by
+default. For `cf-connect-ip` over HTTP/3, send it as `:protocol` with valid
+`:authority` and `:path` fields such as `proxy.example` and `/`. This format
+does not use the RFC 9484 URI Template.
 
-**HTTP/3 `:protocol` is `cf-connect-ip`.** This value and the registered
-`connect-ip` value are included in `ip_proxy.connect_protocols` by default.
-The `cf-connect-ip` format accepts requests such as `:authority: cloudflareaccess.com`
-and `:path: /`.
+For the legacy format over HTTP/2, send a regular CONNECT with the
+`cf-connect-proto: cf-connect-ip` field. Its DATAGRAM capsule value is the
+raw IP packet. The server uses the same framing in the response. Standard
+HTTP/2 CONNECT-IP uses Extended CONNECT, `Capsule-Protocol: ?1`, and includes
+Context ID zero.
 
-**HTTP/3 `:authority` and `:path`.** Some peers use
-`:authority: cloudflareaccess.com` and `:path: /`, with no URI Template
-variables. The CONNECT-IP path ignores both, so `ip_proxy.uri_template` does not
-apply to this format.
-
-**Authentication is configured per listener.** Both Basic and client
-certificate modes are available to this protocol format. A peer that sends no
-`Proxy-Authorization` needs a listener configured for client certificate
-authentication or another compatible authentication policy; see
-[Authentication](configuration.md#authentication). Each listener has one
-authentication mode, and multiple listeners can share one process.
-
-**The HTTP/2 compatibility format uses a separate wire shape.** It sends an ordinary CONNECT with `cf-connect-proto: cf-connect-ip`, not an
-Extended CONNECT `:protocol`. Its DATAGRAM capsule value contains the raw IP
-packet and omits the otherwise mandatory Context ID zero. The server detects
-that exact header and mirrors the framing on responses. Standards-based H2
-CONNECT-IP remains available at the same time; it uses Extended CONNECT,
-`Capsule-Protocol: ?1`, and retains Context ID zero.
-
-Cloudflare's HTTP/3 service does not require clients to observe
-`SETTINGS_ENABLE_CONNECT_PROTOCOL`; this server advertises the setting on both
-HTTP transports where applicable.
-
-**Addresses come from the client's own configuration, not from
-`ADDRESS_ASSIGN`.** These clients send no address-control capsules; the client
-learns its tunnel addresses from its config file and configures its interface
-from those. Two consequences:
-
-- The address must be pinned per client with `[[clients]].ipv4` / `.ipv6`, and
-  the client's configuration must carry the same values. A pool-allocated
-  address would leave the two sides disagreeing, and the server would drop every
-  client packet as a spoofed source.
-- `ADDRESS_ASSIGN` is still sent, and it must agree with the pinned addresses.
-  These clients ignore it for interface configuration but do use it to filter
-  inbound packets, so an address the client is not expecting causes silent drops
-  in the other direction too.
-
-`masque-server enroll-client` generates both sides at once, which is the
-reliable way to keep them consistent.
-
-**Keepalive interacts with the idle timeout.** Keep `server.idle_timeout_secs`
-above the peer's keepalive period; the default is 60 seconds.
-
-**HTTP/2 fallback is available when the client supports it.** These clients may
-carry CONNECT-IP over TCP/H2 instead of QUIC. Point that mode at a listener with
-`transport = "http2"`; address assignment, certificate identity, source checks,
-and TUN routing are shared with HTTP/3. Prefer QUIC when it is reachable because
-TCP loss makes all capsules on the H2 connection wait for retransmission.
+Authentication is selected per listener. A peer that configures its tunnel
+interface out of band needs matching pinned addresses in
+`[[clients]].ipv4` and `[[clients]].ipv6`. The server still sends
+`ADDRESS_ASSIGN` with the actual lease. Select `transport = "http2"` for
+TCP/TLS or `transport = "http3"` for QUIC. The transport selection does not
+change source-address checks or host routing.

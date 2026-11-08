@@ -395,3 +395,44 @@ fn ip_native_datagrams_stop_at_request_fin_while_control_reply_is_blocked() {
         // The next protocol reuses the same connection and released leases.
     }
 }
+
+#[test]
+fn stop_sending_releases_connect_ip_address_before_replacement() {
+    let dir = TempDir::new("ip-stop-sending");
+    let key = p256_key();
+    let (cert, key) = write_pem(dir.path(), "server", &key, &self_signed(&key, None));
+    let mut config = server_config(cert, key, ephemeral_addr(), vec![]);
+    config.listeners[0].auth.enabled = false;
+    config.ip_proxy.ipv4_pool = "10.89.0.0/30".into();
+    config.ip_proxy.ipv6_pool.clear();
+    let peer = spawn_server(config)[0];
+    let mut client = Client::connect_anonymous(peer).unwrap();
+    client.handshake(Duration::from_secs(5)).unwrap();
+    client.init_h3().unwrap();
+
+    let first = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(first, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    let addresses = assigned_addresses(&mut client, first);
+    assert_eq!(addresses.len(), 1);
+    client
+        .quic
+        .stream_shutdown(
+            first,
+            quiche::Shutdown::Read,
+            quiche::h3::WireErrorCode::RequestCancelled as u64,
+        )
+        .unwrap();
+    let replacement = client.send_connect_ip("connect-ip").unwrap();
+    assert_eq!(
+        client
+            .response_status(replacement, Duration::from_secs(5))
+            .unwrap(),
+        200
+    );
+    assert_eq!(assigned_addresses(&mut client, replacement), addresses);
+}

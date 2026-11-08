@@ -14,7 +14,7 @@ file is the canonical deployable example and is tested by the release flow.
 ```text
 masque-server [OPTIONS]
 masque-server hash-password
-masque-server client-config surge --endpoint <HOST:PORT> --username <NAME> [OPTIONS]
+masque-server client-config json --endpoint <HOST:PORT> --username <NAME> [OPTIONS]
 masque-server --config <PATH> check-config
 masque-server --config <PATH> doctor
 masque-server --config <PATH> support-bundle --out <PATH>
@@ -172,7 +172,7 @@ connect, and vice versa. To serve both kinds of client, define two listeners.
 
 Choose `basic` for peers that send HTTP Basic credentials, or `client_cert`
 for peers that authenticate using a registered TLS client public key. See
-[CONNECT-IP compatibility](protocols.md#cloudflare-compatible-clients).
+[CONNECT-IP compatibility](protocols.md#legacy-connect-ip-format).
 
 ### `mode = "basic"` (default)
 
@@ -265,31 +265,30 @@ the final account cannot be removed. Send `SIGHUP` after a successful edit.
 Future requests on existing HTTP/2 and HTTP/3 connections use the new account
 snapshot, while tunnels already authorized continue uninterrupted.
 
-When adding an account, the command can write a client configuration in a
-supported format before discarding the plaintext password:
+When adding an account, the command can export the endpoint, transport,
+username, and password as JSON before discarding the plaintext password.
 
 ```sh
 printf '%s' 'phone-password' | sudo masque-server \
   --config /etc/masque/masque.toml add-user \
   --username phone --password-stdin \
-  --emit-client surge --client-endpoint proxy.example.com:8449 \
-  --client-name phone --client-out /root/phone-surge.conf
+  --emit-client json --client-endpoint proxy.example.com:8449 \
+  --client-name phone --client-out /root/phone-basic.json
 ```
 
-`--client-endpoint` is intentionally explicit: a wildcard listener such as
-`0.0.0.0:8449` is not an address a remote client can dial. The selected output
-format uses HTTP/3, so it is refused for an HTTP/2 listener. The output is a new
-mode-`0600` file and an existing path is never replaced. If `--client-out` is
-omitted the secret declaration goes to stdout with a warning.
+Specify the public endpoint explicitly with `--client-endpoint`. The JSON
+records the selected HTTP transport. `--client-out` creates a new mode-`0600`
+file and refuses an existing path. Without it, the JSON goes to stdout with a
+warning because it contains the plaintext password.
 
 The server retains only Argon2id hashes, so it cannot export an old account's
 password. If the plaintext is known, generate a client file without editing the
 account:
 
 ```sh
-printf '%s' 'phone-password' | masque-server client-config surge \
-  --endpoint proxy.example.com:8449 --username phone \
-  --out /root/phone-surge.conf
+printf '%s' 'phone-password' | masque-server client-config json \
+  --endpoint proxy.example.com:8449 --username phone --transport http3 \
+  --out /root/phone-basic.json
 ```
 
 #### UDP relays and TLS identity
@@ -353,20 +352,11 @@ masque-server --config masque.toml enroll-client \
     --ipv4 10.89.0.2 --ipv6 fd00:abcd::2 --out client.json
 ```
 
-This prints the `[[clients]]` block for this file, a JSON configuration, and a
-`proxies:` entry. Both client configurations contain the private key and must
-be treated as secrets. Their encodings differ: JSON uses a PEM server key and
-bare addresses; the `proxies:` entry uses base64 DER and CIDR addresses.
-
-The JSON fills both `endpoint_v4` / `endpoint_v6` and the corresponding
-`endpoint_h2_v4` / `endpoint_h2_v6` fields with the enrolled server address, so
-the same file works with its default HTTP/3 mode and its `--http2` fallback.
-
-The generated `proxies:` entry uses the active `ip_proxy.tun_mtu` value from the
-same server configuration, so a non-default MTU stays consistent on both ends.
-
-`--out` writes the JSON to a file created as a new `0600` file on Unix; an
-existing path is never overwritten. Without it the JSON goes to the terminal.
+This prints the `[[clients]]` roster entry and exports the endpoint with its
+port, the SEC1 private key in base64, the pinned server public key in PEM, and
+any fixed tunnel addresses in JSON. Treat the JSON as a secret.
+`--out` creates a new mode-`0600` file on Unix and refuses an existing path.
+Without it, the JSON goes to the terminal.
 
 Nothing is written to the server configuration automatically. Append the
 `[[clients]]` block yourself, then run `systemctl reload masque` or restart.
@@ -492,28 +482,20 @@ listener 0.0.0.0:443 transport=http3 auth=basic shards=1 max_datagram_size=1350
 listener 0.0.0.0:4443 transport=http2 auth=client_cert shards=1
 ```
 
-The generated JSON stores the endpoint IP but not its port, so enrollment
-also prints the matching launch argument — `--connect-port 443` for the example
-above, `--connect-port 8449` for a server on 8449. Omitting it silently falls
-back to the client's default port. Add `--http2` when selecting an HTTP/2
-listener.
-
 #### How the certificate is checked
 
-Only the public key inside the certificate is compared against the roster. The
-certificate itself is a disposable envelope: these clients self-sign a fresh
-one per connection with an empty subject and 24-hour validity, so its chain,
-name, and dates carry nothing worth verifying.
+The TLS handshake verifies possession of the client key. The server checks
+the public key against the roster and accepts a self-signed client certificate
+without using its subject or CA chain as identity.
 
 A key that is not on the roster is refused during the handshake with a TLS
 `access_denied` alert, before it can open a stream. The rejected key is logged
 in exactly the form you can paste into a `[[clients]]` entry, so enrolling a new
 client needs no separate key extraction step.
 
-The **server** certificate must use an ECDSA key, because these clients pin its
-public key and reject any other key type. `scripts/gen-certs.sh` produces a
-suitable P-256 certificate. Replacing the server certificate invalidates every
-client configuration that pinned the old key.
+The enrollment JSON includes the **server** certificate's public key for
+pinning. `scripts/gen-certs.sh` can generate a P-256 server certificate. When
+rotating the server key, distribute an updated pin to each peer that uses it.
 
 #### Pinned addresses
 
@@ -629,9 +611,9 @@ add-listener options:
       --username <NAME>     Basic username
       --password-hash <PHC>  Argon2id hash, as printed by hash-password
       --password-stdin      Read the password from stdin and hash it here
-      --emit-client surge   Emit the Basic credential in the selected format
+      --emit-client json   Export Basic connection details as JSON
       --client-endpoint <HOST:PORT>  Public endpoint written to that client config
-      --client-name <NAME>  Optional proxy name
+      --client-name <NAME>  Optional label
       --client-out <PATH>   Create a private client file instead of using stdout
       --disable-auth        Write enabled = false (trusted networks only)
       --no-bind-check       Do not test-bind the new address
@@ -996,10 +978,10 @@ HTTP/2 initial address/control delivery is also bounded by
 its lease and tunnel slot are released even before forwarding starts.
 
 `connect_protocols` lists the accepted CONNECT-IP protocol identifiers. RFC
-9484 registers `connect-ip`; Cloudflare's HTTP/3 endpoint uses
-`:protocol = cf-connect-ip`, while its HTTP/2 dialect carries the same value in
-`cf-connect-proto`. Both identifiers are accepted by default. Narrow the list
-to `["connect-ip"]` to accept only standards-compliant clients.
+9484 registers `connect-ip`. The legacy format carries `cf-connect-ip` in
+the HTTP/3 `:protocol` pseudo-header or in the HTTP/2 `cf-connect-proto`
+field. Both identifiers are accepted by default. Set the list to
+`["connect-ip"]` to require the RFC 9484 format.
 
 `uri_template` is the server-side **path and query** template, not an absolute
 URL. Standard `connect-ip` requests must match it completely, including any

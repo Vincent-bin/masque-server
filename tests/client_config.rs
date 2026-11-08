@@ -31,11 +31,11 @@ fn unused_path(name: &str) -> PathBuf {
 }
 
 #[test]
-fn client_config_writes_a_private_importable_surge_file() {
-    let path = unused_path("surge.conf");
+fn client_config_writes_a_private_json_file() {
+    let path = unused_path("basic.json");
     let output = run(
         &[
-            "surge",
+            "json",
             "--endpoint",
             "proxy.example:8449",
             "--username",
@@ -53,10 +53,12 @@ fn client_config_writes_a_private_importable_surge_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        "[Proxy]\nphone = masque, proxy.example, 8449, username=alice, password=\"secret, with spaces\"\n"
-    );
+    let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(data["name"], "phone");
+    assert_eq!(data["endpoint"], "proxy.example:8449");
+    assert_eq!(data["transport"], "http3");
+    assert_eq!(data["username"], "alice");
+    assert_eq!(data["password"], "secret, with spaces");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -74,7 +76,7 @@ fn client_config_refuses_to_replace_an_existing_file() {
     std::fs::write(&path, "keep me").unwrap();
     let output = run(
         &[
-            "surge",
+            "json",
             "--endpoint",
             "proxy.example:8449",
             "--username",
@@ -94,7 +96,7 @@ fn client_config_refuses_to_replace_an_existing_file() {
 fn client_config_stdout_is_explicitly_marked_as_secret() {
     let output = run(
         &[
-            "surge",
+            "json",
             "--endpoint",
             "[2001:db8::1]:443",
             "--username",
@@ -103,6 +105,8 @@ fn client_config_stdout_is_explicitly_marked_as_secret() {
         b"secret\n",
     );
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("password=secret"));
+    let data: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["endpoint"], "[2001:db8::1]:443");
+    assert_eq!(data["password"], "secret");
     assert!(String::from_utf8_lossy(&output.stderr).contains("plaintext password"));
 }

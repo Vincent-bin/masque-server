@@ -517,3 +517,81 @@ fn pending_truncated_udp_body_fin_drops_early_native_input() {
     send_native(&mut client, replacement, b"replacement works");
     receive_target(&mut client, &target, b"replacement works");
 }
+
+#[test]
+fn udp_stop_sending_drops_late_native_responses_without_affecting_siblings() {
+    let (_dir, mut client, target) = fixture();
+    let stopped = open_udp(&mut client, &target);
+    let sibling = open_udp(&mut client, &target);
+    let mut target_peers = Vec::new();
+    let mut buf = [0; 128];
+    for stream in [stopped, sibling] {
+        send_native(&mut client, stream, b"discover target socket");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let peer = loop {
+            client.drive().unwrap();
+            match target.recv_from(&mut buf) {
+                Ok((len, peer)) => {
+                    assert_eq!(&buf[..len], b"discover target socket");
+                    break peer;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no datagram reached target");
+                }
+                Err(e) => panic!("target receive: {e}"),
+            }
+        };
+        target_peers.push(peer);
+    }
+
+    client
+        .quic
+        .stream_shutdown(
+            stopped,
+            quiche::Shutdown::Read,
+            quiche::h3::WireErrorCode::RequestCancelled as u64,
+        )
+        .unwrap();
+    client.flush().unwrap();
+    let check = client
+        .h3
+        .as_mut()
+        .unwrap()
+        .send_request(
+            &mut client.quic,
+            &[
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"localhost"),
+                quiche::h3::Header::new(b":path", b"/"),
+            ],
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        client
+            .response_status(check, Duration::from_secs(2))
+            .unwrap(),
+        404
+    );
+    target.send_to(b"late response", target_peers[0]).unwrap();
+    target.send_to(b"active response", target_peers[1]).unwrap();
+
+    let deadline = Instant::now() + Duration::from_millis(700);
+    let mut received_sibling = false;
+    while Instant::now() < deadline {
+        client.drive().unwrap();
+        while let Ok(len) = client.quic.dgram_recv(&mut buf) {
+            let datagram = masque::datagram::decode_ref(&buf[..len]).unwrap();
+            assert_ne!(
+                datagram.stream_id, stopped,
+                "datagram arrived after STOP_SENDING"
+            );
+            assert_eq!(datagram.stream_id, sibling);
+            assert_eq!(datagram.payload, b"active response");
+            received_sibling = true;
+        }
+    }
+    assert!(received_sibling);
+    assert!(client.quic.peer_error().is_none());
+}

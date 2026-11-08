@@ -344,9 +344,9 @@ fn connect_ip_request(protocol: &'static str) -> Request<()> {
     request
 }
 
-fn cloudflare_h2_connect_ip_request() -> Request<()> {
+fn legacy_h2_connect_ip_request() -> Request<()> {
     let uri = http::Uri::builder()
-        .authority("cloudflareaccess.com:443")
+        .authority("proxy.example:443")
         .build()
         .unwrap();
     Request::builder()
@@ -940,7 +940,7 @@ async fn connect_ip_assigns_addresses_and_routes_over_http2_capsules() {
     let (server_addr, server_task) = spawn_http2_config(config).await;
     let (mut client, driver) = connect_h2(server_addr).await;
 
-    // Exercise the identifier used by Cloudflare-compatible clients; the
+    // Exercise the legacy CONNECT-IP identifier; the
     // registered `connect-ip` identifier is covered by request unit tests.
     let request = connect_ip_request("cf-connect-ip");
     let (response, mut request_body) = client.send_request(request, false).unwrap();
@@ -1002,7 +1002,7 @@ async fn client_certificate_pins_http2_connect_ip_addresses() {
     let (mut client, driver) =
         connect_h2_with_identity(server_addr, Some((&client_cert_path, &client_key_path))).await;
     let (response, mut request_body) = client
-        .send_request(cloudflare_h2_connect_ip_request(), false)
+        .send_request(legacy_h2_connect_ip_request(), false)
         .unwrap();
     let response = response.await.unwrap();
     assert!(!response.headers().contains_key("capsule-protocol"));
@@ -1022,7 +1022,7 @@ async fn client_certificate_pins_http2_connect_ip_addresses() {
     );
     assert_eq!(addresses.len(), 2);
 
-    // usque's HTTP/2 dialect removes Context ID zero from the DATAGRAM capsule
+    // The context-free HTTP/2 format removes Context ID zero from the DATAGRAM capsule
     // value. A standard-mode decoder would reject this one-byte payload before
     // the stream can close cleanly.
     let mut legacy_capsule = Vec::new();
@@ -1279,7 +1279,7 @@ async fn http2_address_requests_match_ids_preserve_leases_and_drain_before_fin()
     let (mut client, driver) = connect_h2(server_addr).await;
     for protocol in ["connect-ip", "cf-connect-ip", "legacy"] {
         let request = if protocol == "legacy" {
-            cloudflare_h2_connect_ip_request()
+            legacy_h2_connect_ip_request()
         } else {
             connect_ip_request(protocol)
         };

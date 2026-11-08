@@ -26,7 +26,7 @@ impl Shard {
         let max_tunnels = self.config.server.max_tunnels_per_connection;
 
         // A replacement CONNECT can share a packet with STOP_SENDING.
-        Self::reap_stopped_tcp_tunnels(client);
+        Self::reap_stopped_tunnels(&self.shared, client);
         for (stream_id, target) in pending_tcp_setups {
             if !client.pending_tcp_tunnels.contains_key(&stream_id) {
                 continue;
@@ -871,7 +871,7 @@ impl Shard {
         }
     }
 
-    /// Retry only connections made dirty by incoming packets or timers. A
+    /// Reap cancelled tunnels and retry TCP setup on dirty connections. A
     /// blocked response does not mark itself dirty, avoiding a busy loop.
     pub(super) fn retry_tcp_connect_responses(&mut self, dirty: &[u64]) {
         let mut ready = Vec::new();
@@ -882,7 +882,7 @@ impl Shard {
             let Some(client) = self.connections.get_mut(conn_id) else {
                 continue;
             };
-            Self::reap_stopped_tcp_tunnels(client);
+            Self::reap_stopped_tunnels(&self.shared, client);
             for (stream_id, pending) in &mut client.pending_tcp_tunnels {
                 if let Some(connected) = pending.connected.take() {
                     ready.push(TcpRelayEvent::ConnectResult {
@@ -986,35 +986,66 @@ impl Shard {
         }
     }
 
-    /// quiche handles STOP_SENDING at the transport layer without an H3
-    /// event. Check known TCP streams even when the target has no data to send.
-    fn reap_stopped_tcp_tunnels(client: &mut ClientConnection) {
+    /// quiche handles STOP_SENDING without emitting an H3 event. Check active
+    /// streams before admission and output even when the target has no data.
+    fn reap_stopped_tunnels(shared: &Shared, client: &mut ClientConnection) {
         let quic = &mut client.quic;
         let resumes = &mut client.tcp_read_resumes;
-        let mut keep = |stream_id: &u64, response_finished: bool| {
-            match quic.stream_capacity(*stream_id) {
-                Err(quiche::Error::StreamStopped(_)) => {
-                    // quiche has already scheduled RESET_STREAM on the response.
-                    let _ = quic.stream_shutdown(
-                        *stream_id,
-                        quiche::Shutdown::Read,
-                        quiche::h3::WireErrorCode::RequestCancelled as u64,
-                    );
-                }
-                // Consuming a request FIN can collect the stopped stream
-                // before we see StreamStopped. After our own graceful FIN,
-                // leave the TCP writer to drain already accepted uploads.
-                Err(quiche::Error::InvalidStreamState(_))
-                    if !response_finished && quic.stream_closed(*stream_id) => {}
-                _ => return true,
+        let mut keep_tcp = |stream_id: &u64, response_finished| {
+            if !Self::reap_stopped_response(quic, *stream_id, response_finished) {
+                return true;
             }
             resumes.remove(stream_id);
             false
         };
-        client.pending_tcp_tunnels.retain(|id, _| keep(id, false));
+        client
+            .pending_tcp_tunnels
+            .retain(|id, _| keep_tcp(id, false));
         client
             .tcp_tunnels
-            .retain(|id, tunnel| keep(id, tunnel.response_finished));
+            .retain(|id, tunnel| keep_tcp(id, tunnel.response_finished));
+
+        // A native HTTP Datagram is independent of stream send credit, so it
+        // would otherwise still be sent successfully on a cancelled response.
+        let stopped: Vec<_> = client
+            .udp_tunnels
+            .keys()
+            .chain(client.ip_tunnels.keys())
+            .copied()
+            .filter(|id| Self::reap_stopped_response(quic, *id, false))
+            .collect();
+        for stream_id in stopped {
+            if client.udp_tunnels.remove(&stream_id).is_some() {
+                client.remove_capsule_stream(stream_id);
+            } else {
+                Self::teardown_ip_tunnel(shared, client, stream_id, client.index);
+            }
+        }
+    }
+
+    fn reap_stopped_response(
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        response_finished: bool,
+    ) -> bool {
+        match quic.stream_capacity(stream_id) {
+            Err(quiche::Error::StreamStopped(_)) => {
+                // quiche has already scheduled RESET_STREAM on the response.
+                let _ = quic.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    quiche::h3::WireErrorCode::RequestCancelled as u64,
+                );
+                true
+            }
+            // Consuming a request FIN can collect the stopped stream before
+            // we see StreamStopped. After our own graceful TCP response FIN,
+            // leave the TCP writer to drain already accepted uploads.
+            Err(quiche::Error::InvalidStreamState(_)) => {
+                !response_finished && quic.stream_closed(stream_id)
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn reset_tcp_stream(client: &mut ClientConnection, stream_id: u64) {
