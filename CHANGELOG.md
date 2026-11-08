@@ -7,6 +7,8 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.19 - 2026-11-08
+
 ### Fixed
 
 - Release an HTTP/2 TCP tunnel on stream reset after either direction has sent
