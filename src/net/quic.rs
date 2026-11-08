@@ -162,6 +162,7 @@ pub(crate) struct SendPacketBatch {
 
 struct SendMessage {
     data: Vec<u8>,
+    written: usize,
     segment_size: usize,
     segments: usize,
     from: SocketAddr,
@@ -172,6 +173,7 @@ impl SendMessage {
     fn empty() -> Self {
         Self {
             data: Vec::new(),
+            written: 0,
             segment_size: 0,
             segments: 0,
             from: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -180,12 +182,29 @@ impl SendMessage {
     }
 
     fn reset(&mut self, packet: &[u8], info: quiche::SendInfo) {
-        self.data.clear();
-        self.data.extend_from_slice(packet);
+        self.written = 0;
+        self.append(packet);
         self.segment_size = packet.len();
         self.segments = 1;
         self.from = info.from;
         self.to = info.to;
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.data[..self.written]
+    }
+
+    fn reserve_tail(&mut self, len: usize) -> &mut [u8] {
+        let end = self.written + len;
+        if end > self.data.len() {
+            self.data.resize(end, 0);
+        }
+        &mut self.data[self.written..end]
+    }
+
+    fn append(&mut self, packet: &[u8]) {
+        self.reserve_tail(packet.len()).copy_from_slice(packet);
+        self.written += packet.len();
     }
 
     fn can_append(
@@ -198,9 +217,9 @@ impl SendMessage {
             && self.segments < MAX_BATCH_PACKETS
             && self.from == info.from
             && self.to == info.to
-            && self.data.len().is_multiple_of(self.segment_size)
+            && self.written == self.segment_size * self.segments
             && packet_len <= self.segment_size
-            && self.data.len() + packet_len <= aggregate_limit
+            && self.written + packet_len <= aggregate_limit
     }
 }
 
@@ -254,7 +273,7 @@ impl SendPacketBatch {
         if enable_gso && self.used > self.group_start {
             let last = &mut self.messages[self.used - 1];
             if last.can_append(packet.len(), info, aggregate_limit) {
-                last.data.extend_from_slice(packet);
+                last.append(packet);
                 last.segments += 1;
                 self.packet_count += 1;
                 self.byte_count += packet.len();
@@ -270,6 +289,51 @@ impl SendPacketBatch {
         self.used += 1;
         self.packet_count += 1;
         self.byte_count += packet.len();
+    }
+
+    /// Reuse initialized tail storage when another full-sized packet fits.
+    /// This does not expose speculative bytes to the socket.
+    pub(crate) fn gso_tail(&mut self, packet_size: usize, limit: usize) -> Option<&mut [u8]> {
+        if self.used == self.group_start {
+            return None;
+        }
+        let last = &mut self.messages[self.used - 1];
+        let limit = limit.min(udp_max_gso_payload());
+        if last.segment_size != packet_size
+            || last.segments == MAX_BATCH_PACKETS
+            || last.written != last.segment_size * last.segments
+            || last.written + packet_size > limit
+        {
+            return None;
+        }
+        // Keep capacity initialized across batches so the fast path can
+        // give quiche a normal mutable byte slice without touching it first.
+        if last.data.len() < limit {
+            last.data.resize(limit, 0);
+        }
+        Some(&mut last.data[last.written..last.written + packet_size])
+    }
+
+    /// Commit the speculative append only for the same path and pacing
+    /// group. Other packets go through the regular staging path.
+    pub(crate) fn finish_gso_tail(
+        &mut self,
+        len: usize,
+        info: quiche::SendInfo,
+        ready: bool,
+        out: &mut [u8],
+    ) -> bool {
+        let last = &mut self.messages[self.used - 1];
+        if ready && last.from == info.from && last.to == info.to && len <= last.segment_size {
+            last.written += len;
+            last.segments += 1;
+            self.packet_count += 1;
+            self.byte_count += len;
+            true
+        } else {
+            out[..len].copy_from_slice(&last.data[last.written..last.written + len]);
+            false
+        }
     }
 
     fn active(&self) -> &[SendMessage] {
@@ -653,7 +717,7 @@ impl QuicUdpSocket {
     async fn send_individually(&self, messages: &[SendMessage], shared: bool) -> io::Result<()> {
         let mut first_error = None;
         for message in messages {
-            for packet in message.data.chunks(message.segment_size) {
+            for packet in message.payload().chunks(message.segment_size) {
                 let error = match self.socket.send_to(packet, message.to).await {
                     Ok(written) if written == packet.len() => continue,
                     Ok(_) => io::Error::new(io::ErrorKind::WriteZero, "partial UDP datagram send"),
@@ -902,8 +966,8 @@ fn send_mmsg(
         let (address, address_len) = socket_addr_to_raw(message.to);
         let address = addresses[index].write(address);
         let iovec = iovecs[index].write(libc::iovec {
-            iov_base: message.data.as_ptr().cast_mut().cast::<c_void>(),
-            iov_len: message.data.len(),
+            iov_base: message.payload().as_ptr().cast_mut().cast::<c_void>(),
+            iov_len: message.written,
         });
 
         let (control, control_len) = if enable_gso && message.segments > 1 {
@@ -1064,7 +1128,7 @@ mod tests {
         assert_eq!(batch.active().len(), 1);
         assert_eq!(batch.active()[0].segment_size, 1200);
         assert_eq!(batch.active()[0].segments, 3);
-        assert_eq!(batch.active()[0].data.len(), 3000);
+        assert_eq!(batch.active()[0].written, 3000);
     }
 
     #[test]
@@ -1109,6 +1173,32 @@ mod tests {
         batch.clear();
         assert!(!batch.shared);
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn gso_tail_exposes_only_packets_committed_on_the_original_path() {
+        let first = send_info("127.0.0.1:4433".parse().unwrap());
+        let other = send_info("127.0.0.1:4434".parse().unwrap());
+        let mut batch = SendPacketBatch::new();
+        let mut fallback = [0; 1200];
+        batch.push(&[1; 1200], first, true, 4800);
+
+        batch.gso_tail(1200, 4800).unwrap().fill(2);
+        assert!(!batch.finish_gso_tail(1200, first, false, &mut fallback));
+        assert_eq!(fallback, [2; 1200]);
+        assert_eq!(batch.active()[0].payload(), &[1; 1200]);
+
+        batch.gso_tail(1200, 4800).unwrap().fill(3);
+        assert!(!batch.finish_gso_tail(1200, other, true, &mut fallback));
+        assert_eq!(fallback, [3; 1200]);
+        assert_eq!(batch.packet_count(), 1);
+
+        batch.gso_tail(1200, 4800).unwrap().fill(4);
+        assert!(batch.finish_gso_tail(600, first, true, &mut fallback));
+        assert_eq!(batch.packet_count(), 2);
+        assert_eq!(batch.byte_count(), 1800);
+        assert_eq!(&batch.active()[0].payload()[1200..], &[4; 600]);
+        assert!(batch.gso_tail(1200, 4800).is_none());
     }
 
     #[test]
