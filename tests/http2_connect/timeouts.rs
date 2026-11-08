@@ -754,6 +754,86 @@ async fn tcp_reset_after_request_fin_releases_the_tunnel_slot() {
     );
     // Keep the silent target's response direction open after observing FIN.
     body.send_reset(h2::Reason::CANCEL);
+    expect_replacement_tcp_tunnel(&mut client, target_addr).await;
+    drop((response, upstream));
+}
+
+#[tokio::test]
+async fn tcp_reset_after_response_fin_releases_a_backpressured_upload() {
+    let files = TestFiles::new();
+    let mut config = http2_config(&files);
+    config.server.max_tunnels_per_connection = 1;
+    let server = ObservedServer::bind(config).await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Keep the target's receive window bounded from the TCP handshake onward.
+    socket2::SockRef::from(&target)
+        .set_recv_buffer_size(16 * 1024)
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let (mut client, driver) = connect_h2(server.addr).await;
+    let _driver = AbortOnDrop(driver);
+    let (response, mut upload) = client
+        .send_request(connect_request(target_addr), false)
+        .unwrap();
+    let response = tokio::time::timeout(IO_TIMEOUT, response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (mut upstream, _) = tokio::time::timeout(IO_TIMEOUT, target.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    upstream.shutdown().await.unwrap();
+    let mut download = response.into_body();
+    tokio::time::timeout(IO_TIMEOUT, async {
+        while let Some(data) = download.data().await {
+            assert!(data.unwrap().is_empty());
+        }
+    })
+    .await
+    .expect("target FIN did not reach the client");
+
+    // The target keeps its read half open without draining it. Send within
+    // the H2 window until the relay stops returning upload credit.
+    let chunk = Bytes::from_static(&[0x5a; 16 * 1024]);
+    let mut blocked = false;
+    for _ in 0..1024 {
+        upload.reserve_capacity(chunk.len());
+        let Ok(capacity) = tokio::time::timeout(
+            Duration::from_millis(500),
+            std::future::poll_fn(|cx| upload.poll_capacity(cx)),
+        )
+        .await
+        else {
+            blocked = true;
+            break;
+        };
+        let capacity = capacity.unwrap().unwrap().min(chunk.len());
+        upload.send_data(chunk.slice(..capacity), false).unwrap();
+    }
+    assert!(blocked, "upload never encountered target backpressure");
+    let (limited, _) = client
+        .send_request(connect_request(target_addr), true)
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(IO_TIMEOUT, limited)
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    upload.send_reset(h2::Reason::CANCEL);
+    expect_replacement_tcp_tunnel(&mut client, target_addr).await;
+    drop(upstream);
+}
+
+async fn expect_replacement_tcp_tunnel(
+    client: &mut h2::client::SendRequest<Bytes>,
+    target_addr: SocketAddr,
+) {
     tokio::time::timeout(IO_TIMEOUT, async {
         loop {
             let (replacement, _upload) = client
@@ -768,6 +848,5 @@ async fn tcp_reset_after_request_fin_releases_the_tunnel_slot() {
         }
     })
     .await
-    .expect("reset after request FIN did not release the tunnel slot");
-    drop((response, upstream));
+    .expect("reset did not release the tunnel slot after FIN");
 }

@@ -65,28 +65,47 @@ pub(super) async fn serve(
         target_write.shutdown().await?;
         Ok::<_, anyhow::Error>(())
     };
-    let target_to_client = async {
-        let mut buf = vec![0_u8; READ_CHUNK_SIZE];
-        loop {
-            let read = tokio::select! {
-                // The request body stops reporting resets after upload FIN.
-                // Keep watching the response stream even with a silent target.
-                biased;
-                reset = poll_fn(|cx| send.poll_reset(cx)) => {
-                    return Err(h2::Error::from(reset?).into());
+    let relay = async {
+        tokio::pin!(client_to_target);
+        {
+            let target_to_client = async {
+                let mut buf = vec![0_u8; READ_CHUNK_SIZE];
+                loop {
+                    let read = tokio::select! {
+                        // The request body stops reporting resets after upload FIN.
+                        biased;
+                        reset = poll_fn(|cx| send.poll_reset(cx)) => {
+                            return Err(h2::Error::from(reset?).into());
+                        }
+                        read = target_read.read(&mut buf) => read?,
+                    };
+                    if read == 0 {
+                        send_data(&mut send, Bytes::new(), true).await?;
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    activity.touch();
+                    send_data(&mut send, Bytes::copy_from_slice(&buf[..read]), false).await?;
                 }
-                read = target_read.read(&mut buf) => read?,
             };
-            if read == 0 {
-                send_data(&mut send, Bytes::new(), true).await?;
-                return Ok::<_, anyhow::Error>(());
+            tokio::pin!(target_to_client);
+            tokio::select! {
+                result = &mut client_to_target => {
+                    result?;
+                    return target_to_client.await;
+                }
+                result = &mut target_to_client => result?,
             }
-            activity.touch();
-            send_data(&mut send, Bytes::copy_from_slice(&buf[..read]), false).await?;
+        }
+
+        // After response FIN the upload may still be blocked writing to TCP.
+        // Keep polling the reset until that remaining direction finishes.
+        tokio::select! {
+            biased;
+            reset = poll_fn(|cx| send.poll_reset(cx)) => Err(h2::Error::from(reset?).into()),
+            result = client_to_target => result,
         }
     };
 
-    let relay = async { tokio::try_join!(client_to_target, target_to_client).map(|_| ()) };
     tokio::select! {
         result = relay => result?,
         _ = wait_until_idle(Arc::clone(&activity), Duration::from_secs(context.config.server.idle_timeout_secs)) => {

@@ -9,8 +9,8 @@ pre-1.0.
 
 ### Fixed
 
-- Release an HTTP/2 TCP tunnel when the peer resets the stream after ending its
-  upload, even when the target is silent.
+- Release an HTTP/2 TCP tunnel on stream reset after either direction has sent
+  FIN, including a silent target or an upload blocked on the target socket.
 - Discard queued HTTP/3 datagrams and release CONNECT-UDP and CONNECT-IP tunnel
   resources when the peer stops reading the response.
 
