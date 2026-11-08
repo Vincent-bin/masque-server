@@ -154,6 +154,8 @@ impl RecvPacketBatch {
 pub(crate) struct SendPacketBatch {
     messages: Vec<SendMessage>,
     used: usize,
+    group_start: usize,
+    shared: bool,
     packet_count: usize,
     byte_count: usize,
 }
@@ -207,6 +209,8 @@ impl SendPacketBatch {
         Self {
             messages: Vec::new(),
             used: 0,
+            group_start: 0,
+            shared: false,
             packet_count: 0,
             byte_count: 0,
         }
@@ -214,6 +218,8 @@ impl SendPacketBatch {
 
     pub(crate) fn clear(&mut self) {
         self.used = 0;
+        self.group_start = 0;
+        self.shared = false;
         self.packet_count = 0;
         self.byte_count = 0;
     }
@@ -230,6 +236,12 @@ impl SendPacketBatch {
         self.byte_count
     }
 
+    /// Keep independently paced connections in separate GSO messages, even
+    /// if the packets are addressed to the same peer socket.
+    pub(crate) fn start_group(&mut self) {
+        self.group_start = self.used;
+    }
+
     pub(crate) fn push(
         &mut self,
         packet: &[u8],
@@ -239,7 +251,7 @@ impl SendPacketBatch {
     ) {
         let aggregate_limit = aggregate_limit.max(packet.len()).min(udp_max_gso_payload());
 
-        if enable_gso && self.used > 0 {
+        if enable_gso && self.used > self.group_start {
             let last = &mut self.messages[self.used - 1];
             if last.can_append(packet.len(), info, aggregate_limit) {
                 last.data.extend_from_slice(packet);
@@ -250,6 +262,7 @@ impl SendPacketBatch {
             }
         }
 
+        self.shared |= self.used != 0 && self.used == self.group_start;
         if self.used == self.messages.len() {
             self.messages.push(SendMessage::empty());
         }
@@ -608,11 +621,22 @@ impl QuicUdpSocket {
                     ));
                 }
                 Ok(count) => sent += count,
-                Err(error) if use_gso && is_udp_gso_error(&error) => {
+                Err(error)
+                    if use_gso
+                        && (!batch.shared || messages[sent].segments > 1)
+                        && is_udp_gso_error(&error) =>
+                {
                     self.udp_gso = false;
                     tracing::warn!(%error, "UDP GSO unavailable, falling back to individual datagrams");
-                    self.send_individually(&messages[sent..]).await?;
-                    return Ok(());
+                    return self
+                        .send_individually(&messages[sent..], batch.shared)
+                        .await;
+                }
+                Err(error) if batch.shared => {
+                    // sendmmsg has already reported the accepted prefix. A
+                    // failed destination must not discard unrelated packets.
+                    let _ = self.send_individually(&messages[sent + 1..], true).await;
+                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }
@@ -623,22 +647,26 @@ impl QuicUdpSocket {
 
     #[cfg(not(target_os = "linux"))]
     pub(crate) async fn send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<()> {
-        self.send_individually(batch.active()).await
+        self.send_individually(batch.active(), false).await
     }
 
-    async fn send_individually(&self, messages: &[SendMessage]) -> io::Result<()> {
+    async fn send_individually(&self, messages: &[SendMessage], shared: bool) -> io::Result<()> {
+        let mut first_error = None;
         for message in messages {
             for packet in message.data.chunks(message.segment_size) {
-                let written = self.socket.send_to(packet, message.to).await?;
-                if written != packet.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "partial UDP datagram send",
-                    ));
+                let error = match self.socket.send_to(packet, message.to).await {
+                    Ok(written) if written == packet.len() => continue,
+                    Ok(_) => io::Error::new(io::ErrorKind::WriteZero, "partial UDP datagram send"),
+                    Err(error) => error,
+                };
+                if !shared {
+                    return Err(error);
                 }
+                first_error.get_or_insert(error);
+                break;
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1064,6 +1092,26 @@ mod tests {
     }
 
     #[test]
+    fn independent_groups_keep_separate_gso_messages_for_the_same_peer() {
+        let target = "127.0.0.1:4433".parse().unwrap();
+        let mut batch = SendPacketBatch::new();
+        for _ in 0..2 {
+            batch.start_group();
+            batch.push(&[1; 1200], send_info(target), true, 10_000);
+            batch.push(&[2; 1200], send_info(target), true, 10_000);
+        }
+
+        assert_eq!(batch.packet_count(), 4);
+        assert_eq!(batch.active().len(), 2);
+        assert!(batch.active().iter().all(|message| message.segments == 2));
+        assert!(batch.shared);
+
+        batch.clear();
+        assert!(!batch.shared);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
     fn different_destination_starts_new_message() {
         let mut batch = SendPacketBatch::new();
         batch.push(
@@ -1169,6 +1217,51 @@ mod tests {
             assert_eq!(received, len);
             assert!(buffer[..received].iter().all(|value| *value == byte));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shared_send_keeps_accepted_prefix_and_delivers_after_a_failed_destination() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = receiver.local_addr().unwrap();
+        let mut sender = QuicUdpSocket::bind_shared(
+            "127.0.0.1:0".parse().unwrap(),
+            1350,
+            false,
+            false,
+            1,
+            UdpSocketBuffers::default(),
+        )
+        .await
+        .unwrap();
+        let mut batch = SendPacketBatch::new();
+        batch.push(b"prefix", send_info(target), false, 10_000);
+        batch.start_group();
+        batch.push(
+            b"bad destination",
+            send_info("[::1]:9".parse().unwrap()),
+            false,
+            10_000,
+        );
+        batch.start_group();
+        batch.push(b"suffix", send_info(target), false, 10_000);
+
+        assert!(sender.send_batch(&batch).await.is_err());
+        let mut received = [0_u8; 16];
+        for expected in [b"prefix", b"suffix"] {
+            let (len, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                receiver.recv_from(&mut received),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&received[..len], expected);
+        }
+        assert_eq!(
+            receiver.try_recv_from(&mut received).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[cfg(target_os = "linux")]
