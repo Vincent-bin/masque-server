@@ -172,6 +172,11 @@ impl ClientConnection {
         if let Some(stream) = self.capsule_streams.remove(&stream_id) {
             self.capsule_send_bytes -= stream.bytes;
             self.capsule_send_packets -= stream.send.len();
+            // Native DATAGRAMs already queued in quiche can outlive their
+            // response stream unless discarded with the capsule state.
+            self.quic.dgram_purge_outgoing(|wire| {
+                crate::varint::decode(wire).is_ok_and(|(id, _)| id == stream_id / 4)
+            });
         }
         self.capsule_readable.remove(&stream_id);
         self.capsule_read_resumes.remove(&stream_id);

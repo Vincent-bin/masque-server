@@ -1,5 +1,6 @@
 //! TCP CONNECT relay over one HTTP/2 stream.
 
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,7 +68,15 @@ pub(super) async fn serve(
     let target_to_client = async {
         let mut buf = vec![0_u8; READ_CHUNK_SIZE];
         loop {
-            let read = target_read.read(&mut buf).await?;
+            let read = tokio::select! {
+                // The request body stops reporting resets after upload FIN.
+                // Keep watching the response stream even with a silent target.
+                biased;
+                reset = poll_fn(|cx| send.poll_reset(cx)) => {
+                    return Err(h2::Error::from(reset?).into());
+                }
+                read = target_read.read(&mut buf) => read?,
+            };
             if read == 0 {
                 send_data(&mut send, Bytes::new(), true).await?;
                 return Ok::<_, anyhow::Error>(());

@@ -720,3 +720,54 @@ fn reset_during_target_setup_releases_the_tunnel_slot() {
             worker.await.unwrap();
         });
 }
+
+#[tokio::test]
+async fn tcp_reset_after_request_fin_releases_the_tunnel_slot() {
+    let files = TestFiles::new();
+    let mut config = http2_config(&files);
+    config.server.max_tunnels_per_connection = 1;
+    let server = ObservedServer::bind(config).await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let (mut client, driver) = connect_h2(server.addr).await;
+    let _driver = AbortOnDrop(driver);
+    let (response, mut body) = client
+        .send_request(connect_request(target_addr), false)
+        .unwrap();
+    let response = tokio::time::timeout(IO_TIMEOUT, response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (mut upstream, _) = tokio::time::timeout(IO_TIMEOUT, target.accept())
+        .await
+        .unwrap()
+        .unwrap();
+
+    body.send_data(Bytes::new(), true).unwrap();
+    assert_eq!(
+        tokio::time::timeout(IO_TIMEOUT, upstream.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    // Keep the silent target's response direction open after observing FIN.
+    body.send_reset(h2::Reason::CANCEL);
+    tokio::time::timeout(IO_TIMEOUT, async {
+        loop {
+            let (replacement, _upload) = client
+                .send_request(connect_request(target_addr), false)
+                .unwrap();
+            let status = replacement.await.unwrap().status();
+            if status == StatusCode::OK {
+                break;
+            }
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reset after request FIN did not release the tunnel slot");
+    drop((response, upstream));
+}
