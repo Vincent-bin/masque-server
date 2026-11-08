@@ -2,6 +2,8 @@
 
 use super::*;
 
+const MAX_READY_BATCH_CONNECTIONS: usize = 8;
+
 impl Shard {
     /// Reject unverified Basic credentials with the same empty 404 as an
     /// unsupported request, including when verification is overloaded.
@@ -37,14 +39,34 @@ impl Shard {
         let connections = &mut self.connections;
         let conn_by_index = &self.conn_by_index;
         let timers = &mut self.timers;
+        let metrics = &self.metrics;
+        let share_ready = cfg!(target_os = "linux") && dirty.len() > 1;
+        batch.clear();
 
-        for index in dirty {
+        for (position, index) in dirty.iter().enumerate() {
+            // Bound how many other connections can run before an already
+            // ready packet leaves, including connections with no output.
+            if share_ready
+                && position.is_multiple_of(MAX_READY_BATCH_CONNECTIONS)
+                && !batch.is_empty()
+            {
+                Self::flush_ready_batch(socket, batch, metrics).await;
+            }
             let Some(conn_id) = conn_by_index.get(index) else {
                 continue;
             };
             let Some(client) = connections.get_mut(conn_id) else {
                 continue;
             };
+            let share_connection = share_ready
+                && !client.udp_tunnels.is_empty()
+                && client.native_datagrams()
+                && client.tcp_tunnels.is_empty()
+                && client.pending_tcp_tunnels.is_empty()
+                && client.deferred_send.deadline().is_none();
+            if !share_connection && !batch.is_empty() {
+                Self::flush_ready_batch(socket, batch, metrics).await;
+            }
 
             client.expire_first_auth();
             client.quic.on_timeout();
@@ -63,7 +85,8 @@ impl Shard {
             // Linux can collapse equal-sized packets into one GSO aggregate;
             // remaining messages are still emitted by one sendmmsg syscall.
             loop {
-                batch.clear();
+                let queued_before = batch.packet_count();
+                batch.start_group();
                 let max_packet_size = client.quic.max_send_udp_payload_size();
                 let send_quantum = client
                     .quic
@@ -96,6 +119,9 @@ impl Shard {
 
                 while !pacing_blocked
                     && batch.packet_count() + client.deferred_send.len() < MAX_BATCH_PACKETS
+                    // A shared batch retains at most one datagram beyond
+                    // this byte limit, even with larger configured packets.
+                    && (queued_before == 0 || batch.byte_count() < MAX_DATAGRAM_SIZE)
                     && generated_bytes < send_quantum
                     && client.deferred_send.has_capacity(max_packet_size)
                 {
@@ -135,22 +161,23 @@ impl Shard {
                     );
                 }
 
-                if batch.is_empty() {
+                if batch.packet_count() == queued_before {
                     break;
                 }
 
-                let udp_gso_before_send = socket.udp_gso_enabled();
-                match socket.send_batch(batch).await {
-                    Ok(()) => self
-                        .metrics
-                        .record_send_batch(batch.packet_count(), batch.byte_count()),
-                    Err(e) => warn!(%e, "socket send error"),
+                let deferred = client.deferred_send.deadline().is_some();
+                if share_connection
+                    && quiche_done
+                    && !deferred
+                    && batch.packet_count() < MAX_BATCH_PACKETS
+                    && batch.byte_count() < MAX_DATAGRAM_SIZE
+                {
+                    // Only share a completed quantum of already ready packets.
+                    // Flush in this round, without waiting for another event.
+                    break;
                 }
-                if udp_gso_before_send && !socket.udp_gso_enabled() {
-                    self.metrics.disable_udp_gso();
-                }
-
-                if quiche_done || pacing_blocked || client.deferred_send.deadline().is_some() {
+                Self::flush_ready_batch(socket, batch, metrics).await;
+                if quiche_done || pacing_blocked || deferred {
                     break;
                 }
             }
@@ -161,5 +188,24 @@ impl Shard {
             Self::reschedule(client, timers);
             client.sync_metrics();
         }
+        if !batch.is_empty() {
+            Self::flush_ready_batch(socket, batch, metrics).await;
+        }
+    }
+
+    async fn flush_ready_batch(
+        socket: &mut QuicUdpSocket,
+        batch: &mut SendPacketBatch,
+        metrics: &ShardMetrics,
+    ) {
+        let udp_gso_before_send = socket.udp_gso_enabled();
+        match socket.send_batch(batch).await {
+            Ok(()) => metrics.record_send_batch(batch.packet_count(), batch.byte_count()),
+            Err(error) => warn!(%error, "socket send error"),
+        }
+        if udp_gso_before_send && !socket.udp_gso_enabled() {
+            metrics.disable_udp_gso();
+        }
+        batch.clear();
     }
 }
