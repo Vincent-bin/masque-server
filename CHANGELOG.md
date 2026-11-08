@@ -7,6 +7,19 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.20 - 2026-11-08
+
+### Performance
+
+- Batch ready HTTP/3 UDP packets across connections on the same Linux shard.
+  Bound each batch and keep GSO groups separate for each connection.
+- Reduce idle CPU use in HTTP/3 benchmarks with readiness and deadline waits.
+  Batch Linux datagram I/O and preserve unsent packets across partial sends.
+
+### Dependencies
+
+- Update `tun-rs` to 2.8.18.
+
 ## 0.14.19 - 2026-11-08
 
 ### Fixed
