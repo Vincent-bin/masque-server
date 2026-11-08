@@ -17,6 +17,7 @@ use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use tracing::{debug, error, info, warn};
 
+mod benchmark_io;
 mod http2;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -280,6 +281,13 @@ impl InFlight {
     fn is_empty(&self) -> bool {
         self.sent_at.is_empty()
     }
+
+    fn next_expiry(&self, expiry: Duration) -> Option<Instant> {
+        self.order
+            .iter()
+            .find(|(sequence, _)| self.sent_at.contains_key(sequence))
+            .map(|(_, sent_at)| *sent_at + expiry)
+    }
 }
 
 /// Fixed-memory RTT histogram: sixteen buckets per power of two. Quantiles
@@ -526,6 +534,42 @@ impl Client {
                 Err(e) => bail!("QUIC send: {e}"),
             }
         }
+    }
+
+    fn wait_for_benchmark(
+        &mut self,
+        tx: &benchmark_io::Sender,
+        other: Option<(&mut Self, &benchmark_io::Sender)>,
+        mut deadline: Instant,
+    ) -> Result<()> {
+        let now = Instant::now();
+        if let Some(timeout) = self.quic.timeout_instant() {
+            if timeout <= now {
+                self.quic.on_timeout();
+                return Ok(());
+            }
+            deadline = deadline.min(timeout);
+        }
+        if let Some(pacing) = tx.deadline() {
+            deadline = deadline.min(pacing);
+        }
+        let other_socket = if let Some((other, other_tx)) = other {
+            if let Some(timeout) = other.quic.timeout_instant() {
+                if timeout <= now {
+                    other.quic.on_timeout();
+                    return Ok(());
+                }
+                deadline = deadline.min(timeout);
+            }
+            if let Some(pacing) = other_tx.deadline() {
+                deadline = deadline.min(pacing);
+            }
+            Some((&other.socket, other_tx.writable()))
+        } else {
+            None
+        };
+        benchmark_io::wait((&self.socket, tx.writable()), other_socket, deadline)?;
+        Ok(())
     }
 
     /// Receive one packet from the network and feed it to QUIC.
@@ -1003,8 +1047,10 @@ impl Client {
             0
         };
         let mut encoded = Vec::with_capacity(payload.len() + 16);
-        let mut packet_buf = [0u8; BUF_SIZE];
+        let mut rx = benchmark_io::Receiver::new();
         let mut dgram_buf = [0u8; BUF_SIZE];
+        let mut tx = benchmark_io::Sender::new();
+        let mut tcp_tx = benchmark_io::Sender::new();
         let mut in_flight = InFlight::with_capacity(window);
         let mut next_sequence = 0_u64;
         let mut sent = 0_u64;
@@ -1042,20 +1088,20 @@ impl Client {
                 }
             }
 
-            self.flush()?;
+            made_progress |= tx.flush(&self.socket, &mut self.quic)?;
 
-            made_progress |= self.recv_packet_burst(&mut packet_buf)?;
+            made_progress |= self.recv_packet_burst(&mut rx)?;
 
             if let Some(download) = download.as_deref_mut() {
                 if let Some(tcp) = tcp_client.as_deref_mut() {
                     // Keep the two sockets on the same benchmark thread so
                     // the control does not add a download worker core.
-                    let mut tcp_progress = tcp.recv_packet_burst(&mut packet_buf)?;
+                    let mut tcp_progress = tcp.recv_packet_burst(&mut rx)?;
                     tcp_progress |= tcp.poll_mixed_download(download, deadline, &mut dgram_buf)?;
                     if !tcp_progress && tcp.quic.timeout().is_some_and(|t| t.is_zero()) {
                         tcp.quic.on_timeout();
                     }
-                    tcp.flush()?;
+                    tcp_progress |= tcp_tx.flush(&tcp.socket, &mut tcp.quic)?;
                     made_progress |= tcp_progress;
                 } else {
                     made_progress |=
@@ -1099,16 +1145,36 @@ impl Client {
                 break;
             }
             if !made_progress {
-                if self.quic.timeout().is_some_and(|timeout| timeout.is_zero()) {
-                    self.quic.on_timeout();
+                let mut wake = if now < deadline {
+                    deadline
                 } else {
-                    std::thread::yield_now();
+                    drain_deadline
+                };
+                if let Some(expires) = in_flight.next_expiry(expiry) {
+                    wake = wake.min(expires);
                 }
+                if now < deadline
+                    && in_flight.len() < window
+                    && !self.quic.is_dgram_send_queue_full()
+                {
+                    // The next packet becomes due when elapsed * pps first
+                    // reaches the number of already queued requests.
+                    if pps == 0 {
+                        continue;
+                    }
+                    let next_ns = (u128::from(sent) * 1_000_000_000).div_ceil(u128::from(pps));
+                    wake = wake.min(started + Duration::from_nanos(next_ns as u64));
+                }
+                let other = tcp_client.as_deref_mut().map(|tcp| (tcp, &tcp_tx));
+                self.wait_for_benchmark(&tx, other, wake)?;
             }
         }
 
         expired += in_flight.len() as u64;
-        self.socket.set_nonblocking(false)?;
+        tx.finish(&self.socket)?;
+        if let Some(tcp) = tcp_client {
+            tcp_tx.finish(&tcp.socket)?;
+        }
         Ok(ThroughputStats {
             sent,
             received,
@@ -1117,26 +1183,15 @@ impl Client {
         })
     }
 
-    fn recv_packet_burst(&mut self, buf: &mut [u8]) -> Result<bool> {
-        let mut received = false;
-        for _ in 0..2048 {
-            match self.socket.recv(buf) {
-                Ok(len) => {
-                    let info = quiche::RecvInfo {
-                        from: self.peer,
-                        to: self.local,
-                    };
-                    match self.quic.recv(&mut buf[..len], info) {
-                        Ok(_) | Err(quiche::Error::Done) => {}
-                        Err(error) => bail!("QUIC receive: {error}"),
-                    }
-                    received = true;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(received)
+    fn recv_packet_burst(&mut self, rx: &mut benchmark_io::Receiver) -> Result<bool> {
+        let info = quiche::RecvInfo {
+            from: self.peer,
+            to: self.local,
+        };
+        rx.drain(&self.socket, |packet| match self.quic.recv(packet, info) {
+            Ok(_) | Err(quiche::Error::Done) => Ok(()),
+            Err(error) => bail!("QUIC receive: {error}"),
+        })
     }
 
     fn poll_mixed_download(
@@ -1198,36 +1253,21 @@ impl Client {
         self.socket.set_nonblocking(true)?;
 
         let deadline = Instant::now() + timeout;
-        let mut packet_buf = [0_u8; BUF_SIZE];
+        let mut rx = benchmark_io::Receiver::new();
         let mut body_buf = [0_u8; BUF_SIZE];
+        let mut tx = benchmark_io::Sender::new();
         let mut response = HttpDownloadResponse::new();
         let mut stream_finished = false;
 
         loop {
             let mut made_progress = false;
 
-            self.flush()?;
+            made_progress |= tx.flush(&self.socket, &mut self.quic)?;
 
             // Drain a bounded burst from the UDP socket. The bound prevents a
             // permanently busy socket from starving HTTP/3 body consumption
             // and the resulting flow-control updates.
-            for _ in 0..2048 {
-                match self.socket.recv(&mut packet_buf) {
-                    Ok(len) => {
-                        let info = quiche::RecvInfo {
-                            from: self.peer,
-                            to: self.local,
-                        };
-                        match self.quic.recv(&mut packet_buf[..len], info) {
-                            Ok(_) | Err(quiche::Error::Done) => {}
-                            Err(error) => bail!("QUIC receive during TCP download: {error}"),
-                        }
-                        made_progress = true;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error.into()),
-                }
-            }
+            made_progress |= self.recv_packet_burst(&mut rx)?;
 
             {
                 let h3 = self.h3.as_mut().context("H3 not initialised")?;
@@ -1259,7 +1299,7 @@ impl Client {
                 }
             }
 
-            self.flush()?;
+            made_progress |= tx.flush(&self.socket, &mut self.quic)?;
 
             if let Some(expected) = response.expected_body_bytes(configured_body_bytes) {
                 if response.body_bytes > expected {
@@ -1284,15 +1324,12 @@ impl Client {
             }
 
             if !made_progress {
-                if self.quic.timeout().is_some_and(|timeout| timeout.is_zero()) {
-                    self.quic.on_timeout();
-                } else {
-                    std::thread::yield_now();
-                }
+                self.wait_for_benchmark(&tx, None, deadline)?;
             }
         }
 
-        self.socket.set_nonblocking(false)?;
+        let finished_at = Instant::now();
+        tx.finish(&self.socket)?;
 
         if !response.header_complete {
             bail!("CONNECT tunnel closed before a complete HTTP response header arrived");
@@ -1311,7 +1348,7 @@ impl Client {
 
         Ok(TcpDownloadResult {
             response,
-            finished_at: Instant::now(),
+            finished_at,
             stream_finished,
         })
     }
@@ -1400,6 +1437,7 @@ fn run_direct_echo_throughput(
         expired += in_flight.expire(now, expiry);
 
         let mut made_progress = false;
+        let mut send_blocked = false;
         while now < deadline && in_flight.len() < window {
             payload[..8].copy_from_slice(&next_sequence.to_be_bytes());
             match socket.send(&payload) {
@@ -1410,7 +1448,10 @@ fn run_direct_echo_throughput(
                     made_progress = true;
                 }
                 Ok(len) => bail!("short UDP send: {len}/{}", payload.len()),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    send_blocked = true;
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1435,7 +1476,15 @@ fn run_direct_echo_throughput(
             break;
         }
         if !made_progress {
-            std::thread::yield_now();
+            let mut wake = if now < deadline {
+                deadline
+            } else {
+                drain_deadline
+            };
+            if let Some(expires) = in_flight.next_expiry(expiry) {
+                wake = wake.min(expires);
+            }
+            benchmark_io::wait((&socket, send_blocked), None, wake)?;
         }
     }
 
