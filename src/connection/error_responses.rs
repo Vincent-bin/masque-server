@@ -28,7 +28,7 @@ impl PendingErrorResponses {
         self.responses.contains_key(&stream_id)
     }
 
-    pub(crate) fn cancel(&mut self, quic: &mut quiche::Connection, stream_id: u64) {
+    pub(crate) fn cancel(&mut self, quic: &mut crate::connection::ServerQuic, stream_id: u64) {
         if self.responses.remove(&stream_id).is_some() {
             Self::reset(quic, stream_id, quiche::h3::WireErrorCode::RequestCancelled);
         }
@@ -41,7 +41,7 @@ impl PendingErrorResponses {
     pub(crate) fn send(
         &mut self,
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         stream_id: u64,
         status: u16,
     ) {
@@ -73,14 +73,22 @@ impl PendingErrorResponses {
 
     /// Retry only when the connection is already being driven (for example by
     /// MAX_DATA/MAX_STREAM_DATA or STOP_SENDING), without scheduling a busy loop.
-    pub(crate) fn retry(&mut self, h3: &mut quiche::h3::Connection, quic: &mut quiche::Connection) {
+    pub(crate) fn retry(
+        &mut self,
+        h3: &mut quiche::h3::Connection,
+        quic: &mut crate::connection::ServerQuic,
+    ) {
         self.responses
             .retain(|id, pending| Self::try_send(h3, quic, *id, pending.status));
     }
 
     /// The regular idle sweep provides the same bounded lifetime as pending
     /// tunnel responses. Retries never refresh the original timestamp.
-    pub(crate) fn expire(&mut self, quic: &mut quiche::Connection, timeout: Duration) -> bool {
+    pub(crate) fn expire(
+        &mut self,
+        quic: &mut crate::connection::ServerQuic,
+        timeout: Duration,
+    ) -> bool {
         let before = self.responses.len();
         self.responses.retain(|id, pending| {
             if pending.started.elapsed() < timeout {
@@ -95,7 +103,7 @@ impl PendingErrorResponses {
     /// True means the atomic HEADERS write is blocked and must be retained.
     fn try_send(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         stream_id: u64,
         status: u16,
     ) -> bool {
@@ -128,7 +136,11 @@ impl PendingErrorResponses {
         }
     }
 
-    fn reset(quic: &mut quiche::Connection, stream_id: u64, code: quiche::h3::WireErrorCode) {
+    fn reset(
+        quic: &mut crate::connection::ServerQuic,
+        stream_id: u64,
+        code: quiche::h3::WireErrorCode,
+    ) {
         let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Read, code as u64);
         let _ = quic.stream_shutdown(stream_id, quiche::Shutdown::Write, code as u64);
     }

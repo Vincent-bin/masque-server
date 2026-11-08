@@ -163,6 +163,24 @@ impl DeferredSend {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ServerBufFactory;
+
+impl quiche::BufFactory for ServerBufFactory {
+    type Buf = bytes::Bytes;
+    type DgramBuf = Vec<u8>;
+
+    fn buf_from_slice(data: &[u8]) -> Self::Buf {
+        bytes::Bytes::copy_from_slice(data)
+    }
+
+    fn dgram_buf_from_slice(data: &[u8]) -> Self::DgramBuf {
+        data.to_vec()
+    }
+}
+
+pub type ServerQuic = quiche::Connection<ServerBufFactory>;
+
 /// State for a single client connection.
 pub struct ClientConnection {
     pub(crate) capsule_streams: FxHashMap<u64, crate::server::capsules::CapsuleStream>,
@@ -176,7 +194,7 @@ pub struct ClientConnection {
     pub(crate) received_capsules: std::collections::VecDeque<Vec<u8>>,
     pub(crate) received_capsule_bytes: usize,
     pub(crate) resolver: TargetResolver,
-    pub quic: quiche::Connection,
+    pub quic: ServerQuic,
     pub h3: Option<quiche::h3::Connection>,
     pub(crate) pending_error_responses: PendingErrorResponses,
     /// Request streams whose initial HTTP/3 HEADERS have been dispatched.
@@ -239,7 +257,7 @@ pub struct ClientConnection {
 
 impl ClientConnection {
     pub(crate) fn new(
-        quic: quiche::Connection,
+        quic: ServerQuic,
         index: u64,
         metrics: Arc<ShardMetrics>,
         source_admission: SourceAdmission,

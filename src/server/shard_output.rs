@@ -9,7 +9,7 @@ impl Shard {
     /// unsupported request, including when verification is overloaded.
     pub(super) fn send_auth_rejection(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
     ) {
@@ -19,7 +19,7 @@ impl Shard {
     /// Send an HTTP error response.
     pub(super) fn send_error_response(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         status: u16,
