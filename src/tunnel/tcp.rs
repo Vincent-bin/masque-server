@@ -796,6 +796,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_retention_pool_falls_back_to_copy_and_reuses_released_slots() {
+        async fn next_full_read(
+            tunnel: &mut TcpTunnel,
+            events: &mut mpsc::Receiver<TcpRelayEvent>,
+        ) -> Option<Bytes> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let Some(TcpRelayEvent::Data {
+                        data, shareable, ..
+                    }) = events.recv().await
+                    else {
+                        panic!("expected target data");
+                    };
+                    let len = data.len();
+                    assert!(data.iter().all(|byte| *byte == 0x5a));
+                    let retained = shareable.then(|| data.clone());
+                    assert!(tunnel.queue_response(data, shareable));
+                    // Model a partial HTTP/3 write before QUIC takes the
+                    // remaining bytes and keeps its shared reference.
+                    tunnel.advance_response(len - 1);
+                    assert_eq!(tunnel.front_response().unwrap().offset, len - 1);
+                    tunnel.advance_response(1);
+                    if len == TCP_READ_CHUNK_SIZE {
+                        return retained;
+                    }
+                    assert!(!shareable);
+                }
+            })
+            .await
+            .expect("a continuously written target should yield a full read")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reader, upstream) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let reader = reader.unwrap();
+        socket2::SockRef::from(&reader)
+            .set_recv_buffer_size(8 * TCP_READ_CHUNK_SIZE)
+            .unwrap();
+        let (mut upstream, _) = upstream.unwrap();
+        let writer = tokio::spawn(async move {
+            let payload = vec![0x5a; MAX_BUFFERED_RESPONSE_BYTES];
+            while upstream.write_all(&payload).await.is_ok() {}
+        });
+
+        let budget = Arc::new(Semaphore::new(1));
+        let (tx, mut events) = mpsc::channel(TCP_READ_BUFFERS * 2);
+        let mut tunnel = TcpTunnel::from_stream(0, 0, address, reader, tx, Arc::clone(&budget));
+        let mut in_flight = Vec::with_capacity(RETAINED_READ_SLOTS);
+        for _ in 0..RETAINED_READ_SLOTS {
+            in_flight.push(next_full_read(&mut tunnel, &mut events).await.unwrap());
+        }
+        assert_eq!(budget.available_permits(), 0);
+        assert!(next_full_read(&mut tunnel, &mut events).await.is_none());
+
+        // Releasing one acknowledged chunk lets the reader share another.
+        drop(in_flight.pop().unwrap());
+        for _ in 0..=TCP_READ_BUFFERS {
+            if let Some(shared) = next_full_read(&mut tunnel, &mut events).await {
+                in_flight.push(shared);
+                break;
+            }
+        }
+        assert_eq!(in_flight.len(), RETAINED_READ_SLOTS);
+
+        // Tunnel teardown aborts the reader. QUIC can still own a reference
+        // until the stream reset is processed and its send buffer is dropped.
+        let reader_task = tunnel.reader_task.take().unwrap();
+        reader_task.abort();
+        drop(tunnel);
+        let _ = reader_task.await;
+        drop(events);
+        writer.abort();
+        assert_eq!(budget.available_permits(), 0);
+        assert!(in_flight.iter().all(|data| data.iter().all(|b| *b == 0x5a)));
+        drop(in_flight);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn reader_waits_for_a_reusable_buffer_after_partial_writes() {
         async fn next_data(receiver: &mut mpsc::Receiver<TcpRelayEvent>) -> Bytes {
             match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
