@@ -279,7 +279,7 @@ async fn connect_h2(
     h2::client::SendRequest<Bytes>,
     tokio::task::JoinHandle<Result<(), h2::Error>>,
 ) {
-    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
     connector.set_verify(SslVerifyMode::NONE);
     connector.set_alpn_protos(b"\x02h2").unwrap();
     let tls = tokio_boring::connect(

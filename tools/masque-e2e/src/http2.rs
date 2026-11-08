@@ -57,9 +57,8 @@ impl Connection {
             .with_context(|| format!("connect HTTP/2 TCP socket to {peer}"))?;
         tcp.set_nodelay(true)?;
 
-        let mut connector =
-            boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls_client())
-                .context("create HTTP/2 TLS connector")?;
+        let mut connector = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
+            .context("create HTTP/2 TLS connector")?;
         connector.set_verify(boring::ssl::SslVerifyMode::NONE);
         connector.set_alpn_protos(b"\x02h2")?;
         let server_name = std::env::var("MASQUE_SERVER_NAME").unwrap_or_else(|_| "server".into());

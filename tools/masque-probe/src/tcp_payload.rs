@@ -88,7 +88,7 @@ impl TcpExchange {
         match mode {
             TcpMode::Tls => {
                 let mut connector =
-                    SslConnector::builder(SslMethod::tls_client()).map_err(tls_setup_error)?;
+                    SslConnector::builder(SslMethod::tls()).map_err(tls_setup_error)?;
                 connector
                     .set_default_verify_paths()
                     .map_err(tls_setup_error)?;
@@ -211,10 +211,10 @@ mod tests {
         certificate.set_pubkey(&key).unwrap();
         certificate.sign(&key, MessageDigest::sha256()).unwrap();
         let certificate = certificate.build();
-        let mut server = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).unwrap();
+        let mut server = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
         server.set_certificate(&certificate).unwrap();
         server.set_private_key(&key).unwrap();
-        let mut client = SslConnector::builder(SslMethod::tls_client()).unwrap();
+        let mut client = SslConnector::builder(SslMethod::tls()).unwrap();
         client.cert_store_mut().add_cert(certificate).unwrap();
         let mut exchange = TcpExchange {
             tls: Some(

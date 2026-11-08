@@ -39,11 +39,11 @@ base64 = "0.22.1"
 # Same BoringSSL binding quiche links against, so the two share one library.
 # Needed to build the TLS context by hand: requesting a client certificate
 # without verifying its chain has no equivalent in quiche's own Config API.
-boring = "4.3"
+boring = "5.4"
 # The safe wrapper does not expose per-connection session ID contexts. One
 # narrowly wrapped call invalidates pre-reload tickets without disabling TLS
 # resumption; foreign-types provides SslRef::as_ptr for that call.
-boring-sys = "4.3"
+boring-sys = "5.4"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 foreign-types = "0.5"
@@ -57,7 +57,7 @@ serde_json = "1"
 socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1.53.3", features = ["full"] }
-tokio-boring = "4.19"
+tokio-boring = "5.4"
 toml = "1.1"
 toml_edit = "0.25"
 tracing = "0.1"

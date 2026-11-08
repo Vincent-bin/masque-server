@@ -20,13 +20,13 @@ masque = { package = "masque-server", path = "../.." }
 quiche = "0.30.0"
 anyhow = "1"
 base64 = "0.22.1"
-boring = "4.3"
+boring = "5.4"
 bytes = "1"
 h2 = "0.4.18"
 http = "1"
 ring = "0.17"
 tokio = { version = "1", features = ["full"] }
-tokio-boring = "4.19"
+tokio-boring = "5.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

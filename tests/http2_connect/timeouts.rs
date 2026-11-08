@@ -182,7 +182,7 @@ fn metric(text: &str, name: &str, labels: &[&str]) -> u64 {
 }
 
 async fn connect_tls(addr: SocketAddr) -> tokio_boring::SslStream<TcpStream> {
-    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
     connector.set_verify(SslVerifyMode::NONE);
     connector.set_alpn_protos(b"\x02h2").unwrap();
     let tls = tokio::time::timeout(IO_TIMEOUT, async {

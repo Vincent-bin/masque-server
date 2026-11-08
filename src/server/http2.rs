@@ -216,7 +216,7 @@ pub(super) fn build_acceptor(
     client_certs: Option<Arc<SharedRoster>>,
     tls_identity: Arc<tls::SharedTlsIdentity>,
 ) -> anyhow::Result<SslAcceptor> {
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .context("failed to create HTTP/2 TLS context")?;
     tls::configure_dynamic_identity(&mut builder, tls_identity);
     builder.set_alpn_select_callback(|_, client| {

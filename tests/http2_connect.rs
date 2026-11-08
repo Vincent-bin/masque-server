@@ -249,7 +249,7 @@ async fn connect_h2_with_identity_and_peer(
     Vec<u8>,
     Vec<Vec<u8>>,
 ) {
-    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
     connector.set_verify(SslVerifyMode::NONE);
     connector.set_alpn_protos(b"\x02h2").unwrap();
     if let Some((cert, key)) = identity {
@@ -1157,7 +1157,7 @@ async fn http2_tls_identity_reloads_without_dropping_existing_connections() {
     let (server_addr, server_task) = spawn_reloadable_http2_config(config, config_path).await;
 
     let session_der = Arc::new(Mutex::new(None));
-    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
     connector.set_verify(SslVerifyMode::NONE);
     connector.set_alpn_protos(b"\x02h2").unwrap();
     connector.set_session_cache_mode(SslSessionCacheMode::CLIENT);

@@ -171,12 +171,10 @@ impl Connection {
             ProbeFailure::new("TCP_CONNECT_ERROR", format!("set TCP_NODELAY: {error}"))
         })?;
 
-        let mut connector =
-            boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls_client()).map_err(
-                |error| {
-                    ProbeFailure::new("TLS_CONFIG_ERROR", format!("create TLS connector: {error}"))
-                },
-            )?;
+        let mut connector = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
+            .map_err(|error| {
+                ProbeFailure::new("TLS_CONFIG_ERROR", format!("create TLS connector: {error}"))
+            })?;
         connector
             .set_alpn_protos(b"\x02h2")
             .map_err(|error| ProbeFailure::new("TLS_CONFIG_ERROR", error.to_string()))?;
