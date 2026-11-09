@@ -40,7 +40,6 @@ impl Shard {
         let conn_by_index = &self.conn_by_index;
         let timers = &mut self.timers;
         let metrics = &self.metrics;
-        let direct_gso = cfg!(target_os = "linux") && !self.config.quic.discover_pmtu;
         let share_ready = cfg!(target_os = "linux") && dirty.len() > 1;
         batch.clear();
 
@@ -59,7 +58,6 @@ impl Shard {
             let Some(client) = connections.get_mut(conn_id) else {
                 continue;
             };
-            let direct_gso = direct_gso && client.quic.is_established();
             let share_connection = share_ready
                 && !client.udp_tunnels.is_empty()
                 && client.native_datagrams()
@@ -127,30 +125,7 @@ impl Shard {
                     && generated_bytes < send_quantum
                     && client.deferred_send.has_capacity(max_packet_size)
                 {
-                    let tail = if direct_gso
-                        && socket.udp_gso_enabled()
-                        && client.deferred_send.len() == 0
-                    {
-                        batch.gso_tail(max_packet_size, send_quantum)
-                    } else {
-                        None
-                    };
-                    let mut staged = tail.is_some();
-                    let result = if let Some(tail) = tail {
-                        client.quic.send(tail)
-                    } else {
-                        client.quic.send(out)
-                    };
-                    // A changed path may require more space than the active
-                    // path's packet size used to select the batch tail.
-                    let result = match result {
-                        Err(quiche::Error::BufferTooShort) if staged => {
-                            staged = false;
-                            client.quic.send(out)
-                        }
-                        result => result,
-                    };
-                    let (write, send_info) = match result {
+                    let (write, send_info) = match client.quic.send(out) {
                         Ok(v) => v,
                         Err(quiche::Error::Done) => {
                             quiche_done = true;
@@ -168,13 +143,9 @@ impl Shard {
                     // Serialize a bounded group ahead of its release time.
                     // Packets within one timer tick can share this send; later
                     // packets remain bounded in the deferred queue.
-                    let deferred = send_info.at
-                        > Instant::now() + crate::connection::PACING_HORIZON
-                        || client.deferred_send.len() != 0;
-                    if staged && batch.finish_gso_tail(write, send_info, !deferred, out) {
-                        continue;
-                    }
-                    if deferred {
+                    if send_info.at > Instant::now() + crate::connection::PACING_HORIZON
+                        || client.deferred_send.len() != 0
+                    {
                         client.deferred_send.schedule(&out[..write], send_info);
                         if !client.deferred_send.can_prefetch() {
                             pacing_blocked = true;
