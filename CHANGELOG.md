@@ -7,6 +7,14 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.21 - 2026-11-09
+
+### Performance
+
+- Reuse complete HTTP/3 TCP response buffers for QUIC transmission and
+  retransmission. Release each buffer when its final reference drops and fall
+  back to copying when the bounded retention pool is full.
+
 ## 0.14.20 - 2026-11-08
 
 ### Performance
