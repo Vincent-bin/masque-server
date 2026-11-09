@@ -427,7 +427,9 @@ mod tests {
         let peer = "127.0.0.1:10001".parse().unwrap();
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         let id = quiche::ConnectionId::from_vec(vec![0xaa; 16]);
-        let quic = quiche::connect(Some("localhost"), &id, local, peer, &mut config).unwrap();
+        let quic =
+            quiche::connect_with_buffer_factory(Some("localhost"), &id, local, peer, &mut config)
+                .unwrap();
         let metrics = Metrics::new(false)
             .register_listener(local, "http3", "none", 1, false, false)
             .remove(0);

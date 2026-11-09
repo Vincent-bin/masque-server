@@ -407,15 +407,19 @@ impl Shard {
                     return;
                 };
 
-                let quic =
-                    match quiche::accept(&scid, odcid.as_ref(), local, from, &mut self.quic_config)
-                    {
-                        Ok(connection) => connection,
-                        Err(error) => {
-                            error!(%error, "failed to accept connection");
-                            return;
-                        }
-                    };
+                let quic = match quiche::accept_with_buf_factory(
+                    &scid,
+                    odcid.as_ref(),
+                    local,
+                    from,
+                    &mut self.quic_config,
+                ) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        error!(%error, "failed to accept connection");
+                        return;
+                    }
+                };
 
                 info!(shard = self.index, ?scid, %from, "new connection");
 

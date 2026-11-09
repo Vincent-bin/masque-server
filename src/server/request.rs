@@ -139,7 +139,7 @@ impl Shard {
     /// Handle an incoming HTTP/3 request.
     pub(super) fn handle_request(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         headers: &[quiche::h3::Header],
@@ -249,7 +249,7 @@ impl Shard {
     /// Act on an authorized CONNECT request.
     pub(super) fn dispatch_connect(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         request: &ConnectRequest,
@@ -310,7 +310,7 @@ impl Shard {
     /// `200`, so a failed target cannot leave an already-accepted stream.
     fn handle_connect_udp(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         pending_errors: &mut crate::connection::PendingErrorResponses,
         stream_id: u64,
         path: &str,

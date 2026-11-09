@@ -5,7 +5,7 @@ use super::*;
 /// Close an idle stream before releasing the tunnel. If the empty DATA frame
 /// carrying FIN is blocked, RESET_STREAM closes the response without credit.
 fn close_idle_stream(
-    quic: &mut quiche::Connection,
+    quic: &mut crate::connection::ServerQuic,
     h3: Option<&mut quiche::h3::Connection>,
     stream_id: u64,
     reset: bool,

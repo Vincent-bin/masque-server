@@ -441,6 +441,9 @@ impl Server {
             )
             .context("ip_proxy")?,
             resolver: ResolverBudget::default(),
+            tcp_read_retention: Arc::new(Semaphore::new(
+                crate::tunnel::tcp::TCP_READ_RETENTION_POOLS,
+            )),
             address_pool: Mutex::new(address_pool),
             routing_table: RwLock::new(RoutingTable::new()),
             cid_shard: RwLock::new(FxHashMap::default()),
@@ -1517,6 +1520,8 @@ struct Shared {
     /// Immutable destination ACL, shared by both CONNECT-IP transports.
     ip_policy: TargetPolicy,
     resolver: ResolverBudget,
+    /// Extra buffers that HTTP/3 TCP streams may retain through QUIC ACKs.
+    tcp_read_retention: Arc<Semaphore>,
     address_pool: Mutex<AddressPool>,
     routing_table: RwLock<RoutingTable>,
     /// Which shard owns each server-issued connection ID. Consulted when a

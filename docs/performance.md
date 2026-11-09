@@ -119,12 +119,17 @@ packet buffers under a separate 128 KiB spare-buffer budget and is discarded
 when a connection closes. BBR2 is the default controller; explicitly select
 CUBIC if the workload performs better with it.
 
-HTTP/3 TCP target reads reuse up to four 64 KiB buffers per tunnel. Empty pool
-slots allocate only when traffic needs them; the final response owner returns
-its buffer without blocking the shard. Partial consumption releases byte credit
-but keeps the buffer occupied until its final reference is dropped. This bounds
-both buffered payload and whole read allocations, including fragmented reads.
-The pool is private to a tunnel and is discarded on teardown.
+HTTP/3 TCP target reads start with four reusable 64 KiB buffers per tunnel
+and 256 KiB of pending response credit. Empty slots allocate on demand. Partial
+consumption releases byte credit while the buffer remains occupied until its
+last reference is dropped.
+
+Full reads can also be shared with QUIC for transmission and retransmission.
+A separate pool reserves up to 32 additional 64 KiB slots per participating
+tunnel, with a 64 MiB process-wide cap. If no retention slot is available, the
+relay copies into the QUIC send buffer and returns the read buffer to its
+original pool. The retention reservation stays held through tunnel teardown
+until QUIC releases the final shared reference.
 
 Compare cold and steady throughput, CPU per transferred byte, and mixed
 TCP/UDP latency. The [TCP deadline and buffer reuse measurements](performance-tcp-deadlines.md)
@@ -157,7 +162,7 @@ build is therefore not required to retain batching.
 Target readers hand 64 KiB `Bytes` chunks to the owning shard under a 256 KiB
 per-tunnel credit. A shard consumes a bounded group of events that are already
 queued, places all accepted chunks into HTTP/3, and then drives the QUIC
-connection once. This keeps the existing memory ceiling while avoiding a full
+connection once. This preserves the pending byte limit while avoiding a full
 event-loop and QUIC-drive round for every individual read. The exported TCP
 relay event/batch counters reveal the effective coalescing factor.
 

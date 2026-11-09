@@ -1,4 +1,4 @@
-//! Reliable upload backpressure through real QUIC, HTTP/3 and TCP sockets.
+//! Reliable TCP relay through real QUIC, HTTP/3 and TCP sockets.
 
 use super::*;
 use std::io::{Read, Write};
@@ -349,4 +349,111 @@ fn half_closed_target_receives_entire_backpressured_upload() {
 #[test]
 fn pending_upload_resumes_across_empty_data_frame() {
     upload_resumes_after_pressure(true, false, true);
+}
+
+#[test]
+fn download_survives_a_lost_packet_with_a_small_stream_window() {
+    for enable_gso in [false, true] {
+        let dir = TempDir::new("tcp-download-retransmission");
+        let key = p256_key();
+        let (cert, key) = write_pem(
+            dir.path(),
+            "server",
+            &key,
+            &self_signed(&key, Some("server")),
+        );
+        let payload: Vec<_> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let target = std::net::TcpListener::bind(ephemeral_addr()).unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let (start, ready) = std::sync::mpsc::channel();
+        let origin_payload = payload.clone();
+        let origin = std::thread::spawn(move || {
+            let (mut socket, _) = target.accept().unwrap();
+            ready.recv_timeout(Duration::from_secs(10)).unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket.write_all(&origin_payload).unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let mut config = ServerConfig::default();
+        config.tls.cert_path = cert;
+        config.tls.key_path = key;
+        config.listeners[0].listen_addr = ephemeral_addr();
+        config.listeners[0].auth.enabled = false;
+        config.quic.enable_udp_gso = enable_gso;
+        config.ip_proxy.enabled = false;
+        config.tcp_proxy.allow_targets = vec!["127.0.0.0/8".into()];
+        config.tcp_proxy.deny_targets.clear();
+        let peer = spawn_server(config)[0];
+        // The client starts with less stream credit than one target read.
+        let mut client = Client::connect_with_transport(
+            peer,
+            None,
+            None,
+            false,
+            "127.0.0.1".parse().unwrap(),
+            true,
+            16 * 1024,
+        )
+        .unwrap();
+        client.handshake(Duration::from_secs(5)).unwrap();
+        client.init_h3().unwrap();
+        client
+            .socket
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let stream = open_tcp(&mut client, target_addr);
+        client.flush().unwrap();
+        assert_eq!(
+            client
+                .response_status(stream, Duration::from_secs(5))
+                .unwrap(),
+            200
+        );
+        start.send(()).unwrap();
+
+        let info = quiche::RecvInfo {
+            from: peer,
+            to: client.socket.local_addr().unwrap(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut packet = [0; MAX_DATAGRAM_SIZE];
+        let mut dropped = false;
+        let mut finished = false;
+        let mut received = Vec::with_capacity(payload.len());
+        while !finished && Instant::now() < deadline {
+            match client.socket.recv(&mut packet) {
+                // The origin starts after CONNECT succeeds. The first full
+                // datagram of the download carries response stream bytes.
+                Ok(MAX_DATAGRAM_SIZE) if !dropped => dropped = true,
+                Ok(len) => match client.quic.recv(&mut packet[..len], info) {
+                    Ok(_) | Err(quiche::Error::Done) => {}
+                    Err(error) => panic!("receive download packet: {error}"),
+                },
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if client
+                        .quic
+                        .timeout_instant()
+                        .is_some_and(|at| at <= Instant::now())
+                    {
+                        client.quic.on_timeout();
+                    }
+                }
+                Err(error) => panic!("read download datagram: {error}"),
+            }
+            finished = poll_upload(&mut client, stream, &mut received);
+            client.flush().unwrap();
+        }
+        assert!(dropped, "the test must drop a download datagram");
+        assert!(finished, "the download and FIN should recover after loss");
+        assert_eq!(received, payload);
+        origin.join().unwrap();
+    }
 }

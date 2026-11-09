@@ -350,7 +350,7 @@ impl Shard {
     /// means recv_body stopped at framing while QUIC still has buffered bytes.
     pub(super) fn relay_tcp_request_body(
         h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         stream_id: u64,
         pending_tunnels: &mut FxHashMap<u64, PendingTcpTunnel>,
         tunnels: &mut FxHashMap<u64, TcpTunnel>,
@@ -709,6 +709,7 @@ impl Shard {
                             target_addr,
                             stream,
                             self.tcp_event_tx.clone(),
+                            Arc::clone(&self.shared.tcp_read_retention),
                         );
                         for data in early_data {
                             if !tunnel.queue_client_data(data) {
@@ -746,11 +747,13 @@ impl Shard {
                     }
                 }
             }
-            TcpRelayEvent::Data { data, .. } => {
+            TcpRelayEvent::Data {
+                data, shareable, ..
+            } => {
                 let accepted = client
                     .tcp_tunnels
                     .get_mut(&stream_id)
-                    .is_some_and(|tunnel| tunnel.queue_response(data));
+                    .is_some_and(|tunnel| tunnel.queue_response(data, shareable));
                 if !accepted && client.tcp_tunnels.contains_key(&stream_id) {
                     warn!(stream_id, "TCP response chunk after the response closed");
                     Self::reset_tcp_stream(client, stream_id);
@@ -929,8 +932,14 @@ impl Shard {
                     // the reader keeps running ahead instead of waiting for a
                     // round trip through this loop.
                     while let Some(response) = tunnel.front_response() {
-                        let remaining = &response.data[response.offset..];
-                        match h3.send_body(&mut client.quic, *stream_id, remaining, false) {
+                        let result = if response.shareable {
+                            let mut remaining = response.data.slice(response.offset..);
+                            h3.send_body_zc(&mut client.quic, *stream_id, &mut remaining, false)
+                        } else {
+                            let remaining = &response.data[response.offset..];
+                            h3.send_body(&mut client.quic, *stream_id, remaining, false)
+                        };
+                        match result {
                             Ok(0) => break,
                             Ok(written) => tunnel.advance_response(written),
                             Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
@@ -1024,7 +1033,7 @@ impl Shard {
     }
 
     fn reap_stopped_response(
-        quic: &mut quiche::Connection,
+        quic: &mut crate::connection::ServerQuic,
         stream_id: u64,
         response_finished: bool,
     ) -> bool {
