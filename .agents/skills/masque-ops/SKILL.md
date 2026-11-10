@@ -62,8 +62,8 @@ was installed globally.
    on/off testing over the real external path; kernel support and a passing
    connectivity probe do not establish performance or absence of packet loss.
    Target UDP GSO is a separate setting and needs its own CONNECT-UDP test.
-   Refer to the [performance guide](https://github.com/Vincent-bin/masque-server/blob/main/docs/performance.md#quic-socket)
-   and [configuration guide](https://github.com/Vincent-bin/masque-server/blob/main/docs/configuration.md#quic-and-udp).
+   Refer to the [performance guide](https://github.com/zenith-ent/masque-server/blob/main/docs/performance.md#quic-socket)
+   and [configuration guide](https://github.com/zenith-ent/masque-server/blob/main/docs/configuration.md#quic-and-udp).
    This is advice, not authorization or a supported remote configuration
    operation; do not change settings during a release rollout.
 

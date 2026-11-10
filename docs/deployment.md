@@ -35,7 +35,7 @@ resolves the latest stable GitHub release, downloads its archive and checksum,
 verifies SHA-256, and invokes the installer from that archive:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-latest.sh | sudo sh
 ```
 
 Although the script arrives on standard input, interactive answers are read
@@ -100,7 +100,7 @@ The following environment variables make provisioning non-interactive:
 For example, a non-interactive client-certificate installation is:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | \
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-latest.sh | \
   sudo env \
     MASQUE_AUTH_MODE=client_cert \
     MASQUE_TLS_CERT=/root/fullchain.pem \
@@ -367,7 +367,7 @@ roster revocation disconnects the affected client. Manage Basic accounts with
 For the latest stable release, rerun the bootstrap command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-latest.sh | sudo sh
 sudo systemctl status masque --no-pager
 ```
 

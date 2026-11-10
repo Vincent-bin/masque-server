@@ -247,7 +247,7 @@ class InventoryTests(unittest.TestCase):
             "\n".join(
                 [
                     "schema_version = 1",
-                    'repository = "Vincent-bin/masque-server"',
+                    'repository = "zenith-ent/masque-server"',
                     f'state_path = "{self.root / "state.json"}"',
                     "[defaults]",
                     'user = "root"',
@@ -275,6 +275,16 @@ class InventoryTests(unittest.TestCase):
         inventory.path.chmod(0o644)
         with self.assertRaisesRegex(ops.OpsError, "group or others"):
             ops.load_inventory(inventory.path)
+
+    def test_legacy_repository_is_normalized_without_rewriting_inventory(self) -> None:
+        path = self.write_inventory()
+        legacy = path.read_text(encoding="utf-8").replace(
+            ops.DEFAULT_REPOSITORY, ops.LEGACY_REPOSITORY
+        )
+        path.write_text(legacy, encoding="utf-8")
+
+        self.assertEqual(ops.load_inventory(path).repository, ops.DEFAULT_REPOSITORY)
+        self.assertEqual(path.read_text(encoding="utf-8"), legacy)
 
     def test_required_profiles_support_legacy_and_explicit_transports(self) -> None:
         path = self.write_inventory(
@@ -591,7 +601,7 @@ class InventoryTests(unittest.TestCase):
     def test_release_source_is_pinned_to_the_official_repository(self) -> None:
         path = self.write_inventory()
         contents = path.read_text(encoding="utf-8").replace(
-            'repository = "Vincent-bin/masque-server"',
+            'repository = "zenith-ent/masque-server"',
             'repository = "example/masque-server"',
         )
         path.write_text(contents, encoding="utf-8")
