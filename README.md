@@ -62,7 +62,7 @@ operations bundle using the command below. It installs the Skill, deterministic
 CLI, inventory example, and release-matched `masque-probe` together:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-ops.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-ops.sh | sh
 ```
 
 The installer requires Python 3.11 or newer and OpenSSH. It detects the latest
@@ -100,7 +100,7 @@ Skill directly from the repository. This does not create the shell command or
 install the probe:
 
 ```text
-$skill-installer install the masque-ops skill from https://github.com/Vincent-bin/masque-server/tree/main/.agents/skills/masque-ops
+$skill-installer install the masque-ops skill from https://github.com/zenith-ent/masque-server/tree/main/.agents/skills/masque-ops
 ```
 
 For advanced or multi-host setups, the installed inventory example is also
@@ -233,7 +233,7 @@ HTTP/3 first and falls back to HTTP/2, then establishes a real upstream TCP
 CONNECT and performs a DNS-over-UDP round trip through the proxy:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-probe.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-probe.sh | sh
 ```
 
 The installer detects Linux/macOS and x86_64/ARM64, verifies the selected
@@ -265,7 +265,7 @@ On Linux x86_64 or ARM64, download, verify, and install the latest stable
 release with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-latest.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-latest.sh | sudo sh
 ```
 
 For a new configuration the installer prompts for HTTP/3 or HTTP/2, `basic`,

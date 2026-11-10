@@ -8,7 +8,7 @@ supported with security fixes.
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's
-[private vulnerability reporting](https://github.com/Vincent-bin/masque-server/security/advisories/new)
+[private vulnerability reporting](https://github.com/zenith-ent/masque-server/security/advisories/new)
 for authentication bypasses, denial-of-service vectors, unsafe-code defects,
 policy bypasses, request smuggling, or traffic disclosure.
 

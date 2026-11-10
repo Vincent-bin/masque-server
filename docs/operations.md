@@ -25,7 +25,7 @@ Linux and macOS can install the Skill, CLI, inventory example, and matching
 local probe from the latest stable Release with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-ops.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-ops.sh | sh
 ```
 
 The installer verifies the platform-independent operations archive and the
@@ -37,7 +37,7 @@ without reading or changing private inventory, state, or credentials. Pin an
 exact version with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-ops.sh | \
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-ops.sh | \
   env MASQUE_VERSION=vX.Y.Z sh
 ```
 
@@ -132,10 +132,11 @@ install -m 0600 ~/.config/masque-server/fleet.example.toml \
 Replace all documentation addresses and endpoints. The default location is
 `~/.config/masque-server/fleet.toml`; set `MASQUE_OPS_INVENTORY` or pass
 `--inventory` to use another file. The inventory only accepts the official
-`Vincent-bin/masque-server` release source and must not contain inline
+`zenith-ent/masque-server` release source and must not contain inline
 passwords. Referenced SSH identities, probe passwords, and client enrollment
 files are checked separately and must be private regular files rather than
-symlinks.
+symlinks. The CLI maps the previous official repository name to the current
+release source when it reads an existing inventory.
 
 AI agents must not open the inventory or any referenced file. They pass only
 the inventory path and a host alias to `masque-ops`; its output omits SSH
@@ -147,7 +148,7 @@ If it was omitted from the operations install, install the release-matched
 probe separately on Linux or macOS x86_64/ARM64:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-probe.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-probe.sh | sh
 ```
 
 An unprivileged install goes to `~/.local/bin`; root installs to

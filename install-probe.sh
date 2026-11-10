@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPOSITORY=${MASQUE_GITHUB_REPOSITORY:-Vincent-bin/masque-server}
+REPOSITORY=${MASQUE_GITHUB_REPOSITORY:-zenith-ent/masque-server}
 DOWNLOAD_DIR=
 INSTALL_TMP=
 

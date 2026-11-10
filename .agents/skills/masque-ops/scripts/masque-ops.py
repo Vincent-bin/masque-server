@@ -64,7 +64,8 @@ DEFAULT_INVENTORY = Path(
     )
 ).expanduser()
 DEFAULT_STATE = Path.home() / ".local" / "state" / "masque-server" / "ops-state.json"
-DEFAULT_REPOSITORY = "Vincent-bin/masque-server"
+DEFAULT_REPOSITORY = "zenith-ent/masque-server"
+LEGACY_REPOSITORY = "Vincent-bin/masque-server"
 VERSION_RE = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\."
     r"(?P<minor>0|[1-9][0-9]*)\."
@@ -1104,7 +1105,9 @@ def load_inventory(path: Path) -> Inventory:
     repository = require_string(raw.get("repository", DEFAULT_REPOSITORY), "repository")
     if not REPOSITORY_RE.fullmatch(repository):
         raise OpsError("repository must be in owner/name form")
-    if repository != DEFAULT_REPOSITORY:
+    if repository == LEGACY_REPOSITORY:
+        repository = DEFAULT_REPOSITORY
+    elif repository != DEFAULT_REPOSITORY:
         raise OpsError(
             f"repository must be {DEFAULT_REPOSITORY}; the remote maintenance "
             "entrypoint is pinned to that release source"

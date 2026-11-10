@@ -2,7 +2,7 @@
 # documentation value, and chmod the file and each referenced private file to
 # 0600.
 schema_version = 1
-repository = "Vincent-bin/masque-server"
+repository = "zenith-ent/masque-server"
 state_path = "~/.local/state/masque-server/ops-state.json"
 probe_binary = "masque-probe"
 

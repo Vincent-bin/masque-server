@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "End-to-end connectivity diagnostics for MASQUE proxies"
 license = "MIT"
-repository = "https://github.com/Vincent-bin/masque-server"
+repository = "https://github.com/zenith-ent/masque-server"
 publish = false
 
 [lints]

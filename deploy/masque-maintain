@@ -4,7 +4,7 @@ set -eu
 # This root-owned entrypoint is intentionally narrow enough to grant through a
 # dedicated sudoers rule. It never edits the server configuration, TLS files,
 # routing, firewall, or NAT.
-REPOSITORY=Vincent-bin/masque-server
+REPOSITORY=zenith-ent/masque-server
 BOOTSTRAP=/usr/local/libexec/masque-server/install-latest.sh
 BIN=/usr/local/bin/masque-server
 CONFIG=/etc/masque/masque.toml

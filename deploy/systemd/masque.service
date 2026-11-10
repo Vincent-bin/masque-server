@@ -1,6 +1,6 @@
 [Unit]
 Description=MASQUE HTTP/2 and HTTP/3 proxy server
-Documentation=https://github.com/Vincent-bin/masque-server
+Documentation=https://github.com/zenith-ent/masque-server
 Wants=network-online.target
 After=network-online.target
 

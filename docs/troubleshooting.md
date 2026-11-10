@@ -61,7 +61,7 @@ Install the standalone probe on a Linux or macOS x86_64/ARM64 client; the
 installer selects the local architecture and verifies the release SHA-256:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vincent-bin/masque-server/main/install-probe.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zenith-ent/masque-server/main/install-probe.sh | sh
 ```
 
 Linux server archives also install `/usr/local/bin/masque-probe` beside the
