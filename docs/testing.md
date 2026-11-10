@@ -183,6 +183,34 @@ described below. Machine consumers should
 read `UDP_RESULT`, `TCP_DOWNLOAD_RESULT`, and `TCP_DOWNLOAD_SUMMARY` and retain
 their explicit `transport` field.
 
+### HTTPS download through a running HTTP/3 proxy
+
+Set `MASQUE_HTTPS_URL` to measure one HTTPS download through one fresh HTTP/3
+CONNECT connection. Choose an origin that serves a large file with a
+`200 OK` response and `Content-Length`.
+
+```sh
+cargo build --release --locked -p masque-e2e
+MASQUE_SERVER_ADDR=192.0.2.10:443 \
+MASQUE_SERVER_NAME=proxy.example.com \
+MASQUE_BENCH_CA_CERT=/path/to/ca-bundle.pem \
+MASQUE_HTTPS_URL=https://download.example.com/large.bin \
+target/release/masque-e2e
+```
+
+Use a PEM trust bundle for both the proxy and the origin. For Basic
+authentication, supply `MASQUE_USERNAME` and `MASQUE_PASSWORD` through a private
+environment. On macOS, `MASQUE_INTERFACE` binds the QUIC socket to a specific
+network interface.
+
+The ten-second window includes QUIC, CONNECT, and origin TLS setup. The request
+inside the tunnel uses HTTP/1.1. `HTTPS_DOWNLOAD_RESULT` reports payload bytes,
+per-second byte counts, whole-sample throughput (`sample_mbps`), throughput
+after the first body byte (`transfer_mbps`), and whether the entire body was
+received. A download that finishes early uses its measured elapsed time.
+
+### Local benchmark controls
+
 HTTP/3 uses the production `adaptive` Retry policy by default. Set
 `MASQUE_BENCH_QUIC_RETRY=always` to exercise address validation on every
 benchmark connection; use `off` only for a controlled handshake-latency

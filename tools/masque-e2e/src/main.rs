@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 mod benchmark_io;
 mod http2;
+mod https_download;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const BUF_SIZE: usize = 65535;
@@ -3108,6 +3109,24 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Some(url) = std::env::var_os("MASQUE_HTTPS_URL") {
+        let result = (|| {
+            anyhow::ensure!(
+                transport == BenchTransport::Http3,
+                "HTTPS download requires HTTP/3"
+            );
+            let url = url
+                .to_str()
+                .context("MASQUE_HTTPS_URL is not valid UTF-8")?;
+            https_download::run(&server_addr, url)
+        })();
+        if let Err(error) = result {
+            error!(%error, "HTTPS download benchmark failed");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     info!(%server_addr, %echo_addr, transport = transport.as_str(), "MASQUE E2E test suite");
 
