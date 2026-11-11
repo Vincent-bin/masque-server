@@ -114,9 +114,10 @@ enable_dgram = true
 # enabling this: some virtual NICs advertise support and then drop them.
 enable_udp_gso = false
 enable_udp_gro = true
-# Request 2 MiB per direction per QUIC shard for burst tolerance. Check the
-# startup readback: Linux caps requests at net.core.rmem_max/wmem_max and reports
-# doubled accounting sizes. Applies on restart, not credential/TLS reload.
+# Request 2 MiB per direction per QUIC shard for burst tolerance. Linux permits
+# configuration up to the greater of 16 MiB and its per-direction sysctl
+# limit. The kernel still caps the actual request at that sysctl limit and
+# reports doubled accounting sizes at startup. Buffer changes apply on restart.
 # Set 0 to preserve OS defaults; old configurations omitting these fields also
 # keep OS defaults. This changes only the server's QUIC sockets, not sysctls.
 udp_recv_buffer_size = 2097152

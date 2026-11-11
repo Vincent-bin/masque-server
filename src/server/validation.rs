@@ -2,6 +2,18 @@
 
 use super::*;
 
+const QUIC_UDP_BUFFER_COMPAT_LIMIT: usize = 16 * 1024 * 1024;
+
+fn quic_udp_buffer_limit(kernel_limit: Option<&str>) -> usize {
+    // Linux doubles the accepted request in a signed int for socket accounting.
+    const MAX_LINUX_BUFFER_REQUEST: usize = i32::MAX as usize / 2;
+    kernel_limit
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(QUIC_UDP_BUFFER_COMPAT_LIMIT, |limit| {
+            limit.clamp(QUIC_UDP_BUFFER_COMPAT_LIMIT, MAX_LINUX_BUFFER_REQUEST)
+        })
+}
+
 /// Configuration state prepared without opening sockets or creating a TUN
 /// device.
 ///
@@ -428,13 +440,30 @@ pub(super) fn validate_server_config(
         }
     }
 
-    for (name, size) in [
-        ("udp_recv_buffer_size", config.quic.udp_recv_buffer_size),
-        ("udp_send_buffer_size", config.quic.udp_send_buffer_size),
+    for (name, size, sysctl) in [
+        (
+            "udp_recv_buffer_size",
+            config.quic.udp_recv_buffer_size,
+            "/proc/sys/net/core/rmem_max",
+        ),
+        (
+            "udp_send_buffer_size",
+            config.quic.udp_send_buffer_size,
+            "/proc/sys/net/core/wmem_max",
+        ),
     ] {
-        if size > 16 * 1024 * 1024 {
+        if size <= QUIC_UDP_BUFFER_COMPAT_LIMIT {
+            continue;
+        }
+        let kernel_limit = if cfg!(target_os = "linux") {
+            std::fs::read_to_string(sysctl).ok()
+        } else {
+            None
+        };
+        let limit = quic_udp_buffer_limit(kernel_limit.as_deref());
+        if size > limit {
             anyhow::bail!(
-                "quic.{name} must be between 0 and 16777216 bytes (0 keeps the OS default)"
+                "quic.{name} must be between 0 and {limit} bytes (0 keeps the OS default)"
             );
         }
     }
@@ -575,4 +604,23 @@ pub(super) fn validate_server_config(
         total_shards,
         address_pool,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quic_udp_buffer_limit;
+
+    #[test]
+    fn quic_udp_buffer_limit_uses_the_kernel_value_above_the_compatibility_floor() {
+        const MIB: usize = 1024 * 1024;
+
+        assert_eq!(quic_udp_buffer_limit(None), 16 * MIB);
+        assert_eq!(quic_udp_buffer_limit(Some("invalid")), 16 * MIB);
+        assert_eq!(quic_udp_buffer_limit(Some("4194304\n")), 16 * MIB);
+        assert_eq!(quic_udp_buffer_limit(Some("67108864\n")), 64 * MIB);
+        assert_eq!(
+            quic_udp_buffer_limit(Some("2147483647")),
+            i32::MAX as usize / 2
+        );
+    }
 }

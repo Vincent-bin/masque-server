@@ -373,12 +373,22 @@ fn quic_socket_buffer_requests_are_bounded_and_do_not_bind() {
         &key_path,
         "cubic",
     );
-    for field in ["udp_recv_buffer_size", "udp_send_buffer_size"] {
+    for (field, sysctl) in [
+        ("udp_recv_buffer_size", "/proc/sys/net/core/rmem_max"),
+        ("udp_send_buffer_size", "/proc/sys/net/core/wmem_max"),
+    ] {
+        let mut limit = 16 * 1024 * 1024;
+        if cfg!(target_os = "linux")
+            && let Ok(kernel_limit) = std::fs::read_to_string(sysctl)
+            && let Ok(kernel_limit) = kernel_limit.trim().parse::<usize>()
+        {
+            limit = limit.max(kernel_limit).min(i32::MAX as usize / 2);
+        }
         for (size, valid) in [
             (0, true),
             (2097152, true),
-            (16777216, true),
-            (16777217, false),
+            (limit, true),
+            (limit + 1, false),
         ] {
             std::fs::write(
                 &config_path,
