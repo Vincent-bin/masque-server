@@ -7,6 +7,20 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.22 - 2026-11-11
+
+### Added
+
+- Add a single-connection HTTPS download benchmark to `masque-e2e`.
+
+### Changed
+
+- Allow larger configured QUIC UDP socket buffers on Linux when the kernel
+  permits them. Validate receive and send sizes against their respective kernel
+  limits, with a 16 MiB compatibility floor.
+- Update the canonical repository used by documentation, installers, and fleet
+  tools. Existing inventories with the previous repository identifier still work.
+
 ## 0.14.21 - 2026-11-09
 
 ### Performance

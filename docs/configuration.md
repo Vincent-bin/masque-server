@@ -765,8 +765,12 @@ Important relationships:
 - UDP GSO is opt-in because some virtual egress paths advertise it but drop
   super-packets. Enable it only after an external-path A/B test.
 - `udp_recv_buffer_size` and `udp_send_buffer_size` request `SO_RCVBUF` and
-  `SO_SNDBUF` once per QUIC shard socket, in bytes (`0..16777216`). Zero keeps
-  the OS default, including for existing configurations that omit these fields.
+  `SO_SNDBUF` once per QUIC shard socket, in bytes. On Linux, each
+  configuration limit is the greater of 16 MiB and the corresponding
+  `net.core.rmem_max` or `net.core.wmem_max`, bounded by the kernel's
+  signed socket buffer accounting range. Validation uses 16 MiB if the
+  parameter is unavailable or the platform is not Linux. Zero keeps the OS
+  default, including for existing configurations that omit these fields.
   The example above and the fresh-install template explicitly request 2 MiB
   per direction. This is the tested starting point, not a universal optimum.
   They require a restart and do not change HTTP/2 or per-tunnel target sockets.
@@ -780,8 +784,9 @@ Important relationships:
   omitted if readback fails. Limits apply per socket, so budget across all
   HTTP/3 listeners and shards. Increasing buffers cannot repair an egress
   path that drops GSO aggregates; compare GSO on/off with identical buffers.
-  Older binaries reject these new fields; retain a compatible configuration
-  when planning a rollback to a release without socket-buffer tuning.
+  For rollback, confirm the target release accepts these fields and their
+  configured values. Earlier releases with socket-buffer tuning cap requests
+  at 16 MiB.
 - Supported congestion controllers are `cubic`, `reno`, and `bbr2`. BBR2 is
   the default. Paced output uses bounded packet groups; compare throughput,
   latency, and loss on the deployment's actual path. An explicit controller is
