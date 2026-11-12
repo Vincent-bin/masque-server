@@ -1,0 +1,14 @@
+{
+  "exit_code": 0,
+  "failed": 0,
+  "filtered_out": 0,
+  "ignored": 0,
+  "passed": 28,
+  "patch": "0002-musl-msghdr.patch",
+  "schema": 1,
+  "scope": "upstream_unit_tests",
+  "status": "ok",
+  "suite": "datagram-socket",
+  "target": "x86_64-unknown-linux-musl",
+  "version": "0.8.1"
+}

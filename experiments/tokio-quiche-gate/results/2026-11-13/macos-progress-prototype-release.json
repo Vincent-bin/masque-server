@@ -1,0 +1,219 @@
+{
+  "architecture": "arm64",
+  "binary_sha256": "73a713a66798dcfff0cd77eb990c6409612759337240c0ad7120595563e40358",
+  "datagram_socket_build_patch": true,
+  "default_features": false,
+  "harness_failures": [],
+  "observations": [
+    {
+      "candidate": "prototype_patch",
+      "case": "stream_control",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 26,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G5",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "empty_error",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 0,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G5",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "cid16",
+      "compatible": true,
+      "evidence": {
+        "handshake_and_settings": true,
+        "request_delivered": true
+      },
+      "gate": "G4",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "shutdown_read",
+      "compatible": true,
+      "evidence": {
+        "response_fin": true,
+        "write_channel_alive_after_read_shutdown": true
+      },
+      "gate": "G5",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "shutdown_write",
+      "compatible": true,
+      "evidence": {
+        "read_channel_delivers_after_write_shutdown": true
+      },
+      "gate": "G5",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "unknown_flow",
+      "compatible": true,
+      "evidence": {
+        "pre_connect_datagram_replayed": false
+      },
+      "gate": "G6",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "late_datagram",
+      "compatible": true,
+      "evidence": {
+        "native_datagram_delivered_after_request_fin": false,
+        "response_fin": true,
+        "response_preserved": true
+      },
+      "gate": "G6",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "qsid_empty",
+      "compatible": true,
+      "evidence": {
+        "application_close": true,
+        "close_code": 51,
+        "required_code": 51
+      },
+      "gate": "G6",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "qsid_truncated",
+      "compatible": true,
+      "evidence": {
+        "application_close": true,
+        "close_code": 51,
+        "required_code": 51
+      },
+      "gate": "G6",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "qsid_out_of_range",
+      "compatible": true,
+      "evidence": {
+        "application_close": true,
+        "close_code": 51,
+        "required_code": 51
+      },
+      "gate": "G6",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "event_backlog",
+      "compatible": true,
+      "evidence": {
+        "audit_body_bytes": 32768,
+        "body_chunks": 512,
+        "fin_event_delivered": true,
+        "other_event_and_command_queues_bounded": false,
+        "payload_bytes": 32768,
+        "queued_events_after_256_and_512_chunks": [
+          0,
+          0
+        ]
+      },
+      "gate": "G1",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "raw_cid16",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 26,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G4",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "tls_hook",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 26,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G7",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "raw_worker_shutdown",
+      "compatible": true,
+      "evidence": {
+        "raw_worker_completion_observed": true
+      },
+      "gate": "G8",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "retry_privacy",
+      "compatible": false,
+      "evidence": {
+        "retry_seen": true,
+        "source_address_visible_in_token": true,
+        "token_bytes": 52
+      },
+      "gate": "G3",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "native_datagram_control",
+      "compatible": true,
+      "evidence": {
+        "framing_matches": true,
+        "roundtrip_bytes": 3
+      },
+      "gate": "G6",
+      "profile": "release"
+    },
+    {
+      "candidate": "prototype_patch",
+      "case": "blocked_body_fin",
+      "compatible": false,
+      "evidence": {
+        "body_channel_capacity": 16,
+        "body_consumer_paused": true,
+        "native_datagram_delivered": true,
+        "terminal_body_buffered_at_server": true
+      },
+      "gate": "G6",
+      "profile": "release"
+    }
+  ],
+  "production_compatibility": "unverified",
+  "quiche": "0.30.1",
+  "schema": 1,
+  "scope": "focused_driver_contracts",
+  "selected_contracts_passed": false,
+  "system": "Darwin",
+  "tokio_quiche": "0.23.0",
+  "topology": "loopback"
+}

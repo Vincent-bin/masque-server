@@ -1,0 +1,217 @@
+{
+  "architecture": "x86_64",
+  "binary_sha256": "a4156475fca4746572a5bd13c9c52b205f43c15146c8f058784938fb39efdd51",
+  "datagram_socket_build_patch": false,
+  "default_features": false,
+  "harness_failures": [],
+  "observations": [
+    {
+      "candidate": "stock",
+      "case": "stream_control",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 26,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G5",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "empty_error",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 0,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G5",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "cid16",
+      "compatible": false,
+      "evidence": {
+        "handshake_and_settings": true,
+        "request_delivered": false
+      },
+      "gate": "G4",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "shutdown_read",
+      "compatible": false,
+      "evidence": {
+        "response_fin": false,
+        "write_channel_alive_after_read_shutdown": false
+      },
+      "gate": "G5",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "shutdown_write",
+      "compatible": false,
+      "evidence": {
+        "read_channel_delivers_after_write_shutdown": false
+      },
+      "gate": "G5",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "unknown_flow",
+      "compatible": false,
+      "evidence": {
+        "pre_connect_datagram_replayed": true
+      },
+      "gate": "G6",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "late_datagram",
+      "compatible": false,
+      "evidence": {
+        "native_datagram_delivered_after_request_fin": true,
+        "response_fin": true,
+        "response_preserved": true
+      },
+      "gate": "G6",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "qsid_empty",
+      "compatible": false,
+      "evidence": {
+        "application_close": null,
+        "close_code": null,
+        "required_code": 51
+      },
+      "gate": "G6",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "qsid_truncated",
+      "compatible": false,
+      "evidence": {
+        "application_close": null,
+        "close_code": null,
+        "required_code": 51
+      },
+      "gate": "G6",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "qsid_out_of_range",
+      "compatible": true,
+      "evidence": {
+        "application_close": true,
+        "close_code": 51,
+        "required_code": 51
+      },
+      "gate": "G6",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "event_backlog",
+      "compatible": false,
+      "evidence": {
+        "body_chunks": 512,
+        "event_channel_has_capacity": false,
+        "payload_bytes": 32768,
+        "queued_events_after_256_and_512_chunks": [
+          256,
+          512
+        ]
+      },
+      "gate": "G1",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "raw_cid16",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 26,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G4",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "tls_hook",
+      "compatible": true,
+      "evidence": {
+        "response_bytes": 26,
+        "response_fin": true,
+        "status_matches": true
+      },
+      "gate": "G7",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "raw_worker_shutdown",
+      "compatible": true,
+      "evidence": {
+        "raw_worker_completion_observed": true
+      },
+      "gate": "G8",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "retry_privacy",
+      "compatible": false,
+      "evidence": {
+        "retry_seen": true,
+        "source_address_visible_in_token": true,
+        "token_bytes": 52
+      },
+      "gate": "G3",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "native_datagram_control",
+      "compatible": true,
+      "evidence": {
+        "framing_matches": true,
+        "roundtrip_bytes": 3
+      },
+      "gate": "G6",
+      "profile": "debug"
+    },
+    {
+      "candidate": "stock",
+      "case": "blocked_body_fin",
+      "compatible": false,
+      "evidence": {
+        "body_channel_capacity": 1,
+        "body_consumer_paused": true,
+        "native_datagram_delivered": true,
+        "terminal_body_buffered_at_server": true
+      },
+      "gate": "G6",
+      "profile": "debug"
+    }
+  ],
+  "production_compatibility": "unverified",
+  "quiche": "0.30.1",
+  "schema": 1,
+  "scope": "focused_driver_contracts",
+  "selected_contracts_passed": false,
+  "system": "Linux",
+  "tokio_quiche": "0.23.0",
+  "topology": "loopback"
+}

@@ -1,0 +1,24 @@
+{
+  "tokio-quiche": {
+    "version": "0.23.0",
+    "directory": "upstream",
+    "patch": "0001-compatibility-prototype.patch",
+    "files": {
+      "src/http3/driver/mod.rs": "f9f4232de82382c5417889aa5a039ee425123afe9d3e8947e8a7bba112f873d5",
+      "src/http3/driver/server.rs": "0183f2bf8d2ef4af291bf4953e1a38d833af0b24d5db0378cf4512feb90a544c",
+      "src/http3/settings.rs": "91dd2da13e4f7b24dffd37cee9f7eb269e0dcdfb3128d1350d2527683ca338a0",
+      "src/quic/connection/id.rs": "ac39fdac9a15fcf8e5f716c805caee7a439af698f971372d78e01ece3eea94c4",
+      "src/quic/mod.rs": "c9cbff14af161bf9db17768e65897f053e8d78b2816d7cfa22d66a57512c8d83",
+      "src/quic/router/mod.rs": "7071df7b03163320069d50d0be7cd6f4f2198a8a3ece38cacf3d8b1c9b9d079f",
+      "src/settings/config.rs": "94a83e045f866382845b02c3dc071fc800b0446134ddf2016ecc3934fef480a3"
+    }
+  },
+  "datagram-socket": {
+    "version": "0.8.1",
+    "directory": "datagram-socket",
+    "patch": "0002-musl-msghdr.patch",
+    "files": {
+      "src/mmsg.rs": "b4670af253c662f78487c6c40282760e5a07041d4bb33b9125db654b2071aea0"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "architecture": "arm64",
+  "binary_sha256": "b3b96bde09e3cfe8bf5d525bf9edbe19b59965aac9b64b624c22695b0a196a7e",
+  "datagram_socket_build_patch": false,
+  "default_features": false,
+  "harness_failures": [],
+  "observations": [
+    {
+      "candidate": "stock",
+      "case": "event_backlog",
+      "compatible": false,
+      "evidence": {
+        "audit_body_bytes": 32768,
+        "body_chunks": 512,
+        "fin_event_delivered": true,
+        "other_event_and_command_queues_bounded": false,
+        "payload_bytes": 32768,
+        "queued_events_after_256_and_512_chunks": [
+          256,
+          512
+        ]
+      },
+      "gate": "G1",
+      "profile": "debug"
+    }
+  ],
+  "production_compatibility": "unverified",
+  "quiche": "0.30.1",
+  "schema": 1,
+  "scope": "focused_driver_contracts",
+  "selected_contracts_passed": false,
+  "system": "Darwin",
+  "tokio_quiche": "0.23.0",
+  "topology": "loopback"
+}

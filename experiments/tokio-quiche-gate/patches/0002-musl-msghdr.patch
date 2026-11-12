@@ -1,0 +1,61 @@
+--- a/src/mmsg.rs
++++ b/src/mmsg.rs
+@@ -24,7 +24,6 @@
+ // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
+-use std::io::IoSlice;
+ use std::io::{
+     self,
+ };
+@@ -63,15 +62,7 @@
+         // pushing to it would invalidate them.
+         for (buf, iov) in bufs.iter().zip(iovecs.iter_mut()) {
+             msgvec.push(libc::mmsghdr {
+-                msg_hdr: libc::msghdr {
+-                    msg_name: std::ptr::null_mut(),
+-                    msg_namelen: 0,
+-                    msg_iov: iov,
+-                    msg_iovlen: 1,
+-                    msg_control: std::ptr::null_mut(),
+-                    msg_controllen: 0,
+-                    msg_flags: 0,
+-                },
++                msg_hdr: message_header(iov, 1),
+                 msg_len: buf.capacity().try_into().unwrap(),
+             });
+         }
+@@ -167,15 +158,7 @@
+         let iovecs_per_message = if suffix.is_some() { 2 } else { 1 };
+         for message_iovecs in iovecs.chunks_exact_mut(iovecs_per_message) {
+             msgvec.push(libc::mmsghdr {
+-                msg_hdr: libc::msghdr {
+-                    msg_name: std::ptr::null_mut(),
+-                    msg_namelen: 0,
+-                    msg_iov: message_iovecs.as_mut_ptr(),
+-                    msg_iovlen: iovecs_per_message as _,
+-                    msg_control: std::ptr::null_mut(),
+-                    msg_controllen: 0,
+-                    msg_flags: 0,
+-                },
++                msg_hdr: message_header(message_iovecs.as_mut_ptr(), iovecs_per_message),
+                 // Output field populated by the kernel.
+                 msg_len: 0,
+             });
+@@ -212,6 +195,16 @@
+     }
+ 
+     Ok(ret)
++}
++
++fn message_header(iov: *mut libc::iovec, count: usize) -> libc::msghdr {
++    // SAFETY: msghdr contains only integers and raw pointers, for which zero
++    // is valid. Zeroing also initializes musl's private padding. The callers
++    // retain the populated iovec arrays and their buffers across the syscall.
++    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
++    header.msg_iov = iov;
++    header.msg_iovlen = count as _;
++    header
+ }
+ 
+ fn iovec(buf: &[u8]) -> libc::iovec {

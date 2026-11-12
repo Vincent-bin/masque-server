@@ -1,0 +1,233 @@
+{
+  "runs": [
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1614.6012054350265,
+      "mode": "stream",
+      "seconds": 1.330039666,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 0,
+      "topology": "mac-linux",
+      "server_cpu": 1.2986330000000001,
+      "client_cpu": 1.290591,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1605.0308895797216,
+      "mode": "stream",
+      "seconds": 1.337970292,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 1,
+      "topology": "mac-linux",
+      "server_cpu": 1.300888,
+      "client_cpu": 1.3061809999999998,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1665.6417931516976,
+      "mode": "stream",
+      "seconds": 1.289283,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 2,
+      "topology": "mac-linux",
+      "server_cpu": 1.200318,
+      "client_cpu": 1.2745259999999998,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1668.3514059934018,
+      "mode": "stream",
+      "seconds": 1.287189042,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 3,
+      "topology": "mac-linux",
+      "server_cpu": 1.2595170000000002,
+      "client_cpu": 1.2575129999999999,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1616.7840516538604,
+      "mode": "stream",
+      "seconds": 1.328243958,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 4,
+      "topology": "mac-linux",
+      "server_cpu": 1.291154,
+      "client_cpu": 1.31498,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1605.226648796627,
+      "mode": "stream",
+      "seconds": 1.3378071249999999,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 5,
+      "topology": "mac-linux",
+      "server_cpu": 1.282967,
+      "client_cpu": 1.309153,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1596.8317783469076,
+      "mode": "stream",
+      "seconds": 1.34484025,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 6,
+      "topology": "mac-linux",
+      "server_cpu": 1.182923,
+      "client_cpu": 1.3338,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1628.0776853899013,
+      "mode": "stream",
+      "seconds": 1.319030208,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 7,
+      "topology": "mac-linux",
+      "server_cpu": 1.223185,
+      "client_cpu": 1.3090789999999999,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1637.7945987830271,
+      "mode": "stream",
+      "seconds": 1.3112045,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 8,
+      "topology": "mac-linux",
+      "server_cpu": 1.283669,
+      "client_cpu": 1.294579,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    },
+    {
+      "bytes": 268435456,
+      "goodput_mbps": 1608.3158093228628,
+      "mode": "stream",
+      "seconds": 1.335237542,
+      "server": "quinn",
+      "client": "quinn",
+      "repeat": 9,
+      "topology": "mac-linux",
+      "server_cpu": 1.296994,
+      "client_cpu": 1.237524,
+      "server_socket": {
+        "recv_buffer": 4194304,
+        "send_buffer": 4194304
+      },
+      "client_socket": {
+        "recv_buffer": 2097152,
+        "send_buffer": 2097152
+      }
+    }
+  ],
+  "summary": [
+    {
+      "topology": "mac-linux",
+      "mode": "stream",
+      "payload": 0,
+      "target_pps": 0,
+      "server": "quinn",
+      "client": "quinn",
+      "repeats": 10,
+      "failures": 0,
+      "attempts": 10,
+      "goodput_mbps": {
+        "median": 1615.6926285444433,
+        "minimum": 1596.8317783469076,
+        "maximum": 1668.3514059934018
+      },
+      "server_cpu": {
+        "median": 1.283318,
+        "minimum": 1.182923,
+        "maximum": 1.300888
+      },
+      "client_cpu": {
+        "median": 1.3003799999999999,
+        "minimum": 1.237524,
+        "maximum": 1.3338
+      }
+    }
+  ],
+  "failures": []
+}

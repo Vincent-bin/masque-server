@@ -1,0 +1,306 @@
+--- a/src/http3/driver/mod.rs
++++ b/src/http3/driver/mod.rs
+@@ -404,6 +404,8 @@
+ /// its associated [H3Controller]. The controller allows the application to both
+ /// listen for [`H3Event`]s of note and send [`H3Command`]s into the I/O loop.
+ pub struct H3Driver<H: DriverHooks> {
++    suppress_body_progress_events: bool,
++    preserve_stream_directions: bool,
+     /// Configuration used to initialize `conn`. Created from [`Http3Settings`]
+     /// in the constructor.
+     h3_config: h3::Config,
+@@ -470,6 +472,8 @@
+ 
+         (
+             H3Driver {
++                suppress_body_progress_events: http3_settings.suppress_body_progress_events,
++                preserve_stream_directions: http3_settings.preserve_stream_directions,
+                 h3_config: (&http3_settings).into(),
+                 conn: None,
+                 hooks: H::new(&http3_settings),
+@@ -666,12 +670,14 @@
+             match conn.recv_body_buf(qconn, stream_id, &mut *body_recv_buf) {
+                 Ok(n) => {
+                     ctx.audit_stats.add_downstream_bytes_recvd(n as u64);
+-                    let event = H3Event::BodyBytesReceived {
+-                        stream_id,
+-                        num_bytes: n as u64,
+-                        fin: false,
+-                    };
+-                    let _ = self.h3_event_sender.send(event.into());
++                    if !self.suppress_body_progress_events {
++                        let event = H3Event::BodyBytesReceived {
++                            stream_id,
++                            num_bytes: n as u64,
++                            fin: false,
++                        };
++                        let _ = self.h3_event_sender.send(event.into());
++                    }
+                     // Take the filled part, leave the remaining capacity
+                     let filled_body = body_recv_buf.get_mut().split();
+                     // Sanity check: the remaining spare capacity should equal
+@@ -1165,14 +1171,13 @@
+         Ok(())
+     }
+ 
+-    /// Shuts down the indicated HTTP/3 stream by sending frames and cleaning
+-    /// up then cleans up internal state by calling
+-    /// [`Self::cleanup_stream`].
++    /// Shuts down the indicated direction(s), removing state by default.
++    /// When opted in, retain state until both directions have finished.
+     fn shutdown_stream(
+         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
+         shutdown: StreamShutdown,
+     ) -> H3ConnectionResult<()> {
+-        let Some(stream_ctx) = self.stream_map.get(&stream_id) else {
++        let Some(stream_ctx) = self.stream_map.get_mut(&stream_id) else {
+             return Ok(());
+         };
+ 
+@@ -1186,6 +1191,7 @@
+                     quiche::Shutdown::Read,
+                     error_code,
+                 );
++                stream_ctx.recv_state = RecvState::Closed;
+             },
+             StreamShutdown::Write { error_code } => {
+                 audit_stats.set_sent_reset_stream_error_code(error_code as _);
+@@ -1194,6 +1200,10 @@
+                     quiche::Shutdown::Write,
+                     error_code,
+                 );
++                stream_ctx.send_state = SendState::Closed;
++                stream_ctx.recv = None;
++                stream_ctx.queued_frame = None;
++                stream_ctx.cancel_recv_wait();
+             },
+             StreamShutdown::Both {
+                 read_error_code,
+@@ -1213,10 +1223,25 @@
+                     quiche::Shutdown::Write,
+                     write_error_code,
+                 );
+-            },
+-        }
+-
+-        self.cleanup_stream(qconn, stream_id)
++                stream_ctx.recv_state = RecvState::Closed;
++                stream_ctx.send_state = SendState::Closed;
++                stream_ctx.recv = None;
++                stream_ctx.queued_frame = None;
++                stream_ctx.cancel_recv_wait();
++            },
++        }
++
++        let fully_closed = stream_ctx.fully_closed();
++        if !self.preserve_stream_directions {
++            return self.cleanup_stream(qconn, stream_id);
++        }
++        if matches!(shutdown, StreamShutdown::Read { .. } | StreamShutdown::Both { .. }) {
++            H::stream_recv_closed(self, stream_id);
++        }
++        if fully_closed {
++            self.cleanup_stream(qconn, stream_id)?;
++        }
++        Ok(())
+     }
+ 
+     /// Handles a regular [`H3Command`]. May be called internally by
+@@ -1265,6 +1290,10 @@
+                     H::handle_incoming_dgram(self, flow_id, dgram);
+                 },
+                 Err(quiche::Error::Done) => return Ok(()),
++                Err(quiche::Error::BufferTooShort) => {
++                    let _ = qconn.close(true, WireErrorCode::DatagramError as u64, b"");
++                    return Err(H3ConnectionError::H3(h3::Error::IdError));
++                },
+                 Err(err) => return Err(H3ConnectionError::from(err)),
+             }
+         }
+@@ -1570,10 +1599,9 @@
+     /// Send a GOAWAY frame to the peer to initiate a graceful connection
+     /// shutdown.
+     GoAway,
+-    /// Shuts down a stream in the specified direction(s) and removes it from
+-    /// local state.
++    /// Shuts down a stream in the specified direction(s).
+     ///
+-    /// This removes the stream from local state and sends a `RESET_STREAM`
++    /// By default this removes the stream from local state and sends a `RESET_STREAM`
+     /// frame (for write direction) and/or a `STOP_SENDING` frame (for read
+     /// direction) to the peer. See [`quiche::Connection::stream_shutdown`]
+     /// for details.
+@@ -1693,6 +1721,8 @@
+     /// This removes the stream from local state and sends a `RESET_STREAM`
+     /// frame (for write direction) and/or a `STOP_SENDING` frame (for read
+     /// direction) to the peer, depending on the [`StreamShutdown`] variant.
++    /// With `Http3Settings::preserve_stream_directions`, the other direction
++    /// remains usable and state is removed only after both directions close.
+     pub fn shutdown_stream(&self, stream_id: u64, shutdown: StreamShutdown) {
+         let _ = self.cmd_sender.send(
+             H3Command::ShutdownStream {
+--- a/src/http3/driver/server.rs
++++ b/src/http3/driver/server.rs
+@@ -159,6 +159,8 @@
+ const PRE_HEADERS_BOOSTED_PRIORITY_INCREMENTAL: bool = false;
+ 
+ pub struct ServerHooks {
++    discard_unknown_datagrams: bool,
++    discard_datagrams_after_read_fin: bool,
+     /// Helper to enforce limits and timeouts on an HTTP/3 connection.
+     settings_enforcer: Http3SettingsEnforcer,
+     /// Tracks the number of requests that have been handled by this driver.
+@@ -294,6 +296,8 @@
+ 
+     fn new(settings: &Http3Settings) -> Self {
+         Self {
++            discard_unknown_datagrams: settings.discard_unknown_datagrams,
++            discard_datagrams_after_read_fin: settings.discard_datagrams_after_read_fin,
+             settings_enforcer: settings.into(),
+             requests: 0,
+             post_accept_timeout: None,
+@@ -375,13 +379,24 @@
+         }
+ 
+         // Flow already established.
+-        if let Some(flow) = driver.get_flow(flow_id) {
++        if let Some(flow) = driver.flow_map.get_mut(&flow_id) {
++            if driver.hooks.discard_datagrams_after_read_fin {
++                let input_open = driver.stream_map
++                    .get(&flow.associated_stream_id)
++                    .is_some_and(|stream| matches!(stream.recv_state,
++                        super::streams::RecvState::Open(_)));
++                if !input_open {
++                    return;
++                }
++            }
+             flow.send_best_effort(dgram);
+             return;
+         }
+ 
+         // Buffer while awaiting the CONNECT request.
+-        driver.hooks.pending_dgrams.push(flow_id, dgram);
++        if !driver.hooks.discard_unknown_datagrams {
++            driver.hooks.pending_dgrams.push(flow_id, dgram);
++        }
+     }
+ 
+     fn expire_pending_dgrams(&mut self) {
+--- a/src/http3/settings.rs
++++ b/src/http3/settings.rs
+@@ -43,6 +43,19 @@
+ #[derive(Default, Clone, Debug)]
+ #[non_exhaustive]
+ pub struct Http3Settings {
++    /// Suppress per-read body byte events. The per-stream audit counter remains
++    /// available, and FIN and other lifecycle events are still emitted.
++    /// This does not bound the remaining event or command queues.
++    pub suppress_body_progress_events: bool,
++    /// Preserve the other direction on a directional controller shutdown.
++    /// False retains the legacy whole-stream application cleanup behavior.
++    pub preserve_stream_directions: bool,
++    /// Drop DATAGRAMs whose CONNECT request has not been processed yet.
++    /// False preserves the default short-lived pre-CONNECT buffer.
++    pub discard_unknown_datagrams: bool,
++    /// Drop native DATAGRAM input once the associated request input ends.
++    /// This leaves the response and previously delivered capsules available.
++    pub discard_datagrams_after_read_fin: bool,
+     /// Maximum number of requests a
+     /// [ServerH3Driver](crate::http3::driver::ServerH3Driver) allows per
+     /// connection.
+--- a/src/quic/connection/id.rs
++++ b/src/quic/connection/id.rs
+@@ -39,6 +39,12 @@
+ /// Clients currently can't configure a [`ConnectionIdGenerator`] and always use
+ /// the [`SimpleConnectionIdGenerator`].
+ pub trait ConnectionIdGenerator<'a>: Send + Sync + 'static {
++    /// Length of every CID issued by this generator, including replacements.
++    /// The short-header router must use the same length. Defaults to 20.
++    fn connection_id_len(&self) -> usize {
++        quiche::MAX_CONN_ID_LEN
++    }
++
+     /// Creates a new [`ConnectionId`] according to the generator's logic.
+     fn new_connection_id(&self) -> ConnectionId<'a>;
+ 
+--- a/src/quic/mod.rs
++++ b/src/quic/mod.rs
+@@ -300,7 +300,14 @@
+         "O_NONBLOCK should be set for the listening socket"
+     );
+ 
+-    let config = Config::new(params, socket.capabilities).into_io()?;
++    let mut config = Config::new(params, socket.capabilities).into_io()?;
++    config.short_dcid_len = socket.cid_generator.connection_id_len();
++    if !(1..=quiche::MAX_CONN_ID_LEN).contains(&config.short_dcid_len) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "server CID length must be between 1 and 20",
++        ));
++    }
+ 
+     let local_addr = socket.socket.local_addr()?;
+     let socket_tx = Arc::new(socket.socket);
+--- a/src/quic/router/mod.rs
++++ b/src/quic/router/mod.rs
+@@ -47,6 +47,7 @@
+ use foundations::telemetry::log;
+ use quiche::ConnectionId;
+ use quiche::Header;
++#[cfg(test)]
+ use quiche::MAX_CONN_ID_LEN;
+ use std::default::Default;
+ use std::future::Future;
+@@ -252,14 +253,14 @@
+         #[cfg(feature = "perf-quic-listener-metrics")]
+         let start = std::time::Instant::now();
+ 
+-        if let Some(dcid) = short_dcid(&incoming.buf) {
++        if let Some(dcid) = short_dcid_with_len(&incoming.buf, self.config.short_dcid_len) {
+             if let Some(ev_sender) = self.conns.get(&dcid) {
+                 let _ = ev_sender.try_send(incoming);
+                 return Ok(());
+             }
+         }
+ 
+-        let hdr = Header::from_slice(&mut incoming.buf, MAX_CONN_ID_LEN)
++        let hdr = Header::from_slice(&mut incoming.buf, self.config.short_dcid_len)
+             .map_err(|e| match e {
+                 quiche::Error::BufferTooShort | quiche::Error::InvalidPacket =>
+                     labels::QuicInvalidInitialPacketError::FailedToParse.into(),
+@@ -747,11 +748,16 @@
+ }
+ 
+ // Quickly extract the connection id of a short quic packet without allocating
++#[cfg(test)]
+ fn short_dcid(buf: &[u8]) -> Option<ConnectionId<'_>> {
++    short_dcid_with_len(buf, MAX_CONN_ID_LEN)
++}
++
++fn short_dcid_with_len(buf: &[u8], len: usize) -> Option<ConnectionId<'_>> {
+     let is_short_dcid = buf.first()? >> 7 == 0;
+ 
+     if is_short_dcid {
+-        buf.get(1..1 + MAX_CONN_ID_LEN).map(ConnectionId::from_ref)
++        buf.get(1..1 + len).map(ConnectionId::from_ref)
+     } else {
+         None
+     }
+--- a/src/settings/config.rs
++++ b/src/settings/config.rs
+@@ -47,6 +47,7 @@
+ 
+ /// Internal representation of the combined configuration for a QUIC connection.
+ pub(crate) struct Config {
++    pub short_dcid_len: usize,
+     pub quiche_config: quiche::Config,
+     pub disable_client_ip_validation: bool,
+     pub qlog_dir: Option<String>,
+@@ -101,6 +102,7 @@
+         let pacing_offload = quic_settings.enable_pacing && pacing_offload;
+ 
+         Ok(Config {
++            short_dcid_len: quiche::MAX_CONN_ID_LEN,
+             quiche_config: make_quiche_config(params, keylog_file.is_some())?,
+             disable_client_ip_validation: quic_settings
+                 .disable_client_ip_validation,
