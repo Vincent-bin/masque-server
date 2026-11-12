@@ -209,7 +209,7 @@ impl BasicAuthenticator {
         Ok(Self { users })
     }
 
-    /// Validate a complete `Proxy-Authorization` field value, end to end.
+    /// Validate a complete Basic credential field value, end to end.
     ///
     /// Only for tests: the request path must use [`precheck`](Self::precheck)
     /// plus [`BasicCredential::verify`] so the deliberately slow password hash

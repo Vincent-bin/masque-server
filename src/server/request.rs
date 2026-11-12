@@ -191,13 +191,13 @@ impl Shard {
             // The cheap half runs here; only a well-formed request for the
             // configured user reaches the password hash, and that is
             // deliberately slow enough that it must not run on this thread.
-            if headers.duplicate_proxy_authorization {
+            if headers.duplicate_basic_authorization {
                 context.metrics.record_auth_failure();
-                warn!(stream_id, "duplicate proxy credentials");
+                warn!(stream_id, "multiple Basic credential fields");
                 Self::send_auth_rejection(h3, quic, pending_errors, stream_id);
                 return None;
             }
-            match auth.precheck(headers.proxy_authorization) {
+            match auth.precheck(headers.basic_authorization) {
                 AuthPrecheck::Authenticated => {
                     // A long batch of header events can cross the deadline
                     // after the shard began polling it.

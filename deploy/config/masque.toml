@@ -53,11 +53,11 @@ shards = 1
 
 [listeners.auth]
 enabled = true
-# "basic"       — RFC 7617 Proxy-Authorization, checked per request.
+# "basic"       — RFC 7617 credentials, checked per request.
 # "client_cert" — a TLS client certificate, matched against [[clients]] below.
 #
 # Pick "client_cert" when peers authenticate using a TLS client certificate.
-# A listener configured for Basic authentication requires Proxy-Authorization.
+# Send Proxy-Authorization or use Authorization for standard CONNECT-IP.
 #
 # To serve both kinds of client, add the second listener shown at the end of
 # this file. Every listener has its own explicit authentication table.

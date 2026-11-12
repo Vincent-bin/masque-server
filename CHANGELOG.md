@@ -7,6 +7,13 @@ pre-1.0.
 
 ## Unreleased
 
+## 0.14.23 - 2026-11-12
+
+### Added
+
+- Accept `Authorization: Basic` for standard CONNECT-IP over HTTP/2 and HTTP/3.
+  Existing `Proxy-Authorization: Basic` requests remain supported.
+
 ## 0.14.22 - 2026-11-11
 
 ### Added

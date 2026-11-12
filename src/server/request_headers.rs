@@ -7,8 +7,8 @@ pub(super) struct RequestHeaders<'a> {
     pub(super) scheme: Option<&'a [u8]>,
     pub(super) protocol: Option<&'a [u8]>,
     pub(super) authority: Option<&'a [u8]>,
-    pub(super) proxy_authorization: Option<&'a [u8]>,
-    pub(super) duplicate_proxy_authorization: bool,
+    pub(super) basic_authorization: Option<&'a [u8]>,
+    pub(super) duplicate_basic_authorization: bool,
 }
 
 impl<'a> RequestHeaders<'a> {
@@ -62,9 +62,14 @@ impl<'a> RequestHeaders<'a> {
                 {
                     return None;
                 }
-                b"proxy-authorization" => {
-                    request.duplicate_proxy_authorization |=
-                        request.proxy_authorization.replace(value).is_some();
+                // Pseudo-headers have already been read. Only the RFC 9484
+                // CONNECT-IP token accepts the resource's Authorization header.
+                b"proxy-authorization" | b"authorization"
+                    if name == b"proxy-authorization"
+                        || request.protocol == Some(b"connect-ip") =>
+                {
+                    request.duplicate_basic_authorization |=
+                        request.basic_authorization.replace(value).is_some();
                 }
                 _ => {}
             }

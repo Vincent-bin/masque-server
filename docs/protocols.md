@@ -20,11 +20,13 @@ ALPN over TCP/TLS and advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
 ## Authentication
 
 With a listener's `auth.mode = "basic"`, every CONNECT form passes through the
-same proxy authentication pipeline. The client supplies:
+same proxy authentication pipeline. All CONNECT forms accept
+`Proxy-Authorization: Basic BASE64(username:password)`.
 
-```text
-Proxy-Authorization: Basic BASE64(username:password)
-```
+Standard CONNECT-IP over HTTP/2 and HTTP/3 also accepts
+`Authorization: Basic BASE64(username:password)` under
+[RFC 9484 §11](https://www.rfc-editor.org/rfc/rfc9484.html#section-11).
+CONNECT-IP requests that carry both credential fields receive an empty 404.
 
 The server validates syntax, looks up the username in that listener's account
 set, and snapshots only the matching Argon2id hash before scheduling password
