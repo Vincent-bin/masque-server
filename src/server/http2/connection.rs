@@ -279,7 +279,8 @@ async fn handle_request(
 
     if matches!(
         auth::authorize_request(
-            &request,
+            request.headers(),
+            recognized.accepts_authorization(),
             &mut respond,
             &context,
             admission.auth_slots,

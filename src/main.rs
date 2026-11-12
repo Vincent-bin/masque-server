@@ -334,7 +334,7 @@ enum Command {
 /// command-line parsing; the two are mapped in one place below.
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum AuthModeArg {
-    /// RFC 7617 `Proxy-Authorization`, checked per request.
+    /// RFC 7617 Basic credentials, checked per request.
     Basic,
     /// A TLS client certificate, matched against the `[[clients]]` roster.
     ///

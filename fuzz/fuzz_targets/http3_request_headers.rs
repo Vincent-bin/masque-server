@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mode) = input.arbitrary::<u8>() else {
         return;
     };
-    let mut fields: Vec<Field<'_>> = match mode % 4 {
+    let mut fields: Vec<Field<'_>> = match mode % 5 {
         0 => vec![
             (b":method", b"CONNECT"),
             (b":authority", b"[2001:db8::1]:443"),
@@ -34,6 +34,13 @@ fuzz_target!(|data: &[u8]| {
             (b":path", b"*"),
             (b"te", b"trailers"),
         ],
+        3 => vec![
+            (b":method", b"CONNECT"),
+            (b":protocol", b"connect-ip"),
+            (b":scheme", b"https"),
+            (b":authority", b"proxy.example"),
+            (b":path", b"/.well-known/masque/ip/*/*/"),
+        ],
         _ => Vec::new(),
     };
 
@@ -47,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
         else {
             break;
         };
-        let name: &[u8] = match selector % 9 {
+        let name: &[u8] = match selector % 10 {
             0 => b":method",
             1 => b":authority",
             2 => b":path",
@@ -56,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
             5 => b"proxy-authorization",
             6 => b"te",
             7 => b"connection",
+            8 => b"authorization",
             _ => raw_name,
         };
         let index = (usize::from(op) >> 1).min(fields.len());
@@ -75,10 +83,13 @@ fuzz_target!(|data: &[u8]| {
         }
         let credentials = fields
             .iter()
-            .filter(|(name, _)| *name == b"proxy-authorization")
+            .filter(|(name, _)| {
+                *name == b"proxy-authorization"
+                    || (*name == b"authorization" && parsed.protocol == Some(b"connect-ip"))
+            })
             .count();
-        assert_eq!(parsed.proxy_authorization.is_some(), credentials > 0);
-        assert_eq!(parsed.duplicate_proxy_authorization, credentials > 1);
+        assert_eq!(parsed.basic_authorization.is_some(), credentials > 0);
+        assert_eq!(parsed.duplicate_basic_authorization, credentials > 1);
         fields.push((b":method", method));
         assert!(RequestHeaders::parse(fields).is_none());
     }

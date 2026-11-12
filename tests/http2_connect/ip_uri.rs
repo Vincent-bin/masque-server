@@ -157,18 +157,62 @@ async fn ip_uri_validation_does_not_create_an_unauthenticated_stealth_oracle() {
             assert!(response.headers().get("proxy-status").is_none());
         }
     }
-    for (path, status) in [
-        ("/", 400),
-        ("/.well-known/masque/ip/*/17/", 501),
-        ("/.well-known/masque/ip/*/*/", 200),
+    for name in ["authorization", "proxy-authorization"] {
+        for (path, status) in [
+            ("/", 400),
+            ("/.well-known/masque/ip/*/17/", 501),
+            ("/.well-known/masque/ip/*/*/", 200),
+        ] {
+            let mut request = ip_request(path, "connect-ip");
+            request.headers_mut().insert(name, valid.parse().unwrap());
+            let (response, mut body) = client.send_request(request, false).unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status().as_u16(), status, "{name} {path}");
+            if status == 200 {
+                let (frames, _response_body) = read_connect_ip_setup(response).await;
+                assert!(matches!(
+                    frames.first(),
+                    Some(CapsuleFrame::AddressAssign(_))
+                ));
+            }
+            body.send_reset(h2::Reason::CANCEL);
+        }
+    }
+    for (protocol, path, extra_header, credential) in [
+        (
+            "connect-ip",
+            "/.well-known/masque/ip/*/*/",
+            None,
+            wrong.as_str(),
+        ),
+        (
+            "connect-ip",
+            "/.well-known/masque/ip/*/*/",
+            Some("authorization"),
+            valid.as_str(),
+        ),
+        (
+            "connect-ip",
+            "/.well-known/masque/ip/*/*/",
+            Some("proxy-authorization"),
+            valid.as_str(),
+        ),
+        ("cf-connect-ip", "/", None, valid.as_str()),
+        ("connect-udp", "/", None, valid.as_str()),
     ] {
-        let mut request = ip_request(path, "connect-ip");
+        let mut request = ip_request(path, protocol);
         request
             .headers_mut()
-            .insert("proxy-authorization", valid.parse().unwrap());
-        let (response, mut body) = client.send_request(request, false).unwrap();
-        assert_eq!(response.await.unwrap().status().as_u16(), status);
-        body.send_reset(h2::Reason::CANCEL);
+            .insert("authorization", credential.parse().unwrap());
+        if let Some(name) = extra_header {
+            request.headers_mut().append(name, valid.parse().unwrap());
+        }
+        let (response, _) = client.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{protocol}");
+        assert!(response.headers().get("www-authenticate").is_none());
+        assert!(response.headers().get("proxy-authenticate").is_none());
+        assert!(response.into_body().data().await.is_none());
     }
     server_task.abort();
     driver.abort();

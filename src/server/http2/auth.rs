@@ -5,8 +5,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use bytes::Bytes;
 use h2::server::SendResponse;
-use http::header::{HeaderValue, PROXY_AUTHORIZATION};
-use http::{Request, StatusCode};
+use http::header::{AUTHORIZATION, HeaderValue, PROXY_AUTHORIZATION};
+use http::{HeaderMap, StatusCode};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
@@ -43,7 +43,8 @@ pub(super) enum Authorization {
 
 /// Authenticate one recognized proxy request and emit any terminal response.
 pub(super) async fn authorize_request(
-    request: &Request<h2::RecvStream>,
+    headers: &HeaderMap,
+    accepts_authorization: bool,
     respond: &mut SendResponse<Bytes>,
     context: &ConnectionContext,
     auth_slots: Arc<Semaphore>,
@@ -53,7 +54,14 @@ pub(super) async fn authorize_request(
         return Authorization::Granted;
     };
 
-    let mut values = request.headers().get_all(PROXY_AUTHORIZATION).iter();
+    let authorization = accepts_authorization
+        .then(|| headers.get_all(AUTHORIZATION).iter())
+        .into_iter()
+        .flatten();
+    let mut values = headers
+        .get_all(PROXY_AUTHORIZATION)
+        .iter()
+        .chain(authorization);
     let first = values.next().map(HeaderValue::as_bytes);
     if values.next().is_some() {
         context.metrics.record_auth_failure();

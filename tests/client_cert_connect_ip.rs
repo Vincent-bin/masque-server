@@ -634,6 +634,16 @@ impl Client {
         path: &str,
         credentials: Option<&str>,
     ) -> anyhow::Result<u64> {
+        let credentials = credentials.map(|value| ("proxy-authorization", value));
+        self.send_connect_ip_headers(protocol, path, credentials.as_slice())
+    }
+
+    fn send_connect_ip_headers(
+        &mut self,
+        protocol: &str,
+        path: &str,
+        credentials: &[(&str, &str)],
+    ) -> anyhow::Result<u64> {
         let mut headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", protocol.as_bytes()),
@@ -645,12 +655,11 @@ impl Client {
             // QPACK and the server's header scan.
             quiche::h3::Header::new(b"user-agent", b""),
         ];
-        if let Some(credentials) = credentials {
-            headers.push(quiche::h3::Header::new(
-                b"proxy-authorization",
-                credentials.as_bytes(),
-            ));
-        }
+        headers.extend(
+            credentials
+                .iter()
+                .map(|(name, value)| quiche::h3::Header::new(name.as_bytes(), value.as_bytes())),
+        );
 
         let h3 = self.h3.as_mut().unwrap();
         let stream_id = h3.send_request(&mut self.quic, &headers, false)?;
@@ -2319,6 +2328,80 @@ fn two_listeners_serve_both_authentication_modes_from_one_process() {
             !cert_addresses.contains(address),
             "listeners handed out the same address {address:?}; the pool is not shared"
         );
+    }
+}
+
+#[test]
+fn standard_connect_ip_accepts_basic_authorization_over_http3() {
+    let fixture = dual_fixture("ip-authorization");
+    let mut client = Client::connect_anonymous(fixture.basic_peer).unwrap();
+    let timeout = Duration::from_secs(5);
+    client.handshake(timeout).unwrap();
+    client.init_h3().unwrap();
+
+    let valid = fixture.credentials.as_str();
+    let wrong = format!("Basic {}", STANDARD.encode("alice:wrong"));
+    let authorization = ("authorization", valid);
+    let proxy_authorization = ("proxy-authorization", valid);
+    let standard_path = "/.well-known/masque/ip/*/*/";
+    let cases = [
+        (
+            "connect-ip",
+            standard_path,
+            [Some(authorization), None],
+            200,
+        ),
+        ("connect-ip", standard_path, [None, None], 404),
+        (
+            "connect-ip",
+            standard_path,
+            [Some(("authorization", wrong.as_str())), None],
+            404,
+        ),
+        (
+            "connect-ip",
+            standard_path,
+            [Some(authorization), Some(authorization)],
+            404,
+        ),
+        (
+            "connect-ip",
+            standard_path,
+            [Some(proxy_authorization), Some(authorization)],
+            404,
+        ),
+        ("cf-connect-ip", "/", [Some(authorization), None], 404),
+        (
+            "connect-ip",
+            standard_path,
+            [Some(proxy_authorization), None],
+            200,
+        ),
+    ];
+
+    for (protocol, path, credentials, expected) in cases {
+        let credentials: Vec<_> = credentials.into_iter().flatten().collect();
+        let stream = client
+            .send_connect_ip_headers(protocol, path, &credentials)
+            .unwrap();
+        let headers = client.response_headers(stream, timeout).unwrap();
+        assert!(headers.iter().any(|(name, value)| {
+            name == b":status" && value == expected.to_string().as_bytes()
+        }));
+        if expected == 200 {
+            assert!(!assigned_addresses(&mut client, stream).is_empty());
+        } else {
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| { name == b"content-length" && value == b"0" })
+            );
+            assert!(
+                headers.iter().all(|(name, _)| {
+                    name != b"www-authenticate" && name != b"proxy-authenticate"
+                })
+            );
+        }
     }
 }
 

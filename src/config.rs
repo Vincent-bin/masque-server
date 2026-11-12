@@ -69,7 +69,7 @@ pub struct TlsSection {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// RFC 7617 `Proxy-Authorization: Basic`, verified per request.
+    /// RFC 7617 Basic credentials, verified per request.
     #[default]
     Basic,
     /// A TLS client certificate, matched against the `[[clients]]` roster by
@@ -180,7 +180,7 @@ impl std::fmt::Debug for AuthSection {
 }
 
 impl AuthSection {
-    /// Whether `Proxy-Authorization` is required on every CONNECT request.
+    /// Whether Basic credentials are required on every CONNECT request.
     pub fn basic_enabled(&self) -> bool {
         self.enabled && self.mode == AuthMode::Basic
     }

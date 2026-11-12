@@ -188,7 +188,7 @@ shards = 1
 [listeners.auth]
 enabled = true
 mode = "basic"
-# Compatible clients must send Proxy-Authorization on their first request.
+# Send Basic credentials on the first CONNECT request.
 
 [[listeners.auth.users]]
 username = "proxy-user"
@@ -207,10 +207,16 @@ printf '%s' 'a-strong-password' | masque-server hash-password
 ```
 
 Clients send `Proxy-Authorization: Basic BASE64(user:password)` on each
-request, including the first CONNECT. Missing, malformed, duplicated, unknown,
-or wrong credentials receive the same empty `404` as an unsupported request,
-without `Proxy-Authenticate`. Authentication capacity failures also use this
-response; metrics retain the internal failure reason.
+request, including the first CONNECT. Standard CONNECT-IP over HTTP/2 or
+HTTP/3 also accepts `Authorization: Basic BASE64(user:password)` as described
+in [RFC 9484 §11](https://www.rfc-editor.org/rfc/rfc9484.html#section-11).
+Send exactly one credential field. For standard CONNECT-IP, a request
+containing both header names is ambiguous and is rejected.
+
+Missing, malformed, duplicated, unknown, or wrong credentials receive the
+same empty `404` as an unsupported request, without `Proxy-Authenticate`.
+Authentication capacity failures also use this response. Metrics retain the
+internal failure reason.
 
 This applies to both new and existing configurations. The legacy `stealth`
 field remains accepted, but neither `false` nor omission restores a 407

@@ -25,6 +25,12 @@ pub(super) struct RecognizedRequest {
     duplicate_legacy_protocol: bool,
 }
 
+impl RecognizedRequest {
+    pub(super) fn accepts_authorization(&self) -> bool {
+        matches!(self.connect, ConnectRequest::Ip { standard: true, .. })
+    }
+}
+
 /// Recognize a proxy request without parsing its target.
 ///
 /// Keeping recognition separate from `prepare` preserves the authentication
